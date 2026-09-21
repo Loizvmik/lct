@@ -5,7 +5,9 @@
 майнинг композиционных паттернов) плюс два требования этой задачи:
 
 - именование ролей палитры моделью (`naming.py`, единственный модуль пакета,
-  которому разрешено знать про `deckforge.provider` — см. докстроку пакета);
+  который реально вызывает модель — см. докстроку пакета; этот модуль
+  импортирует из `deckforge.provider` только тип `LLMProvider` для сигнатуры
+  параметра `namer` у `from_file` ниже, самого вызова здесь нет);
 - человекочитаемый отчёт «откуда что взято» (`.provenance`) и список
   предупреждений о деградировавших источниках (`.warnings`), собранные из
   признаков происхождения и уверенностей, которые уже возвращает каждый
@@ -531,7 +533,7 @@ class TemplateProfile(BaseModel):
 def _build_provenance(
     *, master_part: str, theme_part: str, theme: ThemeInfo, usage: Usage, type_scale: TypeScale,
     grid: Grid, assets: AssetCatalog, layouts: list[LayoutEntry], patterns: list[Pattern],
-    palette_notes: list[str],
+    palette_notes: list[PaletteNote],
 ) -> list[str]:
     lines: list[str] = []
 
@@ -599,14 +601,14 @@ def _build_provenance(
     )
 
     if palette_notes:
-        lines.append("Роли палитры: " + "; ".join(palette_notes) + ".")
+        lines.append("Роли палитры: " + "; ".join(n.text for n in palette_notes) + ".")
 
     return lines
 
 
 def _build_warnings(
     *, theme: ThemeInfo, usage: Usage, type_scale: TypeScale, grid: Grid,
-    assets: AssetCatalog, layouts: list[LayoutEntry], palette_notes: list[str],
+    assets: AssetCatalog, layouts: list[LayoutEntry], palette_notes: list[PaletteNote],
 ) -> list[str]:
     warnings: list[str] = []
 
@@ -681,7 +683,7 @@ def _build_warnings(
         )
 
     for note in palette_notes:
-        if "не удалось" in note or "заменён запасным" in note or "ниже порога" in note or "фолбэк" in note or "нет ни одного цвета" in note:
-            warnings.append(f"Именование ролей палитры: {note}.")
+        if note.severity == "warning":
+            warnings.append(f"Именование ролей палитры: {note.text}.")
 
     return warnings
