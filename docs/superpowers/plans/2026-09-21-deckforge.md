@@ -1233,6 +1233,7 @@ git commit -m "feat(template): TemplateProfile, именование ролей 
   - `measure(text, font_family, size_pt, box_width_in) -> TextMetrics(lines, height_in, longest_word_in)` — единственный способ померить текст в проекте; им пользуются и сборка, и аудит, чтобы два расчёта одного и того же не расходились молча.
   - `build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, variant: Variant) -> Path` — сохраняет .pptx.
   - `place_slide(prs, slide_spec, pattern, profile) -> None`.
+  - `fits(slide_spec, pattern, profile) -> Fit(ok: bool, overflow_ratio: float, reason: str)` — лезет ли содержание в раскладку. Когда ни одна не подходит, слайд уходит в песочницу (Task 10a).
 
 - [ ] **Step 1: Тест замера**
 
@@ -1478,6 +1479,52 @@ Run: `uv run pytest tests/compose/ -v`
 
 ```bash
 git commit -am "feat(compose): нативные графики, таблицы, диаграммы и пиктограммы"
+```
+
+---
+
+### Task 10a: Песочница для слайдов, которые не лезут в раскладки
+
+Снятых с шаблона раскладок хватает на типовые слайды, но не на всё. Когда содержание не влезает ни в одну, слайд собирает сам агент: пишет код в песочнице, где доступны только примитивы шаблона. Замер из aiva на той же задаче: код по спецификации даёт рабочий файл в 2 прогонах из 2 с нулём ошибок геометрии, код, написанный моделью без ограничений — 1 файл из 4 попыток и 28 ошибок. Отсюда песочница, а не свободное исполнение.
+
+**Files:**
+- Create: `src/deckforge/compose/sandbox.py`, `src/deckforge/compose/primitives.py`
+- Create: `agents/slide-coder/AGENT.md`
+- Modify: `src/deckforge/compose/builder.py` (ветка запасного пути)
+- Test: `tests/compose/test_sandbox.py`
+
+**Interfaces:**
+- Consumes: `TemplateProfile`, `SlideSpec`, `Fit`, `run_deterministic` из Task 11.
+- Produces: `code_slide(prs, slide_spec, profile, llm, *, attempts: int = 2, budget_s: float = 40) -> SlideOutcome`; `SlideOutcome(built: bool, findings: list[Finding], code: str, attempts_used: int, fell_back_to: str | None)`.
+- `primitives.py` — единственное, что видно коду агента: `text(box, content, role)`, `plate(box, role)`, `image(box, asset_id)`, `icon(box, name)`, `chart(box, spec)`, `table(box, spec)`, `divider(box)`, `grid(columns, gutter)`, плюс константы профиля только для чтения. Ни `python-pptx`, ни файловой системы, ни сети.
+
+- [ ] **Step 1: Тест песочницы**
+
+Шесть случаев, каждый отдельным тестом в `tests/compose/test_sandbox.py`:
+
+1. `test_generated_code_cannot_import_anything` — код с `import os` не исполняется, в findings попадает причина.
+2. `test_generated_code_cannot_touch_python_pptx_directly` — обращение к `slide.shapes.add_textbox` отвергается: у кода нет доступа ни к `prs`, ни к `slide`.
+3. `test_only_template_colors_reach_the_slide` — примитив не принимает произвольный цвет, только роль из профиля; множество цветов на готовом слайде вложено в палитру шаблона.
+4. `test_failed_audit_triggers_a_rewrite_then_falls_back` — модель, которая всегда переполняет рамку: две попытки, затем откат на ближайшую раскладку. `fell_back_to` не пуст, `built` истинно. Пустой слайд не выдаётся никогда.
+5. `test_sandbox_respects_the_time_budget` — общий бюджет колоды пять минут, песочница не имеет права его съесть: при `budget_s=40` вызов укладывается в 50 секунд даже с медленной моделью.
+6. `test_infinite_loop_in_generated_code_is_stopped` — `while True: pass` останавливается по лимиту, в findings причина про время.
+
+- [ ] **Step 2: Написать `agents/slide-coder/AGENT.md`**
+
+Промпт получает: содержание слайда, профиль шаблона (палитра с ролями, шкала кеглей, сетка, каталог ассетов), список доступных примитивов с сигнатурами, и причину, по которой не подошла ни одна готовая раскладка. На второй попытке — ещё и findings аудита с первой.
+
+Правила в промпте: координаты только в долях холста и только внутри полей из профиля; цвет задаётся ролью, не значением; кегль берётся из шкалы, промежуточных значений нет; жирное начертание ставится, только если в шаблоне оно идиоматично, и профиль это знает; никаких импортов и обращений к `prs` напрямую.
+
+- [ ] **Step 3: Реализовать песочницу**
+
+Исполнение через `exec` с пустым `__builtins__`, кроме белого списка, и namespace из `primitives.py`. Жёсткий лимит времени и числа операций. После исполнения слайд немедленно прогоняется через `run_deterministic`: находки уровня error означают неудачу попытки. Две попытки, затем откат на раскладку с наименьшим переполнением.
+
+Код каждого слайда сохраняется в артефакты задания: на защите нужно показать, что именно агент написал.
+
+- [ ] **Step 4: Коммит**
+
+```bash
+git commit -am "feat(compose): песочница для слайдов, не влезающих в снятые раскладки"
 ```
 
 ---
@@ -2030,6 +2077,10 @@ def test_rejected_template_gives_a_readable_error(client):
 - [ ] **Step 2: Реализовать API**
 
 Работа идёт в фоне через `asyncio.TaskGroup` с публикацией событий прогресса; клиент читает их через SSE. Артефакты складываются в каталог задания, а не в память.
+
+- [ ] **Step 2a: Починка по умолчанию, выбор по желанию**
+
+ТЗ требует, чтобы пользователь выбирал, какие проблемы чинить. Но демонстрация идёт без диалога: на вход незнакомый шаблон и контент-пакет, на выходе готовая презентация. Поэтому по умолчанию чинится всё, что чинится автоматически, а экран выбора остаётся для случая, когда человек хочет вмешаться. `POST /api/decks` принимает `autofix: bool = True`.
 
 - [ ] **Step 3: Собрать интерфейс**
 
