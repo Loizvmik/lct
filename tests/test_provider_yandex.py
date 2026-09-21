@@ -1,5 +1,6 @@
 import json, os, pytest
 import httpx
+import deckforge.provider.yandex as yandex_module
 from deckforge.provider.yandex import YandexProvider, MAX_TOKENS_BUDGET_CAP, MAX_BUDGET_ESCALATIONS
 
 live = pytest.mark.skipif(not os.getenv("YANDEX_API_KEY"), reason="нет YANDEX_API_KEY")
@@ -57,10 +58,14 @@ def _offline_provider():
 
 
 def _stub_post(monkeypatch, payload):
-    """Подменяет сетевой _post заглушкой и возвращает список тел запросов."""
+    """Подменяет сетевой _post заглушкой и возвращает список тел запросов.
+
+    Принимает **kwargs (deadline_at/tried_budgets/attempt_counter/attempts) —
+    заглушке дедлайн неинтересен, но реальный _post их требует, и сигнатура
+    должна совпадать с тем, как его вызывает продовый код."""
     captured = []
 
-    def fake_post(self, body, attempts=4):
+    def fake_post(self, body, **kwargs):
         captured.append(body)
         return payload
 
@@ -75,7 +80,7 @@ def _stub_post_sequence(monkeypatch, payloads):
     captured = []
     remaining = list(payloads)
 
-    def fake_post(self, body, attempts=4):
+    def fake_post(self, body, **kwargs):
         captured.append(body)
         if not remaining:
             raise AssertionError("_post вызван больше раз, чем ожидалось тестом")
@@ -83,6 +88,28 @@ def _stub_post_sequence(monkeypatch, payloads):
 
     monkeypatch.setattr(YandexProvider, "_post", fake_post)
     return captured
+
+
+def _make_clock(values):
+    """Фиксированная последовательность значений монотонных часов для теста:
+    каждый вызов возвращает следующее значение из values. Не патчит time
+    глобально — подаётся в конструктор провайдера параметром `now`."""
+    it = iter(values)
+
+    def now():
+        try:
+            return next(it)
+        except StopIteration:
+            raise AssertionError("тестовые часы исчерпаны раньше, чем ожидал тест")
+
+    return now
+
+
+def _provider_with_clock(clock, *, deadline_seconds=10.0, timeout=180.0):
+    return YandexProvider(
+        model="qwen3.6-35b-a3b", api_key="x", folder_id="y",
+        timeout=timeout, deadline_seconds=deadline_seconds, now=clock,
+    )
 
 
 def test_schema_merges_into_existing_leading_system_message(monkeypatch):
@@ -248,3 +275,101 @@ def test_http_500_retries_do_not_consume_budget_escalation_attempts(monkeypatch)
     for request in calls:
         body = json.loads(request.content)
         assert body["max_tokens"] == 300
+
+
+# --- Находка 1: wall-clock дедлайн на один вызов (HTTP-ретраи + эскалация) ---
+
+
+def test_deadline_exceeded_between_attempts_raises_with_elapsed(monkeypatch):
+    """Дедлайн истекает во время паузы между HTTP-ретраями (после первого
+    500-ответа): новая попытка не отправляется, ошибка называет прошедшее
+    время и число уже сделанных сетевых попыток."""
+    monkeypatch.setattr(yandex_module.time, "sleep", lambda _s: None)
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(500, json={"error": "oops"})
+
+    # start=0.0; перед попыткой 0: remaining=10-3=7 (>1, отправляем);
+    # перед паузой после 500: remaining=10-10.5=-0.5 (<=0 -> дедлайн истёк).
+    clock = _make_clock([0.0, 3.0, 10.5])
+    provider = _provider_with_clock(clock, deadline_seconds=10.0)
+    provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(RuntimeError) as exc_info:
+        provider.complete([{"role": "user", "content": "Скажи ОК"}], max_tokens=300)
+
+    assert len(calls) == 1, "вторая попытка не должна была отправиться"
+    message = str(exc_info.value)
+    assert "10.5" in message
+    assert "сетевых попыток сделано 1" in message
+    assert "300" in message  # испробованный бюджет max_tokens тоже назван
+
+
+def test_request_timeout_capped_to_remaining_deadline():
+    """Таймаут отдельного HTTP-запроса не должен превышать остаток до
+    дедлайна, даже если конструктор просил timeout заметно больше."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ОК"}, "finish_reason": "stop"}]}
+        )
+
+    # start=0.0; перед единственной попыткой: remaining=10-4=6.
+    clock = _make_clock([0.0, 4.0])
+    provider = _provider_with_clock(clock, deadline_seconds=10.0, timeout=180.0)
+    provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    provider.complete([{"role": "user", "content": "Скажи ОК"}], max_tokens=300)
+
+    assert len(calls) == 1
+    assert calls[0].extensions["timeout"]["read"] == pytest.approx(6.0)
+
+
+def test_backoff_sleep_capped_to_remaining_deadline(monkeypatch):
+    """Пауза экспоненциального бэкоффа не должна спать дольше остатка до
+    дедлайна, даже если сам бэкофф просит больше."""
+    sleeps = []
+    monkeypatch.setattr(yandex_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": "oops"})
+
+    # start=0.0; перед попыткой 0: remaining=10-3=7 (>1, отправляем, 500);
+    # перед паузой: remaining=10-9.6=0.4 (>0, спим min(delay=1.0, 0.4)=0.4);
+    # перед попыткой 1: remaining=10-11=-1 (<=1, дедлайн истёк, не отправляем).
+    clock = _make_clock([0.0, 3.0, 9.6, 11.0])
+    provider = _provider_with_clock(clock, deadline_seconds=10.0)
+    provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    with pytest.raises(RuntimeError):
+        provider.complete([{"role": "user", "content": "Скажи ОК"}], max_tokens=300)
+
+    assert sleeps == [pytest.approx(0.4)], "пауза должна была урезаться до остатка, а не быть 1.0с"
+
+
+def test_call_within_deadline_behaves_as_before():
+    """Регрессия: обычный успешный вызов, укладывающийся в дедлайн с большим
+    запасом, отрабатывает как и до появления дедлайна — один запрос, ответ
+    возвращается как есть."""
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ОК"}, "finish_reason": "stop"}]}
+        )
+
+    clock = _make_clock([0.0, 0.05])
+    provider = _provider_with_clock(clock, deadline_seconds=30.0)
+    provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    out = provider.complete([{"role": "user", "content": "Скажи ОК"}], max_tokens=300)
+
+    assert out == "ОК"
+    assert len(calls) == 1
+
+

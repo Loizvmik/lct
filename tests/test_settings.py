@@ -24,6 +24,7 @@ def test_load_reads_app_yaml():
     settings = Settings.load(APP_YAML)
     assert settings.llm.provider == "yandex"
     assert settings.llm.model
+    assert settings.llm.deadline_seconds > 0
     assert settings.paths.workspace.name == "workspace"
     assert settings.paths.artifacts.name == "artifacts"
 

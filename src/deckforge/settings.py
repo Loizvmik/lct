@@ -36,6 +36,12 @@ class LLMConfig(BaseModel):
     provider: str
     model: str
     roles: LLMRoles
+    # Дефолт дублирует DEFAULT_DEADLINE_SECONDS в provider/yandex.py — см.
+    # комментарий про происхождение числа в app.yaml. Со значением по
+    # умолчанию (а не обязательным полем), чтобы конфиги без явного
+    # deadline_seconds (например, собранные вручную в тестах) не переставали
+    # парситься.
+    deadline_seconds: float = 60.0
 
     def model_for(self, role: str) -> str:
         """Модель для роли; если роль не описана явно — модель по умолчанию."""
