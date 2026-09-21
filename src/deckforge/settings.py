@@ -51,6 +51,14 @@ class LLMConfig(BaseModel):
 class PathsConfig(BaseModel):
     workspace: Path
     artifacts: Path
+    # Каталог диск-кеша TemplateProfile (Task 8 код-ревью, находка 2):
+    # `TemplateProfile.from_file` пишет и читает сюда профили по отпечатку
+    # файла (`fingerprint`), чтобы оркестратор генерации не платил ~20с
+    # разбора и сетевого именования палитры за каждую колоду одного и того
+    # же шаблона. Со значением по умолчанию — не обязательное поле, чтобы
+    # конфиги без явного profile_cache (собранные вручную в тестах, как
+    # workspace/artifacts) не переставали парситься.
+    profile_cache: Path = Path("cache/profiles")
 
 
 class RenderConfig(BaseModel):

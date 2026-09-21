@@ -215,3 +215,81 @@ def test_palette_naming_calls_the_real_model_and_code_still_validates_it():
     roles = profile.palette_roles
     if "surface" in roles and "on_surface" in roles:
         assert contrast_ratio(roles["surface"], roles["on_surface"]) >= MIN_CONTRAST
+
+
+# --- Диск-кеш профиля по отпечатку файла (Task 8 код-ревью, находка 2) ---
+
+
+def test_from_file_writes_a_cache_file_keyed_by_fingerprint(tmp_path):
+    cache_dir = tmp_path / "cache"
+    profile = TemplateProfile.from_file(TEMPLATES_DIR / "VK Tech шаблон.pptx", cache_dir=cache_dir)
+
+    cache_file = cache_dir / f"{profile.fingerprint}.json"
+    assert cache_file.exists()
+    assert TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8")) == profile
+
+
+def test_from_file_second_call_uses_cache_without_reparsing(tmp_path, monkeypatch):
+    """Оркестратор генерации будет дёргать from_file на каждую колоду —
+    повторный вызов на том же файле не должен снова обходить пакет и снова
+    звать модель (fingerprint не меняется, файл на диске не менялся)."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("collect_usage вызван на закешированном профиле — кеш не сработал")
+
+    monkeypatch.setattr("deckforge.template.profile.collect_usage", _must_not_be_called)
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    assert second == first
+
+
+def test_corrupted_cache_file_triggers_a_fresh_parse_instead_of_crashing(tmp_path):
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    cache_file = cache_dir / f"{first.fingerprint}.json"
+    cache_file.write_text("это не json профиля", encoding="utf-8")
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    assert second == first
+    # Повреждённый кеш обязан быть перезаписан валидным профилем, а не
+    # оставлен битым для следующего вызова.
+    assert TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8")) == first
+
+
+def test_different_files_get_independent_cache_entries(tmp_path):
+    cache_dir = tmp_path / "cache"
+    vktech = TemplateProfile.from_file(TEMPLATES_DIR / "VK Tech шаблон.pptx", cache_dir=cache_dir)
+    education = TemplateProfile.from_file(
+        TEMPLATES_DIR / "Шаблон презентации VK Education.pptx", cache_dir=cache_dir,
+    )
+    assert vktech.fingerprint != education.fingerprint
+    assert (cache_dir / f"{vktech.fingerprint}.json").exists()
+    assert (cache_dir / f"{education.fingerprint}.json").exists()
+
+
+def test_default_cache_dir_is_read_from_app_yaml(monkeypatch):
+    """`tests/conftest.py` изолирует дефолт диск-кеша, подменяя
+    `APP_YAML_PATH` временным конфигом для ВСЕХ тестов (чтобы не писать в
+    реальный `cache/` репозитория при каждом прогоне) — здесь конкретно этот
+    тест возвращает `APP_YAML_PATH` на настоящий `config/app.yaml`, чтобы
+    проверить настоящую логику чтения, а не подмену."""
+    from deckforge.settings import Settings
+    from deckforge.template import profile as profile_module
+
+    real_app_yaml = Path(__file__).resolve().parents[2] / "config" / "app.yaml"
+    monkeypatch.setattr(profile_module, "APP_YAML_PATH", real_app_yaml)
+
+    assert profile_module._default_cache_dir() == Settings.load(real_app_yaml).paths.profile_cache
+
+
+def test_default_cache_dir_is_none_when_config_is_unreadable(monkeypatch):
+    from deckforge.template import profile as profile_module
+
+    monkeypatch.setattr(profile_module, "APP_YAML_PATH", Path("/does/not/exist/app.yaml"))
+    assert profile_module._default_cache_dir() is None

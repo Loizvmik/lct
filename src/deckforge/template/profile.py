@@ -26,14 +26,20 @@ from pydantic import BaseModel
 from deckforge.ooxml.color import Color, UnresolvedColor
 from deckforge.ooxml.package import PptxPackage
 from deckforge.provider.base import LLMProvider
+from deckforge.settings import Settings
 from deckforge.template.assets import AssetCatalog, AssetRef, Placement, build_asset_catalog
 from deckforge.template.grid import ColumnAxis, Grid, build_grid
 from deckforge.template.layouts import Background, LayoutEntry, PlaceholderSlot, build_layout_catalog
-from deckforge.template.naming import name_palette_roles_report
+from deckforge.template.naming import PaletteNote, name_palette_roles_report
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec, mine_patterns
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale, build_type_scale
 from deckforge.template.usage import Usage, collect_usage
+
+# config/app.yaml — единственная точка настройки, как и всё остальное в
+# проекте (см. cli.py: тот же путь, тот же parents[N] от файла до корня
+# репозитория — profile.py на один уровень глубже cli.py, отсюда [3], не [2]).
+APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 
 # Ниже какой уверенности число из разбора попадает в предупреждения, а не
 # только в тело отчёта. 0.5 — не наблюдение за тремя файлами, а сама природа
@@ -376,6 +382,19 @@ def _pattern_model(pattern: Pattern) -> PatternModel:
 # TemplateProfile
 # ---------------------------------------------------------------------------
 
+def _default_cache_dir() -> Path | None:
+    """Каталог диск-кеша профилей по умолчанию — `paths.profile_cache` из
+    `config/app.yaml` (единственная точка настройки, как и всё остальное в
+    проекте). `None`, если конфиг не читается вовсе (файла нет, YAML битый,
+    секрет протёк в yaml и т.п.) — кеш в этом случае просто не используется,
+    `from_file` разбирает шаблон как обычно, это не должно ронять вызов."""
+    try:
+        settings = Settings.load(APP_YAML_PATH)
+    except Exception:
+        return None
+    return settings.paths.profile_cache
+
+
 class TemplateProfile(BaseModel):
     """Единый объект дизайн-системы шаблона — интерфейс брифа (Step 1)
     дословно (`.from_file`, `.to_json`, `.fingerprint`, `.provenance`,
@@ -399,7 +418,9 @@ class TemplateProfile(BaseModel):
     fingerprint: str
 
     @classmethod
-    def from_file(cls, path: Path, *, namer: LLMProvider | None = None) -> "TemplateProfile":
+    def from_file(
+        cls, path: Path, *, namer: LLMProvider | None = None, cache_dir: Path | None = None,
+    ) -> "TemplateProfile":
         """Разбирает `.pptx`-шаблон целиком, ровно один проход по пакету.
 
         Порядок и переиспользование посчитанного повторяют
@@ -407,9 +428,42 @@ class TemplateProfile(BaseModel):
         на котором уже стоят тесты Task 4-7) — `usage`/`type_scale`
         передаются в `build_layout_catalog` готовыми, а не пересчитываются
         внутри него (бюджет времени задачи — тяжёлые функции не вызываются
-        дважды)."""
+        дважды).
+
+        Диск-кеш по отпечатку файла (Task 8 код-ревью, находка 2): если файл
+        по пути `path` не менялся (тот же sha256, см. `.fingerprint`) и в
+        каталоге кеша уже лежит профиль с этим отпечатком, ВЫЗЫВАЮЩАЯ
+        СТОРОНА ПОЛУЧАЕТ ГОТОВЫЙ ПРОФИЛЬ ИЗ КЕША — ни разбор пакета, ни
+        (если он был бы нужен) сетевой вызов именования палитры не
+        повторяются. Каталог кеша — `cache_dir`, если передан явно, иначе
+        `paths.profile_cache` из `config/app.yaml` (см. `_default_cache_dir`
+        ниже); если конфиг недоступен или каталог кеша не задан — кеш просто
+        не используется, разбор идёт как обычно (кеш — оптимизация
+        повторного вызова на одном и том же файле, а не обязательное
+        условие сборки профиля). Повреждённый файл кеша не роняет вызов —
+        профиль пересчитывается заново и перезаписывает его.
+
+        Честная оговорка: ключ кеша — только отпечаток ФАЙЛА, без учёта
+        `namer`. Если первый вызов на этом файле прошёл без ключа модели
+        (namer=None, роли — запасным вариантом), а следующий вызов на том
+        же неизменившемся файле передаёт настоящего `namer` — он всё равно
+        получит закешированный профиль первого вызова с ролями запасного
+        варианта, модель повторно вызвана не будет. Это осознанное решение
+        (бриф просит кеш именно по отпечатку файла), а не недосмотр — если
+        вызывающей стороне важно гарантированно получить именование
+        моделью, ей нужен свой `cache_dir` на вызов либо пустой кеш."""
         path = Path(path)
         fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        effective_cache_dir = cache_dir if cache_dir is not None else _default_cache_dir()
+        cache_file = (
+            effective_cache_dir / f"{fingerprint}.json" if effective_cache_dir is not None else None
+        )
+        if cache_file is not None and cache_file.exists():
+            try:
+                return cls.model_validate_json(cache_file.read_text(encoding="utf-8"))
+            except Exception:
+                pass  # повреждённый кеш — разбираем заново и перезаписываем ниже
 
         with PptxPackage.open(path) as pkg:
             canvas = pkg.canvas()
@@ -445,7 +499,7 @@ class TemplateProfile(BaseModel):
             assets=assets, layouts=layouts, palette_notes=palette_report.notes,
         )
 
-        return cls(
+        profile = cls(
             source_name=path.name,
             canvas_width_emu=canvas.width_emu, canvas_height_emu=canvas.height_emu,
             theme=_theme_model(theme), theme_part=theme_part, master_part=master_part,
@@ -456,6 +510,15 @@ class TemplateProfile(BaseModel):
             patterns=[_pattern_model(p) for p in patterns],
             provenance=provenance, warnings=warnings, fingerprint=fingerprint,
         )
+
+        if cache_file is not None:
+            try:
+                cache_file.parent.mkdir(parents=True, exist_ok=True)
+                cache_file.write_text(profile.to_json(), encoding="utf-8")
+            except OSError:
+                pass  # кеш — оптимизация повторного вызова, не обязана быть надёжной
+
+        return profile
 
     def to_json(self) -> str:
         return self.model_dump_json()
