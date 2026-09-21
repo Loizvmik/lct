@@ -122,6 +122,17 @@ _DEFAULT_ALIGN = "l"  # дефолт OOXML для a:pPr/@algn, когда нет
 _DEFAULT_HEADING_LINE_SPACING = 0.9
 _DEFAULT_BODY_LINE_SPACING = 1.0
 
+# Уверенность интерлиньяжа, когда a:lnSpc в шаблоне не найдено ни разу и
+# число — чистая константа по умолчанию (_DEFAULT_HEADING_LINE_SPACING/
+# _DEFAULT_BODY_LINE_SPACING), не измерение (находка повторного код-ревью,
+# п.4: раньше 0.9/1.0 не отличались от честно измеренных значений). 0.0, не
+# какое-то промежуточное число вроде 0.2/0.3, использованных для других
+# "чистых фолбэков" шкалы кеглей (см. _step_confidence): те фолбэки всё же
+# опираются на какую-то структуру данных (позицию в шкале, наличие соседних
+# ступеней), а здесь измерения нет ВООБЩЕ — честный ответ "уверенность
+# отсутствует", а не "низкая, но не нулевая".
+_UNMEASURED_LINE_SPACING_CONFIDENCE = 0.0
+
 
 @dataclass(frozen=True)
 class TypeScale:
@@ -131,22 +142,42 @@ class TypeScale:
     default_align: str
     bold_is_idiomatic: bool
     italic_is_idiomatic: bool
+    # `families` — НОРМАЛИЗОВАННЫЕ имена (хвост начертания отброшен, см.
+    # _normalize_family): "Montserrat" и "Montserrat Medium" — одна
+    # гарнитура, не две (находка повторного код-ревью, п.5 — на контрольном
+    # ЛЦТ2026 без нормализации families_total было 3 вместо 2).
     families: list[str]
     # Моноширинные гарнитуры (код) — отдельно от families, не в счёт "не
     # больше двух" (брифом, п.8; families не должно ложно раздуваться).
+    # Тоже нормализованы тем же способом, для единообразия.
     mono: list[str] = field(default_factory=list)
-    # Сколько всего не-моноширинных гарнитур прошло порог _MIN_FAMILY_CHAR_
-    # SHARE — не только контрактных двух в `families`. families всегда
-    # ограничено двумя (интерфейс брифа), но если families_total > 2, аудит
-    # T01 "гарнитур больше двух" обязан сработать по ЭТОМУ полю, а не по
-    # длине families (она искусственно обрезана и всегда <= 2 — нашёл
-    # general-purpose ревьюер: без этого поля аудит физически не может
-    # обнаружить третью гарнитуру).
+    # Сколько всего НОРМАЛИЗОВАННЫХ не-моноширинных гарнитур прошло порог
+    # _MIN_FAMILY_CHAR_SHARE — не только контрактных двух в `families`.
+    # families всегда ограничено двумя (интерфейс брифа), но если
+    # families_total > 2, аудит T01 "гарнитур больше двух" обязан сработать
+    # по ЭТОМУ полю, а не по длине families (она искусственно обрезана и
+    # всегда <= 2 — нашёл general-purpose ревьюер: без этого поля аудит
+    # физически не может обнаружить третью гарнитуру).
     families_total: int = 0
+    # Нормализованное семейство -> отсортированный список ФАКТИЧЕСКИХ имён
+    # typeface, которыми оно набрано в файле (находка повторного код-ревью,
+    # п.5: без стилевой связки .pptx ссылается на начертание буквально по
+    # имени — вёрстке нужно точное raw-имя ("Montserrat Medium"), а не
+    # только нормализованное ("Montserrat"), чтобы набрать текст тем
+    # начертанием, которое реально есть в шаблоне). Ключи — подмножество
+    # тех нормализованных имён, что прошли порог поддержки (не только
+    # `families`, весь набор, см. families_total).
+    family_variants: dict[str, list[str]] = field(default_factory=dict)
     # Уверенность для каждой ступени steps — общее требование задачи ("каждое
     # число... должно нести меру уверенности"), не отдельное поле интерфейса
     # брифа. Смысл см. _step_confidence.
     step_confidence: dict[str, float] = field(default_factory=dict)
+    # Уверенность интерлиньяжа — тот же принцип, что и step_confidence
+    # (находка повторного код-ревью, п.4): доля голосов моды среди
+    # измеренных a:lnSpc, или _UNMEASURED_LINE_SPACING_CONFIDENCE (0.0),
+    # если измерений не было вовсе и число — константа по умолчанию.
+    heading_line_spacing_confidence: float = 0.0
+    body_line_spacing_confidence: float = 0.0
 
 
 def build_type_scale(pkg: PptxPackage, canvas: Canvas, usage: Usage) -> TypeScale:
@@ -208,8 +239,10 @@ def build_type_scale(pkg: PptxPackage, canvas: Canvas, usage: Usage) -> TypeScal
     # ступенями — два разных уровня точности в одном словаре.
     steps = {k: round(v / _SIZE_ROUNDING_STEP) * _SIZE_ROUNDING_STEP for k, v in raw_steps.items()}
 
-    heading_line_spacing, body_line_spacing = _line_spacing(pkg, canvas)
-    families, mono, families_total = _families_and_mono(usage.fonts)
+    heading_line_spacing, heading_line_spacing_confidence, body_line_spacing, body_line_spacing_confidence = (
+        _line_spacing(pkg, canvas)
+    )
+    families, mono, families_total, family_variants = _families_and_mono(usage.fonts)
 
     total_runs = usage.total_runs or 1
     bold_is_idiomatic = usage.bold_runs / total_runs >= _IDIOMATIC_STYLE_SHARE
@@ -226,7 +259,10 @@ def build_type_scale(pkg: PptxPackage, canvas: Canvas, usage: Usage) -> TypeScal
         families=families,
         mono=mono,
         families_total=families_total,
+        family_variants=family_variants,
         step_confidence=step_confidence,
+        heading_line_spacing_confidence=heading_line_spacing_confidence,
+        body_line_spacing_confidence=body_line_spacing_confidence,
     )
 
 
@@ -390,23 +426,48 @@ def _step_confidence(
     }
 
 
-def _families_and_mono(fonts: dict[str, FontUsage]) -> tuple[list[str], list[str], int]:
-    """Два самых весомых по символам не-моноширинных шрифта, набравших не
-    меньше _MIN_FAMILY_CHAR_SHARE доли символов → families; моноширинные (по
-    имени, см. _MONO_FONT_MARKERS) — отдельно в mono, чтобы не раздувать
-    families и не ломать аудит T01 "гарнитур больше двух" (брифом, п.8).
-    Возвращает и общее число гарнитур, прошедших порог (families_total) —
-    см. докстроку TypeScale.families_total."""
-    mono = sorted(name for name in fonts if _is_mono(name))
-    mono_set = set(mono)
-    non_mono = {name: fu for name, fu in fonts.items() if name not in mono_set}
-    total_chars = sum(fu.chars for fu in non_mono.values())
+def _families_and_mono(
+    fonts: dict[str, FontUsage],
+) -> tuple[list[str], list[str], int, dict[str, list[str]]]:
+    """Два самых весомых по символам не-моноширинных НОРМАЛИЗОВАННЫХ
+    семейства, набравших не меньше _MIN_FAMILY_CHAR_SHARE суммарной доли
+    символов → families; моноширинные (по имени, см. _MONO_FONT_MARKERS) —
+    отдельно в mono, чтобы не раздувать families и не ломать аудит T01
+    "гарнитур больше двух" (брифом, п.8).
 
+    Нормализация (находка повторного код-ревью, п.5): raw-имена typeface из
+    .pptx нередко несут начертание прямо в имени семейства ("Montserrat
+    Medium", "Open Sans SemiBold") — без неё это раздувает счётчик гарнитур
+    (на контрольном ЛЦТ2026 "Montserrat" и "Montserrat Medium" считались
+    двумя разными гарнитурами, families_total=3 вместо честных 2). Символы
+    нескольких raw-имён с одним нормализованным семейством суммируются
+    ДО применения порога поддержки — иначе "Montserrat"+"Montserrat Medium"
+    по отдельности могли бы не пройти порог, хотя суммарно являются
+    доминирующей гарнитурой.
+
+    Возвращает и общее число гарнитур, прошедших порог (families_total) —
+    см. докстроку TypeScale.families_total — и family_variants: раскладку
+    каждого прошедшего порог нормализованного семейства на фактические
+    raw-имена, которыми оно было набрано (нужно вёрстке — см. докстроку
+    TypeScale.family_variants)."""
+    mono_raw = {name for name in fonts if _is_mono(name)}
+    mono = sorted({_normalize_family(name) for name in mono_raw})
+
+    non_mono = {name: fu for name, fu in fonts.items() if name not in mono_raw}
+    grouped_chars: dict[str, int] = {}
+    grouped_variants: dict[str, set[str]] = {}
+    for raw_name, fu in non_mono.items():
+        normalized = _normalize_family(raw_name)
+        grouped_chars[normalized] = grouped_chars.get(normalized, 0) + fu.chars
+        grouped_variants.setdefault(normalized, set()).add(raw_name)
+
+    total_chars = sum(grouped_chars.values())
     qualifying = sorted(
-        (name for name, fu in non_mono.items() if total_chars and fu.chars / total_chars >= _MIN_FAMILY_CHAR_SHARE),
-        key=lambda name: -non_mono[name].chars,
+        (name for name, chars in grouped_chars.items() if total_chars and chars / total_chars >= _MIN_FAMILY_CHAR_SHARE),
+        key=lambda name: -grouped_chars[name],
     )
-    return qualifying[:2], mono, len(qualifying)
+    family_variants = {name: sorted(grouped_variants[name]) for name in qualifying}
+    return qualifying[:2], mono, len(qualifying), family_variants
 
 
 def _is_mono(family: str) -> bool:
@@ -414,7 +475,36 @@ def _is_mono(family: str) -> bool:
     return any(marker in lowered for marker in _MONO_FONT_MARKERS)
 
 
-def _line_spacing(pkg: PptxPackage, canvas: Canvas) -> tuple[float, float]:
+# Хвосты начертания, отбрасываемые при нормализации имени гарнитуры (брифом,
+# п.5 повторного код-ревью, список токенов — дословно из его текста):
+# "Thin, ExtraLight, Light, Regular, Medium, SemiBold, Demi, Bold,
+# ExtraBold, Black, Heavy, Italic, Oblique и их сочетания". Проверка — по
+# ЦЕЛОМУ слову (токену), не по подстроке: иначе "Blackletter" или "Lighthouse"
+# ложно потеряли бы часть имени.
+_STYLE_SUFFIX_TOKENS = frozenset({
+    "thin", "extralight", "light", "regular", "medium", "semibold", "demi",
+    "bold", "extrabold", "black", "heavy", "italic", "oblique",
+})
+
+
+def _normalize_family(name: str) -> str:
+    """Отбрасывает хвост начертания из имени гарнитуры: "Montserrat Medium"
+    -> "Montserrat", "Open Sans Extra Bold Italic" -> "Open Sans" (сочетания
+    начертаний — несколько токенов подряд, отбрасываются по одному с конца).
+    Полное raw-имя не теряется — оно остаётся в TypeScale.family_variants
+    (см. его докстроку), нормализуется только имя, используемое для счёта
+    "сколько гарнитур в шаблоне".
+
+    Никогда не отбрасывает ПОСЛЕДНИЙ оставшийся токен — гарнитура без
+    единого "содержательного" слова в имени (маловероятный, но не нулевой
+    случай) не должна схлопнуться в пустую строку."""
+    tokens = name.split()
+    while len(tokens) > 1 and tokens[-1].lower() in _STYLE_SUFFIX_TOKENS:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def _line_spacing(pkg: PptxPackage, canvas: Canvas) -> tuple[float, float, float, float]:
     """heading — мода интерлиньяжа title-плейсхолдеров; body — мода среди
     ВСЕГО ОСТАЛЬНОГО (не только body-плейсхолдеров: у VK Tech основной текст
     в значительной части сидит в нередактируемых свободных фигурах-карточках,
@@ -428,11 +518,33 @@ def _line_spacing(pkg: PptxPackage, canvas: Canvas) -> tuple[float, float]:
     (крупные декоративные цифры статистики), не только абзацы связного
     текста. Числу это не мешает быть корректным ответом на вопрос "какой
     интерлиньяж типичен для НЕ-заголовочного текста этого шаблона" — просто
-    диапазон брифа откалиброван по другим двум шаблонам."""
+    диапазон брифа откалиброван по другим двум шаблонам.
+
+    Возвращает (heading, heading_confidence, body, body_confidence) — находка
+    повторного код-ревью, п.4: раньше эта функция отдавала только значения,
+    без меры уверенности, и откат на _DEFAULT_HEADING_LINE_SPACING/
+    _DEFAULT_BODY_LINE_SPACING при отсутствии a:lnSpc был неотличим от
+    честного измерения (на контрольном ЛЦТ2026 title-плейсхолдеры вообще не
+    задают a:lnSpc — heading был бы тихой константой 0.9 без единого
+    признака, что это не измерение). Confidence — доля голосов моды среди
+    измеренных значений (тот же приём, что _step_confidence для h1/body),
+    либо _UNMEASURED_LINE_SPACING_CONFIDENCE, если измерений не было вовсе."""
     title_sp, nontitle_sp = _paragraph_spacing(pkg, canvas)
-    heading = _mode(title_sp) / 100 if title_sp else _DEFAULT_HEADING_LINE_SPACING
-    body = _mode(nontitle_sp) / 100 if nontitle_sp else _DEFAULT_BODY_LINE_SPACING
-    return heading, body
+    if title_sp:
+        heading_pct = _mode(title_sp)
+        heading = heading_pct / 100
+        heading_confidence = title_sp[heading_pct] / sum(title_sp.values())
+    else:
+        heading = _DEFAULT_HEADING_LINE_SPACING
+        heading_confidence = _UNMEASURED_LINE_SPACING_CONFIDENCE
+    if nontitle_sp:
+        body_pct = _mode(nontitle_sp)
+        body = body_pct / 100
+        body_confidence = nontitle_sp[body_pct] / sum(nontitle_sp.values())
+    else:
+        body = _DEFAULT_BODY_LINE_SPACING
+        body_confidence = _UNMEASURED_LINE_SPACING_CONFIDENCE
+    return heading, heading_confidence, body, body_confidence
 
 
 def _paragraph_spacing(pkg: PptxPackage, canvas: Canvas) -> tuple[Counter[float], Counter[float]]:
