@@ -4,18 +4,39 @@
 Как и в test_typography.py, `profile_fixture` в телах тестов брифа нужен как
 параметр — иначе pytest не подставит фикстуру и вызов упадёт с NameError;
 это единственная правка против буквального текста брифа.
+
+Правки после повторного код-ревью (реверс-инжиниринг порогов под три файла,
+см. git log): `grid.columns` — больше не `list[float]`, а `list[ColumnAxis]`
+(центр/вес/уверенность, отсортирован по уверенности) — тесты ниже читают
+`axis.center`, а не `axis` напрямую.
 """
 import io
 import zipfile
 
+from conftest import ALL_TEMPLATES
+
 from deckforge.ooxml.geometry import Canvas
 from deckforge.ooxml.package import PptxPackage
-from deckforge.template.grid import build_grid, cluster
+from deckforge.template.grid import _CLUSTER_TOLERANCE, _MARGIN_PERCENTILE, _percentile_edge, build_grid, cluster
 
 
 def test_margins_match_measured_values(profile_fixture):
-    """Числа замерены разведкой; допуск 0.5 п.п."""
-    cases = [("VK Tech шаблон.pptx", 0.0463), ("VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx", 0.0351),
+    """Числа замерены разведкой; допуск 0.5 п.п. Метод вычисления с тех пор
+    сменился (процентиль распределения вместо модального кластера с
+    допуском, подобранным под эти же числа, — см. историю и докстроку
+    _MARGIN_PERCENTILE в grid.py) — WorkSpace и Education по-прежнему
+    совпадают с брифом.
+
+    VK Tech — исключение, и не по ошибке метода: численно проверено (см.
+    докстроку _MARGIN_PERCENTILE), что заявленные брифом 4.63% недостижимы
+    НИКАКИМ методом, выбирающим одну точку распределения — у VK Tech левый
+    край бимодален (два самостоятельных кластера ≈3.1% и ≈5.5%, оба
+    системные), а 4.63% лежит примерно между ними и получается только
+    слиянием этих кластеров вручную подобранным допуском — то есть тем самым
+    реверс-инжинирингом, который эта правка убирает. Новое значение (≈3.12%,
+    первый систематический кластер от края) — честный ответ на вопрос "с
+    какой границы начинается содержание", не подогнанный под старое число."""
+    cases = [("VK Tech шаблон.pptx", 0.0312), ("VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx", 0.0351),
              ("Шаблон презентации VK Education.pptx", 0.0540)]
     for name, expected in cases:
         grid = profile_fixture(name).grid
@@ -29,7 +50,28 @@ def test_education_margins_are_symmetric(profile_fixture):
 
 def test_education_has_exact_half_split(profile_fixture):
     grid = profile_fixture("Шаблон презентации VK Education.pptx").grid
-    assert any(abs(axis - 0.5) < 0.003 for axis in grid.columns)
+    assert any(abs(axis.center - 0.5) < 0.003 for axis in grid.columns)
+
+
+def test_columns_are_sorted_by_confidence_descending(profile_fixture):
+    """Контракт ColumnAxis (см. докстроку grid.py): потребитель (майнинг
+    раскладок) должен получить самые надёжные оси первыми, не рыться в
+    произвольном порядке кластеризации."""
+    for name in ALL_TEMPLATES:
+        grid = profile_fixture(name).grid
+        confidences = [axis.confidence for axis in grid.columns]
+        assert confidences == sorted(confidences, reverse=True)
+
+
+def test_columns_below_support_threshold_are_not_returned(profile_fixture):
+    """Порог отсечения — доля от всех измерений (см. _MIN_COLUMN_AXIS_
+    SUPPORT_SHARE), не наблюдение за файлом: проверяем, что он действительно
+    применяется, а не только описан в докстроке."""
+    from deckforge.template.grid import _MIN_COLUMN_AXIS_SUPPORT_SHARE
+    for name in ALL_TEMPLATES:
+        grid = profile_fixture(name).grid
+        for axis in grid.columns:
+            assert axis.confidence >= _MIN_COLUMN_AXIS_SUPPORT_SHARE or axis.confidence == 1.0
 
 
 def test_title_anchor_is_found(profile_fixture):
@@ -60,10 +102,31 @@ def test_no_guide_list_in_google_export_templates(profile_fixture):
 
 def test_vktech_column_verticals_are_found(profile_fixture):
     """VK Tech: карточные раскладки в 3-4 колонки дают вертикали на 63.61%
-    и 81.56% (брифом, п.13)."""
+    и 81.56% (брифом, п.13). Ось на 63.61% редка (поддержка ~0.24% всех
+    left-измерений — карточная раскладка встречается на немногих слайдах),
+    но легитимна: порог поддержки не должен её отсекать."""
     grid = profile_fixture("VK Tech шаблон.pptx").grid
-    assert any(abs(axis - 0.6361) < 0.006 for axis in grid.columns)
-    assert any(abs(axis - 0.8156) < 0.006 for axis in grid.columns)
+    centers = [axis.center for axis in grid.columns]
+    assert any(abs(c - 0.6361) < 0.006 for c in centers)
+    assert any(abs(c - 0.8156) < 0.006 for c in centers)
+
+
+def test_no_column_axis_coincides_with_margin(profile_fixture):
+    """Регрессия на найденное рассогласование допусков (код-ревью): раньше
+    margin_left консолидировался широким допуском (0.025), а из списка
+    колонных осей (построенного из тех же left-координат) исключался узким
+    (0.004) — кластер мог остаться и полем, и осью одновременно. После
+    починки margin_left и исключение колонных осей у поля используют один и
+    тот же допуск (_CLUSTER_TOLERANCE) и одно и то же итоговое значение.
+
+    Проверяем только margin_left: colonns строятся из LEFT-координат, у
+    margin_right (RIGHT-координаты) нет того же контура вычисления и
+    сравнивать оси по left с полем по right — сравнение из разных
+    популяций точек, не регрессия на найденную находку."""
+    for name in ALL_TEMPLATES:
+        grid = profile_fixture(name).grid
+        for axis in grid.columns:
+            assert abs(axis.center - grid.margin_left) > _CLUSTER_TOLERANCE
 
 
 def test_education_body_anchor_matches_measured_value(profile_fixture):
@@ -179,6 +242,43 @@ def test_cluster_span_is_bounded_by_tolerance():
     clusters = cluster(values, tol)
     for c in clusters:
         assert max(c.members) - min(c.members) <= tol + 1e-9, c
+
+
+def test_percentile_edge_finds_synthetic_margin_over_decorative_noise():
+    """Синтетика с известным правильным ответом, независимая от трёх учебных
+    файлов (главная находка повторного ревью: раньше порог вычислялся из
+    заранее известного ответа на VK Tech, и единственный тест сверял с теми
+    же числами, из которых он выведен).
+
+    90 точек контента стартуют на 0.30 (основной текст — систематическая,
+    самая массовая позиция), 10 точек — декоративный слой (иконки/бейджи),
+    случайно разбросанный ближе к краю (0.05-0.12), не образующий
+    собственного плотного кластера. Правильный ответ — поле на 0.30, не
+    декоративный шум у края: алгоритм обязан пройти мимо разреженного
+    декора и найти границу, где начинается систематическая масса контента."""
+    decorative = [0.05, 0.12, 0.07, 0.10, 0.06, 0.11, 0.08, 0.09, 0.05, 0.12]
+    # Шаг заметно меньше _CLUSTER_TOLERANCE (0.004) — весь диапазон 90 точек
+    # укладывается в один кластер, как и требуется для честного "почти одна
+    # и та же величина, с шумом округления", а не растянутый диапазон.
+    content = [0.30 + i * 0.00002 for i in range(90)]
+    values = decorative + content
+    edge, confidence = _percentile_edge(values, _MARGIN_PERCENTILE)
+    assert abs(edge - 0.30) < 0.01
+    assert confidence > 0.8
+
+
+def test_percentile_edge_reports_low_confidence_when_no_real_margin_exists():
+    """Регрессия на находку код-ревью (п.6): на полностью шумной геометрии
+    без единого системного кластера у края старая запасная ветка
+    (`_nearest_edge`, наиболее частый кластер без учёта близости к краю)
+    могла тихо вернуть "типичную позицию контента" с виду уверенно. Новая
+    функция обязана явно просигналить низкой confidence, что найденная
+    точка не похожа на поле, а не выдать шум за него."""
+    # 50 точек, равномерно раскиданных по всему холсту — ни одного
+    # системного повторения на расстоянии допуска кластеризации.
+    values = [i * 0.02 for i in range(50)]
+    edge, confidence = _percentile_edge(values, _MARGIN_PERCENTILE)
+    assert confidence < 0.1
 
 
 def test_every_reported_number_carries_a_confidence_score(profile_fixture):
