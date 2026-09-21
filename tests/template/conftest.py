@@ -1,11 +1,12 @@
-"""Общая инфраструктура тестов Task 4 (типографическая шкала и сетка).
+"""Общая инфраструктура тестов Task 4 (типографическая шкала и сетка) и
+Task 5 (каталог лейаутов).
 
 `profile_fixture` — вызываемая фикстура: `profile_fixture(name) -> TemplateProfile`
-с полями `.type_scale`/`.grid`, ровно как использует её бриф. Разбор одного
-и того же файла кэшируется на весь прогон (`functools.lru_cache`) — иначе
-каждый тест из test_typography.py/test_grid.py, ссылающийся на один и тот же
-шаблон, заново парсил бы весь .pptx (собственно usage.collect_usage уже
-обходит все слайды/лейауты/мастера, это не дёшево).
+с полями `.type_scale`/`.grid`/`.layouts`, ровно как использует её бриф.
+Разбор одного и того же файла кэшируется на весь прогон (`functools.lru_cache`)
+— иначе каждый тест из test_typography.py/test_grid.py/test_layouts.py,
+ссылающийся на один и тот же шаблон, заново парсил бы весь .pptx (собственно
+usage.collect_usage уже обходит все слайды/лейауты/мастера, это не дёшево).
 """
 from __future__ import annotations
 import functools
@@ -16,6 +17,8 @@ import pytest
 
 from deckforge.ooxml.package import PptxPackage
 from deckforge.template.grid import Grid, build_grid
+from deckforge.template.layouts import LayoutEntry, build_layout_catalog
+from deckforge.template.theme import pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale, build_type_scale
 from deckforge.template.usage import collect_usage
 
@@ -35,6 +38,7 @@ ALL_TEMPLATES = [
 class TemplateProfile:
     type_scale: TypeScale
     grid: Grid
+    layouts: list[LayoutEntry]
 
 
 @functools.lru_cache(maxsize=None)
@@ -44,7 +48,9 @@ def _build_profile(name: str) -> TemplateProfile:
         usage = collect_usage(pkg, canvas)
         type_scale = build_type_scale(pkg, canvas, usage)
         grid = build_grid(pkg, canvas)
-    return TemplateProfile(type_scale=type_scale, grid=grid)
+        theme = read_theme(pkg, pick_primary_master(pkg))
+        layouts = build_layout_catalog(pkg, canvas, theme, grid)
+    return TemplateProfile(type_scale=type_scale, grid=grid, layouts=layouts)
 
 
 @pytest.fixture
