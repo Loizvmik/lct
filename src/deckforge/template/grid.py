@@ -76,6 +76,72 @@ top/bottom считаются `_percentile_edge` — низким процент
 кластера, не по плотности у самой точки процентиля. Если весомых кластеров
 рядом нет — возвращается точка процентиля как есть, без искусственного
 завышения уверенности (см. докстроку `_percentile_edge`).
+
+Четвёртый проход (Task 7 повторное ревью, находка №2 — "поля съехали из-за
+иконотеки"): на шести слайдах контрольного ЛЦТ2026 лежит иконотека по
+108-222 мелких картинки на слайд (замерено — брифом было "113-224",
+численно близко, расхождение в пределах округления способа подсчёта),
+разбросанных по всей ширине холста — каждая иконка попадает в тот же пул
+`lefts`/`rights`/... что и реальные текстовые колонки, но с весом "одно
+попадание", неотличимым от веса целого текстового блока. Сотни таких
+попаданий массой перевешивают выборку и утаскивают `_percentile_edge` от
+настоящего поля (3-5% холста на трёх учебных файлах) к 12%/14% — тот самый
+промежуток "между кластерами", который чинил третий проход, только теперь
+промежуток создаёт не шум округления, а систематическая масса мелкого
+декора. Чинить сам механизм третьего прохода не нужно — нужно не пускать
+иконки в выборку С ТЕМ ЖЕ ВЕСОМ, что и реальный контент.
+
+Приём, ПОСЛЕ ДВУХ отброшенных версий (обе численно проверены на трёх
+учебных файлах и обе портили margin трогая шейпы, которые к иконотеке
+отношения не имеют — см. историю ниже) — вес мелкой картинки СЧИТАЕТСЯ ПО
+СЛАЙДУ, не по самой картинке в отрыве от контекста: `_icon_swarm_weight`
+смотрит, сколько на ЭТОМ СЛАЙДЕ картинок мельче `_ICON_AREA_SHARE` (1%
+холста — заметно больше самой крупной иконки ЛЦТ2026, area≤0.0079, и
+заметно меньше типичного контентного фото), и если таких мало
+(<`_ICON_SWARM_MIN_COUNT`=20 — на порядок ниже 108-222 брифом, но заметно
+выше, чем "два-три декоративных значка на обычном слайде") — вес каждой
+из них остаётся 1.0, ничего не меняется; если МНОГО (это и есть
+"иконотека", а не пара обычных иконок) — вес каждой становится
+`1/count`, так что ИХ СУММАРНЫЙ вклад в выборку равен вкладу ОДНОГО
+обычного измерения, не сотен. Формулировка "иконотека — это МНОГО мелких
+картинок на одном слайде", не "любая мелкая картинка где угодно в
+шаблоне", — прямое прочтение находки ревью (брифом: "по 113-224 мелких
+картинки НА СЛАЙД") и общий критерий, не заточенный под число конкретного
+файла (порог 20 — округлый порядок величины, а не 113-224 сами по себе).
+
+Обе отброшенные версии взвешивали КАЖДУЮ картинку её собственной площадью
+БЕЗ учёта того, много ли таких картинок на слайде — и обе ломали VK Tech,
+хотя разным путём:
+- ПЕРВАЯ взвешивала площадью ВСЕ шейпы без разбора кегли: margin_left VK
+  Tech уехал с 0.0312 до 0.0194 (за допуск 0.005 регрессионного теста),
+  margin_left/right Education разошлись на 0.32 п.п. (тест симметрии
+  требует <0.2 п.п.) — оба шаблона держат реальные поля мелкими ТЕКСТОВЫМИ
+  элементами (подписи, короткие лейблы), которые эта версия душила
+  наравне с декоративным мусором.
+- ВТОРАЯ сузила взвешивание до `p:pic` (правильный шаг — иконки контрольного
+  ЛЦТ2026 это картинки, не текст), но всё ещё по площади КАЖДОЙ картинки
+  без разбора: на VK Tech среди картинок, поддерживающих измеренный правый
+  край, есть КРУПНЫЕ контентные фото (area 0.14, не "мелкая картинка" ни
+  под одним разумным прочтением брифа) — их одинокое присутствие (не
+  сотни, как у настоящей иконотеки) взвешивание всё равно приглушало,
+  margin_right VK Tech сместился с 0.0413 до 0.0550, и у широкой (93.7%
+  холста) картинки на slide38 переставало хватать места между полями —
+  весь паттерн отбраковывался `_within_margins` (было 20 паттернов на VK
+  Tech, стало 18). Числ проверено и с потолком веса, и без — результат тот
+  же: сам факт взвешивания одной-двух КРУПНЫХ картинок уже достаточен,
+  чтобы сдвинуть margin_right, потолок величины веса тут ни при чём — не
+  масштаб веса одной картинки ломал VK Tech, а то, что взвешивание
+  применялось к картинкам, которых на слайде НЕМНОГО (иконотекой не
+  являются), наравне с настоящей иконотекой ЛЦТ2026.
+
+Применяется ТОЛЬКО к вычислению margin_left/right/top/bottom
+(`_percentile_edge`) — колонные оси (`left_axes`/`right_axes`,
+`_MIN_COLUMN_CLUSTER_HITS`/`_MIN_COLUMN_AXIS_SUPPORT_SHARE`) взвешивание не
+получают: находка ревью говорила именно про поля, а не про колонны, и
+легитимная редкая колонная ось VK Tech (63.61%, поддержана ~0.24% всех
+left-измерений, см. `_MIN_COLUMN_AXIS_SUPPORT_SHARE`) уже откалибрована
+под НЕвзвешенный подсчёт — трогать её другим по природе изменением было бы
+лишним риском без сигнала из брифа, что она вообще сломана.
 """
 from __future__ import annotations
 import statistics
@@ -174,6 +240,38 @@ _MARGIN_PERCENTILE = 0.10
 # точка отсечения (аналог тому, как `_MARGIN_PERCENTILE`=0.10 — стандартный
 # дециль, а не подобранное число).
 _MIN_MARGIN_CLUSTER_SUPPORT_SHARE = 0.01
+
+# Порог "мелкая картинка" (Task 7 повторное ревью, находка №2, см.
+# докстроку модуля) — доля площади холста. 1% — заметно больше самой
+# крупной иконки контрольного ЛЦТ2026 (area≤0.0079, замерено разведкой) и
+# заметно меньше типичного контентного фото/иллюстрации (десятки процентов
+# в разведанных файлах) — округлая величина, не подобранная под конкретные
+# числа файла.
+_ICON_AREA_SHARE = 0.01
+
+# Сколько мелких картинок на ОДНОМ слайде считается "иконотекой", а не
+# парой обычных декоративных значков — на порядок МЕНЬШЕ замеренных
+# 108-222 (сама находка ревью), но заметно больше, чем несколько
+# декоративных иконок на обычном контентном слайде (единицы, не десятки).
+# Ниже этого порога вес мелкой картинки не меняется вовсе — легитимный,
+# немногочисленный мелкий декор (в т.ч. на трёх учебных файлах, где
+# настоящей иконотеки нет) взвешивание не затрагивает.
+_ICON_SWARM_MIN_COUNT = 20
+
+
+def _icon_swarm_weight(small_picture_count: int) -> float:
+    """Вес ОДНОЙ мелкой картинки слайда, на котором таких картинок
+    `small_picture_count` штук — 1.0 (без изменений), если это не
+    иконотека (`< _ICON_SWARM_MIN_COUNT`); иначе `1/small_picture_count`,
+    так что СУММАРНЫЙ вклад всей иконотеки слайда в выборку `lefts`/
+    `rights`/... равен вкладу ОДНОГО обычного измерения — иконотека
+    перестаёт массой перевешивать реальные текстовые колонки (находка №2),
+    но не исчезает из выборки совсем (её край — тоже легитимная, просто
+    один раз посчитанная точка данных)."""
+    if small_picture_count < _ICON_SWARM_MIN_COUNT:
+        return 1.0
+    return 1.0 / small_picture_count
+
 
 # Порог веса для кандидата в "частую" вертикальную координату при оценке
 # базового ритма. Разведка (брифом, п.14) явно предупреждает: при слабом
@@ -346,13 +444,22 @@ class Grid:
 @dataclass(frozen=True)
 class _Sample:
     """Один шейп с координатами — сырьё для всех расчётов ниже: left/right/
-    top/bottom в долях холста и категория плейсхолдера (для якорей)."""
+    top/bottom в долях холста и категория плейсхолдера (для якорей).
+
+    `weight` — 1.0 для всего, кроме мелкой картинки (`p:pic`, площадь
+    меньше `_ICON_AREA_SHARE`) на слайде, где таких картинок много
+    (иконотека, `_icon_swarm_weight` — Task 7 повторное ревью, находка №2,
+    см. докстроку модуля за тем, почему вес считается ПО СЛАЙДУ, не по
+    самой картинке) — используется ТОЛЬКО в `_percentile_edge`
+    (margin_left/right/top/bottom), не в кластеризации колонных осей (см.
+    докстроку модуля про эту асимметрию)."""
     left: float
     right: float
     top: float
     bottom: float
     ph_type: str | None
     from_layout: bool
+    weight: float = 1.0
 
 
 def build_grid(pkg: PptxPackage, canvas: Canvas) -> Grid:
@@ -363,11 +470,16 @@ def build_grid(pkg: PptxPackage, canvas: Canvas) -> Grid:
     right_margins = [1 - s.right for s in samples]
     tops = [s.top for s in samples]
     bottom_margins = [1 - s.bottom for s in samples]
+    # Один и тот же вес (площадь шейпа) для всех четырёх краёв — вес
+    # характеризует САМ ШЕЙП ("насколько это похоже на реальный контент, а
+    # не на мелкий декор"), не конкретную сторону, которой он касается (см.
+    # докстроку модуля, находка №2).
+    weights = [s.weight for s in samples]
 
-    margin_left, margin_left_conf = _percentile_edge(lefts, _MARGIN_PERCENTILE)
-    margin_right, margin_right_conf = _percentile_edge(right_margins, _MARGIN_PERCENTILE)
-    margin_top, margin_top_conf = _percentile_edge(tops, _MARGIN_PERCENTILE)
-    margin_bottom, margin_bottom_conf = _percentile_edge(bottom_margins, _MARGIN_PERCENTILE)
+    margin_left, margin_left_conf = _percentile_edge(lefts, _MARGIN_PERCENTILE, weights)
+    margin_right, margin_right_conf = _percentile_edge(right_margins, _MARGIN_PERCENTILE, weights)
+    margin_top, margin_top_conf = _percentile_edge(tops, _MARGIN_PERCENTILE, weights)
+    margin_bottom, margin_bottom_conf = _percentile_edge(bottom_margins, _MARGIN_PERCENTILE, weights)
 
     if margin_left + margin_right >= _MAX_PLAUSIBLE_MARGIN_SUM:
         margin_left_conf *= _IMPLAUSIBLE_MARGIN_CONFIDENCE_PENALTY
@@ -462,16 +574,29 @@ def _collect_samples(pkg: PptxPackage, canvas: Canvas) -> tuple[list[_Sample], i
 
     for part in _slide_parts(pkg):
         root = pkg.xml(part)
-        for ref in walk_shapes(root, canvas, include_groups=False):
+        refs = list(walk_shapes(root, canvas, include_groups=False))
+        # Вес мелкой картинки на ЭТОМ слайде (находка №2, см. докстроку
+        # модуля и `_icon_swarm_weight`) — считается ОДИН РАЗ на слайд,
+        # раньше остального обхода: критерий "это иконотека" смотрит на
+        # весь слайд целиком (много ли на нём мелких картинок), не на
+        # отдельную картинку саму по себе.
+        small_picture_count = sum(
+            1 for r in refs
+            if r.kind == "picture" and r.box is not None and _in_bounds(r.box) and r.box.area < _ICON_AREA_SHARE
+        )
+        icon_weight = _icon_swarm_weight(small_picture_count)
+        for ref in refs:
             if ref.box is None:
                 skipped += 1
                 continue
             if not _in_bounds(ref.box):
                 continue
+            is_swarm_icon = ref.kind == "picture" and ref.box.area < _ICON_AREA_SHARE
             # walk_shapes уже отдаёт ph_type=None для не-плейсхолдера (см.
             # ShapeRef.ph_type в ooxml/walk.py) — доп. условие не нужно.
             samples.append(_Sample(
                 ref.box.left, ref.box.right, ref.box.top, ref.box.bottom, ref.ph_type, from_layout=False,
+                weight=icon_weight if is_swarm_icon else 1.0,
             ))
 
     for part in _layout_parts(pkg):
@@ -491,13 +616,57 @@ def _collect_samples(pkg: PptxPackage, canvas: Canvas) -> tuple[list[_Sample], i
     return samples, skipped
 
 
-def _percentile_edge(values: list[float], percentile: float) -> tuple[float, float]:
-    """Поле — низкий процентиль взвешенного (по числу совпадающих координат)
-    распределения краёв. См. докстроку `_MARGIN_PERCENTILE` за обоснованием
-    самого числа и тем, что заменяет эта функция (`_modal_edge`/
+def _weighted_cluster(values: list[float], weights: list[float], tolerance: float) -> list[Cluster]:
+    """Тот же алгоритм, что `cluster()` (fixed-radius binning от ПЕРВОЙ
+    точки группы, см. её докстроку) — кроме того, что `Cluster.count`
+    становится СУММОЙ весов членов кластера, не их числом, а `center` —
+    взвешенным средним, не простым. При всех весах, равных 1.0, даёт
+    поэлементно тот же результат, что `cluster()` (`count` численно
+    совпадает с числом членов, просто как `float`, а не `int`) — так
+    `_percentile_edge` с `weights=None` (см. её вызов ниже) остаётся
+    БУКВАЛЬНО тем же вычислением, что и до находки №2 повторного ревью, не
+    новым по сути.
+
+    Отдельная функция, не параметр `cluster()`: `cluster()` общая для
+    grid.py (тут) и typography.py (прореживание шкалы кеглей) — находка
+    ревью касалась только margin-вычисления в этом модуле, распространять
+    взвешивание на typography.py брифом не просили и калибровка кеглей его
+    не проверяет (см. докстроку модуля, почему `left_axes`/`right_axes`
+    тоже намеренно остались невзвешенными)."""
+    if not values:
+        return []
+    ordered = sorted(zip(values, weights), key=lambda t: t[0])
+    groups: list[list[tuple[float, float]]] = [[ordered[0]]]
+    for v, w in ordered[1:]:
+        if v - groups[-1][0][0] <= tolerance:
+            groups[-1].append((v, w))
+        else:
+            groups.append([(v, w)])
+    result = []
+    for g in groups:
+        total_w = sum(w for _, w in g)
+        center = sum(v * w for v, w in g) / total_w if total_w > 0 else sum(v for v, _ in g) / len(g)
+        result.append(Cluster(center=center, count=total_w, members=tuple(v for v, _ in g)))
+    return result
+
+
+def _percentile_edge(
+    values: list[float], percentile: float, weights: list[float] | None = None,
+) -> tuple[float, float]:
+    """Поле — низкий процентиль взвешенного (по числу совпадающих координат,
+    и, с находки №2 повторного код-ревью, по площади шейпа — см. `weights`
+    ниже) распределения краёв. См. докстроку `_MARGIN_PERCENTILE` за
+    обоснованием самого числа и тем, что заменяет эта функция (`_modal_edge`/
     `_nearest_edge` из прежней версии модуля — обе требовали объединять
     кластеры допуском, подобранным под уже известный ответ, и обе были
     отдельными правилами для left/right и top/bottom).
+
+    `weights` — вес каждого значения (площадь шейпа, см. докстроку модуля,
+    находка №2 — "поля съехали из-за иконотеки"): `None` (по умолчанию)
+    значит "все веса равны 1.0", то есть ПОЛНОСТЬЮ то же вычисление, что и
+    до этой находки — существующие вызовы/тесты этой функции без третьего
+    аргумента (`test_percentile_edge_*` в tests/template/test_grid.py)
+    остаются регрессией на старое поведение буквально, не только по духу.
 
     Единая формула для всех четырёх краёв, в два шага — ОБЛАСТЬ отдельно от
     ЗНАЧЕНИЯ (повторное код-ревью, третий проход: та же точка процентиля,
@@ -540,20 +709,40 @@ def _percentile_edge(values: list[float], percentile: float) -> tuple[float, flo
     """
     if not values:
         return 0.0, 0.0
-    ordered = sorted(values)
-    idx = min(int(len(ordered) * percentile), len(ordered) - 1)
-    point = ordered[idx]
 
-    significant = [
-        c for c in cluster(values, _CLUSTER_TOLERANCE)
-        if c.count / len(values) >= _MIN_MARGIN_CLUSTER_SUPPORT_SHARE
-    ]
+    if weights is None:
+        # Буквально прежнее вычисление (регрессия на весь набор
+        # `test_percentile_edge_*`, ни один из них не передаёт `weights`) —
+        # позиция по РАНГУ в отсортированном списке, не по накопленному
+        # весу; см. докстроку выше про эквивалентность с `weights=None`.
+        ordered = sorted(values)
+        idx = min(int(len(ordered) * percentile), len(ordered) - 1)
+        point = ordered[idx]
+        total_weight = float(len(values))
+        clusters = _weighted_cluster(values, [1.0] * len(values), _CLUSTER_TOLERANCE)
+        support_at_point = sum(1 for v in values if abs(v - point) <= _CLUSTER_TOLERANCE)
+    else:
+        total_weight = sum(weights)
+        if total_weight <= 0:
+            return 0.0, 0.0
+        pairs = sorted(zip(values, weights), key=lambda t: t[0])
+        target = percentile * total_weight
+        cum = 0.0
+        point = pairs[-1][0]
+        for v, w in pairs:
+            cum += w
+            if cum >= target:
+                point = v
+                break
+        clusters = _weighted_cluster(values, weights, _CLUSTER_TOLERANCE)
+        support_at_point = sum(w for v, w in pairs if abs(v - point) <= _CLUSTER_TOLERANCE)
+
+    significant = [c for c in clusters if c.count / total_weight >= _MIN_MARGIN_CLUSTER_SUPPORT_SHARE]
     if significant:
         nearest = min(significant, key=lambda c: abs(c.center - point))
-        return nearest.center, nearest.count / len(values)
+        return nearest.center, nearest.count / total_weight
 
-    support = sum(1 for v in values if abs(v - point) <= _CLUSTER_TOLERANCE)
-    return point, support / len(values)
+    return point, support_at_point / total_weight
 
 
 # Порог поддержки колонной оси — доля от ВСЕХ left-измерений шаблона, не
