@@ -1,0 +1,12 @@
+.env
+*.zip
+dataset_raw/
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.next/
+out/
+workspace/
+artifacts/
+.superpowers/
