@@ -410,6 +410,7 @@ class TemplateProfile(BaseModel):
     theme_part: str
     master_part: str
     palette_roles: dict[str, str]
+    palette_roles_source: str = "fallback"
     type_scale: TypeScaleModel
     grid: GridModel
     layouts: list[LayoutEntryModel]
@@ -445,15 +446,18 @@ class TemplateProfile(BaseModel):
         условие сборки профиля). Повреждённый файл кеша не роняет вызов —
         профиль пересчитывается заново и перезаписывает его.
 
-        Честная оговорка: ключ кеша — только отпечаток ФАЙЛА, без учёта
-        `namer`. Если первый вызов на этом файле прошёл без ключа модели
-        (namer=None, роли — запасным вариантом), а следующий вызов на том
-        же неизменившемся файле передаёт настоящего `namer` — он всё равно
-        получит закешированный профиль первого вызова с ролями запасного
-        варианта, модель повторно вызвана не будет. Это осознанное решение
-        (бриф просит кеш именно по отпечатку файла), а не недосмотр — если
-        вызывающей стороне важно гарантированно получить именование
-        моделью, ей нужен свой `cache_dir` на вызов либо пустой кеш."""
+        Ключ кеша — только отпечаток ФАЙЛА, без учёта `namer` (Task 8
+        код-ревью, находка 2). Раньше это значило: первый вызов на файле без
+        ключа модели (namer=None, роли — запасным вариантом) навсегда
+        отравлял кеш — следующий вызов с настоящим `namer` получал те же
+        запасные роли, модель не вызывалась никогда. Починено: на кеш-хите,
+        если сохранённый профиль несёт `palette_roles_source != "model"`
+        (роли — запасной вариант, а не ответ модели) и сейчас передан
+        `namer`, роли переназначаются моделью через
+        `_reassign_palette_roles`, и кеш обновляется — остальной разбор
+        (детерминированный, не изменился) не переделывается. Обратное
+        (роли уже от модели, а вызов идёт без ключа) кеш отдаёт как есть —
+        уже полученное от модели не деградирует до запасного варианта."""
         path = Path(path)
         fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -463,9 +467,26 @@ class TemplateProfile(BaseModel):
         )
         if cache_file is not None and cache_file.exists():
             try:
-                return cls.model_validate_json(cache_file.read_text(encoding="utf-8"))
+                cached = cls.model_validate_json(cache_file.read_text(encoding="utf-8"))
             except Exception:
-                pass  # повреждённый кеш — разбираем заново и перезаписываем ниже
+                cached = None  # повреждённый кеш — разбираем заново и перезаписываем ниже
+            if cached is not None:
+                if namer is not None and cached.palette_roles_source != "model":
+                    # Честная оговорка из докстроки выше: ключ кеша — только
+                    # отпечаток файла, без учёта namer. Профиль мог лечь в
+                    # кеш без ключа (роли — запасным вариантом) раньше, чем
+                    # ключ появился. Раз модель сейчас доступна и роли ещё не
+                    # от неё — переназначаем роли моделью и обновляем кеш, не
+                    # трогая остальной (детерминированный, не изменившийся)
+                    # разбор — см. `_reassign_palette_roles`.
+                    cached = cls._reassign_palette_roles(cached, path, namer)
+                    if cache_file is not None:
+                        try:
+                            cache_file.parent.mkdir(parents=True, exist_ok=True)
+                            cache_file.write_text(cached.to_json(), encoding="utf-8")
+                        except OSError:
+                            pass  # кеш — оптимизация, не обязана быть надёжной
+                return cached
 
         with PptxPackage.open(path) as pkg:
             canvas = pkg.canvas()
@@ -506,6 +527,7 @@ class TemplateProfile(BaseModel):
             canvas_width_emu=canvas.width_emu, canvas_height_emu=canvas.height_emu,
             theme=_theme_model(theme), theme_part=theme_part, master_part=master_part,
             palette_roles=dict(palette_report.roles),
+            palette_roles_source=palette_report.source,
             type_scale=_type_scale_model(type_scale), grid=_grid_model(grid),
             layouts=[_layout_entry_model(entry) for entry in layouts],
             assets=_asset_catalog_model(assets),
@@ -521,6 +543,52 @@ class TemplateProfile(BaseModel):
                 pass  # кеш — оптимизация повторного вызова, не обязана быть надёжной
 
         return profile
+
+    @classmethod
+    def _reassign_palette_roles(
+        cls, cached: "TemplateProfile", path: Path, namer: LLMProvider,
+    ) -> "TemplateProfile":
+        """Переназначает роли палитры моделью поверх кеш-хита с запасным
+        вариантом (Task 8 код-ревью, находка 2) — единственный источник
+        входа `.pptx`-пакета, который заново нужен наименованию ролей, это
+        `usage`/`theme` (то же, что вычисляет `from_file` перед вызовом
+        `name_palette_roles_report`, см. выше); типографика, сетка,
+        лейауты, ассеты и паттерны из кеша не пересчитываются — они
+        детерминированы и не изменились с первого разбора.
+
+        Если и на этот раз модель не дала пригодного ответа (сеть/парсинг
+        снова подвели — `palette_report.source` остаётся "fallback"),
+        кешу всё равно можно записать обновлённые заметки об этой попытке;
+        роли при этом не деградируют — `name_palette_roles_report` в этом
+        случае сама возвращает тот же детерминированный запасной вариант."""
+        with PptxPackage.open(path) as pkg:
+            canvas = pkg.canvas()
+            usage = collect_usage(pkg, canvas)
+            theme = usage.primary_theme or read_theme(pkg, cached.master_part)
+
+        palette_report = name_palette_roles_report(usage, theme, namer)
+
+        provenance = [
+            line for line in cached.provenance if not line.startswith("Роли палитры: ")
+        ]
+        if palette_report.notes:
+            provenance = provenance + [
+                "Роли палитры: " + "; ".join(n.text for n in palette_report.notes) + "."
+            ]
+        warnings = [
+            w for w in cached.warnings if not w.startswith("Именование ролей палитры: ")
+        ]
+        warnings = warnings + [
+            f"Именование ролей палитры: {n.text}."
+            for n in palette_report.notes if n.severity == "warning"
+        ]
+
+        return cached.model_copy(update={
+            "palette_roles": dict(palette_report.roles),
+            "palette_roles_source": palette_report.source,
+            "provenance": provenance,
+            "warnings": warnings,
+        })
 
     def to_json(self) -> str:
         return self.model_dump_json()

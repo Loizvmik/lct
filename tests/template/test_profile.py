@@ -38,6 +38,7 @@ from pathlib import Path
 import pytest
 
 import deckforge.template as pkg
+from deckforge.provider.base import LLMProvider
 from deckforge.template.profile import TemplateProfile
 
 TEMPLATES_DIR = Path("dataset/templates")
@@ -293,3 +294,119 @@ def test_default_cache_dir_is_none_when_config_is_unreadable(monkeypatch):
 
     monkeypatch.setattr(profile_module, "APP_YAML_PATH", Path("/does/not/exist/app.yaml"))
     assert profile_module._default_cache_dir() is None
+
+
+# --- Кеш не путает запасной вариант ролей палитры с ответом модели (Task 8
+# код-ревью, находка 2): ключ кеша — только отпечаток файла, без учёта
+# namer, поэтому профиль, закешированный без ключа (роли — запасным
+# вариантом), после появления ключа должен быть переназначен моделью, а не
+# отдан из кеша как есть навсегда. `name_palette_roles_report` подменяется
+# заглушкой (тот же приём, что и в test_from_file_second_call_uses_cache_
+# without_reparsing выше для collect_usage) — поведение зависит только от
+# того, `llm is None` или нет, ровно как у настоящей функции; сама сеть
+# здесь не нужна, проверяется логика profile.py, а не naming.py. ---
+
+
+class _FakeNamer(LLMProvider):
+    """Никогда не вызывается по-настоящему — name_palette_roles_report
+    подменяется заглушкой ниже, которая решает по `llm is None`. Нужен
+    только как typed-корректный «ключ доступен» сигнал для from_file."""
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        raise AssertionError("FakeNamer.complete не должен вызываться в этих тестах")
+
+
+def _patch_palette_naming(monkeypatch, *, fallback_roles=None, model_roles=None):
+    """Подменяет `deckforge.template.profile.name_palette_roles_report`:
+    без llm — фиксированные «запасные» роли (source=fallback), с llm —
+    фиксированные «модельные» роли (source=model). Возвращает список
+    вызовов (для проверки, что на кеш-хите без нужды переназначения роль
+    именования вовсе не дёргается)."""
+    from deckforge.template.naming import PaletteNamingResult, PaletteNote
+
+    fallback_roles = fallback_roles or {"brand": "#111111"}
+    model_roles = model_roles or {"brand": "#222222"}
+    calls: list[bool] = []
+
+    def fake(usage, theme, llm):
+        calls.append(llm is not None)
+        if llm is None:
+            return PaletteNamingResult(
+                roles=dict(fallback_roles),
+                notes=[PaletteNote("запасной вариант (тест)", severity="info")],
+                source="fallback",
+            )
+        return PaletteNamingResult(
+            roles=dict(model_roles),
+            notes=[PaletteNote("роли назначены моделью (тест)", severity="info")],
+            source="model",
+        )
+
+    monkeypatch.setattr("deckforge.template.profile.name_palette_roles_report", fake)
+    return calls
+
+
+def test_cache_hit_with_fallback_roles_and_available_model_reassigns_roles(tmp_path, monkeypatch):
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    calls = _patch_palette_naming(monkeypatch)
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)  # namer=None -> fallback
+    assert first.palette_roles == {"brand": "#111111"}
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, namer=_FakeNamer())
+    assert second.palette_roles == {"brand": "#222222"}
+    assert calls == [False, True]  # первый вызов без llm, второй — с ним
+
+    # Остальной разбор не переделан — те же лейауты/паттерны, что в первом
+    # профиле (детерминированная часть кеша не трогается переназначением).
+    assert second.layouts == first.layouts
+    assert second.patterns == first.patterns
+
+    # Кеш на диске обновлён — следующий вызов без изменения конфигурации
+    # больше не должен опять переназначать.
+    cache_file = cache_dir / f"{first.fingerprint}.json"
+    reread = TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8"))
+    assert reread.palette_roles == {"brand": "#222222"}
+
+
+def test_cache_hit_with_model_roles_and_no_key_returns_as_is(tmp_path, monkeypatch):
+    """Обратный случай: профиль с ролями от модели не деградирует до
+    запасного варианта, если следующий вызов идёт без ключа."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    calls = _patch_palette_naming(monkeypatch)
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir, namer=_FakeNamer())
+    assert first.palette_roles == {"brand": "#222222"}
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("collect_usage вызван без нужды переназначать роли")
+
+    monkeypatch.setattr("deckforge.template.profile.collect_usage", _must_not_be_called)
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, namer=None)
+    assert second.palette_roles == {"brand": "#222222"}  # не деградировал
+    assert second == first
+    assert calls == [True]  # второй вызов вообще не дошёл до name_palette_roles_report
+
+
+def test_cache_hit_with_model_roles_and_same_key_does_not_touch_network(tmp_path, monkeypatch):
+    """Повторный вызов с той же конфигурацией (модель уже доступна и уже
+    была использована) не трогает сеть — роли уже от модели, переназначать
+    нечего."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    calls = _patch_palette_naming(monkeypatch)
+    namer = _FakeNamer()
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir, namer=namer)
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("collect_usage вызван на уже модельном кеш-хите")
+
+    monkeypatch.setattr("deckforge.template.profile.collect_usage", _must_not_be_called)
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, namer=namer)
+    assert second == first
+    assert calls == [True]  # ровно один реальный вызов именования, не два

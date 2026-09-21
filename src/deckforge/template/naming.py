@@ -136,15 +136,33 @@ class PaletteNote:
     severity: NoteSeverity = "info"
 
 
+PaletteRolesSource = Literal["model", "fallback", "empty"]
+
+
 @dataclass(frozen=True)
 class PaletteNamingResult:
     """Результат именования палитры вместе с пояснением источника каждой
     роли — материал для `TemplateProfile.provenance`/`.warnings` (Task 8,
     "отчёт откуда что взято" распространяется и на роли палитры, не только
-    на типографику/сетку)."""
+    на типографику/сетку).
+
+    `source` — структурный (не текстовый) признак происхождения ролей,
+    нужен `TemplateProfile.palette_roles_source` (Task 8 код-ревью,
+    находка 2: диск-кеш по отпечатку файла не различал запасной вариант и
+    ответ модели, из-за чего профиль, закешированный без ключа, никогда не
+    переназначался после появления ключа):
+
+    - "model" — модель реально ответила (даже если код заменил часть ролей
+      запасным вариантом по правилам валидации — ответ модели участвовал);
+    - "fallback" — модель не вызывалась вовсе (`llm=None`) или вызов не дал
+      пригодного результата (сеть/парсинг), все роли — из запасного
+      варианта;
+    - "empty" — во входной палитре не было ни одного цвета, назначать
+      было нечего, модель не вызывалась."""
 
     roles: dict[str, str]
     notes: list[PaletteNote]
+    source: PaletteRolesSource = "fallback"
 
 
 def name_palette_roles(usage: Usage, theme: ThemeInfo, llm: LLMProvider | None) -> dict[str, str]:
@@ -167,6 +185,7 @@ def name_palette_roles_report(
                 "ключ модели не задан — все роли назначены детерминированным запасным вариантом",
                 severity="info",
             )],
+            source="fallback",
         )
     if not candidates:
         return PaletteNamingResult(
@@ -174,10 +193,11 @@ def name_palette_roles_report(
             notes=[PaletteNote(
                 "во входной палитре нет ни одного цвета — назначать нечего", severity="warning",
             )],
+            source="empty",
         )
 
-    result, notes = _ask_model(candidates, theme, llm, fallback)
-    return PaletteNamingResult(roles=result, notes=notes)
+    result, notes, source = _ask_model(candidates, theme, llm, fallback)
+    return PaletteNamingResult(roles=result, notes=notes, source=source)
 
 
 # --------------------------------------------------------------------------
@@ -466,7 +486,7 @@ def _ask_model(
     theme: ThemeInfo,
     llm: LLMProvider,
     fallback: dict[str, str],
-) -> tuple[dict[str, str], list[PaletteNote]]:
+) -> tuple[dict[str, str], list[PaletteNote], PaletteRolesSource]:
     notes: list[PaletteNote] = []
     _meta, prompt_body = _load_agent_prompt()
     payload = _build_input_payload(candidates, theme)
@@ -488,7 +508,7 @@ def _ask_model(
             "детерминированным запасным вариантом",
             severity="warning",
         ))
-        return dict(fallback), notes
+        return dict(fallback), notes, "fallback"
 
     result: dict[str, str] = {}
     valid_hexes = set(candidates)
@@ -562,4 +582,4 @@ def _ask_model(
             f"роли {', '.join(sorted(result))} назначены моделью и приняты кодом без замен",
             severity="info",
         ))
-    return result, notes
+    return result, notes, "model"

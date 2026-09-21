@@ -101,6 +101,7 @@ def test_valid_model_response_is_accepted_without_replacement():
     assert namer.calls[0]["max_tokens"] == _PALETTE_NAMING_INITIAL_MAX_TOKENS
     assert all(note.severity == "info" for note in result.notes)
     assert any("без замен" in note.text for note in result.notes)
+    assert result.source == "model"
 
 
 # --- Ветка 2: цвет не из входной палитры ---
@@ -133,6 +134,11 @@ def test_color_not_in_input_palette_is_replaced_with_fallback():
         if role == "brand":
             continue
         assert result.roles[role] == hexv
+    # Модель ответила (пусть код и заменил один цвет фолбэком) — это всё
+    # ещё источник "model" для кеша (Task 8, находка 2), не "fallback":
+    # "fallback" зарезервирован за случаями, когда модель не была вызвана
+    # вовсе или её ответ целиком отброшен (см. тесты ниже).
+    assert result.source == "model"
 
 
 # --- Ветка 3: контраст пары ниже порога ---
@@ -202,6 +208,7 @@ def test_unparseable_json_response_falls_back_entirely():
     assert len(result.notes) == 1
     assert result.notes[0].severity == "warning"
     assert "не удалось" in result.notes[0].text
+    assert result.source == "fallback"
 
 
 # --- Структурная серьёзность: остальные ветки ---
@@ -212,6 +219,7 @@ def test_no_key_configured_is_informational_not_warning():
     result = name_palette_roles_report(usage, theme, None)
     assert len(result.notes) == 1
     assert result.notes[0].severity == "info"
+    assert result.source == "fallback"
 
 
 def test_no_candidates_at_all_is_a_warning():
@@ -223,3 +231,4 @@ def test_no_candidates_at_all_is_a_warning():
     assert len(result.notes) == 1
     assert result.notes[0].severity == "warning"
     assert namer.calls == []  # без кандидатов модель вообще не дёргаем
+    assert result.source == "empty"
