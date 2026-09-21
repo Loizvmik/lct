@@ -61,7 +61,7 @@ class ShapeRef:
     ph_idx: int | None        # p:ph/@idx
 
 
-def _sp_tree_of(tree_root: etree._Element) -> etree._Element:
+def sp_tree_of(tree_root: etree._Element) -> etree._Element:
     """p:sld / p:sldLayout / p:sldMaster / p:spTree → p:spTree.
 
     walk_shapes принимает любой из четырёх — определяется по локальному имени
@@ -266,5 +266,5 @@ def walk_shapes(
     так как группа-предок сломана (нет валидного a:xfrm) — см. описание
     ShapeRef.box для деталей. Из самого ShapeRef отличить оба случая нельзя.
     """
-    sp_tree = _sp_tree_of(tree_root)
+    sp_tree = sp_tree_of(tree_root)
     yield from _walk_container(sp_tree, canvas, (), 0, include_groups)

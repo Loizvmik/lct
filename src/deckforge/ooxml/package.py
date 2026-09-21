@@ -122,14 +122,21 @@ class PptxPackage:
         self._raw_rels_cache[part_name] = cached
         return cached
 
-    def canvas(self) -> Canvas:
-        """Холст презентации из `p:sldSz` в `ppt/presentation.xml`.
+    def presentation_part(self) -> str:
+        """Имя части presentation.xml через relationship `officeDocument` корня пакета.
 
-        В отличие от темы, `ppt/presentation.xml` — фиксированный по OPC-
-        соглашению путь пакета .pptx, а не то, что нужно резолвить через
-        rels (тот же приём уже используется в tests/ooxml/test_walk.py).
+        Тем же приёмом, что и тема (см. докстроку модуля): не жёстко
+        `"ppt/presentation.xml"`, а резолвом через `_rels/.rels` — OPC формально
+        не гарантирует этот путь, гарантирует только сам relationship.
         """
-        root = self.xml("ppt/presentation.xml")
+        related = self.related("", "officeDocument")
+        if not related:
+            raise ValueError("пакет без relationship officeDocument в корне — не .pptx?")
+        return related[0]
+
+    def canvas(self) -> Canvas:
+        """Холст презентации из `p:sldSz` в presentation.xml."""
+        root = self.xml(self.presentation_part())
         sz = root.find(qn("p:sldSz"))
         return Canvas(width_emu=int(sz.get("cx")), height_emu=int(sz.get("cy")))
 
