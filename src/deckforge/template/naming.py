@@ -1,10 +1,11 @@
 """Именование ролей палитры: модель предлагает, код проверяет.
 
-Единственный модуль пакета `deckforge.template`, которому разрешено знать про
-`deckforge.provider` (см. докстроку пакета) — вызов модели нужен буквально
-здесь, для присвоения частотным цветам шаблона семантических ролей дизайн-
-системы (`brand`, `surface`, `on_surface`, `accent`, `muted`, `border`,
-`danger`, `warning`).
+Единственный модуль пакета `deckforge.template`, который реально ВЫЗЫВАЕТ
+модель (см. докстроку пакета) — для присвоения частотным цветам шаблона
+семантических ролей дизайн-системы (`brand`, `surface`, `on_surface`,
+`accent`, `muted`, `border`, `danger`, `warning`). `profile.py` тоже
+импортирует из `deckforge.provider` — но только тип `LLMProvider` для
+сигнатуры параметра `namer`, самого вызова там нет.
 
 Промпт — не строка в коде, а файл `agents/palette-namer/AGENT.md` (ТЗ требует
 промпты файлами, не зашитыми в код, и версионирования агентов — версия несётся
@@ -28,6 +29,7 @@ import colorsys
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Literal
 
 import yaml
 
@@ -46,6 +48,32 @@ AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "palette-namer" / 
 # промпта AGENT.md ("не ниже 4.5:1"), продублирован здесь как число, которое
 # код обязан пересчитать сам, а не доверять слову модели.
 MIN_CONTRAST = 4.5
+
+# Начальный бюджет max_tokens именно для этого вызова — не дефолт
+# LLMProvider.complete=4096 (Task 8 код-ревью, находка 3: на дефолте
+# эскалация бюджета в yandex.py была правилом на каждом вызове, а не
+# исключением, и стоила ~12 лишних секунд из ~24 на вызов, см. живой прогон
+# `deckforge parse` в task-8-report.md). naming.py работает через абстрактный
+# LLMProvider и ни с одним конкретным провайдером не связан — число не
+# импортировано из deckforge.provider.yandex (как и MIN_CONTRAST выше не
+# импортирован ниоткуда), но обязано оставаться ниже
+# MAX_TOKENS_BUDGET_CAP=6144 в yandex.py: выше него эскалации (см.
+# _post_with_budget_escalation) уже некуда идти.
+#
+# Число измерено, не угадано: живой прогон llm.complete(...) на всех четырёх
+# шаблонах (три учебных + контрольный ЛЦТ2026), по 2-3 прогона на шаблон —
+# qwen3.6 рассуждающая и тратит на reasoning больше, чем на сам ответ, с
+# заметным разбросом между прогонами одного и того же шаблона.
+# completion_tokens успешных ответов (finish_reason=stop, content не пуст):
+# 4074, 4298, 4569, 4894, 4993, 5116, 5150, 5181, 5237, 5779, 6180. 5632
+# покрывает 9 из 11 замеров без единой эскалации; оставшиеся два (5779,
+# 6180) уходят в единственный оставшийся шаг эскалации до потолка 6144.
+#
+# Честная оговорка: сам потолок эскалации (6144) не гарантированно
+# достаточен для этого вызова — один живой прогон (6180) превысил бы и его.
+# Это отдельный риск роли palette_namer, не устраняемый одним лишь
+# поднятием стартового бюджета, и не входит в объём этой находки.
+_PALETTE_NAMING_INITIAL_MAX_TOKENS = 5632
 
 # Насыщенность/яркость, ниже/выше которых цвет визуально серый, чёрный или
 # белый — HSV, не откалибровано по конкретному шаблону: это общее свойство
@@ -93,6 +121,21 @@ class PaletteCandidate:
         return self.fill_count + self.text_chars + self.line_count + self.layout_bg_count
 
 
+NoteSeverity = Literal["info", "warning"]
+
+
+@dataclass(frozen=True)
+class PaletteNote:
+    """Одна заметка о происхождении/деградации роли — текст для человека
+    плюс структурный признак серьёзности (Task 8 код-ревью, находка 6):
+    раньше `profile.py` искал предупреждения подстрокой в тексте заметки
+    ("не удалось", "заменён запасным" и т.д.) — поменяется формулировка,
+    предупреждение тихо исчезает. `severity` не зависит от текста."""
+
+    text: str
+    severity: NoteSeverity = "info"
+
+
 @dataclass(frozen=True)
 class PaletteNamingResult:
     """Результат именования палитры вместе с пояснением источника каждой
@@ -101,7 +144,7 @@ class PaletteNamingResult:
     на типографику/сетку)."""
 
     roles: dict[str, str]
-    notes: list[str]
+    notes: list[PaletteNote]
 
 
 def name_palette_roles(usage: Usage, theme: ThemeInfo, llm: LLMProvider | None) -> dict[str, str]:
@@ -120,11 +163,17 @@ def name_palette_roles_report(
     if llm is None:
         return PaletteNamingResult(
             roles=fallback,
-            notes=["ключ модели не задан — все роли назначены детерминированным запасным вариантом"],
+            notes=[PaletteNote(
+                "ключ модели не задан — все роли назначены детерминированным запасным вариантом",
+                severity="info",
+            )],
         )
     if not candidates:
         return PaletteNamingResult(
-            roles={}, notes=["во входной палитре нет ни одного цвета — назначать нечего"],
+            roles={},
+            notes=[PaletteNote(
+                "во входной палитре нет ни одного цвета — назначать нечего", severity="warning",
+            )],
         )
 
     result, notes = _ask_model(candidates, theme, llm, fallback)
@@ -417,8 +466,8 @@ def _ask_model(
     theme: ThemeInfo,
     llm: LLMProvider,
     fallback: dict[str, str],
-) -> tuple[dict[str, str], list[str]]:
-    notes: list[str] = []
+) -> tuple[dict[str, str], list[PaletteNote]]:
+    notes: list[PaletteNote] = []
     _meta, prompt_body = _load_agent_prompt()
     payload = _build_input_payload(candidates, theme)
     messages = [
@@ -427,15 +476,18 @@ def _ask_model(
     ]
 
     try:
-        raw = llm.complete(messages, schema=_ROLE_SCHEMA)
+        raw = llm.complete(
+            messages, schema=_ROLE_SCHEMA, max_tokens=_PALETTE_NAMING_INITIAL_MAX_TOKENS,
+        )
         proposed = json.loads(raw)
         if not isinstance(proposed, dict):
             raise ValueError(f"ожидался объект JSON, получено {type(proposed).__name__}")
     except Exception as exc:  # сеть/модель — не должны ронять сборку профиля
-        notes.append(
+        notes.append(PaletteNote(
             f"именование ролей палитры моделью не удалось ({exc}) — все роли назначены "
-            "детерминированным запасным вариантом"
-        )
+            "детерминированным запасным вариантом",
+            severity="warning",
+        ))
         return dict(fallback), notes
 
     result: dict[str, str] = {}
@@ -444,21 +496,26 @@ def _ask_model(
         if role not in proposed:
             if role in fallback:
                 result[role] = fallback[role]
-                notes.append(f"{role}: модель не высказалась — взят запасной вариант {fallback[role]}")
+                notes.append(PaletteNote(
+                    f"{role}: модель не высказалась — взят запасной вариант {fallback[role]}",
+                    severity="warning",
+                ))
             continue
         value = proposed.get(role)
         if not isinstance(value, str) or not value:
             # Модель осознанно оставила роль пустой (валидно для danger/warning
             # без красного/жёлтого в палитре, брифом AGENT.md) — уважаем это,
-            # даже если у запасного варианта была своя догадка.
-            notes.append(f"{role}: модель оставила роль пустой")
+            # даже если у запасного варианта была своя догадка. Это не
+            # деградация источника, а корректный ответ модели.
+            notes.append(PaletteNote(f"{role}: модель оставила роль пустой", severity="info"))
             continue
         hex_val = value.upper()
         if hex_val not in valid_hexes:
-            notes.append(
+            notes.append(PaletteNote(
                 f"{role}: модель предложила цвет {hex_val}, которого нет во входной палитре — "
-                f"заменён запасным вариантом" + (f" {fallback[role]}" if role in fallback else " (нет)")
-            )
+                "заменён запасным вариантом" + (f" {fallback[role]}" if role in fallback else " (нет)"),
+                severity="warning",
+            ))
             if role in fallback:
                 result[role] = fallback[role]
             continue
@@ -468,10 +525,11 @@ def _ask_model(
     if surface and on_surface:
         contrast = contrast_ratio(surface, on_surface)
         if contrast < MIN_CONTRAST:
-            notes.append(
+            notes.append(PaletteNote(
                 f"surface/on_surface: контраст {contrast:.2f}:1 ниже порога {MIN_CONTRAST}:1 — "
-                "обе роли заменены запасным вариантом"
-            )
+                "обе роли заменены запасным вариантом",
+                severity="warning",
+            ))
             if "surface" in fallback:
                 result["surface"] = fallback["surface"]
             else:
@@ -489,12 +547,19 @@ def _ask_model(
             result["on_surface"] = fallback["on_surface"]
         if "surface" in result and "on_surface" in result:
             if contrast_ratio(result["surface"], result["on_surface"]) < MIN_CONTRAST:
-                notes.append("surface/on_surface: комбинация модель+фолбэк не прошла контраст — взята пара целиком из фолбэка")
+                notes.append(PaletteNote(
+                    "surface/on_surface: комбинация модель+фолбэк не прошла контраст — "
+                    "взята пара целиком из фолбэка",
+                    severity="warning",
+                ))
                 if "surface" in fallback:
                     result["surface"] = fallback["surface"]
                 if "on_surface" in fallback:
                     result["on_surface"] = fallback["on_surface"]
 
     if not notes:
-        notes.append(f"роли {', '.join(sorted(result))} назначены моделью и приняты кодом без замен")
+        notes.append(PaletteNote(
+            f"роли {', '.join(sorted(result))} назначены моделью и приняты кодом без замен",
+            severity="info",
+        ))
     return result, notes
