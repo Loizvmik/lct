@@ -2131,3 +2131,60 @@ git commit -am "docs: README, ARCHITECTURE, MODELS, AUDIT и сквозная п
 **Плейсхолдеры.** Прогнал по тексту: «TBD», «позже», «аналогично задаче N» не встречаются. Пороги везде числовые и вынесены в `config/audit.yaml`.
 
 **Согласованность типов.** `Box`, `Canvas`, `Pattern`, `PatternSlot`, `Finding`, `DeckSpec`, `SlideSpec`, `Variant`, `TemplateProfile` определены по одному разу и используются под теми же именами дальше. `measure()` из Task 9 — единственная функция замера, её зовут и `compose`, и `audit`. `run_deterministic` имеет одну сигнатуру во всех задачах.
+
+---
+
+### Task 18 (отложена): Генерация изображений внутри слайда
+
+Задача со звёздочкой из п.3.1 ТЗ, для десяти команд, прошедших отборочный этап. Выполняется **после** Tasks 1–17: до отбора она ничего не решает, а пайплайн без неё работает на ассетах шаблона.
+
+**Files:**
+- Create: `src/deckforge/provider/imagegen.py`, `src/deckforge/compose/images.py`
+- Create: `agents/image-prompter/AGENT.md`
+- Modify: `config/models.yaml` (карточка модели), `src/deckforge/template/patterns.py` (слот `image` получает признак «можно генерировать»)
+- Test: `tests/compose/test_images.py`
+
+**Ограничение ТЗ:** «Команда предлагает модель класса text-to-image до 20B». На ключе Yandex text-to-image моделей нет, поэтому инференс локальный. Кандидаты, оба подходят по лицензии и размеру: **SDXL-Turbo** (Apache 2.0, 3.5B UNet, один шаг, ~1–2 с на кадр на M4) и **FLUX.1-schnell** (Apache 2.0, 12B, 4 шага, качество выше, ~8–15 с на кадр и ~24 ГБ в fp16, на 16 ГБ требует квантования). Запуск через MLX (`mlx-community/stable-diffusion-xl-turbo`) либо `diffusers` с MPS.
+
+- [ ] **Step 1: Тест**
+
+```python
+# tests/compose/test_images.py
+def test_generated_image_matches_the_slot_aspect_ratio():
+    slot = next(s for s in PATTERN.slots if s.role == "image")
+    image = generate_for_slot(slot, "команда за работой в опенспейсе", PROFILE, GEN)
+    expected = (slot.box.width * CANVAS.width_in) / (slot.box.height * CANVAS.height_in)
+    assert abs(Image.open(image).width / Image.open(image).height - expected) < 0.02
+
+def test_prompt_carries_the_template_palette():
+    """Картинка в чужой гамме ломает шаблон сильнее, чем её отсутствие."""
+    prompt = build_image_prompt("команда за работой", PROFILE, PROMPTER)
+    assert PROFILE.palette.roles["brand"] in prompt or "синий" in prompt.lower()
+
+def test_falls_back_to_template_assets_when_generation_is_unavailable():
+    image = generate_for_slot(SLOT, "команда за работой", PROFILE, UnavailableGenerator())
+    assert image in {a.part_name for a in PROFILE.assets.photos}
+
+def test_generation_stays_within_the_deck_time_budget():
+    """5 минут на колоду — общий бюджет. На картинки отводится не больше 90 секунд,
+    дальше слайды добирают ассетами шаблона."""
+    start = time.monotonic()
+    generate_deck_images(DECK, PROFILE, GEN, budget_s=90)
+    assert time.monotonic() - start < 100
+
+def test_image_is_embedded_as_a_picture_shape_not_as_the_whole_slide():
+    """ТЗ: слайд, выгруженный единым растровым изображением, не засчитывается."""
+    prs = Presentation(str(build_deck(DECK_WITH_IMAGES, PROFILE, TEMPLATE, Variant.visual)))
+    for slide in prs.slides:
+        assert any(s.shape_type != MSO_SHAPE_TYPE.PICTURE for s in slide.shapes)
+```
+
+- [ ] **Step 2: Реализовать**
+
+`imagegen.py` — интерфейс `ImageGenerator.generate(prompt, width, height, seed) -> bytes` с реализацией на MLX и честным отказом, когда модель не скачана; отказ приводит к фолбэку на фотографии шаблона, а не к падению колоды. `agents/image-prompter/AGENT.md` превращает смысл слайда в промпт, вкладывая туда палитру шаблона и запрет на текст внутри картинки (диффузионные модели пишут его с ошибками, а проверка C08 «текст без опечаток» смотрит и на картинку). Генерация идёт параллельно вёрстке, с общим бюджетом времени; кадры кэшируются по хешу промпта.
+
+- [ ] **Step 3: Дописать MODELS.md и коммит**
+
+```bash
+git commit -am "feat(images): генерация изображений в слот паттерна локальной моделью"
+```
