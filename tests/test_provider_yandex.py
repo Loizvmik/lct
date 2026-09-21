@@ -45,3 +45,55 @@ def test_provider_refuses_disallowed_model():
     from deckforge.provider.registry import ModelNotAllowed
     with pytest.raises(ModelNotAllowed):
         YandexProvider(model="gpt-oss-120b", api_key="x", folder_id="y")
+
+
+def _offline_provider():
+    return YandexProvider(model="qwen3.6-35b-a3b", api_key="x", folder_id="y")
+
+
+def _stub_post(monkeypatch, payload):
+    """Подменяет сетевой _post заглушкой и возвращает список тел запросов."""
+    captured = []
+
+    def fake_post(self, body, attempts=4):
+        captured.append(body)
+        return payload
+
+    monkeypatch.setattr(YandexProvider, "_post", fake_post)
+    return captured
+
+
+def test_schema_merges_into_existing_leading_system_message(monkeypatch):
+    """Если messages уже начинается с system-сообщения (промпт роли из
+    agents/*/AGENT.md), инструкция про схему должна дописаться в него, а не
+    стать вторым system-сообщением — иначе Yandex отвечает 400."""
+    provider = _offline_provider()
+    captured = _stub_post(
+        monkeypatch, {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+    )
+    provider.complete(
+        [
+            {"role": "system", "content": "Ты пишешь план презентации."},
+            {"role": "user", "content": "Привет"},
+        ],
+        schema={"type": "object"},
+    )
+    messages = captured[0]["messages"]
+    system_messages = [m for m in messages if m["role"] == "system"]
+    assert len(system_messages) == 1
+    assert messages[0]["role"] == "system"
+    assert "Ты пишешь план презентации." in system_messages[0]["content"]
+    assert "type" in system_messages[0]["content"]
+    assert messages[1]["role"] == "user"
+
+
+def test_schema_adds_leading_system_message_when_absent(monkeypatch):
+    provider = _offline_provider()
+    captured = _stub_post(
+        monkeypatch, {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+    )
+    provider.complete([{"role": "user", "content": "Привет"}], schema={"type": "object"})
+    messages = captured[0]["messages"]
+    assert messages[0]["role"] == "system"
+    assert len(messages) == 2
+    assert messages[1] == {"role": "user", "content": "Привет"}

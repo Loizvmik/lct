@@ -27,14 +27,22 @@ class YandexProvider(LLMProvider, VisionProvider):
     def complete(self, messages: list[Msg], *, schema: dict | None = None,
                  max_tokens: int = 4096, temperature: float = 0.3) -> str:
         if schema is not None:
-            # Yandex AI Studio требует system-сообщение первым в списке messages:
-            # добавление его в конец ломает применение prompt-шаблона (проверено
-            # живым запросом, HTTP 400 "System message must be at the beginning").
-            messages = [{
-                "role": "system",
-                "content": "Ответь одним объектом JSON по схеме, без markdown-ограды:\n"
-                           + json.dumps(schema, ensure_ascii=False),
-            }, *messages]
+            # Yandex AI Studio требует system-сообщение первым в списке messages
+            # (проверено живым запросом, HTTP 400 "System message must be at the
+            # beginning") — и неизвестно, значит ли это "ровно одно на позиции 0".
+            # Дальше по проекту messages уже может начинаться с системного промпта
+            # роли (agents/*/AGENT.md): дописываем инструкцию про схему в него,
+            # а не добавляем второе system-сообщение.
+            instruction = (
+                "Ответь одним объектом JSON по схеме, без markdown-ограды:\n"
+                + json.dumps(schema, ensure_ascii=False)
+            )
+            if messages and messages[0].get("role") == "system":
+                leading, *rest = messages
+                merged = {**leading, "content": f"{leading['content']}\n\n{instruction}"}
+                messages = [merged, *rest]
+            else:
+                messages = [{"role": "system", "content": instruction}, *messages]
         body: dict[str, Any] = {
             "model": self.model_uri, "messages": messages,
             "max_tokens": max_tokens, "temperature": temperature,
