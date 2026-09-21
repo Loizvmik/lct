@@ -58,6 +58,24 @@ md5, та же длина что у VK Tech, что у WorkSpace, что у Educ
 корректно опознаёт контейнер и его метаданные (семейство, начертание), но
 сам замер идёт по метрически близкому Arial — честно объявленное
 ограничение, не тихая порча (см. отчёт задачи).
+
+Task 9, повторная правка (находка №2 отчёта, "замер идёт не по настоящему
+шрифту"). Практическая часть: `Play` (учебные шаблоны, OFL, Google Fonts)
+теперь установлен в системе координатором — цепочка подмены находит его на
+шаге 2 ("тот же шрифт, что и запрошен, но из системы"), и на всех трёх
+учебных шаблонах замер снова идёт по настоящим метрикам Play, а не по
+Arial (координатор явно подтвердил: запас на этот случай закладывать не
+нужно, `.fntdata` при этом остаётся нечитаемым — MTX по-прежнему не
+декодирован, просто тот же самый шрифт нашёлся ещё и в системе).
+
+Честная часть — на будущее (шаблон с защищённым/недоступным где-либо
+шрифтом): `measure()` теперь отдаёт `TextMetrics.font_source` —
+`"exact"`, когда шрифт резолвился как встроенный в шаблон ИЛИ найденный в
+системе ПОД ТЕМ ЖЕ именем семейства (`_resolve_font`, см. ниже), и
+`"fallback"`, когда пришлось уйти на Liberation Sans/Arial/Pillow-дефолт.
+В `"fallback"`-случае `height_in`/`longest_word_in` домножаются на
+`_FALLBACK_SAFETY_MARGIN` (см. её докстроку про откуда число) — метрика
+"влезает ли" не должна молча выдавать себя за точную, когда шрифт другой.
 """
 from __future__ import annotations
 import hashlib
@@ -86,12 +104,35 @@ _DEFAULT_LINE_SPACING = 1.2
 
 _CACHE_DIR = Path(tempfile.gettempdir()) / "deckforge-fonts"
 
+# Запас на приблизительность замера, когда точный шрифт недоступен и мы
+# меряем текст запасной гарнитурой (Liberation Sans/Arial/Pillow-дефолт).
+# Обоснование числа: сравнение средней ширины глифа между метрически НЕ
+# откалиброванными друг под друга открытыми sans-гарнитурами (та же пара
+# семейств, что видна в этом проекте — например Play против Arial)
+# типично расходится на 10-20% (Liberation Sans — единственная в цепочке,
+# что специально калибровалась под Arial "глиф-в-глиф"; для произвольной
+# третьей гарнитуры такой калибровки нет и в общем случае не бывает).
+# 1.15 — середина этого диапазона с округлением вверх: закладывает запас
+# на типичный случай, не на held-out экстремум (моноширинные/узкие
+# декоративные гарнитуры бывают ещё дальше, но такое либо не пройдёт даже
+# с запасом, либо не является типичным телом слайда). Инфляция — только
+# на выходные метрики (`height_in`/`longest_word_in`), не на сам перенос
+# по словам: пересимулировать перенос на чужих метриках с инфляцией
+# ширины было бы точнее, но кратно дороже, а после инфляции высоты и так
+# получаем нужный сигнал "решительно не влезет" на 15% раньше, чем без
+# запаса — честно объявленное упрощение, не молчаливая неточность.
+_FALLBACK_SAFETY_MARGIN = 1.15
+
 
 @dataclass(frozen=True)
 class TextMetrics:
     lines: int
     height_in: float
     longest_word_in: float
+    # "exact" — резолвился шрифт шаблона/системный шрифт ПОД ТЕМ ЖЕ именем
+    # семейства; "fallback" — цепочка подмены дошла до Liberation Sans/
+    # Arial/Pillow-дефолта. См. докстроку модуля и `_FALLBACK_SAFETY_MARGIN`.
+    font_source: str = "exact"
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +153,7 @@ def measure(
     `.text_frame.text` для `a:br`) считается ЖЁСТКИМ переносом строки, тем
     же, что и `\\n` — семантически это новая строка внутри абзаца, не
     пробел."""
-    font_path = font_file_for(font_family)
+    font_path, font_source = _resolve_font(font_family)
     font_key = str(font_path) if font_path is not None else None
     size_px = max(1, round(size_pt))
     max_width_pt = max(box_width_in, 0.0) * PT_PER_INCH
@@ -129,7 +170,13 @@ def measure(
         longest_word_pt = max(longest_word_pt, para_longest)
 
     height_in = total_lines * (size_pt / PT_PER_INCH) * line_spacing
-    return TextMetrics(lines=total_lines, height_in=height_in, longest_word_in=longest_word_pt / PT_PER_INCH)
+    longest_word_in = longest_word_pt / PT_PER_INCH
+    if font_source == "fallback":
+        # см. докстроку `_FALLBACK_SAFETY_MARGIN` — запас на приблизительность,
+        # не на сам перенос по словам (тот уже посчитан выше запасным шрифтом).
+        height_in *= _FALLBACK_SAFETY_MARGIN
+        longest_word_in *= _FALLBACK_SAFETY_MARGIN
+    return TextMetrics(lines=total_lines, height_in=height_in, longest_word_in=longest_word_in, font_source=font_source)
 
 
 def _wrap_paragraph(font_key: str | None, size_px: int, para: str, max_width_pt: float) -> tuple[int, float]:
@@ -203,20 +250,31 @@ def font_file_for(family: str) -> Path | None:
     """Файл шрифта для замера — цепочка подмены целиком (см. докстроку
     модуля): встроенный в шаблон → тот же шрифт из системы → Liberation
     Sans → Arial → `None` (замер тогда падает на встроенный Pillow, см.
-    `_load_font`)."""
+    `_load_font`). Часть интерфейса брифа дословно (Task 9, Step 1) —
+    сигнатура `family -> Path | None` не меняется; провенанс (точный шрифт
+    или запасной) отдаёт `_resolve_font`, которым пользуется `measure()`."""
+    return _resolve_font(family)[0]
+
+
+def _resolve_font(family: str) -> tuple[Path | None, str]:
+    """То же самое, что `font_file_for`, плюс провенанс: `"exact"`, когда
+    файл резолвился ПОД ТЕМ ЖЕ именем семейства (встроенный в шаблон или
+    найденный в системе), `"fallback"`, когда цепочка ушла на Liberation
+    Sans/Arial/Pillow-дефолт (см. `TextMetrics.font_source`,
+    `_FALLBACK_SAFETY_MARGIN`)."""
     key = _normalize_family(family)
     embedded = _EMBEDDED_FONTS.get(key)
     if embedded is not None:
-        return embedded
+        return embedded, "exact"
 
     found = _system_font_file(family)
     if found is not None:
-        return found
+        return found, "exact"
     for fallback in _FALLBACK_FAMILIES:
         found = _system_font_file(fallback)
         if found is not None:
-            return found
-    return None
+            return found, "fallback"
+    return None, "fallback"
 
 
 @lru_cache(maxsize=128)
