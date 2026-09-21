@@ -1,3 +1,6 @@
+import io
+import zipfile
+
 import pytest
 from pathlib import Path
 from deckforge.ooxml.package import PptxPackage
@@ -72,3 +75,30 @@ def test_canvas_is_standard_for_workspace_and_education():
             canvas = pkg.canvas()
             assert canvas.width_emu == 12192000
             assert canvas.height_emu == 6858000
+
+
+def test_canvas_raises_value_error_when_sld_sz_missing():
+    """Task 3 code review (finding 7): canvas() падал AttributeError на
+    presentation.xml без p:sldSz. Соседние методы того же файла
+    (presentation_part, _master_theme_part в theme.py) в похожей ситуации
+    кидают понятный ValueError с именем части — canvas() должен вести себя
+    так же, а не ронять непонятный AttributeError на None.find()."""
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "_rels/.rels",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+            '<Relationship Id="rId1" '
+            'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+            'Target="ppt/presentation.xml"/></Relationships>',
+        )
+        zf.writestr(
+            "ppt/presentation.xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>',
+        )
+    buf.seek(0)
+    pkg = PptxPackage(zipfile.ZipFile(buf, "r"))
+    with pytest.raises(ValueError, match="ppt/presentation.xml"):
+        pkg.canvas()

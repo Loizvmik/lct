@@ -136,8 +136,11 @@ class PptxPackage:
 
     def canvas(self) -> Canvas:
         """Холст презентации из `p:sldSz` в presentation.xml."""
-        root = self.xml(self.presentation_part())
+        presentation_part = self.presentation_part()
+        root = self.xml(presentation_part)
         sz = root.find(qn("p:sldSz"))
+        if sz is None:
+            raise ValueError(f"{presentation_part}: нет p:sldSz — размер холста не задан")
         return Canvas(width_emu=int(sz.get("cx")), height_emu=int(sz.get("cy")))
 
     def media(self) -> list[MediaEntry]:
