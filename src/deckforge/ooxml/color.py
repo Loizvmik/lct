@@ -18,17 +18,47 @@ from deckforge.ooxml.ns import local_name
 _NO_COLOR_FILL_TAGS = {"noFill", "grpFill", "gradFill"}
 
 # Системные цвета (a:sysClr) без атрибута lastClr — в реальных файлах
-# lastClr почти всегда есть (приложение кеширует фактический RGB), это
-# фолбэк на случай его отсутствия.
+# lastClr почти всегда есть (приложение кеширует фактический RGB на момент
+# сохранения), это фолбэк на случай его отсутствия. Имена — полный набор
+# ST_SystemColorVal из ECMA-376 Part 1, §20.1.10.55 (сопоставлен с Win32
+# GetSysColor: sysClr описывает системный цвет ОС, поэтому сама спецификация
+# не фиксирует для них конкретный RGB — только имена; значения ниже это
+# классическая палитра Windows 2000/XP «Windows Standard», используемая как
+# разумное приближение). Если этот путь когда-нибудь окажется горячим на
+# реальном шаблоне (lastClr отсутствует) — стоит сверить с фактическим
+# файлом, а не доверять слепо: точность этих конкретных байтов не
+# гарантирована спецификацией.
 _SYS_COLOR_FALLBACK = {
-    "windowText": "000000",
-    "window": "FFFFFF",
-    "highlightText": "FFFFFF",
-    "highlight": "0000FF",
+    "scrollBar": "C8C8C8",
+    "background": "000000",
     "activeCaption": "0000FF",
+    "activeBorder": "D4D0C8",
+    "appWorkspace": "808080",
+    "window": "FFFFFF",
+    "windowFrame": "000000",
+    "windowText": "000000",
+    "menu": "FFFFFF",
+    "menuText": "000000",
     "captionText": "FFFFFF",
+    "inactiveBorder": "D4D0C8",
+    "inactiveCaption": "808080",
+    "inactiveCaptionText": "C0C0C0",
+    "highlight": "0000FF",
+    "highlightText": "FFFFFF",
+    "btnFace": "C0C0C0",
+    "btnShadow": "808080",
+    "grayText": "808080",
+    "btnText": "000000",
+    "btnHighlight": "FFFFFF",
+    "3dDkShadow": "404040",
+    "3dLight": "C0C0C0",
+    "infoText": "000000",
+    "infoBk": "FFFFE1",
+    "hotLight": "0066CC",
     "gradientActiveCaption": "0000FF",
     "gradientInactiveCaption": "808080",
+    "menuHighlight": "0000FF",
+    "menuBar": "C0C0C0",
 }
 
 # Именованные цвета DrawingML (a:prstClr) — значения совпадают с
@@ -93,10 +123,35 @@ class Color:
     alpha: float = 1.0
 
 
-def resolve_color(node, scheme: dict[str, str], clr_map: dict[str, str]) -> Color | None:
+@dataclass(frozen=True)
+class UnresolvedColor:
+    """Цветовой элемент присутствует в XML, но его значение нельзя определить.
+
+    Отличается от `None` (заливки нет вовсе — `noFill`/`grpFill`/`gradFill`,
+    либо узла нет совсем): здесь заливка есть, просто этот слой её не понял —
+    неизвестное имя `sysClr`/`prstClr` без записи в таблице фолбэка,
+    отсутствующий слот `schemeClr` в теме/`clr_map`, или вовсе нераспознанный
+    тег цветового элемента. Смешивать это с «заливки нет» опасно вдвойне:
+    молча портит и сбор палитры шаблона (пропущенный реальный цвет), и
+    аудит «цвет не из палитры» (ложно решит, что заливки не было). Вызывающий
+    код должен собирать список `UnresolvedColor` по всему шаблону и показать
+    человеку, а не падать на первом и не путать с честным `noFill`.
+    """
+    tag: str
+    val: str | None
+    reason: str
+
+
+def resolve_color(
+    node, scheme: dict[str, str], clr_map: dict[str, str],
+) -> Color | UnresolvedColor | None:
     """Разрешает цвет заливки узла OOXML (`a:solidFill`/`a:noFill`/... или сам цветовой элемент).
 
-    `noFill`, `grpFill` и `gradFill` возвращают `None` (градиент разбирает usage.py).
+    `noFill`, `grpFill` и `gradFill` возвращают `None` (градиент разбирает
+    usage.py) — заливки в документном смысле действительно нет. Цветовой
+    элемент, значение которого не удалось разобрать (неизвестный `sysClr`/
+    `prstClr`, ненайденный слот `schemeClr`, нераспознанный тег), возвращает
+    `UnresolvedColor`, а не `None` — см. его докстроку.
     """
     if node is None:
         return None
@@ -112,19 +167,31 @@ def resolve_color(node, scheme: dict[str, str], clr_map: dict[str, str]) -> Colo
     return _resolve_color_element(node, scheme, clr_map)
 
 
-def _resolve_color_element(el, scheme: dict[str, str], clr_map: dict[str, str]) -> Color | None:
+def _resolve_color_element(
+    el, scheme: dict[str, str], clr_map: dict[str, str],
+) -> Color | UnresolvedColor | None:
     tag = local_name(el)
     val = el.get("val")
-    hex_ = _base_hex(tag, val, el, scheme, clr_map)
-    if hex_ is None:
+    base = _base_hex(tag, val, el, scheme, clr_map)
+    if isinstance(base, UnresolvedColor):
+        return base
+    if base is None:
         return None
 
-    r, g, b = _hex_to_rgb(hex_)
+    # Вся цепочка модификаторов считается в float (0..1 на канал) один раз,
+    # без промежуточных round() и без промежуточных возвратов в 8-битный
+    # RGB — иначе каждый модификатор теряет до половины бита на округлении,
+    # и при двух модификаторах подряд расхождение с честной формулой
+    # доходит до нескольких десятков /255 по каналу (см. тест
+    # test_two_modifiers_in_a_row_preserve_precision). Байт получается
+    # один раз, на выходе, в _frgb_to_hex.
+    r, g, b = _hex_to_frgb(base)
     alpha = 1.0
-    # модификаторы применяются строго в порядке появления в XML —
-    # lumMod и lumOff, например, обычно идут парой и вместе дают
-    # L' = L*lumMod + lumOff, что и получается при последовательном
-    # применении в документном порядке.
+    # Порядок применения — документный (порядок детей в XML), не
+    # фиксированный приоритет: <a:lumMod/><a:lumOff/> и <a:lumOff/><a:lumMod/>
+    # дают разный результат (ECMA-376 требует именно документный порядок,
+    # см. test_modifier_order_changes_result), поэтому здесь просто `for mod
+    # in el`, без сортировки по типу модификатора.
     for mod in el:
         mtag = local_name(mod)
         mval = mod.get("val")
@@ -132,59 +199,91 @@ def _resolve_color_element(el, scheme: dict[str, str], clr_map: dict[str, str]) 
             continue
         frac = int(mval) / 100000
         if mtag == "alpha":
+            # alpha трогает только альфа-канал, не RGB.
             alpha = frac
         elif mtag == "lumMod":
-            r, g, b = _apply_hls(r, g, b, l_scale=frac, l_offset=0.0)
+            r, g, b = _apply_hls(r, g, b, l_scale=frac)
         elif mtag == "lumOff":
-            r, g, b = _apply_hls(r, g, b, l_scale=1.0, l_offset=frac)
+            r, g, b = _apply_hls(r, g, b, l_offset=frac)
         elif mtag == "satMod":
             r, g, b = _apply_hls(r, g, b, s_scale=frac)
         elif mtag == "shade":
-            # ECMA-376: "10% shade — это 10% исходного цвета, смешанные с 90% чёрного"
-            r, g, b = (round(c * frac) for c in (r, g, b))
+            # ECMA-376: "10% shade — это 10% исходного цвета, смешанные
+            # с 90% чёрного" — линейная интерполяция канала к 0.0, в float,
+            # зажатая в [0, 1] после шага (см. lumOff-комментарий выше).
+            r, g, b = (min(1.0, max(0.0, c * frac)) for c in (r, g, b))
         elif mtag == "tint":
-            # аналогично, но смешение с белым вместо чёрного
-            r, g, b = (round(c * frac + 255 * (1 - frac)) for c in (r, g, b))
+            # аналогично, но смешение с белым (1.0) вместо чёрного.
+            r, g, b = (min(1.0, max(0.0, c * frac + (1.0 - frac))) for c in (r, g, b))
 
-    return Color(_rgb_to_hex(r, g, b), alpha)
+    return Color(_frgb_to_hex(r, g, b), alpha)
 
 
-def _base_hex(tag: str, val: str | None, el, scheme: dict[str, str], clr_map: dict[str, str]) -> str | None:
+def _base_hex(
+    tag: str, val: str | None, el, scheme: dict[str, str], clr_map: dict[str, str],
+) -> str | UnresolvedColor | None:
+    """Базовый (до модификаторов) hex цвета — либо маркер «не распознан».
+
+    Возвращает `str` (`"#RRGGBB"`), когда цвет разрешён; `UnresolvedColor`,
+    когда элемент — узнаваемый цветовой тег с значением, которое не удалось
+    сопоставить с реальным RGB (см. докстроку `UnresolvedColor`). `None` тут
+    не возвращается вовсе: «заливки нет» — это состояние выше, на уровне
+    `resolve_color`/`_NO_COLOR_FILL_TAGS`, не этой функции.
+    """
     if tag == "srgbClr":
-        return f"#{val.upper()}" if val else None
+        if not val:
+            return UnresolvedColor(tag, val, "srgbClr без атрибута val")
+        return f"#{val.upper()}"
     if tag == "schemeClr":
         if val is None:
-            return None
+            return UnresolvedColor(tag, val, "schemeClr без атрибута val")
         # сначала пробуем через clr_map (PowerPoint пишет tx1/bg1/tx2/bg2),
         # если слота там нет — берём val напрямую по схеме (так пишет Google: dk1/lt1/...)
         slot = clr_map.get(val, val)
-        return scheme.get(slot) or scheme.get(val)
+        hex_ = scheme.get(slot) or scheme.get(val)
+        if hex_ is None:
+            return UnresolvedColor(tag, val, f"слот {slot!r}/{val!r} не найден ни в теме, ни в clr_map")
+        return hex_
     if tag == "sysClr":
         last = el.get("lastClr")
         if last:
             return f"#{last.upper()}"
         fallback = _SYS_COLOR_FALLBACK.get(val or "")
-        return f"#{fallback}" if fallback else None
+        if fallback is None:
+            return UnresolvedColor(
+                tag, val, f"sysClr {val!r} без @lastClr и без записи в таблице фолбэка",
+            )
+        return f"#{fallback}"
     if tag == "prstClr":
         found = _PRESET_COLORS.get((val or "").lower())
-        return f"#{found}" if found else None
-    return None
+        if found is None:
+            return UnresolvedColor(tag, val, f"prstClr {val!r} не найден в таблице именованных цветов")
+        return f"#{found}"
+    return UnresolvedColor(tag, val, f"нераспознанный тег цветового элемента {tag!r}")
 
 
-def _apply_hls(r: int, g: int, b: int, *, l_scale: float = 1.0, l_offset: float = 0.0,
-               s_scale: float = 1.0) -> tuple[int, int, int]:
-    h, l, s = colorsys.rgb_to_hls(r / 255, g / 255, b / 255)
+def _apply_hls(r: float, g: float, b: float, *, l_scale: float = 1.0, l_offset: float = 0.0,
+               s_scale: float = 1.0) -> tuple[float, float, float]:
+    """HLS-модификация канала на float RGB (0..1), без округления до байта.
+
+    `colorsys` уже работает в диапазоне 0..1, поэтому здесь нет отдельного
+    /255 туда-обратно — только зажатие L и S в [0, 1] после применения
+    (иначе `lumOff` может увести светлоту за единицу, а composed-цепочка
+    из нескольких модификаторов — накопить недопустимые значения).
+    """
+    h, l, s = colorsys.rgb_to_hls(r, g, b)
     l = min(1.0, max(0.0, l * l_scale + l_offset))
     s = min(1.0, max(0.0, s * s_scale))
-    r2, g2, b2 = colorsys.hls_to_rgb(h, l, s)
-    return round(r2 * 255), round(g2 * 255), round(b2 * 255)
+    return colorsys.hls_to_rgb(h, l, s)
 
 
-def _hex_to_rgb(hex_: str) -> tuple[int, int, int]:
+def _hex_to_frgb(hex_: str) -> tuple[float, float, float]:
+    """`"#RRGGBB"` → (r, g, b) в диапазоне 0..1 (float, без промежуточного округления)."""
     h = hex_.lstrip("#")
-    return int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return int(h[0:2], 16) / 255, int(h[2:4], 16) / 255, int(h[4:6], 16) / 255
 
 
-def _rgb_to_hex(r: int, g: int, b: int) -> str:
-    r, g, b = (min(255, max(0, c)) for c in (r, g, b))
+def _frgb_to_hex(r: float, g: float, b: float) -> str:
+    """(r, g, b) в 0..1 → `"#RRGGBB"` — единственное место, где канал округляется до байта."""
+    r, g, b = (min(255, max(0, round(c * 255))) for c in (r, g, b))
     return f"#{r:02X}{g:02X}{b:02X}"
