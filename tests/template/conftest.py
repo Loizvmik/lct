@@ -49,7 +49,11 @@ def _build_profile(name: str) -> TemplateProfile:
         type_scale = build_type_scale(pkg, canvas, usage)
         grid = build_grid(pkg, canvas)
         theme = read_theme(pkg, pick_primary_master(pkg))
-        layouts = build_layout_catalog(pkg, canvas, theme, grid)
+        # usage/type_scale переданы явно (находка код-ревью Task 5, п.4):
+        # build_layout_catalog больше не обязан пересчитывать их сам, раз
+        # они уже посчитаны парой строк выше для остального профиля —
+        # без этого архив обходился бы дважды.
+        layouts = build_layout_catalog(pkg, canvas, theme, grid, usage=usage, type_scale=type_scale)
     return TemplateProfile(type_scale=type_scale, grid=grid, layouts=layouts)
 
 

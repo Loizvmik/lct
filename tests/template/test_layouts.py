@@ -15,6 +15,7 @@
 from __future__ import annotations
 import io
 import zipfile
+from unittest import mock
 
 import pytest
 from conftest import ALL_TEMPLATES
@@ -25,9 +26,11 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.template.grid import build_grid
 from deckforge.template.layouts import (
     PlaceholderSlot, _argmax, _effective_master_title_size, _features, _geometry_scores,
-    _load_synonyms, _name_scores, build_layout_catalog,
+    _heading_leaders, _load_synonyms, _name_scores, build_layout_catalog,
 )
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
+from deckforge.template.typography import build_type_scale
+from deckforge.template.usage import collect_usage
 
 
 def test_every_layout_gets_a_kind(profile_fixture):
@@ -388,6 +391,120 @@ def test_largest_area_share_still_finds_real_dominant_content_block():
     assert f.largest_area_share == pytest.approx(0.56)
 
 
+def _package_with_two_layouts_sharing_bg_image() -> tuple[PptxPackage, bytes]:
+    """Два лейаута под одним мастером, оба со своим `p:bg` — картинка,
+    ссылающаяся на ОДИН И ТОТ ЖЕ медиа-парт (находка №5: на контрольном
+    ЛЦТ2026 22 из 23 лейаутов ссылаются на одну и ту же картинку 3840×2160,
+    и раньше она декодировалась заново на каждый — полный разбор занимал
+    почти полторы секунды почти целиком на этом)."""
+    img_buf = io.BytesIO()
+    Image.new("RGB", (4, 4), (10, 10, 10)).save(img_buf, format="PNG")
+    layout_bg = (
+        "<p:bg><p:bgPr><a:blipFill><a:blip r:embed=\"rId2\"/></a:blipFill>"
+        "<a:stretch><a:fillRect/></a:stretch></p:bgPr></p:bg>"
+    )
+    rel_extra = f'<Relationship Id="rId2" Type="{_REL_BASE}/image" Target="../media/image1.png"/>'
+    layout_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<p:sldLayout xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"
+             xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <p:cSld name="Тест">
+    {layout_bg}
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+    </p:spTree>
+  </p:cSld>
+</p:sldLayout>
+"""
+    files: dict[str, bytes | str] = {
+        "_rels/.rels": (
+            f'{_RELS_HEADER}<Relationships {_RELS_NS}>'
+            f'<Relationship Id="rId1" Type="{_REL_BASE}/officeDocument" Target="ppt/presentation.xml"/>'
+            "</Relationships>"
+        ),
+        "ppt/presentation.xml": (
+            f'{_RELS_HEADER}'
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<p:sldMasterIdLst><p:sldMasterId id="2147483649" r:id="rId1"/></p:sldMasterIdLst>'
+            "</p:presentation>"
+        ),
+        "ppt/_rels/presentation.xml.rels": (
+            f'{_RELS_HEADER}<Relationships {_RELS_NS}>'
+            f'<Relationship Id="rId1" Type="{_REL_BASE}/slideMaster" '
+            'Target="slideMasters/slideMaster1.xml"/></Relationships>'
+        ),
+        "ppt/slideMasters/slideMaster1.xml": _EMPTY_MASTER_XML,
+        "ppt/theme/theme1.xml": _MINIMAL_THEME_XML,
+        "ppt/slideMasters/_rels/slideMaster1.xml.rels": (
+            f'{_RELS_HEADER}<Relationships {_RELS_NS}>'
+            f'<Relationship Id="rId1" Type="{_REL_BASE}/slideLayout" '
+            'Target="../slideLayouts/slideLayout1.xml"/>'
+            f'<Relationship Id="rId2" Type="{_REL_BASE}/slideLayout" '
+            'Target="../slideLayouts/slideLayout2.xml"/>'
+            f'<Relationship Id="rId3" Type="{_REL_BASE}/theme" Target="../theme/theme1.xml"/>'
+            "</Relationships>"
+        ),
+        "ppt/slideLayouts/slideLayout1.xml": layout_xml,
+        "ppt/slideLayouts/_rels/slideLayout1.xml.rels": (
+            f'{_RELS_HEADER}<Relationships {_RELS_NS}>'
+            f'<Relationship Id="rId1" Type="{_REL_BASE}/slideMaster" '
+            'Target="../slideMasters/slideMaster1.xml"/>'
+            f"{rel_extra}"
+            "</Relationships>"
+        ),
+        "ppt/slideLayouts/slideLayout2.xml": layout_xml,
+        "ppt/slideLayouts/_rels/slideLayout2.xml.rels": (
+            f'{_RELS_HEADER}<Relationships {_RELS_NS}>'
+            f'<Relationship Id="rId1" Type="{_REL_BASE}/slideMaster" '
+            'Target="../slideMasters/slideMaster1.xml"/>'
+            f"{rel_extra}"
+            "</Relationships>"
+        ),
+        "ppt/media/image1.png": img_buf.getvalue(),
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for path, content in files.items():
+            zf.writestr(path, content)
+    buf.seek(0)
+    return PptxPackage(zipfile.ZipFile(buf, "r")), img_buf.getvalue()
+
+
+def test_picture_background_is_decoded_once_per_shared_media_part():
+    """Находка №5: тот же медиа-парт, на который ссылаются ДВА разных
+    лейаута, должен декодироваться `Image.open` ровно один раз за весь
+    разбор каталога, а не по разу на лейаут."""
+    pkg, _ = _package_with_two_layouts_sharing_bg_image()
+    real_open = Image.open
+    with mock.patch("deckforge.template.layouts.Image.open", side_effect=real_open) as spy:
+        catalog = _catalog_of(pkg)
+    assert len(catalog) == 2
+    assert spy.call_count == 1
+    assert all(e.background.luminance is not None for e in catalog)
+
+
+def test_build_layout_catalog_accepts_precomputed_usage_and_type_scale():
+    """Находка №4: `build_layout_catalog` не обязан сам вызывать
+    `collect_usage`/`build_type_scale` — следующая задача (сборка профиля
+    целиком) уже вызывает их сама и передаёт готовые. Если `usage`/
+    `type_scale` переданы явно, повторного вызова быть не должно (иначе
+    двойной обход всего архива)."""
+    with PptxPackage.open("dataset/templates/VK Tech шаблон.pptx") as pkg:
+        canvas = pkg.canvas()
+        usage = collect_usage(pkg, canvas)
+        type_scale = build_type_scale(pkg, canvas, usage)
+        grid = build_grid(pkg, canvas)
+        theme = read_theme(pkg, pick_primary_master(pkg))
+        with (
+            mock.patch("deckforge.template.layouts.collect_usage", side_effect=AssertionError("не должен звать")),
+            mock.patch("deckforge.template.layouts.build_type_scale", side_effect=AssertionError("не должен звать")),
+        ):
+            catalog = build_layout_catalog(pkg, canvas, theme, grid, usage=usage, type_scale=type_scale)
+    assert catalog
+
+
 def test_master_title_size_fallback_is_used_when_layout_defines_no_own_size():
     """Находка №6: `title_size_ratio` — вырожден (None) на нативном шаблоне,
     где кегль заголовка задан не в лейауте, а в `p:txStyles` мастера (20 из
@@ -502,3 +619,50 @@ def test_standard_powerpoint_layout_names_are_recognized():
         assert _argmax(scores) == kind, f"{name!r}: ожидали {kind!r}, получили {scores!r}"
 
 
+def test_heading_leaders_synthetic_set_independent_of_dataset_files():
+    """Находка №2 (обязательный синтетический тест): произвольный набор
+    heading_score, НЕ связанный ни с одним файлом датасета. Решает не
+    абсолютная величина балла, а разрыв (largest gap) между уровнями баллов
+    ВНУТРИ этого конкретного набора."""
+    # Два явных лидера (0.9), два явных "почти, но нет" (0.3) и низкий фон
+    # (0.05) — самый большой разрыв в отсортированном наборе (0.6) стоит
+    # между 0.9 и 0.3, поэтому лидируют только первые два.
+    scores = [0.9, 0.9, 0.3, 0.3, 0.05, 0.05, 0.05]
+    leaders = _heading_leaders(scores)
+    assert set(leaders) == {0, 1}
+    assert leaders[0] == pytest.approx(0.6)
+    assert leaders[1] == pytest.approx(0.6)
+
+    # П.1 требования брифа: решение не зависит от АБСОЛЮТНОЙ величины балла
+    # — сдвиг всего набора на константу не должен изменить, кто лидирует.
+    shifted = [s + 0.5 for s in scores]
+    assert set(_heading_leaders(shifted)) == {0, 1}
+
+    # Уверенность отражает величину отрыва: более разошедшийся набор даёт
+    # больший margin лидеру, чем менее разошедшийся, при том же числе лидеров.
+    tight = [0.6, 0.6, 0.5, 0.5, 0.05, 0.05]
+    wide = [0.9, 0.9, 0.5, 0.5, 0.05, 0.05]
+    assert _heading_leaders(wide)[0] > _heading_leaders(tight)[0]
+
+    # Файл без единого героического заголовка (все баллы равны, включая все
+    # нулевые) — лидировать не над чем.
+    assert _heading_leaders([0.0, 0.0, 0.0]) == {}
+    assert _heading_leaders([0.4, 0.4, 0.4]) == {}
+
+
+def test_heading_leaders_matches_reverse_engineered_workspace_case():
+    """Регрессия на находку №2 (см. отчёт): у WorkSpace геометрический балл
+    "обложечности" 0.4279 у ДВУХ пограничных лейаутов раньше проходил
+    старый абсолютный порог 0.5 впритык (граница калибровалась под этот
+    файл). У ТРЁХ настоящих обложек балл 0.7349-0.7364 — они обязаны
+    остаться лидерами, а пограничные 0.4279 — нет, при том что оба числа
+    получены не из константы, а из места среди ОСТАЛЬНЫХ баллов файла."""
+    scores = [
+        0.7363636363636363, 0.2863636363636364, 0.13636363636363635,
+        0.42792654100055677, 0.734857615525332, 0.734857615525332,
+        0.13636363636363635, 0.42792654100055677, 0.13636363636363635,
+        0.13636363636363635, 0.13636363636363635, 0.13636363636363635,
+        0.13636363636363635, 0.13636363636363635, 0.13636363636363635,
+    ]
+    leaders = _heading_leaders(scores)
+    assert set(leaders) == {0, 4, 5}

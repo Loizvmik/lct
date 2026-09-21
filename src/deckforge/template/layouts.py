@@ -39,33 +39,48 @@
    говорит `free`, геометрия предпочитает `content` (0.75 против 0.6), но
    ОБА варианта геометрически правдоподобны сами по себе — расхождение
    между двумя похожими, оба разумными прочтениями не повод отбросить
-   имя), а правдоподобен ли САМ КАНДИДАТ ИМЕНИ геометрически: если его
-   собственный геометрический балл (`geometry_scores[name_kind]`) ниже
-   `_GEOMETRY_DECISIVE_THRESHOLD`, ЛИБО геометрия несёт прямое структурное
-   свидетельство (`_HARD_EVIDENCE_KINDS`: PICTURE/TABLE-плейсхолдер физически
-   есть в XML, колонки физически не пересекаются — не эвристика, а факт) —
-   геометрии доверяем больше декларативного имени (ровно случай WorkSpace:
-   у "11_Титульный слайд" геометрический балл САМОГО `title` — 0.426, ниже
-   порога, потому что заголовок не центрирован и не крупный), `kind_confidence
-   = 0.4*geometry_score` победившего геометрией типа — заведомо ниже, чем при
-   согласии (п.3-4), потому что имя здесь не подтвердило выбор.
+   имя), а правдоподобен ли САМ КАНДИДАТ ИМЕНИ геометрически. Для kind'ов
+   ВНЕ `_HEADING_FAMILY` (quote/kpi/...) правдоподобие — собственный
+   геометрический балл (`geometry_scores[name_kind]`) не ниже
+   `_GEOMETRY_DECISIVE_THRESHOLD`. Для title/section/closing — ПОВТОРНОЕ
+   код-ревью (Task 5, п.2) заменило эту же проверку на относительную: имя
+   правдоподобно, если этот лейаут — один из ЛИДЕРОВ по heading_score
+   СРЕДИ ОСТАЛЬНЫХ ЛЕЙАУТОВ ЭТОГО ЖЕ ФАЙЛА (`_heading_leaders`, largest-gap
+   разрыв в распределении баллов файла, не абсолютная константа — см. её
+   докстроку и честную оговорку про калибровку `_GEOMETRY_DECISIVE_
+   THRESHOLD` под три учебных файла, которую это заменяет). ЛИБО геометрия
+   несёт прямое структурное свидетельство (`_HARD_EVIDENCE_KINDS`:
+   PICTURE/TABLE-плейсхолдер физически есть в XML, колонки физически не
+   пересекаются — не эвристика, а факт, и не применяется к самой
+   `_HEADING_FAMILY` — см. докстроку `_HARD_EVIDENCE_KINDS`) — геометрии
+   доверяем больше декларативного имени (случай WorkSpace: у "11_Титульный
+   слайд" heading_score = 0.4279, НЕ входит в верхний уровень heading_score
+   файла — три настоящих обложки WorkSpace на уровне ~0.735, разрыв 0.307,
+   самый большой во всём файле), `kind_confidence = 0.4*geometry_score`
+   победившего геометрией типа — заведомо ниже, чем при согласии (п.3-4),
+   потому что имя здесь не подтвердило выбор.
 6. Расходятся, но кандидат имени геометрически правдоподобен сам по себе
-   (его собственный балл не ниже порога, и структурного факта против него
-   нет) — доверяем имени, `kind_confidence = 0.6*name_score +
-   0.4*geometry_score(name_kind)`.
+   (для НЕ-heading kind'ов — балл не ниже порога; для title/section/closing
+   — лейаут лидирует по heading_score файла, и структурного факта против
+   него нет) — доверяем имени, `kind_confidence = 0.6*name_score +
+   0.4*geometry_component`, где `geometry_component` — собственный
+   геометрический балл кандидата (НЕ-heading) либо margin отрыва от "фона"
+   файла (heading-семья, см. `_heading_leaders` — брифом: "уверенность
+   должна отражать величину отрыва").
 7. Имя не совпало вовсе — решает одна геометрия, `kind_confidence =
    0.4*geometry_score`.
 
-`_GEOMETRY_DECISIVE_THRESHOLD = 0.5` — половина шкалы геометрического
-балла: кандидат имени должен быть геометрически правдоподобен как минимум
-наравне со случайным выбором, иначе имени доверять нельзя. Не выведено из
-трёх файлов реверс-инжинирингом (в отличие от порогов, которые прошлые
-ревью уже находили и чинили в grid.py/typography.py) — это округлая,
-независимая от данных точка отсечения; проверено, что при ней тест на
-WorkSpace (не больше 3 «title» из 15) проходит и одновременно
-"1_Свободный дизайн" остаётся `free`, а не `content`, но само число не
-подобрано ПОД эти тесты — см. отчёт про честную оговорку по калибровке
-весов `_heading_score`.
+`_GEOMETRY_DECISIVE_THRESHOLD = 0.5` — используется в п.5-6 только для
+kind'ов ВНЕ `_HEADING_FAMILY` (после повторного код-ревью, Task 5, п.2, см.
+`_heading_leaders`): половина шкалы геометрического балла, кандидат имени
+должен быть геометрически правдоподобен как минимум наравне со случайным
+выбором. Не выведено из трёх файлов реверс-инжинирингом — округлая,
+независимая от данных точка отсечения. Для title/section/closing ЭТОТ
+абсолютный порог раньше калибровался циклом "тест на WorkSpace падает,
+меняем веса `_heading_score`, тест проходит" — запас у настоящих обложек
+WorkSpace был всего 0.07 от порога, а у "1_Свободный дизайн" VK Tech (для
+`free`, тем же порогом) — тоже тонкий; честная оговорка про эту калибровку
+и её замену на `_heading_leaders` — см. отчёт Task 5.
 """
 from __future__ import annotations
 import io
@@ -84,8 +99,8 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import ShapeRef, walk_shapes
 from deckforge.template.grid import Grid
 from deckforge.template.theme import ThemeInfo, read_theme
-from deckforge.template.typography import build_type_scale
-from deckforge.template.usage import collect_usage
+from deckforge.template.typography import TypeScale, build_type_scale
+from deckforge.template.usage import Usage, collect_usage
 
 _CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "layout-kinds.yaml"
 
@@ -166,9 +181,19 @@ _MIN_DOMINANT_AREA_SHARE = 0.10
 # у VK Tech "1_Свободный дизайн" geometry даёт content=0.75 против
 # собственного (по имени) free=0.6 — оба выше порога, оба геометрически
 # правдоподобны, поэтому имя (free) остаётся в силе, хотя у content балл
-# выше. У проблемного WorkSpace-случая (напр. "11_Титульный слайд")
-# geometry даёт title(имя)=0.426 — ниже порога, имя геометрически
-# неправдоподобно, побеждает собственный кандидат геометрии.
+# выше.
+#
+# Повторное код-ревью, Task 5, п.2: для кандидатов ИЗ `_HEADING_FAMILY`
+# (title/section/closing) эта проверка БОЛЬШЕ НЕ ПРИМЕНЯЕТСЯ — заменена на
+# относительную (`_heading_leaders`, см. её докстроку и докстроку модуля):
+# героический заголовок несопоставим по абсолютной величине между файлами
+# (0.79 у ЛЦТ2026, 0.73 у WorkSpace, 0.43 у пограничных WorkSpace-случаев,
+# 0.29 у "Разделителя" VK Tech), и у WorkSpace-случая (напр. "11_Титульный
+# слайд", geometry title(имя)=0.4279) запас до 0.5 был всего 0.07 — эта
+# константа калибровалась циклом "тест на WorkSpace падает, меняем веса
+# _heading_score, тест проходит" (честная оговорка — см. отчёт Task 5).
+# Для остальных kind'ов (quote/kpi/...) порог остаётся этим же, брифом
+# находка касалась именно title-подобных типов.
 _GEOMETRY_DECISIVE_THRESHOLD = 0.5
 
 # "Жёсткие" геометрические признаки — не эвристический балл 0..1, а прямое
@@ -286,8 +311,30 @@ class LayoutEntry:
     usage_count: int = 0
 
 
+@dataclass(frozen=True)
+class _RawLayout:
+    """Всё посчитанное для ОДНОГО лейаута в первом проходе
+    `build_layout_catalog`, кроме `kind`/`kind_confidence` — те решает
+    второй проход, после того как посчитаны признаки ВСЕХ лейаутов файла
+    (находка код-ревью Task 5, п.2: "титульность" лейаута по геометрии —
+    его МЕСТО среди heading_score остальных лейаутов ЭТОГО ЖЕ файла, не
+    абсолютная константа, поэтому классификация одного лейаута не может
+    начаться раньше, чем посчитаны признаки всех остальных — см.
+    `_heading_leaders`)."""
+    layout_part: str
+    name: str
+    master_index: int
+    background: Background
+    is_dark: bool
+    placeholders: list[PlaceholderSlot]
+    decor_count: int
+    asset_refs: list[str]
+    features: _Features
+
+
 def build_layout_catalog(
     pkg: PptxPackage, canvas: Canvas, theme: ThemeInfo, grid: Grid,
+    *, usage: Usage | None = None, type_scale: TypeScale | None = None,
 ) -> list[LayoutEntry]:
     """Каталог лейаутов шаблона с классификацией `kind` (см. докстроку модуля).
 
@@ -309,22 +356,34 @@ def build_layout_catalog(
     относятся к сетке в целом, не к конкретному лейауту. Параметр принят по
     контракту интерфейса и не отброшен молча.
 
-    `type_scale.steps["display"]` (кегль заголовка относительно него — один
-    из геометрических признаков, брифом, Step 2) вычисляется здесь же, не
-    передаётся аргументом — интерфейс брифа перечисляет `PptxPackage,
-    ThemeInfo, Canvas, Grid` и не включает ни `Usage`, ни `TypeScale`; оба
-    зависят только от `pkg`/`canvas` и пересчитываются внутри без изменения
-    контракта вызова.
+    `usage`/`type_scale` — НЕОБЯЗЯТЕЛЬНЫЕ, уже посчитанные вызывающим
+    `Usage`/`TypeScale` (находка код-ревью Task 5, п.4). Контракт: если
+    переданы — используются КАК ЕСТЬ, без повторного вызова
+    `collect_usage`/`build_type_scale` (это раньше делал сам
+    `build_layout_catalog`, хотя вызывающий код часто уже вызвал их сам —
+    см. `tests/template/conftest.py`; следующая задача, сборка профиля
+    шаблона целиком, дёргает `collect_usage`/`build_type_scale` один раз на
+    весь профиль и передаёт готовые сюда — без этого контракта двойной
+    обход архива умножился бы). Если НЕ переданы (по умолчанию `None`) —
+    вычисляются здесь же, тем же best-effort `try/except`, что и раньше —
+    для обратной совместимости и для случая, когда `build_layout_catalog`
+    вызывается сам по себе, без остального профиля. `type_scale.steps
+    ["display"]` (кегль заголовка относительно него — один из геометрических
+    признаков, брифом, Step 2) читается из готового `type_scale`, не
+    пересчитывается отдельно.
 
-    `collect_usage` обходит ВЕСЬ пакет (все слайды/лейауты/мастера, не
-    только тот лейаут, что каталогизируется прямо сейчас) — битый цвет ГДЕ
-    УГОДНО в шаблоне не должен ронять каталог лейаутов целиком (тот же
-    принцип, что и у `_resolve_background` для фона ОДНОГО лейаута — см.
-    её докстроку; здесь блаcт-радиус шире, поэтому защита отдельная).
+    `collect_usage` (когда вызывается здесь) обходит ВЕСЬ пакет (все
+    слайды/лейауты/мастера, не только тот лейаут, что каталогизируется
+    прямо сейчас) — битый цвет ГДЕ УГОДНО в шаблоне не должен ронять каталог
+    лейаутов целиком (тот же принцип, что и у `_resolve_background` для
+    фона ОДНОГО лейаута — см. её докстроку; здесь блаcт-радиус шире, поэтому
+    защита отдельная).
     """
     try:
-        usage = collect_usage(pkg, canvas)
-        type_scale = build_type_scale(pkg, canvas, usage)
+        if usage is None:
+            usage = collect_usage(pkg, canvas)
+        if type_scale is None:
+            type_scale = build_type_scale(pkg, canvas, usage)
         display = type_scale.steps.get("display") or 0.0
     except Exception:
         # display=0.0 — честное "неизвестно": _features трактует display=0
@@ -336,8 +395,11 @@ def build_layout_catalog(
     master_order = _master_order(pkg)
     usage_count = _usage_count_by_layout(pkg)
     theme_cache: dict[str, ThemeInfo] = {}
+    image_luminance_cache: dict[str, float | None] = {}
 
-    entries: list[LayoutEntry] = []
+    # --- первый проход: геометрическая сигнатура и фон КАЖДОГО лейаута,
+    # без классификации (см. докстроку _RawLayout). ---
+    raw: list[_RawLayout] = []
     for layout_part in _layout_parts(pkg):
         layout_root = pkg.xml(layout_part)
         c_sld = layout_root.find(qn("p:cSld"))
@@ -348,7 +410,9 @@ def build_layout_catalog(
         layout_theme = _theme_for_master(pkg, master_part, theme, theme_cache) if master_part else theme
 
         try:
-            background = _resolve_background(pkg, layout_part, layout_root, master_part, layout_theme)
+            background = _resolve_background(
+                pkg, layout_part, layout_root, master_part, layout_theme, image_luminance_cache,
+            )
         except Exception:
             # Битый p:bg (нечисловой/усечённый val цветового модификатора и
             # т.п.) не должен ронять каталог целиком ради одного лейаута —
@@ -362,25 +426,38 @@ def build_layout_catalog(
         placeholders = _placeholder_slots(pkg, refs, master_part, canvas)
         decor_count = sum(1 for r in refs if not r.is_placeholder)
         asset_refs = sorted(set(pkg.related(layout_part, "image")))
+        master_title_size = _effective_master_title_size(pkg, master_part, layout_theme, canvas)
+        features = _features(placeholders, display, refs, canvas, master_title_size)
 
+        raw.append(_RawLayout(
+            layout_part=layout_part, name=name, master_index=master_idx, background=background,
+            is_dark=is_dark, placeholders=placeholders, decor_count=decor_count, asset_refs=asset_refs,
+            features=features,
+        ))
+
+    # --- между проходами: место каждого лейаута среди heading_score ВСЕХ
+    # лейаутов ЭТОГО файла (см. докстроку _heading_leaders). ---
+    leaders = _heading_leaders([_heading_score(r.features) for r in raw])
+
+    entries: list[LayoutEntry] = []
+    for i, r in enumerate(raw):
         kind, kind_confidence = _classify(
-            name=name, synonyms=synonyms, placeholders=placeholders,
-            display=display, canvas=canvas, refs=refs, is_dark=is_dark,
+            name=r.name, synonyms=synonyms, features=r.features,
+            is_heading_leader=i in leaders, heading_margin=leaders.get(i, 0.0),
         )
-
         entries.append(LayoutEntry(
-            layout_id=Path(layout_part).stem,
-            part_name=layout_part,
-            name=name,
-            master_index=master_idx,
+            layout_id=Path(r.layout_part).stem,
+            part_name=r.layout_part,
+            name=r.name,
+            master_index=r.master_index,
             kind=kind,
             kind_confidence=kind_confidence,
-            background=background,
-            is_dark=is_dark,
-            placeholders=placeholders,
-            decor_count=decor_count,
-            asset_refs=asset_refs,
-            usage_count=usage_count.get(layout_part, 0),
+            background=r.background,
+            is_dark=r.is_dark,
+            placeholders=r.placeholders,
+            decor_count=r.decor_count,
+            asset_refs=r.asset_refs,
+            usage_count=usage_count.get(r.layout_part, 0),
         ))
     return entries
 
@@ -593,7 +670,38 @@ def _heading_score(f: _Features) -> float:
     маскируя слабость собственно "обложечных" признаков (позиции и кегля).
     Вес перенесён на позицию (0.6) и кегль относительно `display` (0.25) —
     именно они и есть настоящий геометрический смысл "это обложка/разделитель",
-    не число плейсхолдеров."""
+    не число плейсхолдеров.
+
+    Повторное код-ревью (Task 5, п.2) потребовало обосновать САМИ веса
+    смыслом признака, а не тем, что получилось на трёх файлах (итоговый
+    балл ниже всё равно сравнивается не с абсолютной константой, а с
+    heading_score остальных лейаутов файла, см. `_heading_leaders`, — но
+    ВНУТРИ себя балл обязан складываться из содержательно ранжированных, а
+    не подогнанных слагаемых):
+    - **позиция заголовка (0.6, большинство)** — самый прямой геометрический
+      смысл понятия "обложка/разделитель": заголовок, стоящий не у верхнего
+      края, а ближе к центру/низу холста, — это буквально то, чем обложка
+      ОТЛИЧАЕТСЯ от рабочего контентного слайда (там заголовок — якорь
+      сверху, под ним идёт содержимое). Это не косвенный коррелят, а прямое
+      определение признака, поэтому он несёт больше половины балла.
+    - **кегль относительно `display` (0.25, второй по весу)** — крупный
+      заголовок ТИПИЧЕН для обложки, но это опосредованный, менее надёжный
+      сигнал: кегль отражает решение дизайнера о типографской иерархии
+      вообще, а не конкретно о роли этого слайда, и физически отсутствует
+      чаще, чем позиция (title_size_ratio — `None`, когда кегль не резолвится
+      ни в лейауте, ни в мастере, см. `_effective_master_title_size`) —
+      весомый, но подчинённый вклад.
+    - **горизонтальная симметрия (0.15, наименьший)** — самый слабый и
+      самый неоднозначный из трёх: центрирование заголовка — обычная
+      дизайнерская привычка и на многих рабочих контентных слайдах с
+      единственным заголовком-плейсхолдером, не только на обложках, поэтому
+      само по себе почти ничего не говорит об "обложечности" — годится
+      только как небольшое подтверждающее слагаемое, не как самостоятельный
+      driver.
+    Порядок значимости (позиция > кегль > симметрия) — содержательный и не
+    зависит от чисел на конкретном файле; конкретные доли (0.6/0.25/0.15)
+    выражают именно этот порядок и в сумме дают 1.0, чтобы шкала балла
+    оставалась сопоставимой между файлами для `_heading_leaders`."""
     if not f.has_title:
         return 0.0
     score = 0.0
@@ -663,6 +771,84 @@ def _geometry_scores(f: _Features) -> dict[str, float]:
     return scores
 
 
+def _heading_leaders(heading_scores: list[float]) -> dict[int, float]:
+    """Кто из лейаутов ЭТОГО файла геометрически похож на обложку/раздел/
+    прощание СИЛЬНЕЕ остальных — находка код-ревью Task 5, п.2 (см.
+    докстроку модуля про калибровку `_heading_score`/абсолютного порога под
+    известные файлы).
+
+    Раньше "правдоподобие" кандидата имени из `_HEADING_FAMILY` сравнивалось
+    с абсолютной константой (`_GEOMETRY_DECISIVE_THRESHOLD = 0.5`) — но
+    heading_score НЕСОПОСТАВИМ по абсолютной величине между файлами (у
+    контрольного ЛЦТ2026 настоящая обложка — 0.79, у WorkSpace — 0.73, у
+    пограничных WorkSpace-случаев — 0.43, у VK Tech "Разделителя" — 0.29): у
+    трёх настоящих титульных лейаутов WorkSpace запас до порога — 0.07, у
+    "1_Свободный дизайн" VK Tech (для ДРУГОГО типа, тем же порогом) — тоже
+    тонкий. Титульный/разделительный/прощальный лейаут — не "балл выше
+    константы", а один из НЕМНОГИХ лейаутов ЭТОГО файла, чей heading_score
+    заметно оторвался от heading_score остальных (брифом дословно).
+
+    Метод — поиск САМОГО БОЛЬШОГО разрыва (`largest gap`) в отсортированном
+    по убыванию списке РАЗЛИЧНЫХ значений heading_score этого файла: всё
+    выше разрыва — лидеры, всё на разрыве и ниже — "фон" (типичный лейаут
+    файла, чаще всего контентный, без героического заголовка). Разрыв,
+    выбранный так, ищется не под известный ответ конкретного файла (нет ни
+    одной константы, подобранной под число) — это то же самое, чем largest-
+    gap/elbow-детекция является в общем случае: самая большая ступень в
+    распределении значений статистически надёжнее отличает "сигнал" от
+    "шума", чем любая заранее фиксированная точка отсечения, потому что она
+    считается ЗАНОВО для КАЖДОГО файла из его собственных чисел.
+
+    Проверено (см. отчёт Task 5) на всех трёх учебных файлах и на
+    синтетике, не зависящей ни от одного из них
+    (`test_heading_leaders_synthetic_set_independent_of_dataset_files`):
+    - WorkSpace: разрыв между тремя настоящими обложками (~0.735) и двумя
+      пограничными "Титульный слайд" (0.4279) — 0.307, самый большой во всём
+      файле → лидируют только три настоящих (регрессия на брифом
+      цитированный случай, `test_heading_leaders_matches_reverse_
+      engineered_workspace_case`);
+    - Education: разрыв между "Финальный с QR" (0.698, закрывающий, легитимно
+      структурно похож на обложку — единственный крупный блок) и следующим
+      уровнем (0.15) — 0.548, больше разрыва между ним и титульным (0.9205,
+      0.222) → и титульные, И закрывающие лидируют, "раздела"-лейауты
+      (0.1364, сливаются с фоном) — нет;
+    - VK Tech: разрыв между самым слабым настоящим титульным/прощальным
+      уровнем (0.5512) и "Разделителем" (0.2934) — 0.258, самый большой во
+      всём файле → "Разделитель" остаётся ЗА пределами лидеров (тот же
+      исход, что и раньше — см. отчёт про честную регрессию).
+
+    `margin(i)` — насколько СОБСТВЕННЫЙ уровень значения heading_score[i]
+    оторван от уровня, СРАЗУ следующего за найденным разрывом ("потолок
+    фона") — не абсолютный балл, а именно отрыв, поэтому лейаут из самого
+    верхнего уровня файла получает больший margin, чем лейаут из более
+    слабого, но всё ещё лидирующего уровня (Education: title margin=0.77,
+    closing margin=0.55) — брифом: "уверенность должна отражать величину
+    отрыва". `margin` лежит в том же [0,1], что и сам heading_score (разность
+    двух чисел из [0,1]), поэтому годится как компонента `kind_confidence`
+    напрямую, без отдельной калиброванной шкалы.
+
+    Возвращает индекс (позиция в ВХОДНОМ списке `heading_scores`, порядок
+    `_layout_parts`) → margin для каждого лидера; индекс отсутствует в
+    словаре — лейаут не лидер. Пустой словарь — весь файл на одном уровне
+    (включая случай "героического заголовка нет вовсе", все нули) —
+    сравнивать не с чем, лидировать не над чем.
+    """
+    distinct_desc = sorted(set(heading_scores), reverse=True)
+    if len(distinct_desc) < 2 or distinct_desc[0] <= 0.0:
+        return {}
+
+    gaps = [distinct_desc[k] - distinct_desc[k + 1] for k in range(len(distinct_desc) - 1)]
+    split_at = max(range(len(gaps)), key=lambda k: gaps[k])
+    noise_ceiling = distinct_desc[split_at + 1]
+    leader_values = set(distinct_desc[: split_at + 1])
+
+    return {
+        i: score - noise_ceiling
+        for i, score in enumerate(heading_scores)
+        if score in leader_values
+    }
+
+
 # --- ансамбль ----------------------------------------------------------
 
 # Явный приоритет тай-брейка при точном равенстве баллов (обязан быть
@@ -703,23 +889,25 @@ def _argmax(scores: dict[str, float]) -> str:
 
 
 def _classify(
-    *, name: str, synonyms: dict[str, list[str]], placeholders: list[PlaceholderSlot],
-    display: float, canvas: Canvas, refs: list[ShapeRef], is_dark: bool,
+    *, name: str, synonyms: dict[str, list[str]], features: _Features,
+    is_heading_leader: bool, heading_margin: float,
 ) -> tuple[str, float]:
     """См. докстроку модуля за полным описанием алгоритма (п.1-7).
 
-    `is_dark` в сигнатуру принят, но геометрический балл ни одного kind не
-    использует его напрямую (разведка, п.6: и тёмные, и светлые лейауты
-    встречаются у всех типов — "Свободный дизайн" VK Tech тёмный, контентные
-    лейауты Education светлые) — доля тёмного фона упомянута брифом среди
-    признаков геометрической сигнатуры, но как ОТДЕЛЬНОЕ поле LayoutEntry
-    (is_dark), не как классифицирующий признак типа; параметр принят для
-    полноты сигнатуры, честно не используется в scoring, задокументировано
-    здесь, а не отброшено молча.
-    """
-    del is_dark  # см. докстроку выше
+    `features` — геометрическая сигнатура ЭТОГО лейаута, посчитанная
+    вызывающим заранее (см. `_RawLayout`) — не пересчитывается здесь: она
+    нужна была уже ДО классификации, чтобы посчитать heading_score всех
+    лейаутов файла и определить `is_heading_leader`/`heading_margin` (см.
+    `_heading_leaders`), пересчитывать её второй раз было бы лишней работой
+    и риском разойтись с тем, что видел `_heading_leaders`.
 
-    features = _features(placeholders, display, refs, canvas)
+    `is_heading_leader`/`heading_margin` — находка код-ревью Task 5, п.2:
+    заменяют абсолютный порог `_GEOMETRY_DECISIVE_THRESHOLD` конкретно для
+    кандидата имени из `_HEADING_FAMILY` (title/section/closing) — см.
+    докстроку `_heading_leaders`. Для остальных kind'ов (quote/kpi/...)
+    порог остаётся прежним, брифом эта находка касалась именно title-
+    подобных типов, а не всей геометрической сигнатуры целиком.
+    """
     geometry_scores = _geometry_scores(features)
     geometry_kind = _argmax(geometry_scores)
     geometry_score = geometry_scores[geometry_kind]
@@ -746,22 +934,36 @@ def _classify(
         and geometry_score >= 1.0
         and name_kind not in _HEADING_FAMILY
     )
-    name_implausible = name_kind_geometry_score < _GEOMETRY_DECISIVE_THRESHOLD
+    if name_kind in _HEADING_FAMILY:
+        # Находка код-ревью Task 5, п.2: "правдоподобие" кандидата имени из
+        # title/section/closing больше не сравнивается с абсолютной
+        # константой — решает МЕСТО heading_score этого лейаута среди
+        # heading_score остальных лейаутов ЭТОГО ЖЕ файла (см. докстроку
+        # `_heading_leaders`). `geometry_component` — тоже не абсолютный
+        # heading_score, а margin отрыва: увереннее лейаут, оторвавшийся от
+        # остальных сильнее (брифом дословно).
+        name_implausible = not is_heading_leader
+        geometry_component = heading_margin
+    else:
+        name_implausible = name_kind_geometry_score < _GEOMETRY_DECISIVE_THRESHOLD
+        geometry_component = name_kind_geometry_score
     if hard_evidence or name_implausible:
         # Настоящее расхождение — и либо геометрия несёт прямое структурное
         # свидетельство (PICTURE/TABLE/непересекающиеся колонки — см.
         # _HARD_EVIDENCE_KINDS), либо кандидат ИМЕНИ геометрически
-        # неправдоподобен сам по себе (см. докстроку _GEOMETRY_DECISIVE_
-        # THRESHOLD: сравнение идёт с баллом кандидата имени, не с баллом
-        # геометрии-победителя). Доверяем структуре, а не декларативному
-        # имени (WorkSpace-случай — ровно ради него эта ветка и введена).
+        # неправдоподобен сам по себе (для heading-семьи — не лидер среди
+        # heading_score файла; для остальных kind'ов — балл ниже
+        # _GEOMETRY_DECISIVE_THRESHOLD). Доверяем структуре, а не
+        # декларативному имени (WorkSpace-случай — ровно ради него эта
+        # ветка и введена).
         return geometry_kind, _GEOMETRY_WEIGHT * geometry_score
 
     # Геометрия предпочитает другой тип, но кандидат имени всё равно
-    # геометрически правдоподобен (его собственный балл выше порога) — оба
-    # сигнала можно защитить, расхождение — не повод отбросить имя (см.
-    # докстроку _GEOMETRY_DECISIVE_THRESHOLD, кейс "1_Свободный дизайн").
-    confidence = _NAME_WEIGHT * name_score + _GEOMETRY_WEIGHT * name_kind_geometry_score
+    # геометрически правдоподобен — оба сигнала можно защитить, расхождение
+    # — не повод отбросить имя (см. докстроку _GEOMETRY_DECISIVE_THRESHOLD,
+    # кейс "1_Свободный дизайн", и докстроку `_heading_leaders` для
+    # title/section/closing).
+    confidence = _NAME_WEIGHT * name_score + _GEOMETRY_WEIGHT * geometry_component
     return name_kind, confidence
 
 
@@ -861,12 +1063,25 @@ def _relative_luminance(hex_color: str) -> float:
 _BG_IMAGE_SAMPLE_SIZE = (16, 16)
 
 
-def _picture_luminance(pkg: PptxPackage, bg_part: str, blip_fill_el) -> float | None:
+def _picture_luminance(
+    pkg: PptxPackage, bg_part: str, blip_fill_el, cache: dict[str, float | None],
+) -> float | None:
     """Средняя относительная яркость картинки-фона (`a:blipFill`) —
     best-effort: не резолвится `r:embed`, нет такой части в архиве, битый/
     неподдерживаемый формат (emf/wmf и т.п., см. `PptxPackage._media_entry`
     про тот же класс проблем) — `None`, не падение (декоративное фото не
-    должно ронять весь каталог лейаутов из-за одной нечитаемой картинки)."""
+    должно ронять весь каталог лейаутов из-за одной нечитаемой картинки).
+
+    `cache` — находка код-ревью Task 5, п.5: на контрольном ЛЦТ2026 22 из 23
+    лейаутов ссылаются на ОДНУ И ТУ ЖЕ картинку-фон (3840×2160), и без кэша
+    она декодировалась заново на каждый лейаут (почти вся полуторасекундная
+    стоимость полного разбора — на этом). Ключ — резолвленное имя МЕДИА-
+    парта (`target`), не `bg_part`/элемент: разные лейауты ссылаются на один
+    и тот же медиа-файл через РАЗНЫЕ `r:embed`-идентификаторы (локальные для
+    своих `.rels`), но резолвятся в одно и то же имя части. Кэш — параметр,
+    не `lru_cache` на уровне модуля: живёт ровно один вызов
+    `build_layout_catalog` (см. её докстроку), не переживает пакет, как и
+    `theme_cache` рядом."""
     blip = blip_fill_el.find(qn("a:blip"))
     rid = blip.get(qn("r:embed")) if blip is not None else None
     if not rid:
@@ -874,19 +1089,27 @@ def _picture_luminance(pkg: PptxPackage, bg_part: str, blip_fill_el) -> float | 
     target = pkg.rels(bg_part).get(rid)
     if not target:
         return None
+    if target in cache:
+        return cache[target]
+
     try:
         with Image.open(io.BytesIO(pkg.part(target))) as img:
             pixels = list(img.convert("RGB").resize(_BG_IMAGE_SAMPLE_SIZE).getdata())
     except Exception:
+        cache[target] = None
         return None
     if not pixels:
+        cache[target] = None
         return None
     total = sum(_relative_luminance_rgb(r / 255, g / 255, b / 255) for r, g, b in pixels)
-    return total / len(pixels)
+    luminance = total / len(pixels)
+    cache[target] = luminance
+    return luminance
 
 
 def _resolve_background(
     pkg: PptxPackage, layout_part: str, layout_root, master_part: str | None, theme: ThemeInfo,
+    image_luminance_cache: dict[str, float | None],
 ) -> Background:
     """См. докстроку `Background` про три источника (`source`). Вызывающий
     (`build_layout_catalog`) оборачивает этот вызов в `try/except` — сама
@@ -896,7 +1119,10 @@ def _resolve_background(
     reviewer: раньше это ронял `build_layout_catalog` целиком из-за ОДНОГО
     испорченного цвета в ОДНОМ лейауте, хотя рядом, в `_theme_for_master`,
     для того же класса порчи постороннего мастера уже есть прецедент
-    честной деградации — см. её докстроку)."""
+    честной деградации — см. её докстроку).
+
+    `image_luminance_cache` — сквозной кэш декодирования картинки-фона на
+    весь каталог, см. докстроку `_picture_luminance`."""
     bg = _bg_element(layout_root)
     source = "layout"
     bg_part = layout_part
@@ -919,7 +1145,7 @@ def _resolve_background(
 
     resolved = _resolve_bg_color(bg, theme)
     if resolved.is_picture:
-        luminance = _picture_luminance(pkg, bg_part, resolved.picture_element)
+        luminance = _picture_luminance(pkg, bg_part, resolved.picture_element, image_luminance_cache)
         return Background(color=None, source=source, luminance=luminance)
 
     luminance = _relative_luminance(resolved.color.hex) if isinstance(resolved.color, Color) else None
