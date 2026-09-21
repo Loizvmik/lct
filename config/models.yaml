@@ -1,0 +1,29 @@
+models:
+  - id: qwen3.6-35b-a3b
+    provider: yandex
+    hf: Qwen/Qwen3.6-35B-A3B
+    license: Apache-2.0
+    params_b: 35
+    active_params_b: 3
+    vision: true
+    roles: [outline, writer, pattern_picker, palette_namer, content_audit]
+  - id: gpt-oss-20b
+    provider: yandex
+    hf: openai/gpt-oss-20b
+    license: Apache-2.0
+    params_b: 21
+    vision: false
+    roles: [outline, writer, pattern_picker, palette_namer]
+denied:
+  - id: gpt-oss-120b
+    reason: "120B превышает потолок 35B из ТЗ"
+  - id: qwen3-235b-a22b-fp8
+    reason: "235B превышает потолок 35B из ТЗ"
+  - id: yandexgpt-5-pro
+    reason: "закрытая лицензия, ТЗ требует Apache 2.0 / MIT"
+  - id: yandexgpt-5-lite
+    reason: "закрытая лицензия, ТЗ требует Apache 2.0 / MIT"
+  - id: aliceai-llm
+    reason: "закрытая лицензия, ТЗ требует Apache 2.0 / MIT"
+  - id: deepseek-v4-flash
+    reason: "закрытая лицензия, ТЗ требует Apache 2.0 / MIT"
