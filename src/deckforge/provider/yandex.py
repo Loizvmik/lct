@@ -67,13 +67,30 @@ class YandexProvider(LLMProvider, VisionProvider):
     def __init__(
         self,
         model: str,
-        api_key: str,
-        folder_id: str,
+        api_key: str | None,
+        folder_id: str | None,
         *,
         timeout: float = 180.0,
         deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
         now: Callable[[], float] = time.monotonic,
     ):
+        # Settings.load() намеренно не проверяет секреты (config/app.yaml
+        # должен грузиться и без .env — этим пользуются тесты, которые
+        # сознательно запускаются без ключа). Первая точка, которой секреты
+        # реально нужны, — конструктор клиента: падать должна попытка
+        # создать провайдера, а не загрузка конфига, иначе первая внятная
+        # ошибка приходит уже с сервера как "Api-Key None".
+        missing = [
+            name
+            for name, value in (("YANDEX_API_KEY", api_key), ("YANDEX_FOLDER_ID", folder_id))
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                f"{', '.join(missing)} не заданы (пусто или None). Секретам место в "
+                ".env (см. .env.example), а не в config/app.yaml — убедитесь, что .env "
+                "существует и переменные заполнены, либо передайте значения явно."
+            )
         self.card = assert_allowed(model)
         self.model_uri = f"gpt://{folder_id}/{model}/latest"
         self._timeout = timeout

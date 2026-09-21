@@ -373,7 +373,6 @@ def test_call_within_deadline_behaves_as_before():
     assert len(calls) == 1
 
 
-
 # --- Находка 3: слияние system-сообщения с мультимодальным content ---
 
 
@@ -406,3 +405,34 @@ def test_schema_merge_appends_text_block_to_multimodal_leading_system(monkeypatc
     # Регрессия: f-string по списку дал бы "[{'type': 'text', ...}]\n\n...".
     assert "[{'type'" not in added["text"]
 
+
+# --- Находка 4: секреты молча становятся None ---
+
+
+def test_provider_rejects_missing_api_key():
+    with pytest.raises(ValueError, match="YANDEX_API_KEY"):
+        YandexProvider(model="qwen3.6-35b-a3b", api_key=None, folder_id="y")
+
+
+def test_provider_rejects_missing_folder_id():
+    with pytest.raises(ValueError, match="YANDEX_FOLDER_ID"):
+        YandexProvider(model="qwen3.6-35b-a3b", api_key="x", folder_id=None)
+
+
+def test_provider_rejects_empty_string_secret():
+    """os.environ.get на отсутствующую переменную иногда даёт "" (не только
+    None, например если .env есть, но значение не заполнено) — тот же класс
+    дефекта, тоже должен падать явно, а не тихо уйти в заголовок Api-Key ""."""
+    with pytest.raises(ValueError, match="YANDEX_API_KEY"):
+        YandexProvider(model="qwen3.6-35b-a3b", api_key="", folder_id="y")
+
+
+def test_provider_missing_secrets_error_points_to_env():
+    """Сообщение должно называть обе переменные окружения и где им место —
+    первая внятная ошибка, а не 'Api-Key None' с сервера."""
+    with pytest.raises(ValueError) as exc_info:
+        YandexProvider(model="qwen3.6-35b-a3b", api_key=None, folder_id=None)
+    message = str(exc_info.value)
+    assert "YANDEX_API_KEY" in message
+    assert "YANDEX_FOLDER_ID" in message
+    assert ".env" in message
