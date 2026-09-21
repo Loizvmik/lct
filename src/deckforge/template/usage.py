@@ -305,7 +305,7 @@ class _ThemeGraph:
                 # Task 3 повторное код-ревью, находка adversarial-reviewer:
                 # ValueError — не единственный способ, которым чтение темы
                 # постороннего мастера может провалиться (см. докстроку
-                # theme._is_master_stock — тот же класс порчи: dangling
+                # theme._probe_master_theme — тот же класс порчи: dangling
                 # relationship target даёт KeyError при чтении из zip,
                 # невалидный XML даёт lxml.etree.XMLSyntaxError). Ловим
                 # широко здесь совершенно сознательно: мастер уже не

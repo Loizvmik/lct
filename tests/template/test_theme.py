@@ -220,6 +220,112 @@ def test_stock_master_is_rejected_even_with_more_layouts():
     assert theme.scheme["accent1"] == "#0077FF"
 
 
+# --- Task 3 повторное код-ревью, дожатие находки adversarial-reviewer: тема
+# первичного мастера обязана быть читаемой, если рядом есть хоть один
+# исправный кандидат. Раньше нечитаемая тема (нет relationship theme, битый
+# Target, невалидный XML) не считалась "стоковой" и потому проходила в пул
+# кандидатов наравне с читаемыми — и могла выиграть тай-брейк по числу
+# лейаутов, роняя весь разбор на read_theme(), хотя рядом был годный мастер.
+
+def _two_master_package_with_broken_themes(
+    *, master1_layouts: int, master2_layouts: int,
+    master1_broken: bool = False, master2_broken: bool = False,
+    master1_accents: dict[str, str] | None = None,
+    master2_accents: dict[str, str] | None = None,
+) -> PptxPackage:
+    """Как _two_master_package, но с опцией сломать relationship theme
+    одного или обоих мастеров вовсе (не физическая порча XML — тот же
+    класс дефекта, что и в test_usage.py, но нужен на уровне theme.py:
+    pick_primary_master обязан обходить нечитаемый мастер стороной, если
+    рядом есть исправный, а не просто "не падать где-то ниже по стеку")."""
+    files: dict[str, str] = {
+        "_rels/.rels": _rels_xml([("rId1", "officeDocument", "ppt/presentation.xml")]),
+        "ppt/presentation.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<p:sldMasterIdLst><p:sldMasterId id="2147483649" r:id="rId1"/>'
+            '<p:sldMasterId id="2147483650" r:id="rId2"/></p:sldMasterIdLst>'
+            '<p:sldSz cx="12192000" cy="6858000"/></p:presentation>'
+        ),
+        "ppt/_rels/presentation.xml.rels": _rels_xml([
+            ("rId1", "slideMaster", "slideMasters/slideMaster1.xml"),
+            ("rId2", "slideMaster", "slideMasters/slideMaster2.xml"),
+        ]),
+        "ppt/slideMasters/slideMaster1.xml": _MASTER_XML,
+        "ppt/slideMasters/slideMaster2.xml": _MASTER_XML,
+    }
+    if not master1_broken:
+        files["ppt/theme/theme1.xml"] = _theme_xml("Master1Theme", master1_accents or _brand_accents("AA0000"))
+    if not master2_broken:
+        files["ppt/theme/theme2.xml"] = _theme_xml("Master2Theme", master2_accents or _brand_accents("0077FF"))
+
+    master1_rels: list[tuple[str, str, str]] = []
+    rid = 1
+    if not master1_broken:
+        master1_rels.append((f"rId{rid}", "theme", "../theme/theme1.xml"))
+        rid += 1
+    for i in range(master1_layouts):
+        idx = i + 1
+        master1_rels.append((f"rId{rid}", "slideLayout", f"../slideLayouts/slideLayout{idx}.xml"))
+        rid += 1
+        files[f"ppt/slideLayouts/slideLayout{idx}.xml"] = _LAYOUT_XML
+        files[f"ppt/slideLayouts/_rels/slideLayout{idx}.xml.rels"] = _rels_xml(
+            [("rId1", "slideMaster", "../slideMasters/slideMaster1.xml")],
+        )
+    files["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = _rels_xml(master1_rels)
+
+    master2_rels: list[tuple[str, str, str]] = []
+    rid = 1
+    if not master2_broken:
+        master2_rels.append((f"rId{rid}", "theme", "../theme/theme2.xml"))
+        rid += 1
+    for j in range(master2_layouts):
+        idx = master1_layouts + j + 1
+        master2_rels.append((f"rId{rid}", "slideLayout", f"../slideLayouts/slideLayout{idx}.xml"))
+        rid += 1
+        files[f"ppt/slideLayouts/slideLayout{idx}.xml"] = _LAYOUT_XML
+        files[f"ppt/slideLayouts/_rels/slideLayout{idx}.xml.rels"] = _rels_xml(
+            [("rId1", "slideMaster", "../slideMasters/slideMaster2.xml")],
+        )
+    files["ppt/slideMasters/_rels/slideMaster2.xml.rels"] = _rels_xml(master2_rels)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for path, content in files.items():
+            zf.writestr(path, content)
+    buf.seek(0)
+    return PptxPackage(zipfile.ZipFile(buf, "r"))
+
+
+def test_readable_master_wins_over_corrupted_master_with_more_layouts():
+    """Битый мастер (нет relationship theme) несёт БОЛЬШЕ лейаутов, чем
+    исправный рядом. Раньше это давало сломанному мастеру победу в тай-брейке
+    по числу лейаутов; читаемость обязана стоять выше числа лейаутов —
+    выбран должен быть исправный, и разбор не должен падать."""
+    pkg = _two_master_package_with_broken_themes(
+        master1_layouts=5, master1_broken=True,
+        master2_layouts=2, master2_broken=False,
+        master2_accents=_brand_accents("0077FF"),
+    )
+    master = pick_primary_master(pkg)
+    assert master == "ppt/slideMasters/slideMaster2.xml"
+    theme = read_theme(pkg, master)  # не должен падать
+    assert theme.scheme["accent1"] == "#0077FF"
+
+
+def test_all_masters_corrupted_raises_informative_error():
+    """Ни одного читаемого мастера нет — заменить некем, и разбор обязан
+    упасть, как и раньше, с сообщением, называющим конкретную часть
+    (в отличие от предыдущего теста, где есть кем заменить)."""
+    pkg = _two_master_package_with_broken_themes(
+        master1_layouts=5, master1_broken=True,
+        master2_layouts=2, master2_broken=True,
+    )
+    with pytest.raises(ValueError, match="slideMaster"):
+        read_theme(pkg, pick_primary_master(pkg))
+
+
 # --- refine_font_scheme_degraded (Task 3 код-ревью, п.4): синтетические
 # случаи, не требующие пакета вовсе — чистая функция от ThemeInfo + счётчика
 # символов по шрифтам.
