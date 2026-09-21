@@ -425,8 +425,9 @@ git commit -m "feat(provider): реестр моделей по ТЗ и клие
   - `PptxPackage.open(path: Path) -> PptxPackage`; `.part(name: str) -> bytes`; `.xml(name: str) -> lxml.etree._Element`; `.rels(part_name: str) -> dict[str, str]` (rId → имя парта); `.related(part_name: str, rel_type_suffix: str) -> list[str]`; `.names() -> list[str]`; `.media() -> list[MediaEntry]`.
   - `resolve_color(node, scheme: dict[str, str], clr_map: dict[str, str]) -> Color | None`, где `Color(hex: str, alpha: float)`.
   - `Box(left: float, top: float, width: float, height: float)` в долях холста, методы `.right`, `.bottom`, `.area`, `.intersect(other) -> Box | None`.
-  - `shape_box(sp, canvas: Canvas, chain: list[GroupFrame]) -> Box` — применяет аффинное преобразование всех групп по цепочке.
-  - `walk_shapes(tree_root, canvas) -> Iterator[ShapeRef]` — рекурсивный обход с уже разрешёнными координатами.
+  - `shape_box(element, canvas: Canvas, chain: Sequence[GroupFrame]) -> Box | None` — применяет аффинное преобразование всех групп по цепочке; `None`, когда у шейпа нет `a:xfrm` и координаты наследуются от плейсхолдера лейаута.
+  - `walk_shapes(tree_root, canvas, *, include_groups: bool = False) -> Iterator[ShapeRef]` — рекурсивный обход `p:spTree` слайда, лейаута или мастера в документном порядке (z-order снизу вверх), со спуском в `p:grpSp` и накоплением цепочки групп.
+  - `ShapeRef(element, kind, box: Box | None, name, shape_id, rotation, flip_h, flip_v, group_depth, group_chain, is_placeholder, ph_type: str | None, ph_idx: int | None)`; `kind` ∈ `{"shape","picture","graphic_frame","connector","group"}`. Отсутствие `p:ph/@type` в OOXML означает тип `body`, а не «типа нет» — `ph_type` возвращает `"body"`.
 
 - [ ] **Step 1: Тест на аффинное преобразование групп**
 
