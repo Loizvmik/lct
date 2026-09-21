@@ -16,6 +16,7 @@ from __future__ import annotations
 import io
 import zipfile
 
+import pytest
 from conftest import ALL_TEMPLATES
 from PIL import Image
 
@@ -349,3 +350,40 @@ def test_malformed_bg_color_modifier_does_not_crash_the_catalog():
     assert catalog[0].background.source == "resolve_error"
     assert catalog[0].background.luminance is None
     assert catalog[0].is_dark is False
+
+
+# --- регрессии на находки повторного код-ревью Task 5 (см. task-5-report.md) ---
+
+
+def test_largest_area_share_excludes_furniture_placeholders():
+    """Находка №1: `largest_area_share` раньше считался по ВСЕМ
+    плейсхолдерам, включая "мебель" (колонтитул/дата/номер слайда), хотя
+    докстрока `_FURNITURE_PH_TYPES` обещает исключать её из структурных
+    геометрических подсчётов. На трёх учебных файлах эффекта не было (мебель
+    там крошечная), но на нативном шаблоне с крупным колонтитулом это ложно
+    взводило "одинокий доминирующий блок" (quote/kpi) по площади подвала, а
+    не контента. Огромный FOOTER (90% холста) не должен попасть в
+    largest_area_share при том, что реальный контент — два маленьких BODY."""
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+    placeholders = [
+        PlaceholderSlot(ph_type="FOOTER", box=Box(0.0, 0.0, 1.0, 0.9)),
+        PlaceholderSlot(ph_type="BODY", box=Box(0.1, 0.92, 0.3, 0.05)),
+        PlaceholderSlot(ph_type="BODY", box=Box(0.5, 0.92, 0.3, 0.05)),
+    ]
+    f = _features(placeholders, display=0.0, refs=[], canvas=canvas)
+    assert f.largest_area_share == pytest.approx(0.015)
+    assert f.no_title_dominant is False  # ниже _MIN_DOMINANT_AREA_SHARE (0.10) без мебели
+
+
+def test_largest_area_share_still_finds_real_dominant_content_block():
+    """Контроль к предыдущему тесту: без мебели, с одним настоящим крупным
+    контентным блоком, largest_area_share обязан по-прежнему видеть его."""
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+    placeholders = [
+        PlaceholderSlot(ph_type="FOOTER", box=Box(0.0, 0.95, 1.0, 0.05)),
+        PlaceholderSlot(ph_type="BODY", box=Box(0.1, 0.1, 0.8, 0.7)),
+    ]
+    f = _features(placeholders, display=0.0, refs=[], canvas=canvas)
+    assert f.largest_area_share == pytest.approx(0.56)
+
+

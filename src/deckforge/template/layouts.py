@@ -488,7 +488,16 @@ def _features(
     has_table = any(p.ph_type == "TABLE" for p in placeholders)
     bodies = [p for p in placeholders if p.ph_type in _BODY_LIKE_PH_TYPES]
 
-    largest_area_share = max((p.box.area for p in placeholders), default=0.0)
+    # Находка код-ревью Task 5, п.1: раньше считался по ВСЕМ плейсхолдерам,
+    # включая мебель (`_FURNITURE_PH_TYPES`) — докстрока этой константы уже
+    # обещала исключать её из структурных геометрических подсчётов, но эта
+    # конкретная величина была пропущена. На трёх учебных файлах эффекта не
+    # было (мебель там крошечная, максимум 0.0418 при пороге 0.10), но на
+    # нативном шаблоне с настоящим крупным колонтитулом это ложно взводило
+    # "одинокий доминирующий блок" (quote/kpi, см. `_no_title_score`) по
+    # площади подвала, а не контента. По `content_ph`, как и everywhere
+    # ниже (`dominant`, `no_title_dominant`).
+    largest_area_share = max((p.box.area for p in content_ph), default=0.0)
 
     title_slot = next((p for p in placeholders if p.ph_type in _TITLE_PH_TYPES), None)
     title_top_center = (title_slot.box.top + title_slot.box.height / 2) if title_slot else None
