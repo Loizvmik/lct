@@ -30,10 +30,13 @@
 "Требования к работе").
 """
 from __future__ import annotations
+import io
 import re
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+
+from PIL import Image
 
 from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.geometry import Box, Canvas
@@ -42,6 +45,17 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import ShapeRef, walk_shapes
 from deckforge.template.assets import AssetCatalog
 from deckforge.template.grid import TITLE_PH_TYPES, Grid
+# Task 7 повторное ревью, находка №4 ("Определение тёмного фона слабее, чем
+# уже есть в проекте"): `layouts.py` уже умеет резолвить `p:bg` (цепочка
+# слайд→лейаут→мастер→lt1), градиенты (цвет первой точки) и яркость
+# картиночного фона (пиксельный сэмпл) — сильнее декоративно-фигурной
+# эвристики, которая была здесь раньше (см. `_slide_is_dark`). Вместо
+# повторной реализации той же логики — прямой импорт её приватных хелперов
+# из `layouts.py` (осознанное отступление от заведённого в template/
+# принципа "каждый модуль читает свой срез XML сам, не тянет чужие
+# приватные функции" — здесь наоборот прямо потребовало код-ревью: одна и
+# та же p:bg-цепочка не должна разъезжаться в двух местах).
+from deckforge.template import layouts as _layouts
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale
 
@@ -123,6 +137,22 @@ class DecorShape:
     геометрии/оформления, чтобы сборщик слайдов мог воспроизвести шейп на
     новом холсте: тип, бокс, поворот/отражение, цвет заливки (если
     разрешился) и была ли заливка вовсе.
+
+    `fill_kind` (Task 7 повторное ревью, находка №6, "мелочи") — вид
+    заливки как она объявлена в XML: `"none"` (`noFill`),
+    `"unspecified"` (в `p:spPr` вовсе нет узла заливки — наследуется от
+    стиля), `"solid"`, `"gradient"`, `"pattern"`, `"picture"` (`blipFill`),
+    `"group"` (`grpFill`, наследует заливку родительской группы — из
+    контекста этого шейпа она не резолвится). Раньше (до этой правки)
+    сборщик получал для градиентной/узорной/картиночной плашки только
+    `has_fill=True, fill_hex=None` — "заливка есть, а какая, не знаю" — и
+    не мог отличить "забыли посчитать цвет" от "цвета и не может быть
+    (картинка)". `fill_hex` теперь заполняется, когда это возможно, ДЛЯ
+    ВСЕХ видов заливки, не только сплошной — средним цветом (см.
+    `_to_decor`): для градиента — среднее резолвленных цветов всех
+    стоп-точек, для узора — среднее переднего/заднего цвета, для картинки —
+    среднее пикселей уменьшенной копии (тот же приём, что
+    `layouts._picture_luminance`, только цвет, а не яркость).
     """
     kind: str
     box: Box
@@ -131,6 +161,7 @@ class DecorShape:
     flip_v: bool
     fill_hex: str | None
     has_fill: bool
+    fill_kind: str = "unspecified"
 
 
 @dataclass(frozen=True)
@@ -243,10 +274,25 @@ def mine_patterns(
     theme = read_theme(pkg, pick_primary_master(pkg))
     logo_target = assets.logo.part_name if assets.logo else None
     bg_targets = {ref.part_name for ref in assets.backgrounds}
+    # Кэш decode картинки-фона на весь прогон mine_patterns (находка №4):
+    # тот же приём и тот же смысл, что `image_luminance_cache` в
+    # `layouts.build_layout_catalog` — несколько слайдов нередко ссылаются
+    # на одну и ту же картинку-фон, декодировать её заново на каждый слайд
+    # не нужно.
+    bg_image_cache: dict[str, float | None] = {}
+    # Кэш средних цветов картиночных/узорных декоративных заливок (находка
+    # №6, "мелочи") — отдельный от `bg_image_cache`: разные части
+    # (декоративный шейп со своей картинкой-заливкой vs фон слайда/лейаута)
+    # обычно разные медиа-файлы, но даже при совпадении имени части смысл
+    # закэшированного значения разный (яркость vs хекс среднего цвета).
+    decor_image_cache: dict[str, str | None] = {}
 
     candidates: list[Pattern] = []
     for slide_part in _slide_parts(pkg):
-        pattern = _mine_slide(pkg, canvas, grid, scale, theme, slide_part, logo_target, bg_targets)
+        pattern = _mine_slide(
+            pkg, canvas, grid, scale, theme, slide_part, logo_target, bg_targets,
+            bg_image_cache, decor_image_cache,
+        )
         if pattern is not None:
             candidates.append(pattern)
     return _dedup(candidates)
@@ -274,12 +320,17 @@ def _slide_number(part_name: str) -> int:
 @dataclass(frozen=True)
 class _TierInfo:
     """Типографический разбор одного контентного текстового шейпа —
-    промежуточное сырьё для назначения роли (см. `_finalize_roles`)."""
+    промежуточное сырьё для назначения роли (см. `_finalize_roles`).
+
+    `text` — `None` для пустого плейсхолдера-слота (Task 7 повторное
+    ревью, находка №1): нечего измерять/показывать как текст-рыбу, но сам
+    слот — не менее реальный кандидат в headline/card_title и т.п., чем
+    заполненный (см. `_tier_info`/`_split_content_decor`)."""
     step: str  # ближайшая ступень TypeScale.steps: micro/caption/body/h2/h1/display
     size_pt: float
     numeric: bool
     bulleted: bool
-    text: str
+    text: str | None
     align: str
     color_hex: str | None
 
@@ -291,6 +342,7 @@ _TIER_RANK = {name: i for i, name in enumerate(_TIER_ORDER)}
 def _mine_slide(
     pkg: PptxPackage, canvas: Canvas, grid: Grid, scale: TypeScale, theme: ThemeInfo,
     slide_part: str, logo_target: str | None, bg_targets: set[str],
+    bg_image_cache: dict[str, float | None], decor_image_cache: dict[str, str | None],
 ) -> Pattern | None:
     root = pkg.xml(slide_part)
     layout_part = _slide_layout_part(pkg, slide_part)
@@ -335,13 +387,13 @@ def _mine_slide(
 
     slide_number = _slide_number(slide_part)
     layout_id = Path(layout_part).stem if layout_part else ""
-    is_dark = _slide_is_dark(decor, theme)
+    is_dark = _slide_is_dark(pkg, theme, slide_part, layout_part, decor, bg_image_cache)
     capacity = _capacity(content, slots, repeat, grid)
     score = _score(slots, repeat, roles_present)
     if score < _MIN_SCORE:
         return None
 
-    decor_shapes = [_to_decor(ref, theme) for ref in decor]
+    decor_shapes = [_to_decor(pkg, rels, ref, theme, decor_image_cache) for ref in decor]
 
     return Pattern(
         pattern_id=f"{Path(slide_part).stem}",
@@ -416,25 +468,41 @@ def _picture_target(element, rels: dict[str, str]) -> str | None:
 
 
 def _shape_text(element) -> str:
-    """Текст шейпа — только `a:r/a:t`, абзацы разделены `\\n`.
+    """Текст шейпа — `a:r/a:t` внутри каждого `a:p`, абзацы разделены `\\n`.
 
-    Намеренно не заглядывает в `a:br` (мягкий перенос строки): у него нет
-    текстового содержимого вовсе, это разметочный элемент, а не текст —
-    `\\x0b` (которым мягкий перенос отдаёт `python-pptx` через свойство
-    `.text_frame.text`, см. докстроку брифа и теста
-    `test_soft_line_break_does_not_corrupt_slot_text`) появляется только у
-    того слоя, который сам его туда подставляет; этот модуль читает XML
-    напрямую через lxml, не через `python-pptx`, поэтому такого слоя здесь
-    попросту нет — свойство теста выполняется не совпадением, а тем, что
-    взять `\\x0b` тут неоткуда."""
+    Task 7 повторное ревью, находка №3: раньше функция собирала текст
+    ТОЛЬКО из `p.findall(qn("a:r"))`, полностью игнорируя `a:br` (мягкий
+    перенос строки) — у него и правда нет текстового узла, но пропустить
+    его молча значит склеить текст ДО и ПОСЛЕ переноса без единого
+    разделителя ("Заголовок" + `a:br` + "в две строчку" → "Заголовокв две
+    строчку", встречалось 15/9/84/10 раз в четырёх шаблонах — системная
+    порча, не краевой случай). Раз `a:br` в документном порядке стоит
+    МЕЖДУ рядом идущими `a:r`, читать нужно ВСЕХ детей `a:p` по порядку, не
+    только раздел `a:r` отдельно — иначе порядок и место разрыва потеряны.
+
+    `a:br` → `\\n`, тот же разделитель, что и между абзацами (не пробел):
+    мягкий перенос — это НОВАЯ строка внутри одного абзаца, семантически
+    он ближе к границе абзаца, чем к пробелу между словами.
+
+    Свойство теста `test_soft_line_break_does_not_corrupt_slot_text` — что
+    в результате не появляется `\\x0b` — сохраняется по той же причине, что
+    и раньше: `\\x0b` — это то, чем МЯГКИЙ ПЕРЕНОС отдаёт `python-pptx`
+    через `.text_frame.text`, а этот модуль читает XML напрямую через lxml,
+    такого слоя здесь просто нет."""
     tx_body = element.find(qn("p:txBody"))
     if tx_body is None:
         return ""
     lines = []
     for p in tx_body.findall(qn("a:p")):
-        runs = p.findall(qn("a:r"))
-        line = "".join((r.find(qn("a:t")).text or "") for r in runs if r.find(qn("a:t")) is not None)
-        lines.append(line)
+        parts = []
+        for child in p:
+            tag = local_name(child)
+            if tag == "r":
+                t_el = child.find(qn("a:t"))
+                parts.append(t_el.text or "" if t_el is not None else "")
+            elif tag == "br":
+                parts.append("\n")
+        lines.append("".join(parts))
     return "\n".join(lines)
 
 
@@ -472,9 +540,31 @@ def _split_content_decor(
         elif ref.kind == "graphic_frame":
             content.append(ref)
         elif ref.kind == "shape":
-            if _shape_text(ref.element).strip():
+            if ref.is_placeholder:
+                # Task 7 повторное ревью, находка №1 (главная причина
+                # обеднённого урожая на контрольном ЛЦТ2026): пустой
+                # ПЛЕЙСХОЛДЕР — контентный слот с известной геометрией, а не
+                # декор, даже когда в нём нет ни одного `a:r` — заполнителя
+                # вписывает команда, которая будет пользоваться шаблоном
+                # (слайды 8/9/10 ЛЦТ2026: `<p:ph type="title"/>` с полностью
+                # разрешённой геометрией и без единого символа текста — то
+                # же самое устройство, что у слайда 9, готовой карточной
+                # раскладки на пять участников команды). Сам факт, что
+                # дизайнер поставил здесь ИМЕННО плейсхолдер (не случайную
+                # фигуру), — уже структурный сигнал "здесь должен быть
+                # контент", вне зависимости от того, вписан ли в шаблон
+                # текст-рыба. `sample_text` для такого слота — `None` (см.
+                # `_tier_info`/`PatternSlot.sample_text` — поле уже
+                # опционально ровно для этого случая).
+                content.append(ref)
+            elif _shape_text(ref.element).strip():
                 content.append(ref)
             else:
+                # НЕ-плейсхолдер без текста — вот это уже декор как он есть
+                # (фигура без заливки и без текста, линия, фоновая плашка,
+                # логотип): присутствие/отсутствие заливки само по себе не
+                # меняет вывод — и подложка-плашка С заливкой, и голая
+                # линия БЕЗ неё остаются декором, если это не плейсхолдер.
                 decor.append(ref)
         # kind == "group" не встречается: walk_shapes(include_groups=False)
     return content, decor
@@ -566,7 +656,11 @@ def _tier_info(ref: ShapeRef, canvas: Canvas, scale: TypeScale, theme: ThemeInfo
         return None  # картинки/таблицы разбираются отдельно, см. _finalize_roles
     text = _shape_text(ref.element)
     stripped = text.strip()
-    if not stripped:
+    if not stripped and not ref.is_placeholder:
+        # Пустой НЕ-плейсхолдер сюда попасть не должен вовсе (см.
+        # `_split_content_decor` — он декор, в `content` не входит), но
+        # защита остаётся: без текста и без структурного статуса
+        # плейсхолдера измерять/классифицировать нечего.
         return None
 
     size_pt = _shape_dominant_size(ref.element, canvas)
@@ -587,7 +681,7 @@ def _tier_info(ref: ShapeRef, canvas: Canvas, scale: TypeScale, theme: ThemeInfo
     align = _dominant_align(ref.element, scale)
     color_hex = _dominant_color(ref.element, theme)
     return _TierInfo(step=step, size_pt=size_pt, numeric=numeric, bulleted=bulleted,
-                      text=text, align=align, color_hex=color_hex)
+                      text=text if stripped else None, align=align, color_hex=color_hex)
 
 
 # --- поиск повтора (бриф, Step 2, п.4) --------------------------------------
@@ -679,6 +773,24 @@ def _prelim_repeat_role(tier: _TierInfo | None, ref: ShapeRef) -> str:
     return "card_body"
 
 
+def _aligned(a: "_RepeatCandidate", b: "_RepeatCandidate", content: list[ShapeRef]) -> bool:
+    """Два кандидата повтора описывают ОДНУ И ТУ ЖЕ физическую сетку (не
+    просто совпавшие по числу/шагу два независимых ряда где-то на слайде),
+    если координаты их членов ВДОЛЬ ОСИ ПОВТОРА совпадают поэлементно
+    (допуск `_SIZE_TOLERANCE`, тот же порядок величины, что и у совпадения
+    размера бокса) — заголовок карточки №2 и тело карточки №2 стоят на ОДНОЙ
+    и той же x-координате (при axis="x"), просто на разной высоте; два
+    независимых ряда карточек с тем же шагом, но на разных x-стартах — уже
+    другая сетка, сливать их значило бы придумать связь, которой на слайде
+    нет (см. докстроку `_find_repeat` про находку №5 повторного код-ревью)."""
+    coord = (lambda box: box.left) if a.axis == "x" else (lambda box: box.top)
+    a_coords = sorted(coord(content[i].box) for i in a.indices)
+    b_coords = sorted(coord(content[i].box) for i in b.indices)
+    if len(a_coords) != len(b_coords):
+        return False
+    return all(abs(x - y) <= _SIZE_TOLERANCE for x, y in zip(a_coords, b_coords))
+
+
 def _find_repeat(
     content: list[ShapeRef], tiers: list[_TierInfo | None],
 ) -> tuple[RepeatSpec | None, dict[int, str]]:
@@ -723,6 +835,17 @@ def _find_repeat(
         return None, {}
 
     # Слияние кандидатов одной и той же физической сетки (см. докстроку).
+    #
+    # Task 7 повторное ревью, находка №5 (синтетический тест на саму суть
+    # задачи): одного совпадения axis/count/step НЕДОСТАТОЧНО — оно слило
+    # бы и два ПРОСТРАНСТВЕННО НЕСВЯЗАННЫХ ряда с одинаковым шагом и тем же
+    # числом элементов (совпадение шага само по себе не редкость: 3-4
+    # карточки с одним и тем же жёлобом сетки могут стоять где угодно на
+    # слайде). Легитимное слияние (заголовок карточки + тело карточки одной
+    # сетки) распознаётся не только по шагу, а по тому, что координаты
+    # элементов ВДОЛЬ ОСИ ПОВТОРА у обеих групп совпадают поэлементно —
+    # тот же ряд позиций (колонок сетки/строк), просто разного рода
+    # содержимое, не просто "тот же шаг где-то ещё" (см. `_aligned`).
     used = [False] * len(candidates)
     merged_groups: list[list[_RepeatCandidate]] = []
     for i, c in enumerate(candidates):
@@ -734,7 +857,11 @@ def _find_repeat(
             if used[j]:
                 continue
             o = candidates[j]
-            if o.axis == c.axis and o.count == c.count and abs(o.step - c.step) <= _STEP_TOLERANCE:
+            same_grid = (
+                o.axis == c.axis and o.count == c.count and abs(o.step - c.step) <= _STEP_TOLERANCE
+                and _aligned(c, o, content)
+            )
+            if same_grid:
                 group.append(o)
                 used[j] = True
         merged_groups.append(group)
@@ -1152,10 +1279,27 @@ def _capacity(
             1 - grid.margin_left - grid.margin_right if repeat.axis == "x"
             else 1 - grid.margin_top - grid.margin_bottom
         )
+        # Task 7 повторное ревью, находка №6 (мелочи): `span / step + 1`
+        # считал, будто ПОСЛЕДНЯЯ карточка занимает только шаг, а не
+        # собственную ширину/высоту сверх него — N карточек с шагом `step`
+        # физически занимают `(N-1)*step + item_size`, не `N*step`, значит
+        # правильная вместимость — `(span - item_size)/step + 1`, не
+        # `span/step + 1` (переоценка на единицу при типичном step >
+        # item_size, т.е. когда между карточками есть зазор). `item_size` —
+        # размер УЖЕ намайненного слота той же роли, что и повтор (все члены
+        # повтора прошли `_group_by_size` с допуском 2%, значит любой из них
+        # представитель); 0.0 (честная деградация к старой формуле), если
+        # почему-то ни один слот с ролью повтора не нашёлся — не должно
+        # происходить, `repeat.slot_roles` строится из тех же самых слотов.
+        item_size = next(
+            (s.box.width if repeat.axis == "x" else s.box.height for s in slots if s.role in repeat.slot_roles),
+            0.0,
+        )
+        usable_span = max(span - item_size, 0.0)
         # Вместимость по геометрии — сколько повторов такого шага реально
         # умещается между полями шаблона, не только то, что нарисовано на
         # исходном слайде-примере (тот и есть предмет параметризации).
-        max_items = max(repeat.count, int(span / repeat.step) + 1)
+        max_items = max(repeat.count, int(usable_span / repeat.step) + 1)
     else:
         max_items = 1
 
@@ -1210,14 +1354,15 @@ def _shape_fill_color(element, theme: ThemeInfo) -> Color | None:
     return resolved if isinstance(resolved, Color) else None
 
 
-def _slide_is_dark(decor: list[ShapeRef], theme: ThemeInfo) -> bool:
-    """Тёмная ли композиция слайда — по цвету самой крупной декоративной
-    фигуры-подложки (доля площади не меньше `_BG_AREA_SHARE`), не по `p:bg`
-    части: у слайда-примера фон почти всегда наследуется от лейаута/мастера
-    без собственного `p:bg`, а майнингу важнее фактический цвет, которым
-    закрашена видимая площадь СЛАЙДА, а не декларация формата. `False`
-    (не "тёмный") — честный фолбэк при отсутствии кандидата, тот же
-    принцип асимметричной безопасности, что у `LayoutEntry.is_dark`."""
+def _decor_shape_luminance(decor: list[ShapeRef], theme: ThemeInfo) -> float | None:
+    """Яркость самой крупной декоративной фигуры-подложки (площадь не
+    меньше `_BG_AREA_SHARE`) со сплошной заливкой — `None`, если такой
+    фигуры нет. Это была ЕДИНСТВЕННАЯ логика `_slide_is_dark` до Task 7
+    повторного ревью (находка №4): работает, только когда фон СЛАЙДА
+    нарисован декоративной плашкой-фигурой, а не задан `p:bg` (частый
+    случай на трёх учебных шаблонах — см. докстроку `mine_patterns` про
+    то, что фон почти всегда наследуется без собственного `p:bg`), и
+    ничего не знает ни про картинку-фон, ни про градиент."""
     best: tuple[float, str] | None = None
     for ref in decor:
         if ref.kind != "shape" or ref.box is None or ref.box.area < _BG_AREA_SHARE:
@@ -1227,19 +1372,205 @@ def _slide_is_dark(decor: list[ShapeRef], theme: ThemeInfo) -> bool:
             continue
         if best is None or ref.box.area > best[0]:
             best = (ref.box.area, color.hex)
-    if best is None:
+    return _relative_luminance(best[1]) if best is not None else None
+
+
+def _bg_chain_luminance(
+    pkg: PptxPackage, theme: ThemeInfo, slide_part: str, layout_part: str | None,
+    bg_image_cache: dict[str, float | None],
+) -> float | None:
+    """Яркость фона слайда по цепочке `p:bg` слайд → лейаут → мастер → lt1
+    темы — ровно то, что уже умеет `layouts._resolve_background` (реюз её
+    приватных хелперов, см. комментарий у импорта `_layouts` вверху файла):
+    умеет градиент (цвет первой точки) и картинку-фон (пиксельный сэмпл
+    средней яркости, с кэшем), не только сплошную заливку.
+
+    Отличие от `layouts._resolve_background`: та функция резолвит фон
+    ЛЕЙАУТА (готового каталога, без слайда в цепочке вовсе — у лейаута нет
+    родительского слайда), а здесь нужен фон КОНКРЕТНОГО СЛАЙДА-ПРИМЕРА, у
+    которого собственный `p:bg` (редко, но бывает и на слайде, не только
+    на лейауте/мастере) стоит ВЫШЕ по цепочке наследования, чем у его
+    лейаута — резолвим его сами тем же `_resolve_bg_color`/
+    `_picture_luminance`, а на лейаут/мастер делегируем уже готовой
+    `_resolve_background`, если у слайда своего `p:bg` нет. Сигнатура
+    `mine_patterns` каталог макетов не принимает (бриф Task 7, Step 1,
+    дословно) — читаем `p:bg` слайда и его макета напрямую тем же
+    способом, что и `layouts.py`, а не через готовый `LayoutEntry`."""
+    try:
+        slide_bg = _layouts._bg_element(pkg.xml(slide_part))
+        if slide_bg is not None:
+            resolved = _layouts._resolve_bg_color(slide_bg, theme)
+            if resolved.is_picture:
+                return _layouts._picture_luminance(pkg, slide_part, resolved.picture_element, bg_image_cache)
+            if isinstance(resolved.color, Color):
+                return _relative_luminance(resolved.color.hex)
+            return None
+        if layout_part is None:
+            return None
+        layout_root = pkg.xml(layout_part)
+        master_related = pkg.related(layout_part, "slideMaster")
+        master_part = master_related[0] if master_related else None
+        background = _layouts._resolve_background(pkg, layout_part, layout_root, master_part, theme, bg_image_cache)
+        return background.luminance
+    except Exception:
+        # Битый цветовой модификатор в p:bg где-то по цепочке не должен
+        # ронять майнинг всего слайда/шаблона из-за одного нерезолвящегося
+        # фона (тот же принцип честной деградации, что у
+        # `build_layout_catalog` вокруг `_resolve_background` — см. её
+        # докстроку) — is_dark просто не резолвится этим путём, дальше
+        # решает декоративная фигура/честный False-фолбэк в _slide_is_dark.
+        return None
+
+
+def _slide_is_dark(
+    pkg: PptxPackage, theme: ThemeInfo, slide_part: str, layout_part: str | None,
+    decor: list[ShapeRef], bg_image_cache: dict[str, float | None],
+) -> bool:
+    """Тёмная ли композиция слайда (Task 7 повторное ревью, находка №4).
+
+    Приоритет источников, оба реальны на разведанных файлах:
+    1. Декоративная фигура-подложка слайда (`_decor_shape_luminance`) —
+       если она есть, это САМЫЙ прямой сигнал того, что реально видно на
+       слайде: полноразмерная плашка часто нарисована ПОВЕРХ формально
+       светлого `p:bg`, унаследованного от мастера (три учебных шаблона
+       делают именно так — см. докстроку `mine_patterns`), и в этом случае
+       именно она, а не декларация `p:bg`, определяет фактический цвет.
+    2. Иначе — цепочка `p:bg` слайд→лейаут→мастер→lt1 (`_bg_chain_luminance`,
+       реюз `layouts.py` — единственный источник, различающий картинку и
+       градиент от плоского цвета; см. её докстроку). Нужна для нативного
+       нестуденческого шаблона (ЛЦТ2026), где фон задан по-настоящему
+       через `p:bg`, а не декоративной фигурой.
+    3. Ни то ни другое не дало цвета — `False` (не "тёмный"), честный
+       фолбэк, тот же принцип асимметричной безопасности, что и у
+       `LayoutEntry.is_dark`."""
+    luminance = _decor_shape_luminance(decor, theme)
+    if luminance is None:
+        luminance = _bg_chain_luminance(pkg, theme, slide_part, layout_part, bg_image_cache)
+    if luminance is None:
         return False
-    return _relative_luminance(best[1]) < _WCAG_DARK_THRESHOLD
+    return luminance < _WCAG_DARK_THRESHOLD
 
 
-def _to_decor(ref: ShapeRef, theme: ThemeInfo) -> DecorShape:
-    fill = _shape_fill_color(ref.element, theme) if ref.kind == "shape" else None
+_FILL_TAG_TO_KIND = {
+    "noFill": "none", "solidFill": "solid", "gradFill": "gradient",
+    "pattFill": "pattern", "blipFill": "picture", "grpFill": "group",
+}
+
+
+def _average_hex(colors: list[Color]) -> str | None:
+    if not colors:
+        return None
+    r = sum(int(c.hex[1:3], 16) for c in colors) / len(colors)
+    g = sum(int(c.hex[3:5], 16) for c in colors) / len(colors)
+    b = sum(int(c.hex[5:7], 16) for c in colors) / len(colors)
+    return f"#{round(r):02X}{round(g):02X}{round(b):02X}"
+
+
+def _gradient_average_color(fill_el, theme: ThemeInfo) -> str | None:
+    """Средний цвет градиента — среднее РАЗРЕШИВШИХСЯ цветов всех стоп-точек
+    `a:gsLst/a:gs` (не только первой, как в `layouts._resolve_bg_color` —
+    там одной точки достаточно для яркости "тёмный/светлый", здесь нужен
+    представительный ЦВЕТ для рендера плашки, и усреднение по всем точкам
+    честнее одной крайней)."""
+    gs_lst = fill_el.find(qn("a:gsLst"))
+    if gs_lst is None:
+        return None
+    colors = []
+    for gs in gs_lst.findall(qn("a:gs")):
+        color_el = next(iter(gs), None)
+        if color_el is None:
+            continue
+        resolved = resolve_color(color_el, theme.scheme, theme.clr_map)
+        if isinstance(resolved, Color):
+            colors.append(resolved)
+    return _average_hex(colors)
+
+
+def _pattern_average_color(fill_el, theme: ThemeInfo) -> str | None:
+    """Средний цвет узорной заливки — среднее переднего (`a:fgClr`) и
+    заднего (`a:bgClr`) цветов узора: при типичной плотности штриховки оба
+    вносят сопоставимый вклад в то, что видит глаз издалека, ни один не
+    доминирует настолько, чтобы им одним заменить другой."""
+    colors = []
+    for tag in ("a:fgClr", "a:bgClr"):
+        el = fill_el.find(qn(tag))
+        color_el = next(iter(el), None) if el is not None else None
+        if color_el is None:
+            continue
+        resolved = resolve_color(color_el, theme.scheme, theme.clr_map)
+        if isinstance(resolved, Color):
+            colors.append(resolved)
+    return _average_hex(colors)
+
+
+# Сторона уменьшенной копии картинки-заливки для оценки среднего цвета —
+# тот же порядок величины и то же обоснование, что и
+# `layouts._BG_IMAGE_SAMPLE_SIZE` (см. её докстроку): средний тон, не
+# точный рендер, дёшево декодировать.
+_DECOR_IMAGE_SAMPLE_SIZE = (16, 16)
+
+
+def _picture_fill_average_color(
+    pkg: PptxPackage, rels: dict[str, str], fill_el, cache: dict[str, str | None],
+) -> str | None:
+    """Средний цвет картиночной заливки декоративного шейпа — best-effort,
+    тот же класс защит (`r:embed` не резолвится, часть отсутствует, формат
+    не читается PIL), что и `layouts._picture_luminance`, только результат —
+    хекс среднего цвета, а не яркость (для яркости годится готовая
+    `layouts._picture_luminance`, но нужного здесь среднего ЦВЕТА (не
+    яркости) у неё нет — маленький независимый хелпер, тот же приём, что
+    everywhere в template/, см. докстроку `_layouts` про этот класс
+    решений)."""
+    blip = fill_el.find(qn("a:blip"))
+    rid = blip.get(qn("r:embed")) if blip is not None else None
+    if not rid:
+        return None
+    target = rels.get(rid)
+    if not target:
+        return None
+    if target in cache:
+        return cache[target]
+    try:
+        with Image.open(io.BytesIO(pkg.part(target))) as img:
+            data = img.convert("RGB").resize(_DECOR_IMAGE_SAMPLE_SIZE).tobytes()
+    except Exception:
+        cache[target] = None
+        return None
+    if not data:
+        cache[target] = None
+        return None
+    pixel_count = len(data) // 3
+    r_total = sum(data[i] for i in range(0, pixel_count * 3, 3))
+    g_total = sum(data[i] for i in range(1, pixel_count * 3, 3))
+    b_total = sum(data[i] for i in range(2, pixel_count * 3, 3))
+    hex_color = f"#{round(r_total / pixel_count):02X}{round(g_total / pixel_count):02X}{round(b_total / pixel_count):02X}"
+    cache[target] = hex_color
+    return hex_color
+
+
+def _to_decor(
+    pkg: PptxPackage, rels: dict[str, str], ref: ShapeRef, theme: ThemeInfo,
+    decor_image_cache: dict[str, str | None],
+) -> DecorShape:
     sp_pr = ref.element.find(qn("p:spPr")) if ref.kind in ("shape", "connector") else None
     fill_el = _pick_fill_element(sp_pr) if sp_pr is not None else None
-    has_fill = fill_el is not None and local_name(fill_el) != "noFill"
+    fill_kind = _FILL_TAG_TO_KIND.get(local_name(fill_el), "unspecified") if fill_el is not None else "unspecified"
+    has_fill = fill_kind not in ("none", "unspecified")
+
+    fill_hex: str | None = None
+    if fill_kind == "solid":
+        color = _shape_fill_color(ref.element, theme)
+        fill_hex = color.hex if color else None
+    elif fill_kind == "gradient":
+        fill_hex = _gradient_average_color(fill_el, theme)
+    elif fill_kind == "pattern":
+        fill_hex = _pattern_average_color(fill_el, theme)
+    elif fill_kind == "picture":
+        fill_hex = _picture_fill_average_color(pkg, rels, fill_el, decor_image_cache)
+
     return DecorShape(
         kind=ref.kind, box=ref.box, rotation=ref.rotation, flip_h=ref.flip_h, flip_v=ref.flip_v,
-        fill_hex=fill.hex if fill else None, has_fill=has_fill,
+        fill_hex=fill_hex, has_fill=has_fill, fill_kind=fill_kind,
     )
 
 
