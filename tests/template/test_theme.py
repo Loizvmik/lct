@@ -257,3 +257,42 @@ def test_refine_does_not_raise_flag_that_was_not_set():
     )
     refined = refine_font_scheme_degraded(theme, {"Play": 1000})
     assert refined.font_scheme_degraded is False
+
+
+# --- Task 3 повторное код-ревью, п.3: доля шрифта темы (theme_font_share)
+# видна снаружи рядом с флагом, не только вердикт — порог 0.5 откалиброван
+# по одному наблюдению, пограничный случай должен быть отличим от явного.
+
+def test_theme_font_share_is_exposed_when_theme_font_dominates():
+    theme = _degraded_office_theme("Arial")
+    refined = refine_font_scheme_degraded(theme, {"Arial": 500})
+    assert refined.font_scheme_degraded is False
+    assert refined.theme_font_share == pytest.approx(1.0)
+
+
+def test_theme_font_share_is_exposed_near_the_threshold():
+    """45% при доминировании другого шрифта — деградация остаётся True, но
+    доля рядом с флагом должна показать, что случай пограничный, а не
+    выглядеть так же уверенно, как явный отсев."""
+    theme = _degraded_office_theme("Arial")
+    refined = refine_font_scheme_degraded(theme, {"Arial": 450, "Play": 550})
+    assert refined.font_scheme_degraded is True
+    assert refined.theme_font_share == pytest.approx(0.45)
+
+
+def test_theme_font_share_stays_none_when_nothing_to_refine():
+    """Структурный сигнал уже False — сравнивать было не с чем, share не
+    выдумывается."""
+    theme = ThemeInfo(
+        scheme={}, clr_map={}, major_font="Play", minor_font="Play", scheme_name="",
+        font_scheme_degraded=False, text_styles_degraded=False, is_stock_office_palette=False,
+    )
+    refined = refine_font_scheme_degraded(theme, {"Play": 1000})
+    assert refined.theme_font_share is None
+
+
+def test_theme_font_share_stays_none_when_there_is_no_text():
+    theme = _degraded_office_theme("Arial")
+    refined = refine_font_scheme_degraded(theme, {})
+    assert refined.theme_font_share is None
+    assert refined.font_scheme_degraded is True

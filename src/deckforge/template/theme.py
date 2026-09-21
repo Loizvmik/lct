@@ -71,6 +71,19 @@ class ThemeInfo:
     font_scheme_degraded: bool
     text_styles_degraded: bool
     is_stock_office_palette: bool
+    # Task 3 повторное код-ревью, п.3: доля символов, набранных шрифтом
+    # темы (theme.major_font), от всего текста с явно резолвящимся шрифтом
+    # — та же величина, которую refine_font_scheme_degraded сравнивает с
+    # _THEME_FONT_MAJORITY_SHARE, но выведенная наружу рядом с итоговым
+    # флагом. Порог 0.5 откалиброван по одному наблюдению (см. докстроку
+    # _THEME_FONT_MAJORITY_SHARE) — без самой доли пограничный случай
+    # (шрифт темы набрал 45% при доминировании другого) неотличим снаружи
+    # от уверенного (шрифт темы набрал 5%): оба дают одно и то же
+    # font_scheme_degraded=True. None — refine_font_scheme_degraded не
+    # вызывался, либо структурного сигнала не было изначально (нечего
+    # уточнять), либо текста не было вовсе (сравнивать не с чем) — см. её
+    # докстроку.
+    theme_font_share: float | None = None
     # Не входит в перечень полей брифа — добавлено, потому что общее
     # требование задачи прямое: нераспознанные цвета не выбрасывать молча,
     # а собирать отдельным списком на просмотр человеку (см. докстроку
@@ -118,6 +131,15 @@ def refine_font_scheme_degraded(theme: ThemeInfo, font_chars: Mapping[str, int])
     был True. Нет структурного сигнала — снимать нечего, флаг остаётся как
     есть (False). Текста нет вовсе — сравнивать не с чем, доверяем
     структурному сигналу без изменений.
+
+    Task 3 повторное код-ревью, п.3: рядом с вердиктом (флагом) наружу
+    выводится и сама доля — `ThemeInfo.theme_font_share` — чтобы человек,
+    читающий отчёт о разборе, видел не только итог, но и насколько он
+    близок к порогу `_THEME_FONT_MAJORITY_SHARE` (0.45 при доминировании
+    другого шрифта выглядит так же уверенно, как 0.05, если смотреть только
+    на булев флаг). Заполняется в обеих ветках (флаг снят или остался),
+    как только доля вообще была посчитана; остаётся `None`, если считать
+    было не с чем (см. случаи выше).
     """
     if not theme.font_scheme_degraded:
         return theme
@@ -125,9 +147,10 @@ def refine_font_scheme_degraded(theme: ThemeInfo, font_chars: Mapping[str, int])
     if total == 0:
         return theme
     theme_font_chars = font_chars.get(theme.major_font, 0)
-    if theme_font_chars / total > _THEME_FONT_MAJORITY_SHARE:
-        return replace(theme, font_scheme_degraded=False)
-    return theme
+    share = theme_font_chars / total
+    if share > _THEME_FONT_MAJORITY_SHARE:
+        return replace(theme, font_scheme_degraded=False, theme_font_share=share)
+    return replace(theme, theme_font_share=share)
 
 
 def is_stock_office(scheme: dict[str, str]) -> bool:
@@ -151,6 +174,23 @@ def pick_primary_master(pkg: PptxPackage) -> str:
     для незнакомого шаблона с защиты). Среди оставшихся выбирает мастер с
     наибольшим числом лейаутов; при равенстве — тот, на который ссылается
     больше слайдов.
+
+    Известный, сознательно принятый компромисс (Task 3 повторное код-ревью,
+    находка adversarial-reviewer): мастер, чья тема физически не читается
+    (нет relationship theme, битый Target, невалидный XML), для
+    `_is_master_stock` — не "стоковый" (см. её докстроку), значит попадает
+    в пул кандидатов наравне с читаемыми и может выиграть тай-брейк по
+    числу лейаутов, даже если рядом есть полностью годный мастер с меньшим
+    их числом. Если такой мастер станет первичным, `_ThemeGraph` в usage.py
+    упадёт на прямом `read_theme()` с внятным сообщением — это ожидаемое,
+    заданное самим контрактом Task 3 поведение ("первичный мастер — особый
+    случай: если не читается он, падать правильно"), не тихая порча.
+    Чинить выбор первичного так, чтобы он всегда обходил нечитаемые темы в
+    пользу читаемых с меньшим числом лейаутов, в рамках этой починки не
+    стали — это отдельное усиление алгоритма ранжирования, не тот класс
+    бага ("посторонний мастер роняет весь разбор"), который здесь чинили;
+    посторонний (непервичный) мастер с битой темой по-прежнему не роняет
+    разбор (см. _ThemeGraph.__init__ в usage.py).
     """
     presentation_part = pkg.presentation_part()
     masters = pkg.related(presentation_part, "slideMaster")
@@ -212,8 +252,37 @@ def _master_theme_part(pkg: PptxPackage, master_part: str) -> str:
 
 
 def _is_master_stock(pkg: PptxPackage, master_part: str) -> bool:
-    theme_part = _master_theme_part(pkg, master_part)
-    scheme, *_ = _read_theme_elements(pkg, theme_part)
+    """True, если тема мастера — стоковая палитра Office.
+
+    Task 3 повторное код-ревью, п.2: тема, которая не читается вовсе (нет
+    relationship theme, часть без a:themeElements), — не стоковая по
+    определению, не "неизвестно" и не повод падать: тот же принцип
+    асимметричной безопасности, что уже описан у is_stock_office
+    (неполные/нерезолвленные данные всегда дают False, никогда не мешают
+    отбору). Без этого один посторонний мастер с битой связью темы ронял
+    бы pick_primary_master целиком, хотя для отбора первичного мастера эта
+    проверка вообще не обязана уметь читать его тему безупречно —
+    непрочитавшаяся тема ПЕРВИЧНОГО мастера, если он всё же будет выбран,
+    проявится позже и честно, при прямом read_theme() в _ThemeGraph.
+
+    Ловим `Exception`, не только `ValueError` (Task 3 повторное код-ревью,
+    находка adversarial-reviewer поверх п.2): relationship theme может
+    физически существовать, но вести в никуда — Target указывает на файл,
+    которого нет в архиве (`PptxPackage.xml`/`.part` бросает `KeyError` при
+    чтении из zip), либо файл есть, но не well-formed XML (`lxml` бросает
+    `lxml.etree.XMLSyntaxError`, не `ValueError`). Для непрочитанного
+    постороннего мастера, который сюда попал именно потому что его тема
+    как-то не в порядке, перечислять заранее все конкретные виды порчи
+    архива — заведомо неполный список; здесь сознательно ловится широко,
+    ровно как задумано для этой конкретной, изолированной оценки одного
+    мастера (не для чтения ПЕРВИЧНОГО мастера — там любая ошибка обязана
+    дойти до вызывающего и уронить разбор честно, см. read_theme в
+    _ThemeGraph)."""
+    try:
+        theme_part = _master_theme_part(pkg, master_part)
+        scheme, *_ = _read_theme_elements(pkg, theme_part)
+    except Exception:
+        return False
     return is_stock_office(scheme)
 
 
