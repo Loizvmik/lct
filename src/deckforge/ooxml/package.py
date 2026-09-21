@@ -41,6 +41,11 @@ class PptxPackage:
         self._name_set = set(self._names)
         self._xml_cache: dict[str, etree._Element] = {}
         self._rels_cache: dict[str, dict[str, str]] = {}
+        # rid → (rel_type, target, is_external) для part_name, сырые (ещё не
+        # резолвнутые в имя парта) relationship-записи. Общий кэш для rels()
+        # и related() — раньше related() перечитывал и перепарсивал .rels-XML
+        # из zip на каждый вызов, не пользуясь кэшем вовсе, в отличие от rels().
+        self._raw_rels_cache: dict[str, list[tuple[str, str, str, bool]]] = {}
 
     @classmethod
     def open(cls, path: Path) -> "PptxPackage":
@@ -96,17 +101,23 @@ class PptxPackage:
             out.append(target if is_external else _resolve_target(part_name, target))
         return out
 
-    def _iter_rels(self, part_name: str):
+    def _iter_rels(self, part_name: str) -> list[tuple[str, str, str, bool]]:
+        cached = self._raw_rels_cache.get(part_name)
+        if cached is not None:
+            return cached
+
         rels_name = _rels_part_name(part_name)
         if rels_name not in self._name_set:
-            return
-        root = etree.fromstring(self.part(rels_name))
-        for rel in root:
-            rid = rel.get("Id")
-            rel_type = rel.get("Type", "")
-            target = rel.get("Target", "")
-            is_external = rel.get("TargetMode") == "External"
-            yield rid, rel_type, target, is_external
+            cached = []
+        else:
+            root = etree.fromstring(self.part(rels_name))
+            cached = [
+                (rel.get("Id"), rel.get("Type", ""), rel.get("Target", ""),
+                 rel.get("TargetMode") == "External")
+                for rel in root
+            ]
+        self._raw_rels_cache[part_name] = cached
+        return cached
 
     def media(self) -> list[MediaEntry]:
         return [
