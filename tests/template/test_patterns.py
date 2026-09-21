@@ -24,6 +24,7 @@ from deckforge.template.patterns import (
     _TierInfo,
     _capacity,
     _classify_kind,
+    _columns,
     _find_repeat,
     _shape_text,
     _slide_is_dark,
@@ -531,3 +532,84 @@ def test_classify_kind_does_not_treat_repeat_of_single_lines_as_cards():
     kind = _classify_kind([], slots, repeat, roles_present, _CANVAS)
 
     assert kind != "cards"
+
+
+# === Task 7 повторное ревью — дефект №2: колонка — вертикальная полоса из
+# НЕСКОЛЬКИХ блоков, не отдельный текстовый блок (найдено на слайде 11
+# контрольного ЛЦТ2026: subhead и текст одной колонки слегка пересекаются
+# по вертикали и совпадают по ширине — `_column_pair` считал их четырьмя
+# отдельными кандидатами вместо двух колонок) ===============================
+
+
+def _col_slot(role: str, left: float, top: float, *, width: float = 0.40, height: float = 0.08) -> PatternSlot:
+    return PatternSlot(
+        role=role, box=Box(left=left, top=top, width=width, height=height),
+        size_pt=14.0, color_hex=None, align="l", max_chars=10, wraps=False, sample_text="x",
+    )
+
+
+def test_columns_groups_stacked_blocks_into_two_vertical_strips():
+    """Две вертикальные полосы, в каждой по три блока (subhead + два body,
+    как на слайде 11: подзаголовок и текст одной колонки), опознаются как
+    ДВЕ колонки — полосы сначала группируются по горизонтали (`grid.cluster`
+    на левом крае), потом уже полосы сравниваются как колонки, а не
+    отдельные блоки внутри одной полосы."""
+    slots = [
+        _col_slot("subhead", 0.05, 0.10),
+        _col_slot("body", 0.05, 0.20),
+        _col_slot("body", 0.05, 0.32),
+        _col_slot("subhead", 0.55, 0.10),
+        _col_slot("body", 0.55, 0.20),
+        _col_slot("body", 0.55, 0.32),
+    ]
+
+    columns = _columns(slots)
+
+    assert len(columns) == 2
+    assert {len(c) for c in columns} == {3}
+
+
+def test_columns_rejects_single_block_next_to_a_three_block_strip():
+    """Один блок и рядом полоса из трёх блоков (разной ширины) — НЕ две
+    колонки: ширина одинокого блока не совпадает с шириной полосы, значит
+    полноценной пары сопоставимых по ширине полос нет."""
+    slots = [
+        _col_slot("body", 0.05, 0.10, width=0.15, height=0.06),
+        _col_slot("subhead", 0.55, 0.10),
+        _col_slot("body", 0.55, 0.20),
+        _col_slot("body", 0.55, 0.32),
+    ]
+
+    assert _columns(slots) == []
+
+
+def test_columns_recognizes_three_vertical_strips_not_two():
+    """Три вертикальные полосы сопоставимой ширины опознаются как ТРИ
+    колонки, а не как две — группировка не должна молча отбрасывать
+    третью полосу."""
+    slots = [
+        _col_slot("body", 0.03, 0.10, width=0.28),
+        _col_slot("body", 0.03, 0.25, width=0.28),
+        _col_slot("body", 0.36, 0.10, width=0.28),
+        _col_slot("body", 0.36, 0.25, width=0.28),
+        _col_slot("body", 0.69, 0.10, width=0.28),
+        _col_slot("body", 0.69, 0.25, width=0.28),
+    ]
+
+    columns = _columns(slots)
+
+    assert len(columns) == 3
+
+
+def test_columns_still_recognizes_the_simple_one_block_per_column_case():
+    """Регрессия: одиночный блок с каждой стороны (обычная простая
+    двухколоночная раскладка без вложенной структуры внутри колонки) — тот
+    случай, который умел старый `_column_pair`, не должен сломаться."""
+    slots = [
+        _col_slot("body", 0.06, 0.30, width=0.38),
+        _col_slot("body", 0.56, 0.30, width=0.38),
+    ]
+
+    columns = _columns(slots)
+
+    assert len(columns) == 2

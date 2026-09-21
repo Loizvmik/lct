@@ -44,7 +44,7 @@ from deckforge.ooxml.ns import local_name, qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import ShapeRef, walk_shapes
 from deckforge.template.assets import AssetCatalog
-from deckforge.template.grid import TITLE_PH_TYPES, Grid
+from deckforge.template.grid import TITLE_PH_TYPES, Grid, cluster
 # Task 7 повторное ревью, находка №4 ("Определение тёмного фона слабее, чем
 # уже есть в проекте"): `layouts.py` уже умеет резолвить `p:bg` (цепочка
 # слайд→лейаут→мастер→lt1), градиенты (цвет первой точки) и яркость
@@ -907,6 +907,12 @@ def _find_repeat(
 # ручной проверки).
 _TWO_COL_ROLES = frozenset({"body", "bullet", "card_body", "subhead"})
 
+# "Минимальная ширина содержательной колонки" (было инлайн-литералом внутри
+# старого `_column_pair`) — отсекает пары мелких значков, случайно
+# оказавшихся рядом и одинаковых по ширине; округлая отсечка, не
+# откалиброванная по трём файлам.
+_MIN_COLUMN_WIDTH = 0.15
+
 # Минимум "несколько" (бриф Task 7 повторного ревью №2, находка №1: карточку
 # делает структура повтора — "несколько групп... и несколько элементов в
 # каждой"). Одного слота на группу мало, чтобы называть повтор "карточками",
@@ -914,42 +920,97 @@ _TWO_COL_ROLES = frozenset({"body", "bullet", "card_body", "subhead"})
 _MIN_CARD_GROUP_SIZE = 2
 
 
-def _column_pair(slots: list[PatternSlot]) -> tuple[int, int] | None:
-    """Пара индексов текстовых слотов, стоящих рядом (без пересечения по
-    горизонтали) в одной "строке" (пересекаются по вертикали), с
-    практически равной шириной — геометрический сигнал двухколоночной
-    раскладки (тот же приём, что `layouts._row_groups`, но здесь нужна не
-    просто ширина группы, а конкретная пара — индексы возвращаются, а не
-    только факт).
+def _column_groups(slots: list[PatternSlot]) -> list[list[int]]:
+    """Группирует текстовые слоты (роли `_TWO_COL_ROLES`) в вертикальные
+    полосы по горизонтальному положению — Task 7 повторное ревью №2,
+    находка №2: колонка — это вертикальная ПОЛОСА, в которой лежит
+    НЕСКОЛЬКО блоков (subhead и текст одной колонки слайда 11 контрольного
+    ЛЦТ2026 слегка пересекаются по вертикали и совпадают по ширине — старый
+    `_column_pair` читал их как два отдельных кандидата в колонку вместо
+    одной полосы), а не отдельный текстовый блок сам по себе.
 
-    Требует РОВНО два члена такой "строки" — не фрагмент карточной сетки
-    из трёх и более одинаковых по ширине блоков (та уже свёрнута в
-    `RepeatSpec` и классифицирована как "cards" раньше в `_classify_kind`,
-    попадать сюда как обрезок "двух колонок" не должна)."""
+    Использует общую `grid.cluster()` (та же кластеризация, что для
+    полей/колонн разметки в grid.py, тот же допуск `_SIZE_TOLERANCE`, что и
+    раньше для сравнения ширины) на ГОРИЗОНТАЛЬНОМ ЦЕНТРЕ бокса
+    (`left + width/2`), не на левом крае: подзаголовок и текст одной
+    колонки реального слайда (11-й слайд контрольного ЛЦТ2026) не обязаны
+    начинаться от одного и того же левого края день в день — ширина
+    подзаголовка и абзаца внутри одной и той же колонки может отличаться на
+    2%+ холста (уже больше `_SIZE_TOLERANCE`), при том что правый край у
+    обоих совпадает почти точно. Левый край — произвольный выбор одной из
+    двух сторон бокса, ничем не более обоснованный, чем правый; центр —
+    единственная величина, не привязанная к тому, с какой стороны колонка
+    "выровнена", и на практике устойчивее к обеим асимметриям сразу.
+
+    `slots` сортируются по этому центру ДО вызова `cluster()`, чтобы
+    `cluster()` получила уже отсортированный список — тогда её внутренний
+    `sorted()` не меняет порядок (стабильная сортировка на уже
+    отсортированных данных — тождество), и `cluster.count` элементов подряд
+    из отсортированного `slots` можно взять как members кластера напрямую,
+    без сопоставления по значению (которое было бы ненадёжным при
+    повторяющихся координатах)."""
     boxable = [(i, s.box) for i, s in enumerate(slots) if s.role in _TWO_COL_ROLES]
-    ordered = sorted(boxable, key=lambda t: t[1].left)
-    for a in range(len(ordered)):
-        i1, box1 = ordered[a]
-        row = [(i1, box1)]
-        for b in range(len(ordered)):
-            if b == a:
-                continue
-            i2, box2 = ordered[b]
-            same_row = not (box2.top > box1.bottom or box1.top > box2.bottom)
-            same_width = abs(box1.width - box2.width) < _SIZE_TOLERANCE
-            if same_row and same_width:
-                row.append((i2, box2))
-        members = {i: box for i, box in row}
-        if len(members) != 2:
-            continue
-        (j1, bx1), (j2, bx2) = sorted(members.items(), key=lambda t: t[1].left)
-        # Минимальная ширина содержательной колонки и отсутствие
-        # горизонтального пересечения — отсекает пары мелких значков,
-        # случайно оказавшихся рядом и одинаковых по ширине (округлая
-        # отсечка, не откалиброванная по трём файлам).
-        if bx2.left >= bx1.right - _SIZE_TOLERANCE and bx1.width > 0.15:
-            return j1, j2
-    return None
+    if len(boxable) < 2:
+        return []
+    boxable.sort(key=lambda t: t[1].left + t[1].width / 2)
+    centers = [box.left + box.width / 2 for _, box in boxable]
+    groups: list[list[int]] = []
+    pos = 0
+    for cl in cluster(centers, _SIZE_TOLERANCE):
+        members = [boxable[pos + k][0] for k in range(cl.count)]
+        pos += cl.count
+        groups.append(members)
+    return groups
+
+
+def _columns(slots: list[PatternSlot]) -> list[list[int]]:
+    """Полосы `_column_groups`, которые физически складываются в колонки:
+    сопоставимая ширина (допуск `_SIZE_TOLERANCE`), не уже
+    `_MIN_COLUMN_WIDTH`, не пересекаются по горизонтали. Возвращает ВСЕ
+    подходящие полосы слева направо — две полосы дают "две колонки", три
+    сопоставимые по ширине полосы дают "три колонки" (не режутся до двух),
+    меньше двух подходящих полос — вовсе не колонки (пустой список).
+
+    Ширина полосы для сравнения — СРЕДНЯЯ ширина её членов, не ширина
+    объемлющего прямоугольника (`max(right) - min(left)` по всем членам):
+    у объемлющего прямоугольника та же слабость, что была у старого
+    `_column_pair` с левым краем — он берёт самый широкий левый выступ И
+    самый широкий правый выступ, даже если это края РАЗНЫХ блоков полосы, и
+    поэтому переоценивает ширину полосы ровно тогда, когда подзаголовок и
+    абзац одной колонки чуть отличаются шириной друг от друга (11-й слайд
+    контрольного ЛЦТ2026: подзаголовок правой колонки на ~2% холста шире
+    тела). Средняя по членам полосы устойчива к этой асимметрии и не
+    отличается от ширины объемлющего прямоугольника там, где все члены и
+    так одной ширины (см. синтетику `test_columns_*`)."""
+    bands = _column_groups(slots)
+    measured = []
+    for members in bands:
+        boxes = [slots[i].box for i in members]
+        left = min(b.left for b in boxes)
+        right = max(b.right for b in boxes)
+        content_width = sum(b.width for b in boxes) / len(boxes)
+        if content_width > _MIN_COLUMN_WIDTH:
+            measured.append((members, left, right, content_width))
+    if len(measured) < 2:
+        return []
+
+    # Полосы, отличающиеся шириной от большинства (мелкий одинокий блок
+    # рядом с настоящей колонкой), — не колонки: образец ширины — самая
+    # частая среди подходящих по минимальной ширине полос, а не первая
+    # попавшаяся.
+    ref_width = max(
+        measured, key=lambda m: sum(1 for o in measured if abs(o[3] - m[3]) <= _SIZE_TOLERANCE),
+    )[3]
+    matched = [m for m in measured if abs(m[3] - ref_width) <= _SIZE_TOLERANCE]
+    matched.sort(key=lambda m: m[1])
+
+    for prev, curr in zip(matched, matched[1:]):
+        if curr[1] < prev[2] - _SIZE_TOLERANCE:
+            return []  # полосы пересекаются по горизонтали — не настоящие колонки
+
+    if len(matched) < 2:
+        return []
+    return [m[0] for m in matched]
 
 
 def _finalize_roles(
@@ -1138,7 +1199,7 @@ def _classify_kind(
     ):
         return "cards"
 
-    if _column_pair(slots) is not None:
+    if len(_columns(slots)) >= 2:
         return "two_col"
 
     if "kpi_value" in roles_present and repeat is None:
