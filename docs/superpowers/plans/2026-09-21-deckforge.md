@@ -680,9 +680,9 @@ git commit -m "feat(ooxml): пакет, резолв цвета DrawingML, аф�
 **Interfaces:**
 - Consumes: `PptxPackage`, `resolve_color`, `Canvas`.
 - Produces:
-  - `read_theme(pkg, master_part: str) -> ThemeInfo` с полями `scheme: dict[str,str]`, `clr_map: dict[str,str]`, `major_font: str`, `minor_font: str`, `scheme_name: str`, `font_scheme_degraded: bool`, `text_styles_degraded: bool`, `is_stock_office_palette: bool`.
+  - `read_theme(pkg, master_part: str) -> ThemeInfo` с полями `scheme: dict[str,str]`, `clr_map: dict[str,str]`, `major_font: str`, `minor_font: str`, `scheme_name: str`, `font_scheme_degraded: bool` (признак заглушки: имя схемы `Office`, major совпадает с minor, и шрифт темы почти не встречается в фактическом тексте; по именам шрифтов судить нельзя — Arial и Calibri в корпоративном шаблоне бывают осознанным выбором), `text_styles_degraded: bool`, `is_stock_office_palette: bool`.
   - `pick_primary_master(pkg) -> str` — часть с брендовой темой, а не первая попавшаяся.
-  - `collect_usage(pkg, canvas, theme) -> Usage` с полями `fill: Counter[Color]`, `text: Counter[Color]`, `line: Counter[Color]`, `layout_bg: Counter[Color]`, `fonts: dict[str, FontUsage]`, `sizes_pt: Counter[float]` (нормированные), `line_spacing: Counter[float]`, `align: Counter[str]`, `bold_runs: int`, `italic_runs: int`, `total_runs: int`.
+  - `collect_usage(pkg, canvas) -> Usage` — тему для каждой части поднимает сама по графу связей (слайд → макет → мастер → тема). Единая тема на весь пакет неверна: в двух учебных шаблонах по два мастера с разными темами, и цвета макетов второго мастера резолвились бы чужой палитрой молча. `Usage` с полями `fill: Counter[Color]`, `text: Counter[Color]`, `line: Counter[Color]`, `layout_bg: Counter[Color]`, `fonts: dict[str, FontUsage]`, `sizes_pt: Counter[float]` (нормированные), `line_spacing: Counter[float]`, `align: Counter[str]`, `bold_runs: int`, `italic_runs: int`, `total_runs: int`.
 
 - [ ] **Step 1: Тест на детект деградации**
 
@@ -791,6 +791,16 @@ def test_sizes_are_normalised_to_reference_canvas():
     _, usage = load("VK Tech шаблон.pptx")
     assert max(usage.sizes_pt) > 40
 ```
+
+- [ ] **Step 4a: Устойчивость к нативному файлу PowerPoint**
+
+Три учебных шаблона — экспорт из Google Slides, и разбор легко заточить под их особенности. На защите будет нативный файл, где по-другому устроено ровно то, что разбирает этот модуль:
+
+- Шрифт указывается токенами `+mj-lt` и `+mn-lt`, а не именем. Токен резолвится в шрифт темы **всегда**, независимо от признака деградации: иначе шрифт теряется на больших кусках текста.
+- Встречается `mc:AlternateContent`. Его ветки взаимоисключающие: наивный обход считает шейп дважды. Брать надо первый `mc:Choice`, чьё требуемое пространство имён мы понимаем, иначе `mc:Fallback`.
+- Дефолтная тема Office бывает привязана к мастеру напрямую, а не сиротой. Отсев стоковой палитры обязан срабатывать, и это проверяется синтетическим пакетом, где стоковый мастер несёт больше макетов.
+- Фон макета чаще наследуется от мастера. Отсутствие `p:bg` у макета — не повод его пропустить.
+- Доля текста без явного `rPr` выше. Символы такого текста считаются всегда, неизвестные свойства уходят в отдельный счётчик «унаследовано», и его доля попадает в отчёт о разборе.
 
 - [ ] **Step 4: Реализовать `usage.py`, прогнать**
 
