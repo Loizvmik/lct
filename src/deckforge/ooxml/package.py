@@ -16,6 +16,9 @@ from pathlib import Path
 from lxml import etree
 from PIL import Image
 
+from deckforge.ooxml.geometry import Canvas
+from deckforge.ooxml.ns import qn
+
 
 @dataclass(frozen=True)
 class MediaEntry:
@@ -118,6 +121,17 @@ class PptxPackage:
             ]
         self._raw_rels_cache[part_name] = cached
         return cached
+
+    def canvas(self) -> Canvas:
+        """Холст презентации из `p:sldSz` в `ppt/presentation.xml`.
+
+        В отличие от темы, `ppt/presentation.xml` — фиксированный по OPC-
+        соглашению путь пакета .pptx, а не то, что нужно резолвить через
+        rels (тот же приём уже используется в tests/ooxml/test_walk.py).
+        """
+        root = self.xml("ppt/presentation.xml")
+        sz = root.find(qn("p:sldSz"))
+        return Canvas(width_emu=int(sz.get("cx")), height_emu=int(sz.get("cy")))
 
     def media(self) -> list[MediaEntry]:
         return [

@@ -50,3 +50,25 @@ def test_media_inventory_is_not_empty(path):
         media = pkg.media()
         assert media
         assert all(m.size_bytes > 0 for m in media)
+
+
+def test_canvas_reads_slide_size_from_presentation_xml():
+    """VK Tech свёрстан на холсте 10×5.625″ (9144000×5143500 EMU) — не на
+    стандартном 13.333″, как остальные. Task 3 нормирует кегли на canvas.norm,
+    для этого нужен настоящий размер, а не догадка по большинству шаблонов."""
+    path = Path("dataset/templates/VK Tech шаблон.pptx")
+    with PptxPackage.open(path) as pkg:
+        canvas = pkg.canvas()
+        assert canvas.width_emu == 9144000
+        assert canvas.height_emu == 5143500
+
+
+def test_canvas_is_standard_for_workspace_and_education():
+    for name in [
+        "VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx",
+        "Шаблон презентации VK Education.pptx",
+    ]:
+        with PptxPackage.open(Path("dataset/templates") / name) as pkg:
+            canvas = pkg.canvas()
+            assert canvas.width_emu == 12192000
+            assert canvas.height_emu == 6858000
