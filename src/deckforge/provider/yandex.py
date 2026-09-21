@@ -102,7 +102,18 @@ class YandexProvider(LLMProvider, VisionProvider):
             )
             if messages and messages[0].get("role") == "system":
                 leading, *rest = messages
-                merged = {**leading, "content": f"{leading['content']}\n\n{instruction}"}
+                leading_content = leading["content"]
+                if isinstance(leading_content, list):
+                    # Msg.content: Any допускает мультимодальный content
+                    # (base.py) — f-string по списку дал бы мусор вида
+                    # "[{'type': ...}]\n\n...". Дописываем инструкцию
+                    # отдельным text-блоком, как в ask_image ниже.
+                    merged_content: Any = [
+                        *leading_content, {"type": "text", "text": instruction}
+                    ]
+                else:
+                    merged_content = f"{leading_content}\n\n{instruction}"
+                merged = {**leading, "content": merged_content}
                 messages = [merged, *rest]
             else:
                 messages = [{"role": "system", "content": instruction}, *messages]

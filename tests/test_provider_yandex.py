@@ -373,3 +373,36 @@ def test_call_within_deadline_behaves_as_before():
     assert len(calls) == 1
 
 
+
+# --- Находка 3: слияние system-сообщения с мультимодальным content ---
+
+
+def test_schema_merge_appends_text_block_to_multimodal_leading_system(monkeypatch):
+    """Msg.content допускает list (мультимодальный content, см. base.py).
+    f-string по списку дал бы мусор вида "[{'type': ...}]\\n\\n..." — вместо
+    этого инструкция про схему должна дописываться отдельным text-блоком."""
+    provider = _offline_provider()
+    captured = _stub_post(
+        monkeypatch, {"choices": [{"message": {"content": "{}"}, "finish_reason": "stop"}]}
+    )
+    leading_content = [{"type": "text", "text": "Ты пишешь план презентации."}]
+    provider.complete(
+        [
+            {"role": "system", "content": leading_content},
+            {"role": "user", "content": "Привет"},
+        ],
+        schema={"type": "object"},
+    )
+    messages = captured[0]["messages"]
+    system_messages = [m for m in messages if m["role"] == "system"]
+    assert len(system_messages) == 1
+    merged_content = system_messages[0]["content"]
+    assert isinstance(merged_content, list)
+    assert merged_content[0] == leading_content[0]
+    assert len(merged_content) == 2
+    added = merged_content[1]
+    assert added["type"] == "text"
+    assert "type" in added["text"] and "object" in added["text"]
+    # Регрессия: f-string по списку дал бы "[{'type': 'text', ...}]\n\n...".
+    assert "[{'type'" not in added["text"]
+
