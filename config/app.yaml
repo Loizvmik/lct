@@ -1,6 +1,6 @@
 # Единственная точка настройки DeckForge (ТЗ требует воспроизводимый сетап
 # конфиг-файлом). Секреты (ключ и id каталога Yandex) сюда не попадают —
-# они читаются только из .env, см. config.example.yaml и README.
+# они читаются только из .env, см. config.example.yaml.
 
 llm:
   provider: yandex
