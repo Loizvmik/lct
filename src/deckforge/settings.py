@@ -77,6 +77,12 @@ class Settings(BaseModel):
     def load(cls, path: Path) -> Settings:
         """Прочитать app.yaml и подмешать секреты из окружения (.env)."""
         data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        leaked = [key for key in ("yandex_api_key", "yandex_folder_id") if key in data]
+        if leaked:
+            raise ValueError(
+                f"{path}: секретам ({', '.join(leaked)}) не место в yaml-конфиге — "
+                "их место в .env (см. .env.example)."
+            )
         return cls(
             **data,
             yandex_api_key=os.environ.get("YANDEX_API_KEY"),

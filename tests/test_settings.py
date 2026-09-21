@@ -50,6 +50,35 @@ def test_missing_config_file_raises():
         Settings.load(ROOT / "config" / "does-not-exist.yaml")
 
 
+def test_secret_in_yaml_raises_clear_error_not_typeerror(tmp_path):
+    """Секретам место только в .env. Если ключ случайно попал в app.yaml,
+    ошибка должна объяснять это, а не быть голым TypeError про повтор
+    аргумента конструктора."""
+    config_path = tmp_path / "app.yaml"
+    config_path.write_text(
+        """
+llm:
+  provider: yandex
+  model: qwen3.6-35b-a3b
+  roles:
+    outline: qwen3.6-35b-a3b
+    writer: qwen3.6-35b-a3b
+    pattern_picker: qwen3.6-35b-a3b
+    palette_namer: qwen3.6-35b-a3b
+    content_audit: qwen3.6-35b-a3b
+paths:
+  workspace: workspace
+  artifacts: artifacts
+render:
+  soffice_path: null
+yandex_api_key: leaked-into-yaml
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="yandex_api_key"):
+        Settings.load(config_path)
+
+
 def test_soffice_uses_configured_path_without_autodiscovery(tmp_path):
     fake_soffice = tmp_path / "soffice"
     fake_soffice.write_text("")
