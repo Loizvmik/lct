@@ -9,10 +9,13 @@ Google-экспорта, см. theme.py).
    шагом 0.5pt, что и `usage.sizes_pt` (`round(pt * 2) / 2`) — иначе дробные
    кегли Google-пересчёта (8.12, 6.75, 14.06 у VK Tech, п.5 разведки)
    рассыпают гистограмму в шум вместо чистых ступеней.
-2. Гистограмма `sz` по run'ам слайдов — уже собрана в `Usage.sizes_pt`, но
-   БЕЗ разбивки по типу плейсхолдера; для "мода среди run'ов title/body-
+2. Гистограмма `sz` по run'ам — уже собрана в `Usage.sizes_pt` (по слайдам,
+   лейаутам И мастерам — см. `usage._all_shape_bearing_parts`), но БЕЗ
+   разбивки по типу плейсхолдера; для "мода среди run'ов title/body-
    плейсхолдеров" этого недостаточно (`Usage` не хранит, какому шейпу
-   принадлежит run), поэтому этот модуль сам обходит слайды за size+ph_type.
+   принадлежит run), поэтому этот модуль сам обходит СЛАЙДЫ (не лейауты/
+   мастера — там txStyles/lstStyle это декларация, не факт употребления) за
+   size+ph_type.
 3. Медиана по ph_type — когда ни лейаут, ни явные run'ы ничего не дают.
 
 Оба тира (1 и 2) для title/body суммируются как голоса "эта ступень
@@ -29,6 +32,15 @@ body для WorkSpace — ключевой случай задачи: в лей�
 отсутствии — мода по символам среди всех run'ов") — не по числу run'ов, как
 для остальных источников: короткая подпись из трёх run'ов не должна перевесить
 абзац из одного length-run'а на пятьдесят символов.
+
+Известное ограничение: текст ячеек таблиц (`a:tbl/a:tc`) не разбирается ни
+одним из обходчиков этого модуля (в отличие от `usage.py`, который явно это
+делает — см. `_collect_table` там) — попадает в `candidate_pool` только
+транзитивно через `Usage.sizes_pt`, но не участвует в голосовании за
+title/body и не входит в `all_run_chars`. На table-heavy шаблоне (Education,
+3 таблицы) это может сдвинуть моду body, если основной текст сидит именно в
+таблицах — не подтверждено разведкой ни на одном из трёх шаблонов, но стоит
+иметь в виду при разборе шаблона с защиты.
 """
 from __future__ import annotations
 from collections import Counter
@@ -38,19 +50,36 @@ from deckforge.ooxml.geometry import Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import walk_shapes
-from deckforge.template.grid import cluster
+from deckforge.template.grid import BODY_PH_TYPES, TITLE_PH_TYPES, cluster
 from deckforge.template.usage import FontUsage, Usage
 
 # Шаг округления нормированного кегля — тот же, что в usage.py
-# (`round(pt * 2) / 2`), для прямой сопоставимости источников 1 и 2.
+# (`round(pt * 2) / 2`), для прямой сопоставимости источников 1 и 2, И для
+# итогового вывода ступеней шкалы (см. _rounded_steps) — без этого центр
+# кластера (среднее сырых значений) просачивался наружу нескруглённым числом
+# вида 14.191503267973856 вперемешку с округлёнными до 0.1pt синтетическими
+# ступенями (найдено general-purpose ревьюером, Task 4, повторное ревью).
 _SIZE_ROUNDING_STEP = 0.5
 
 # Прореживание шкалы: "два значения ближе 1.5pt схлопываются в одно"
 # (брифом, Step 2) — переиспользует общую cluster() из grid.py.
 _SCALE_THINNING_TOLERANCE_PT = 1.5
 
-_TITLE_PH_TYPES = frozenset({"title", "ctrTitle"})
-_BODY_PH_TYPES = frozenset({"body", "subTitle"})
+# Минимальная поддержка (число run'ов) кегля из гистограммы Usage.sizes_pt,
+# чтобы он вообще попал в пул кандидатов ступеней шкалы. Без этого порога
+# единичный декоративный run (иконка-цифра, порядковый номер шага крупным
+# шрифтом — на VK Tech такой run с текстом "7" при sz=221.5pt нормированных
+# встретился дважды на весь шаблон) становится "display" с confidence=1.0,
+# хотя это не типографическая ступень, а случайная деталь оформления —
+# нашёл adversarial-reviewer (Task 4, повторное ревью). Порог 3 отсекает
+# ровно такие единичные/парные выбросы (проверено на всех трёх шаблонах:
+# следующая по редкости легитимная ступень везде имеет поддержку от 3-4
+# run'ов), не задевая реальные ступени шкалы — те по определению кегль,
+# которым набрано много текста, а не один decorative run.
+_MIN_RUN_HISTOGRAM_SUPPORT = 3
+
+# TITLE_PH_TYPES/BODY_PH_TYPES — импортированы из grid.py (см. import выше),
+# не продублированы: единый список категорий плейсхолдеров для обоих модулей.
 
 # Признаки моноширинных гарнитур по имени (брифом, п.8: "Consolas-подобных").
 # Список шире одного Consolas — на неизвестном шаблоне защиты моноширинный
@@ -58,6 +87,17 @@ _BODY_PH_TYPES = frozenset({"body", "subTitle"})
 # регистра ловит основные семейства, реально встречающиеся в .pptx (Courier,
 # generic "Mono"/"Code" в названии, системные Menlo/Monaco/Cascadia).
 _MONO_FONT_MARKERS = ("consolas", "courier", "mono", "code", "menlo", "monaco", "cascadia")
+
+# Минимальная доля символов (от всех не-моноширинных), чтобы шрифт вообще
+# считался гарнитурой шаблона, а не случайным вкраплением (импортированный
+# слайд, буква-другая latin в основном кириллическом тексте). На VK Tech без
+# порога Arial (5 символов из 7586, 0.07%) становится "второй гарнитурой
+# шаблона" наравне с Play (7581 символ) — абсурд, который проходил мимо теста
+# "не больше двух гарнитур" именно потому, что гарнитур и так было ровно две
+# (нашёл general-purpose ревьюер). Порог 2% с большим запасом отсекает такие
+# случайные вкрапления, не отсеивая реальную вторую гарнитуру (у Education
+# Arial — 2814 из 7569 символов, 37% — далеко за порогом).
+_MIN_FAMILY_CHAR_SHARE = 0.02
 
 # Синтетические ступени ниже body, когда среди кандидатов нет ни одной
 # реально наблюдаемой ступени: типографский шаг ~0.8 — общепринятая
@@ -70,6 +110,12 @@ _MICRO_TO_CAPTION_RATIO = 0.8
 # исключением. На трёх учебных шаблонах максимум — 6.3% (WorkSpace, bold);
 # порог 15% берётся с заметным запасом, чтобы шаблон, где bold — реальный
 # приём (не эти три, но возможный на защите), не был ошибочно отсеян.
+# Знаменатель (total_runs) шире числителя по построению (usage.py считает
+# bold_runs только для run'ов с явным a:rPr — см. Usage.bold_runs), то есть
+# фактическая доля СРЕДИ ЯВНО СТИЛИЗОВАННЫХ run'ов будет выше этого числа —
+# на шаблоне с большой долей унаследованных (без явного rPr) run'ов порог
+# может сработать позже, чем кажется на первый взгляд; на трёх учебных
+# шаблонах (explicit_style_chars — большинство текста) это не меняет вывод.
 _IDIOMATIC_STYLE_SHARE = 0.15
 
 _DEFAULT_ALIGN = "l"  # дефолт OOXML для a:pPr/@algn, когда нет ни одного явного значения
@@ -89,6 +135,14 @@ class TypeScale:
     # Моноширинные гарнитуры (код) — отдельно от families, не в счёт "не
     # больше двух" (брифом, п.8; families не должно ложно раздуваться).
     mono: list[str] = field(default_factory=list)
+    # Сколько всего не-моноширинных гарнитур прошло порог _MIN_FAMILY_CHAR_
+    # SHARE — не только контрактных двух в `families`. families всегда
+    # ограничено двумя (интерфейс брифа), но если families_total > 2, аудит
+    # T01 "гарнитур больше двух" обязан сработать по ЭТОМУ полю, а не по
+    # длине families (она искусственно обрезана и всегда <= 2 — нашёл
+    # general-purpose ревьюер: без этого поля аудит физически не может
+    # обнаружить третью гарнитуру).
+    families_total: int = 0
     # Уверенность для каждой ступени steps — общее требование задачи ("каждое
     # число... должно нести меру уверенности"), не отдельное поле интерфейса
     # брифа. Смысл см. _step_confidence.
@@ -102,17 +156,18 @@ def build_type_scale(pkg: PptxPackage, canvas: Canvas, usage: Usage) -> TypeScal
     title_votes = layout_title + slide_title
     body_votes = layout_body + slide_body
 
-    # Общий пул кандидатов ступеней: лейаут-декларации (оба типа
-    # плейсхолдеров) плюс полная гистограмма run'ов слайдов (Usage.sizes_pt,
-    # источник 2) — из него после прореживания строится лестница
-    # display/h2/caption/micro.
+    # Пул кандидатов ступеней: лейаут-декларации (без порога поддержки — это
+    # явное дизайнерское решение, а не статистика по тексту, редкость сама
+    # по себе не делает его недостоверным) плюс гистограмма run'ов слайдов,
+    # ОТФИЛЬТРОВАННАЯ по _MIN_RUN_HISTOGRAM_SUPPORT (см. её докстроку).
     candidate_pool: Counter[float] = Counter()
     candidate_pool.update(layout_title)
     candidate_pool.update(layout_body)
-    candidate_pool.update(usage.sizes_pt)
-    thinned = sorted(
-        c.center for c in cluster(list(candidate_pool.elements()), _SCALE_THINNING_TOLERANCE_PT)
-    )
+    candidate_pool.update({sz: n for sz, n in usage.sizes_pt.items() if n >= _MIN_RUN_HISTOGRAM_SUPPORT})
+    size_clusters = cluster(list(candidate_pool.elements()), _SCALE_THINNING_TOLERANCE_PT)
+    thinned = sorted(c.center for c in size_clusters)
+    support_by_center = {c.center: c.count for c in size_clusters}
+    total_candidate_weight = sum(c.count for c in size_clusters)
 
     display = thinned[-1] if thinned else 0.0
 
@@ -141,13 +196,20 @@ def build_type_scale(pkg: PptxPackage, canvas: Canvas, usage: Usage) -> TypeScal
     caption = _step_below(thinned, above=body, ratio=_CAPTION_TO_BODY_RATIO)
     micro = _step_below(thinned, above=caption, ratio=_MICRO_TO_CAPTION_RATIO)
 
-    steps = {"micro": micro, "caption": caption, "body": body, "h2": h2, "h1": h1, "display": display}
+    raw_steps = {"micro": micro, "caption": caption, "body": body, "h2": h2, "h1": h1, "display": display}
     step_confidence = _step_confidence(
-        steps, thinned=thinned, title_votes=title_votes, body_votes=body_votes, all_run_chars=all_run_chars,
+        raw_steps, support_by_center=support_by_center, total_candidate_weight=total_candidate_weight,
+        title_votes=title_votes, body_votes=body_votes, all_run_chars=all_run_chars,
     )
+    # Округление — ПОСЛЕ вычисления confidence (которое ищет точное совпадение
+    # с сырыми центрами кластеров/декларациями), но ДО возврата наружу: без
+    # этого центр кластера (среднее сырых значений) просачивался как
+    # 14.191503267973856pt рядом с округлёнными до 0.1pt синтетическими
+    # ступенями — два разных уровня точности в одном словаре.
+    steps = {k: round(v / _SIZE_ROUNDING_STEP) * _SIZE_ROUNDING_STEP for k, v in raw_steps.items()}
 
     heading_line_spacing, body_line_spacing = _line_spacing(pkg, canvas)
-    families, mono = _families_and_mono(usage.fonts)
+    families, mono, families_total = _families_and_mono(usage.fonts)
 
     total_runs = usage.total_runs or 1
     bold_is_idiomatic = usage.bold_runs / total_runs >= _IDIOMATIC_STYLE_SHARE
@@ -163,6 +225,7 @@ def build_type_scale(pkg: PptxPackage, canvas: Canvas, usage: Usage) -> TypeScal
         italic_is_idiomatic=italic_is_idiomatic,
         families=families,
         mono=mono,
+        families_total=families_total,
         step_confidence=step_confidence,
     )
 
@@ -194,9 +257,9 @@ def _layout_defrpr_sizes(pkg: PptxPackage, canvas: Canvas) -> tuple[Counter[floa
             sz = _placeholder_defrpr_sz(ref.element, canvas)
             if sz is None:
                 continue
-            if ref.ph_type in _TITLE_PH_TYPES:
+            if ref.ph_type in TITLE_PH_TYPES:
                 title_votes[sz] += 1
-            elif ref.ph_type in _BODY_PH_TYPES:
+            elif ref.ph_type in BODY_PH_TYPES:
                 body_votes[sz] += 1
     return title_votes, body_votes
 
@@ -225,9 +288,9 @@ def _slide_run_sizes(pkg: PptxPackage, canvas: Canvas) -> tuple[Counter[float], 
             if ref.kind != "shape":
                 continue
             category = None
-            if ref.is_placeholder and ref.ph_type in _TITLE_PH_TYPES:
+            if ref.is_placeholder and ref.ph_type in TITLE_PH_TYPES:
                 category = "title"
-            elif ref.is_placeholder and ref.ph_type in _BODY_PH_TYPES:
+            elif ref.is_placeholder and ref.ph_type in BODY_PH_TYPES:
                 category = "body"
             for sz, chars in _run_sizes(ref.element, canvas):
                 all_run_chars[sz] += chars
@@ -263,8 +326,9 @@ def _mode(counter: Counter) -> float:
 
 def _step_between(thinned: list[float], *, low: float, high: float) -> float:
     """h2 — ближайшая наблюдаемая ступень СТРОГО между body и h1. Если такой
-    нет (в прореженной шкале body и h1 — соседи), синтезируем геометрическую
-    середину, округлённую до 0.1pt."""
+    нет (в прореженной шкале body и h1 — соседи), синтезируем среднее
+    арифметическое, округлённое до 0.1pt (округление до общего шага 0.5pt —
+    финальным проходом в build_type_scale, см. _SIZE_ROUNDING_STEP)."""
     between = [c for c in thinned if low < c < high]
     if between:
         return max(between)
@@ -282,18 +346,25 @@ def _step_below(thinned: list[float], *, above: float, ratio: float) -> float:
 
 
 def _step_confidence(
-    steps: dict[str, float], *, thinned: list[float],
+    steps: dict[str, float], *, support_by_center: dict[float, int], total_candidate_weight: int,
     title_votes: Counter[float], body_votes: Counter[float], all_run_chars: Counter[float],
 ) -> dict[str, float]:
-    """Уверенность по каждой ступени — общее требование задачи. h1/body:
-    доля голосов выигравшего значения от суммы голосов его категории (явный
-    сигнал того же рода, что confidence в Grid). h2/caption/micro: 0.5, если
-    ступень реально наблюдалась в прореженном пуле кандидатов, иначе 0.3
-    (синтезирована коэффициентом — не выдумана из воздуха, но и не измерена).
-    display: 1.0, если пул кандидатов вообще был непуст."""
+    """Уверенность по каждой ступени — общее требование задачи.
+
+    display/h2/caption/micro (когда наблюдались): доля веса выигравшего
+    кластера от общего веса пула кандидатов — та же величина, что и weight-
+    based confidence в Grid, а не блок "1.0, потому что пул был непуст"
+    (это давало confidence=1.0 декоративному выбросу — см. докстроку
+    _MIN_RUN_HISTOGRAM_SUPPORT). h1/body: доля голосов выигравшего значения
+    от суммы голосов его категории. Синтезированные (не наблюдавшиеся)
+    h2/caption/micro — фиксированные 0.3 (не измерены, но и не выдуманы из
+    воздуха — коэффициент типографского шага)."""
     def _vote_share(counter: Counter[float], value: float) -> float:
         total = sum(counter.values())
         return counter[value] / total if total else 0.0
+
+    def _support_share(value: float) -> float:
+        return support_by_center.get(value, 0) / total_candidate_weight if total_candidate_weight else 0.0
 
     if title_votes:
         h1_conf = _vote_share(title_votes, steps["h1"])
@@ -309,26 +380,33 @@ def _step_confidence(
     else:
         body_conf = 0.1
 
-    observed = set(thinned)
     return {
-        "display": 1.0 if thinned else 0.0,
+        "display": _support_share(steps["display"]),
         "h1": h1_conf,
-        "h2": 0.5 if steps["h2"] in observed else 0.3,
+        "h2": _support_share(steps["h2"]) if steps["h2"] in support_by_center else 0.3,
         "body": body_conf,
-        "caption": 0.5 if steps["caption"] in observed else 0.3,
-        "micro": 0.5 if steps["micro"] in observed else 0.3,
+        "caption": _support_share(steps["caption"]) if steps["caption"] in support_by_center else 0.3,
+        "micro": _support_share(steps["micro"]) if steps["micro"] in support_by_center else 0.3,
     }
 
 
-def _families_and_mono(fonts: dict[str, FontUsage]) -> tuple[list[str], list[str]]:
-    """Два самых весомых по символам не-моноширинных шрифта → families;
-    моноширинные (по имени, см. _MONO_FONT_MARKERS) — отдельно в mono, чтобы
-    не раздувать families и не ломать аудит T01 "гарнитур больше двух"
-    (брифом, п.8)."""
+def _families_and_mono(fonts: dict[str, FontUsage]) -> tuple[list[str], list[str], int]:
+    """Два самых весомых по символам не-моноширинных шрифта, набравших не
+    меньше _MIN_FAMILY_CHAR_SHARE доли символов → families; моноширинные (по
+    имени, см. _MONO_FONT_MARKERS) — отдельно в mono, чтобы не раздувать
+    families и не ломать аудит T01 "гарнитур больше двух" (брифом, п.8).
+    Возвращает и общее число гарнитур, прошедших порог (families_total) —
+    см. докстроку TypeScale.families_total."""
     mono = sorted(name for name in fonts if _is_mono(name))
     mono_set = set(mono)
-    families = sorted((name for name in fonts if name not in mono_set), key=lambda name: -fonts[name].chars)
-    return families[:2], mono
+    non_mono = {name: fu for name, fu in fonts.items() if name not in mono_set}
+    total_chars = sum(fu.chars for fu in non_mono.values())
+
+    qualifying = sorted(
+        (name for name, fu in non_mono.items() if total_chars and fu.chars / total_chars >= _MIN_FAMILY_CHAR_SHARE),
+        key=lambda name: -non_mono[name].chars,
+    )
+    return qualifying[:2], mono, len(qualifying)
 
 
 def _is_mono(family: str) -> bool:
@@ -342,7 +420,15 @@ def _line_spacing(pkg: PptxPackage, canvas: Canvas) -> tuple[float, float]:
     в значительной части сидит в нередактируемых свободных фигурах-карточках,
     не в формальных плейсхолдерах — ограничение title-плейсхолдеров дало бы
     те же 90%, что и title, и завалило бы правило "заголовок теснее текста",
-    см. разведку в scratchpad)."""
+    см. разведку в scratchpad).
+
+    На VK Tech это даёт body_line_spacing≈1.33 (133%), заметно выше
+    заявленных брифом «100-110%» — потому что "всё остальное" здесь шире,
+    чем "основной текст": попадают и карточки с очень свободным интерлиньяжем
+    (крупные декоративные цифры статистики), не только абзацы связного
+    текста. Числу это не мешает быть корректным ответом на вопрос "какой
+    интерлиньяж типичен для НЕ-заголовочного текста этого шаблона" — просто
+    диапазон брифа откалиброван по другим двум шаблонам."""
     title_sp, nontitle_sp = _paragraph_spacing(pkg, canvas)
     heading = _mode(title_sp) / 100 if title_sp else _DEFAULT_HEADING_LINE_SPACING
     body = _mode(nontitle_sp) / 100 if nontitle_sp else _DEFAULT_BODY_LINE_SPACING
@@ -357,7 +443,7 @@ def _paragraph_spacing(pkg: PptxPackage, canvas: Canvas) -> tuple[Counter[float]
         for ref in walk_shapes(root, canvas, include_groups=False):
             if ref.kind != "shape":
                 continue
-            is_title = ref.is_placeholder and ref.ph_type in _TITLE_PH_TYPES
+            is_title = ref.is_placeholder and ref.ph_type in TITLE_PH_TYPES
             bucket = title_sp if is_title else nontitle_sp
             for value in _shape_paragraph_spacings(ref.element):
                 bucket[value] += 1

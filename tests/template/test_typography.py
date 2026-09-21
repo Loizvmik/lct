@@ -40,6 +40,16 @@ def test_workspace_body_scale_falls_back_to_runs(profile_fixture):
 # --- дополнительные тесты на утверждения, явно сформулированные текстом
 # брифа (разведка, п.7-8), которых бриф не дал в виде готового кода ---
 
+def test_arial_is_not_a_false_second_family_on_vktech(profile_fixture):
+    """У VK Tech Arial встречается в 5 символах из 7586 (0.07% нетекста) —
+    случайное вкрапление, не вторая гарнитура шаблона (нашёл general-purpose
+    ревьюер: без порога по доле символов families = ['Play', 'Arial'], хотя
+    Arial практически не используется)."""
+    scale = profile_fixture("VK Tech шаблон.pptx").type_scale
+    assert scale.families == ["Play"]
+    assert scale.families_total == 1
+
+
 def test_mono_fonts_are_excluded_from_families(profile_fixture):
     """Consolas (526 симв. у VK Tech, 262 у Education) — код, не вторая
     гарнитура бренда: должен уйти в `mono`, не в `families` (иначе аудит
