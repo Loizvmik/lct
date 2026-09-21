@@ -16,9 +16,13 @@ def provider():
 @live
 def test_complete_returns_json_matching_schema(provider):
     schema = {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+    # max_tokens=1500, не 300: qwen3.6 — reasoning-модель и тратит бюджет в
+    # первую очередь на reasoning_content, а не на сам JSON-ответ. 300 было
+    # догадкой без замера и заметно флакало (не хватало на reasoning + ответ),
+    # см. task-1-report.md. Не срезайте обратно "на глаз".
     out = provider.complete(
         [{"role": "user", "content": "Столица Франции. Ответь JSON с полем city."}],
-        schema=schema, max_tokens=300,
+        schema=schema, max_tokens=1500,
     )
     assert json.loads(out)["city"].lower().startswith("париж")
 
