@@ -142,19 +142,43 @@ def _assign_quote(block: QuoteBlock, by_role: dict[str, list[PatternSlot]]) -> l
     return result
 
 
+_CARD_BODY_ROLES = ("card_body", "bullet", "body")
+
+
 def _assign_cards(block: CardBlock, pattern: Pattern, grid: Grid) -> list[SlotContent]:
     if pattern.repeat is None or not block.items:
         return []
     groups = expand_repeat(pattern, len(block.items), grid)
     result: list[SlotContent] = []
     for card, group in zip(block.items, groups):
+        body_slot = _pick_body_slot(group)
         for slot in group:
             if slot.role == "card_title":
                 if card.title:
                     result.append(SlotContent(slot, "card_title", [Paragraph(card.title)]))
-            elif slot.role in ("card_body", "bullet", "body"):
+            elif slot is body_slot:
                 result.append(SlotContent(slot, "card_body", [Paragraph(card.body)]))
     return result
+
+
+def _pick_body_slot(group: list[PatternSlot]) -> PatternSlot | None:
+    """Когда в ОДНОЙ группе повтора несколько слотов роли
+    `"card_body"`/`"bullet"`/`"body"` (майнинг не всегда структурно отличает
+    заголовок-подпись от абзаца — находка ручной проверки Task 9, отчёт
+    задачи: паттерн "slide14" шаблона VK Tech несёт узкий `card_body`
+    (сэмпл-текст "01"/"02", высота 0.032 холста — место под номер, не под
+    предложение) и широкий `card_body` (место под абзац) в одной группе),
+    текст карточки кладётся ТОЛЬКО в САМЫЙ ЁМКИЙ по площади слот этой роли.
+
+    Раньше (до этой правки) `_assign_cards` клал ОДИН И ТОТ ЖЕ текст
+    карточки во ВСЕ такие слоты группы — узкий слот получал полноценное
+    предложение, не помещался ни на одном кегле шкалы и усекался до
+    голого «…» (see `builder._is_cosmetic_truncation`) — пустая/усечённая-
+    до-точек карточка хуже, чем оставить узкий слот вовсе без текста."""
+    candidates = [s for s in group if s.role in _CARD_BODY_ROLES]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: s.box.width * s.box.height)
 
 
 def _assign_kpis(block: KpiBlock, by_role: dict[str, list[PatternSlot]]) -> list[SlotContent]:

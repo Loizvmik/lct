@@ -51,16 +51,37 @@ class Variant(Enum):
 
 @dataclass(frozen=True)
 class Fit:
-    """Лезет ли содержание слайда в раскладку паттерна БЕЗ ужимания —
-    используется на выборе паттерна (см. `_pick_pattern`) и остаётся
-    доступным вызывающему коду (Task 10a: "ни одна не подходит — слайд
-    уходит в песочницу"). `overflow_ratio` — во сколько раз (сверх 1.0)
-    самый переполненный слот превышает свою высоту на СОБСТВЕННОМ кегле
-    паттерна (0.0 — не переполнен нигде); `reason` — какой слот и почему."""
+    """Лезет ли содержание слайда в раскладку паттерна — используется на
+    выборе паттерна (см. `_pick_pattern`) и остаётся доступным вызывающему
+    коду (Task 10a: "ни одна не подходит — слайд уходит в песочницу").
+
+    Правка по итогам визуального ревью (отчёт задачи, находка №1): раньше
+    `overflow_ratio` считался на СОБСТВЕННОМ (native) кегле паттерна, без
+    ужимания — наивная проверка отбраковывала раскладки, которые
+    `_draw_slot` потом УСПЕШНО укладывал, ужав шрифт по шкале `TypeScale`.
+    Теперь `overflow_ratio` — лучший (наименьший) результат по ВСЕЙ шкале
+    ужимания вплоть до `caption` (то же самое, что реально попробует
+    `_draw_slot`), 0.0 — есть кегль шкалы, на котором слот не переполнен
+    нигде. `reason` — какой слот и почему (плюс `"exact"`/`"fallback"` про
+    шрифт замера, см. `font_source`, — пригодится отчёту/аудиту, чтобы
+    отличать надёжный overflow от посчитанного с запасом на неточный
+    шрифт).
+
+    `fill_ratio` — доля площади холста, которую реально займёт содержание
+    в этой раскладке (сумма площадей слотов, в которые попал контент, как
+    доля холста 0..1) — нужен подборщику, чтобы не брать формально
+    влезающую, но почти пустую раскладку (ТЗ D05: "слайд заполнен меньше
+    четверти или больше трёх четвертей — брак"; пороги `_FILL_RATIO_MIN`/
+    `_FILL_RATIO_MAX` те же 0.25/0.75, что и в плане будущего
+    `config/audit.yaml` — см. `docs/superpowers/plans/2026-09-21-
+    deckforge.md`, ещё не заведён отдельным конфигом в границах этой
+    задачи)."""
 
     ok: bool
     overflow_ratio: float
     reason: str
+    fill_ratio: float = 0.0
+    font_source: str = "exact"
 
 
 class BuildError(RuntimeError):
@@ -120,6 +141,18 @@ def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, va
                 "паттерна этого шаблона — слайд не собран."
             )
             continue
+        fit = fits(slide_spec, pattern, profile)
+        if not fit.ok:
+            # Бриф: "если ни одна раскладка не подходит, выбирай ту, где
+            # переполнение наименьшее, и оставляй явный след о проблеме" —
+            # след пишется здесь, в момент выбора, а не только если потом
+            # дойдёт до усечения в `_draw_slot` (сам выбор уже "наименее
+            # плохой" среди кандидатов этого kind, это надо знать заранее).
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: содержание не помещается ни в одну раскладку вида "
+                f"{slide_spec.kind!r} даже на минимальном кегле — выбрана раскладка с наименьшим "
+                f"переполнением ({fit.overflow_ratio:.0%}, {fit.reason})."
+            )
         place_slide(prs, slide_spec, pattern, profile, bullet_char=bullet_char)
 
     out_path = _output_path(spec, template_path, variant)
@@ -143,25 +176,35 @@ def place_slide(
     grid = _grid_from_model(profile.grid)
     family = _primary_family(profile)
     for content in assign_content(slide_spec, pattern, grid):
+        # Контраст — от фона НЕПОСРЕДСТВЕННО под этим слотом (плашка декора,
+        # если слот на ней стоит), не от `pattern.is_dark` вслепую — см.
+        # `_local_background_is_dark`.
         _draw_slot(
             slide, slide_spec, content, profile, family, bullet_char, canvas_width_emu, canvas_height_emu,
-            pattern.is_dark,
+            _local_background_is_dark(content.slot.box, pattern),
         )
 
 
 def fits(slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile) -> Fit:
-    """Лезет ли содержание `slide_spec` в `pattern` БЕЗ ужимания шрифта —
-    более лёгкая проверка, чем реальная укладка (`place_slide`), для
-    выбора паттерна ДО того, как тратить время на построение слайда."""
+    """Лезет ли содержание `slide_spec` в `pattern` — более лёгкая проверка,
+    чем реальная укладка (`place_slide`), для выбора паттерна ДО того, как
+    тратить время на построение слайда.
+
+    Шкала ужимания та же, что реально попробует `_draw_slot`
+    (`_shrink_sequence`) — иначе (см. докстроку `Fit`) эта проверка
+    отбраковывала бы раскладки, которые сборка успешно укладывает ужатым
+    шрифтом."""
     grid = _grid_from_model(profile.grid)
     assignments = assign_content(slide_spec, pattern, grid)
     canvas_width_in = profile.canvas_width_emu / EMU_PER_INCH
     canvas_height_in = profile.canvas_height_emu / EMU_PER_INCH
     family = _primary_family(profile)
-    norm = 12192000 / profile.canvas_width_emu if profile.canvas_width_emu else 1.0
 
     worst_ratio = 0.0
     worst_reason = ""
+    font_source = "exact"
+    canvas_area_in2 = canvas_width_in * canvas_height_in
+    covered_area = 0.0
     for content in assignments:
         text = _joined_text(content.paragraphs)
         if not text.strip():
@@ -171,13 +214,36 @@ def fits(slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile) -> F
         if box_height_in <= 0:
             continue
         line_spacing = _line_spacing_for(content.role_hint, profile)
-        # `PatternSlot.size_pt` нормирован к эталонному холсту (см. докстроку
-        # `_shrink_sequence`) — денормируем тем же коэффициентом.
-        metrics = measure(text, family, content.slot.size_pt / norm, box_width_in, line_spacing=line_spacing)
-        ratio = metrics.height_in / box_height_in - 1.0
-        if ratio > worst_ratio:
-            worst_ratio = ratio
-            worst_reason = f"слот «{content.role_hint}» переполнен на {ratio:.0%} на кегле паттерна"
+        slot_ratio = None
+        best_height_in = box_height_in
+        for size_pt in _shrink_sequence(profile, content.slot.size_pt):
+            metrics = measure(text, family, size_pt, box_width_in, line_spacing=line_spacing)
+            if metrics.font_source == "fallback":
+                font_source = "fallback"
+            ratio = metrics.height_in / box_height_in - 1.0
+            if slot_ratio is None or ratio < slot_ratio:
+                slot_ratio, best_height_in = ratio, metrics.height_in
+            if slot_ratio <= 0.0:
+                break  # нашли кегль шкалы, на котором слот не переполнен — дальше мельчить незачем
+        slot_ratio = max(slot_ratio or 0.0, 0.0)
+        if slot_ratio > worst_ratio:
+            worst_ratio = slot_ratio
+            worst_reason = (
+                f"слот «{content.role_hint}» переполнен на {slot_ratio:.0%} даже на минимальном "
+                "кегле шкалы (caption)"
+            )
+        # Доля холста, реально занятая ЧЕРНИЛАМИ этого слота — по факту
+        # нарисованного текста (высота на выбранном кегле, отсечённая рамкой
+        # слота), НЕ по площади самого слота. Находка визуального ревью
+        # (отчёт задачи, №3, "слайд заполнен меньше четверти"): слот
+        # `bullets`/`body` часто высокий по замыслу раскладки, но текст
+        # начинается сверху и не растягивается на всю высоту (`_draw_slot`
+        # не центрирует и не растягивает по вертикали) — если считать по
+        # площади СЛОТА, а не по факту нарисованного текста, подборщик не
+        # видит, что три коротких буллета оставляют низ слайда пустым.
+        ink_height_in = min(best_height_in, box_height_in)
+        if canvas_area_in2 > 0:
+            covered_area += (ink_height_in * box_width_in) / canvas_area_in2
 
     missing = _missing_signals(slide_spec, assignments)
     if missing:
@@ -185,7 +251,31 @@ def fits(slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile) -> F
         worst_reason = f"нет слота под роль(и): {', '.join(missing)}"
 
     ok = worst_ratio <= 0.0
-    return Fit(ok=ok, overflow_ratio=max(worst_ratio, 0.0), reason=worst_reason or "содержание помещается")
+    return Fit(
+        ok=ok, overflow_ratio=max(worst_ratio, 0.0), reason=worst_reason or "содержание помещается",
+        fill_ratio=covered_area, font_source=font_source,
+    )
+
+
+# Пороги "не слишком пусто / не слишком плотно" — те же числа, что ТЗ
+# отводит будущей проверке аудита D05 (`fill_ratio_min`/`fill_ratio_max`,
+# см. докстроку `Fit`) — подбор паттерна здесь пользуется теми же порогами,
+# чтобы не выбирать раскладку, которую аудит потом всё равно забракует.
+_FILL_RATIO_MIN = 0.25
+_FILL_RATIO_MAX = 0.75
+
+
+def _fill_badness(fill_ratio: float) -> float:
+    """0.0, когда `fill_ratio` укладывается в [_FILL_RATIO_MIN,
+    _FILL_RATIO_MAX], иначе — на сколько (в долях холста) он вышел за
+    границу; используется только как ранжирующий сигнал `_pick_pattern`
+    (не как жёсткий отказ — жёсткий отказ "слишком пусто/плотно" по всей
+    колоде целиком, не по одному кандидату, работа будущего аудита D05)."""
+    if fill_ratio < _FILL_RATIO_MIN:
+        return _FILL_RATIO_MIN - fill_ratio
+    if fill_ratio > _FILL_RATIO_MAX:
+        return fill_ratio - _FILL_RATIO_MAX
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +320,21 @@ def _missing_signals(slide_spec: SlideSpec, assignments: list[SlotContent]) -> l
 def _pick_pattern(
     slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
 ) -> Pattern | None:
+    """Перебирает кандидатов `pattern.kind == slide_spec.kind` и берёт того,
+    в кого содержание влезает (`fits()`, шкала ужимания целиком, не только
+    свой кегль) — не первого попавшегося. Порядок ранжирования:
+
+    1. влезает ли вообще (`fit.ok`) — не влезающие кандидаты хуже любого
+       влезающего;
+    2. среди не влезающих — наименьшее `overflow_ratio` (бриф: "если ни
+       одна не подходит, выбирай ту, где переполнение наименьшее");
+    3. "не слишком пусто/плотно" (`_fill_badness`, ТЗ D05) — среди влезающих
+       кандидатов раскладка, где содержание не тонет в пустоте и не
+       перегружает холст, предпочтительнее формально влезающей, но
+       занимающей четверть холста;
+    4. паттерн с более высоким `score` (майнинг увереннее в нём);
+    5. `Variant.visual`/`Variant.dense` — тот же бонус/штраф за декор, что и
+       раньше (временная эвристика Task 13, см. докстроку `Variant`)."""
     candidates = [p for p in patterns if p.kind == slide_spec.kind]
     if not candidates:
         return None
@@ -237,7 +342,7 @@ def _pick_pattern(
     def rank(p: Pattern):
         fit = fits(slide_spec, p, profile)
         visual_bias = len(p.decor) if variant is Variant.visual else -len(p.decor)
-        return (0 if fit.ok else 1, fit.overflow_ratio, -p.score, -visual_bias)
+        return (0 if fit.ok else 1, fit.overflow_ratio, _fill_badness(fit.fill_ratio), -p.score, -visual_bias)
 
     return min(candidates, key=rank)
 
@@ -376,6 +481,49 @@ def _contrast_adjusted(color_hex: str, is_dark: bool, profile: TemplateProfile) 
     return light_pole if is_dark else dark_pole
 
 
+def _contains(outer: Box, inner: Box, tolerance: float = 0.01) -> bool:
+    """`inner` целиком лежит внутри `outer` (с допуском на округление) —
+    геометрический тест "слот стоит на этой плашке декора"."""
+    return (
+        outer.left - tolerance <= inner.left
+        and outer.top - tolerance <= inner.top
+        and inner.left + inner.width <= outer.left + outer.width + tolerance
+        and inner.top + inner.height <= outer.top + outer.height + tolerance
+    )
+
+
+def _plaque_under(box: Box, decor: list[DecorShape]) -> DecorShape | None:
+    """Самая маленькая (самая специфичная — не подложка всего слайда)
+    плашка декора паттерна, полностью содержащая `box` и несущая цвет
+    заливки — кандидат на "настоящий локальный фон" под содержимым слота
+    (см. `_local_background_is_dark`)."""
+    candidates = [
+        d for d in decor
+        if d.kind == "shape" and d.has_fill and d.fill_hex and _contains(d.box, box)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda d: d.box.width * d.box.height)
+
+
+def _local_background_is_dark(slot_box: Box, pattern: Pattern) -> bool:
+    """Тёмный ли фон НЕПОСРЕДСТВЕННО под слотом — находка визуального
+    ревью (ЛЦТ2026, "cards": паттерн в целом тёмный, `pattern.is_dark=True`
+    считается по доминирующему фону ВСЕГО паттерна/слайда, но конкретная
+    карточка — БЕЛАЯ плашка декора поверх этого тёмного фона; контраст
+    текста внутри такой плашки обязан считаться от ЕЁ цвета, а не от фона
+    всего паттерна — иначе белый ("для тёмного фона") текст ложится на
+    такую же белую плашку и становится невидим).
+
+    Если под слотом не нашлось охватывающей плашки с известным цветом —
+    решает `pattern.is_dark`, как и раньше (это сам фон слайда под слотом,
+    без декора)."""
+    plaque = _plaque_under(slot_box, pattern.decor)
+    if plaque is not None and plaque.fill_hex:
+        return _relative_luminance(plaque.fill_hex) < 0.5
+    return pattern.is_dark
+
+
 def _color_for_role(role_hint: str, slot: PatternSlot, profile: TemplateProfile, is_dark: bool) -> str:
     values = set(profile.palette_roles.values())
     if slot.color_hex and slot.color_hex in values:
@@ -421,6 +569,32 @@ def _split_back(text: str, original: list[Paragraph]) -> list[Paragraph]:
     return [Paragraph(line, bullet=(bullet_flags[i] if i < len(bullet_flags) else last_flag)) for i, line in enumerate(lines)]
 
 
+# Порог "усечение ещё косметическое, а не разрушительное" — доля исходной
+# длины текста (в знаках, без многоточия), которую усечение ОБЯЗАНО
+# сохранить, иначе оно не применяется вовсе (см. `_is_cosmetic_truncation`).
+# Находка визуального ревью (отчёт задачи): «Доработка для закупок…» на
+# VK Tech сохраняла ~40% исходной фразы и уже читалась как брак, а «…» без
+# единого слова содержания — 0%. 0.7 — обоснование: усечение, вырезающее
+# МЕНЬШЕ 30% знаков, типично отрезает только хвостовое уточнение/придаточное
+# (для этих коротких карточных фраз главное — подлежащее+сказуемое —
+# статистически укладывается в первые 60-70% предложения), смысл остаётся
+# читаемым. Усечение, которое вырезало бы больше — уже не "подрезали хвост",
+# а "переписали контент огрызком" — хуже, чем оставить текст целиком и
+# позволить ему видимо вылезти за рамку (это поймает будущий аудит/
+# песочница, Task 10a, а не тихо спрятанный обрубок).
+_COSMETIC_TRUNCATION_MIN_RETAINED = 0.7
+
+
+def _is_cosmetic_truncation(original: str, truncated: str) -> bool:
+    """Сохраняет ли `truncated` (результат `_truncate_to_fit`, включая
+    завершающее «…», если оно есть) не меньше `_COSMETIC_TRUNCATION_MIN_
+    RETAINED` доли исходной длины `original` (в знаках)."""
+    if not original:
+        return True
+    prefix = truncated[:-1] if truncated.endswith("…") else truncated
+    return len(prefix) / len(original) >= _COSMETIC_TRUNCATION_MIN_RETAINED
+
+
 def _truncate_to_fit(
     text: str, family: str, size_pt: float, box_width_in: float, box_height_in: float, line_spacing: float,
 ) -> tuple[str, bool]:
@@ -431,7 +605,14 @@ def _truncate_to_fit(
     честно объявленное упрощение: сюда доходит только контент, для
     которого ужимание по всей шкале уже не помогло (редкий, аварийный
     путь — находка о самом факте усечения важнее аккуратности разбивки
-    остатка на исходные абзацы)."""
+    остатка на исходные абзацы).
+
+    Возвращает КАНДИДАТА на усечение и было ли оно вообще нужно — не
+    решает, принять ли его: разрушительное усечение (меньше
+    `_COSMETIC_TRUNCATION_MIN_RETAINED` исходной длины, включая усечение до
+    голого «…») ОТКЛОНЯЕТ вызывающий код (`_draw_slot`,
+    `_is_cosmetic_truncation`) — пустая/усечённая-до-точек карточка хуже
+    видимого переполнения (находка визуального ревью, отчёт задачи)."""
     metrics = measure(text, family, size_pt, box_width_in, line_spacing=line_spacing)
     if metrics.height_in <= box_height_in + _FIT_TOLERANCE_IN:
         return text, False
@@ -479,6 +660,15 @@ def _draw_slot(
     textbox = slide.shapes.add_textbox(Emu(left), Emu(top), Emu(width), Emu(height))
     tf = textbox.text_frame
     tf.word_wrap = True
+    # python-pptx даёт текстовой рамке ненулевые поля по умолчанию (0.1"
+    # слева/справа, 0.05" сверху/снизу, OOXML `a:bodyPr` lIns/rIns/tIns/
+    # bIns) — `measure()` меряет по ПОЛНОЙ ширине/высоте фигуры (см.
+    # `box_width_in`/`box_height_in` ниже), без вычета полей. Найдено на
+    # повторном визуальном ревью (после установки Play): заголовок стал
+    # переноситься на строку больше, чем предсказал замер, и наезжать на
+    # содержимое ниже — бокс, который меряет `measure()`, обязан совпадать
+    # с боксом, в который реально льётся текст у PowerPoint/LibreOffice.
+    tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = Emu(0)
 
     line_spacing = _line_spacing_for(content.role_hint, profile)
     box_width_in = width / EMU_PER_INCH
@@ -498,13 +688,27 @@ def _draw_slot(
             break
 
     if not fit_found:
-        chosen_text, truncated = _truncate_to_fit(
+        truncated_text, truncated = _truncate_to_fit(
             full_text, family, chosen_size, box_width_in, box_height_in, line_spacing,
         )
-        if truncated:
+        if truncated and _is_cosmetic_truncation(full_text, truncated_text):
+            chosen_text = truncated_text
             slide_spec.findings.append(
                 f"Слайд {slide_spec.index}: текст слота «{content.role_hint}» усечён — "
                 f"не влезает даже кеглем подписи ({chosen_size:.1f}pt)."
+            )
+        elif truncated:
+            # Усечение вырезало бы больше _COSMETIC_TRUNCATION_MIN_RETAINED
+            # исходного текста (в пределе — до голого «…» или пустоты) —
+            # находка ревью: пустая/усечённая-до-точек карточка хуже
+            # переполненной. Оставляем текст ЦЕЛИКОМ на минимальном кегле:
+            # он видимо вылезет за рамку слота, зато не потеряет смысл, и
+            # это честно ловит finding, а не молча прячет контент.
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: текст слота «{content.role_hint}» не помещается даже "
+                f"кеглем подписи ({chosen_size:.1f}pt), а усечение вырезало бы больше "
+                f"{(1 - _COSMETIC_TRUNCATION_MIN_RETAINED):.0%} содержания — оставлен целиком "
+                "(слот переполнен, эта раскладка не подходит для этого содержания)."
             )
 
     display_paragraphs = _split_back(chosen_text, content.paragraphs)
