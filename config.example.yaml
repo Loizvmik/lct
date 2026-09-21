@@ -1,0 +1,22 @@
+# Шаблон config/app.yaml для нового окружения.
+# Скопируйте в config/app.yaml (он тоже коммитится — секретов в нём нет)
+# и при необходимости поправьте пути/роли моделей.
+# Секреты сюда не вписываются: YANDEX_FOLDER_ID и YANDEX_API_KEY живут
+# только в .env (см. .env, он в .gitignore).
+
+llm:
+  provider: yandex
+  model: qwen3.6-35b-a3b
+  roles:
+    outline: qwen3.6-35b-a3b
+    writer: qwen3.6-35b-a3b
+    pattern_picker: qwen3.6-35b-a3b
+    palette_namer: qwen3.6-35b-a3b
+    content_audit: qwen3.6-35b-a3b
+
+paths:
+  workspace: workspace
+  artifacts: artifacts
+
+render:
+  soffice_path: null

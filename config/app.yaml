@@ -1,0 +1,26 @@
+# Единственная точка настройки DeckForge (ТЗ требует воспроизводимый сетап
+# конфиг-файлом). Секреты (ключ и id каталога Yandex) сюда не попадают —
+# они читаются только из .env, см. config.example.yaml и README.
+
+llm:
+  provider: yandex
+  # Модель по умолчанию для ролей, не перечисленных явно в roles.
+  model: qwen3.6-35b-a3b
+  # Какая модель отвечает за какую роль конвейера. Разнесено по ролям заранее,
+  # чтобы в следующих задачах можно было переключить конкретную роль на другую
+  # модель из config/models.yaml, не трогая код.
+  roles:
+    outline: qwen3.6-35b-a3b
+    writer: qwen3.6-35b-a3b
+    pattern_picker: qwen3.6-35b-a3b
+    palette_namer: qwen3.6-35b-a3b
+    content_audit: qwen3.6-35b-a3b
+
+paths:
+  workspace: workspace
+  artifacts: artifacts
+
+render:
+  # Путь к бинарнику soffice. Если не задан — автопоиск по типичным путям
+  # macOS (Homebrew, /Applications) и через PATH.
+  soffice_path: null
