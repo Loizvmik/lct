@@ -47,7 +47,22 @@ class YandexProvider(LLMProvider, VisionProvider):
             "model": self.model_uri, "messages": messages,
             "max_tokens": max_tokens, "temperature": temperature,
         }
-        return self._extract(self._post(body))
+        payload = self._post(body)
+        content = self._extract(payload)
+        if schema is not None:
+            # Второй вид нехватки бюджета: content непустой, но обрезан на
+            # середине и не парсится как JSON. Отдавать наверх голый
+            # JSONDecodeError нельзя — диагноз должен быть таким же внятным,
+            # как для пустого content выше.
+            try:
+                json.loads(content)
+            except json.JSONDecodeError as exc:
+                finish_reason = payload["choices"][0].get("finish_reason")
+                raise RuntimeError(
+                    "модель вернула обрезанный или невалидный JSON "
+                    f"(finish_reason={finish_reason}): {exc}. Увеличьте max_tokens."
+                ) from exc
+        return content
 
     def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
         if not self.card.vision:

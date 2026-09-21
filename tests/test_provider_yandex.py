@@ -97,3 +97,27 @@ def test_schema_adds_leading_system_message_when_absent(monkeypatch):
     assert messages[0]["role"] == "system"
     assert len(messages) == 2
     assert messages[1] == {"role": "user", "content": "Привет"}
+
+
+def test_truncated_json_raises_informative_error(monkeypatch):
+    """content непустой, но обрезан посреди JSON (бюджет max_tokens кончился
+    не на пустом content, а на середине ответа) — ошибка должна быть внятной,
+    а не голым JSONDecodeError."""
+    provider = _offline_provider()
+    _stub_post(
+        monkeypatch,
+        {
+            "choices": [
+                {"message": {"content": '{"city": "Пар'}, "finish_reason": "length"}
+            ]
+        },
+    )
+    with pytest.raises(RuntimeError) as exc_info:
+        provider.complete(
+            [{"role": "user", "content": "Столица Франции"}],
+            schema={"type": "object"},
+            max_tokens=10,
+        )
+    message = str(exc_info.value)
+    assert "finish_reason=length" in message
+    assert "max_tokens" in message
