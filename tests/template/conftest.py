@@ -1,13 +1,14 @@
 """Общая инфраструктура тестов Task 4 (типографическая шкала и сетка),
-Task 5 (каталог лейаутов) и Task 6 (каталог ассетов).
+Task 5 (каталог лейаутов), Task 6 (каталог ассетов) и Task 7 (майнинг
+композиционных паттернов).
 
 `profile_fixture` — вызываемая фикстура: `profile_fixture(name) -> TemplateProfile`
-с полями `.type_scale`/`.grid`/`.layouts`/`.assets`, ровно как использует её бриф.
-Разбор одного и того же файла кэшируется на весь прогон (`functools.lru_cache`)
-— иначе каждый тест из test_typography.py/test_grid.py/test_layouts.py/
-test_assets.py, ссылающийся на один и тот же шаблон, заново парсил бы весь
-.pptx (собственно usage.collect_usage уже обходит все слайды/лейауты/мастера,
-это не дёшево).
+с полями `.type_scale`/`.grid`/`.layouts`/`.assets`/`.patterns`, ровно как
+использует её бриф. Разбор одного и того же файла кэшируется на весь прогон
+(`functools.lru_cache`) — иначе каждый тест из test_typography.py/
+test_grid.py/test_layouts.py/test_assets.py/test_patterns.py, ссылающийся на
+один и тот же шаблон, заново парсил бы весь .pptx (собственно
+usage.collect_usage уже обходит все слайды/лейауты/мастера, это не дёшево).
 """
 from __future__ import annotations
 import functools
@@ -20,6 +21,7 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.template.assets import AssetCatalog, build_asset_catalog
 from deckforge.template.grid import Grid, build_grid
 from deckforge.template.layouts import LayoutEntry, build_layout_catalog
+from deckforge.template.patterns import Pattern, mine_patterns
 from deckforge.template.theme import pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale, build_type_scale
 from deckforge.template.usage import collect_usage
@@ -42,6 +44,7 @@ class TemplateProfile:
     grid: Grid
     layouts: list[LayoutEntry]
     assets: AssetCatalog
+    patterns: list[Pattern]
 
 
 @functools.lru_cache(maxsize=None)
@@ -58,7 +61,10 @@ def _build_profile(name: str) -> TemplateProfile:
         # без этого архив обходился бы дважды.
         layouts = build_layout_catalog(pkg, canvas, theme, grid, usage=usage, type_scale=type_scale)
         assets = build_asset_catalog(pkg, canvas, layouts)
-    return TemplateProfile(type_scale=type_scale, grid=grid, layouts=layouts, assets=assets)
+        patterns = mine_patterns(pkg, canvas, grid, type_scale, assets)
+    return TemplateProfile(
+        type_scale=type_scale, grid=grid, layouts=layouts, assets=assets, patterns=patterns,
+    )
 
 
 @pytest.fixture
