@@ -185,6 +185,93 @@ def test_shape_without_xfrm_yields_none_box_and_does_not_crash():
     assert refs["4"].box is not None
 
 
+# 5b. Группа без валидного a:xfrm (p:grpSpPr вовсе без a:xfrm) отдаёт box=None
+#     и себе (при include_groups=True), и обоим детям — а не тождественное
+#     преобразование, которое протащило бы сырые координаты системы координат
+#     группы (ровно тот мусор, ради устранения которого сделана вся задача).
+#     Обход не падает и не останавливается — оба ребёнка находятся.
+_SYNTH_BROKEN_GROUP = """<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+      <p:grpSp>
+        <p:nvGrpSpPr><p:cNvPr id="10" name="BrokenGroup"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+        <p:grpSpPr/>
+        <p:sp>
+          <p:nvSpPr><p:cNvPr id="11" name="Child1"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr>
+            <a:xfrm><a:off x="100" y="100"/><a:ext cx="200" cy="200"/></a:xfrm>
+          </p:spPr>
+        </p:sp>
+        <p:sp>
+          <p:nvSpPr><p:cNvPr id="12" name="Child2"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr>
+            <a:xfrm><a:off x="300" y="300"/><a:ext cx="400" cy="400"/></a:xfrm>
+          </p:spPr>
+        </p:sp>
+      </p:grpSp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>
+"""
+
+
+def test_group_without_valid_xfrm_gives_none_box_to_group_and_children():
+    root = etree.fromstring(_SYNTH_BROKEN_GROUP.encode())
+    canvas = Canvas(width_emu=9144000, height_emu=5143500)
+    refs = {ref.shape_id: ref for ref in walk_shapes(root, canvas, include_groups=True)}
+    assert set(refs) == {"10", "11", "12"}  # обход не остановился на сломанной группе
+    assert refs["10"].kind == "group"
+    assert refs["10"].box is None
+    assert refs["11"].box is None
+    assert refs["12"].box is None
+
+
+# 5c. Группа с chExt=0 по одной оси (не по обеим) — тоже считаем невалидной:
+#     resolve_point не делит на ноль (там уже есть защита), но масштаб по
+#     этой оси становится 0.0, и все дети схлопываются в одну и ту же
+#     координату по ней — такая же тихая порча координат, просто частичная,
+#     не по обеим осям сразу. Решение: box=None для группы и её детей, как
+#     и для полностью невалидного xfrm (см. отчёт, п. 2).
+_SYNTH_ZERO_CHEXT_ONE_AXIS = """<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+      <p:grpSp>
+        <p:nvGrpSpPr><p:cNvPr id="20" name="ZeroChExtGroup"/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+        <p:grpSpPr>
+          <a:xfrm>
+            <a:off x="0" y="0"/><a:ext cx="1000" cy="1000"/>
+            <a:chOff x="0" y="0"/><a:chExt cx="0" cy="500"/>
+          </a:xfrm>
+        </p:grpSpPr>
+        <p:sp>
+          <p:nvSpPr><p:cNvPr id="21" name="Child"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+          <p:spPr>
+            <a:xfrm><a:off x="100" y="100"/><a:ext cx="200" cy="200"/></a:xfrm>
+          </p:spPr>
+        </p:sp>
+      </p:grpSp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>
+"""
+
+
+def test_group_with_zero_ch_ext_on_one_axis_gives_none_box():
+    root = etree.fromstring(_SYNTH_ZERO_CHEXT_ONE_AXIS.encode())
+    canvas = Canvas(width_emu=9144000, height_emu=5143500)
+    refs = {ref.shape_id: ref for ref in walk_shapes(root, canvas, include_groups=True)}
+    assert refs["20"].box is None
+    assert refs["21"].box is None
+
+
 # 6. ph_type для плейсхолдера без атрибута @type равен "body", а не None —
 #    в трёх шаблонах такой плейсхолдер не встретился (все Google-экспорты
 #    проставляют @type явно), реальная ловушка OOXML нужна синтетически.

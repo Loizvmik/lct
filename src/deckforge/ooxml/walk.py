@@ -35,11 +35,6 @@ _KIND_BY_TAG = {
 # Корневые элементы, которые walk_shapes принимает напрямую помимо p:spTree.
 _ROOTS_WITH_CSLD = {"sld", "sldLayout", "sldMaster"}
 
-# Группа без валидного xfrm (в трёх учебных шаблонах не встретилась ни разу —
-# разведкой проверено, что у каждого grpSp есть полный off/ext/chOff/chExt) —
-# тождественное преобразование, чтобы обход не падал и не выдумывал сдвиг.
-_IDENTITY_GROUP_FRAME = GroupFrame(off=(0, 0), ext=(1, 1), ch_off=(0, 0), ch_ext=(1, 1))
-
 
 @dataclass(frozen=True)
 class ShapeRef:
@@ -134,30 +129,49 @@ def shape_box(element: etree._Element, canvas: Canvas, chain: Sequence[GroupFram
     return box_from_emu(x1, y1, x2 - x1, y2 - y1, canvas)
 
 
-def _read_group_frame(element: etree._Element) -> GroupFrame:
+def _read_group_frame(element: etree._Element) -> GroupFrame | None:
+    """GroupFrame группы, либо `None`, если у неё нет валидного `a:xfrm`.
+
+    Невалиден: `a:xfrm` нет вовсе; нет хотя бы одного из `a:off`/`a:ext`/
+    `a:chOff`/`a:chExt`; либо `chExt` равен нулю хотя бы по одной оси —
+    не только по обеим сразу. `resolve_point` уже не делится на ноль в
+    этом случае (там есть защита), но при `chExt`=0 по одной оси масштаб
+    по ней становится 0.0, и все точки этой оси схлопываются в одну и ту
+    же координату — точно такая же тихая порча координат, как и для
+    полностью отсутствующего `xfrm`, просто по одной оси вместо обеих.
+    Раньше эта функция отдавала тождественное преобразование как фолбэк —
+    это молча протаскивало координаты детей в системе координат группы
+    (ровно тот мусор, ради устранения которого сделана вся задача).
+    Вызывающий код (`_walk_container`) на `None` отдаёт `box=None` и самой
+    группе, и всему её поддереву, но продолжает обход.
+    """
     container = element.find(qn("p:grpSpPr"))
     xfrm = container.find(qn("a:xfrm")) if container is not None else None
     if xfrm is None:
-        return _IDENTITY_GROUP_FRAME
+        return None
 
     off = xfrm.find(qn("a:off"))
     ext = xfrm.find(qn("a:ext"))
     ch_off = xfrm.find(qn("a:chOff"))
     ch_ext = xfrm.find(qn("a:chExt"))
     if off is None or ext is None or ch_off is None or ch_ext is None:
-        return _IDENTITY_GROUP_FRAME
+        return None
+
+    ch_ext_x, ch_ext_y = int(ch_ext.get("cx")), int(ch_ext.get("cy"))
+    if ch_ext_x == 0 or ch_ext_y == 0:
+        return None
 
     return GroupFrame(
         off=(int(off.get("x")), int(off.get("y"))),
         ext=(int(ext.get("cx")), int(ext.get("cy"))),
         ch_off=(int(ch_off.get("x")), int(ch_off.get("y"))),
-        ch_ext=(int(ch_ext.get("cx")), int(ch_ext.get("cy"))),
+        ch_ext=(ch_ext_x, ch_ext_y),
     )
 
 
 def _shape_ref(
     element: etree._Element, kind: str, canvas: Canvas,
-    chain: tuple[GroupFrame, ...], depth: int,
+    chain: tuple[GroupFrame, ...], depth: int, *, force_none_box: bool = False,
 ) -> ShapeRef:
     nv = _nv_wrapper(element)
     cnvpr = nv.find(qn("p:cNvPr")) if nv is not None else None
@@ -184,7 +198,7 @@ def _shape_ref(
     return ShapeRef(
         element=element,
         kind=kind,
-        box=shape_box(element, canvas, chain),
+        box=None if force_none_box else shape_box(element, canvas, chain),
         name=name,
         shape_id=shape_id,
         rotation=rotation,
@@ -200,20 +214,30 @@ def _shape_ref(
 
 def _walk_container(
     container: etree._Element, canvas: Canvas,
-    chain: tuple[GroupFrame, ...], depth: int, include_groups: bool,
+    chain: tuple[GroupFrame, ...], depth: int, include_groups: bool, *, broken: bool = False,
 ) -> Iterator[ShapeRef]:
+    """`broken=True` — где-то выше по цепочке уже встретилась группа без
+    валидного `a:xfrm`: всё поддерево получает `box=None`, но обход не
+    останавливается — шейпы по-прежнему находятся и отдаются, просто без
+    координат (см. `_read_group_frame`)."""
     for element in container:
         kind = _KIND_BY_TAG.get(etree.QName(element).localname)
         if kind is None:
             continue  # p:nvGrpSpPr/p:grpSpPr и прочее не по кейсу kind-таблицы
 
-        ref = _shape_ref(element, kind, canvas, chain, depth)
         if kind == "group":
+            frame = _read_group_frame(element)
+            own_broken = broken or frame is None
+            ref = _shape_ref(element, kind, canvas, chain, depth, force_none_box=own_broken)
             if include_groups:
                 yield ref
-            child_chain = chain + (_read_group_frame(element),)
-            yield from _walk_container(element, canvas, child_chain, depth + 1, include_groups)
+            child_broken = broken or frame is None
+            child_chain = chain if frame is None else chain + (frame,)
+            yield from _walk_container(
+                element, canvas, child_chain, depth + 1, include_groups, broken=child_broken,
+            )
         else:
+            ref = _shape_ref(element, kind, canvas, chain, depth, force_none_box=broken)
             yield ref
 
 
