@@ -346,6 +346,17 @@ class DecorShapeModel(BaseModel):
     fill_hex: str | None
     has_fill: bool
     fill_kind: str
+    # Task 9 повторное ревью, находка №1: принадлежность декора группе
+    # повтора текстовых слотов (`repeat_index` — позиция в группе) — без
+    # этих полей `compose/` нечем отличить декор, который обязан
+    # развернуться вместе с текстом (`compose.blocks.expand_decor`), от
+    # самостоятельного украшения. Значения по умолчанию — обратная
+    # совместимость со старым диск-кешем профиля (см. `TemplateProfile.
+    # from_file`, docstring про "повреждённый кеш не роняет вызов"): старая
+    # запись без этих полей валидируется как "декор вне группы повтора",
+    # что и было её фактическим поведением до этой правки.
+    repeat_group: bool = False
+    repeat_index: int = 0
 
 
 def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
@@ -353,6 +364,7 @@ def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
         kind=decor.kind, box=_box_model(decor.box), rotation=decor.rotation,
         flip_h=decor.flip_h, flip_v=decor.flip_v, fill_hex=decor.fill_hex,
         has_fill=decor.has_fill, fill_kind=decor.fill_kind,
+        repeat_group=decor.repeat_group, repeat_index=decor.repeat_index,
     )
 
 

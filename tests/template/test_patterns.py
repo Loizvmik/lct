@@ -25,6 +25,7 @@ from deckforge.template.patterns import (
     _capacity,
     _classify_kind,
     _columns,
+    _decor_repeat_membership,
     _find_repeat,
     _shape_text,
     _slide_is_dark,
@@ -449,6 +450,83 @@ def test_to_decor_reports_fill_kind_and_average_color_for_gradient():
     assert decor.fill_kind == "gradient"
     assert decor.has_fill is True
     assert decor.fill_hex == "#808080"  # среднее (000000, FFFFFF)
+
+
+def test_to_decor_marks_repeat_group_membership_when_given_an_index():
+    """`_to_decor` получает готовую позицию в группе повтора (см.
+    `_decor_repeat_membership`) от вызывающего (`_mine_slide`) и просто
+    переносит её в `DecorShape` — сам `_to_decor` геометрию не считает."""
+    element = etree.fromstring(_GRADIENT_DECOR_SHAPE_XML)
+    ref = _ref(Box(0.0, 0.0, 0.1, 0.1), element=element)
+
+    decor = _to_decor(None, {}, ref, _theme(), {}, 2)
+
+    assert decor.repeat_group is True
+    assert decor.repeat_index == 2
+
+
+def test_to_decor_defaults_to_no_repeat_group():
+    """Обратная совместимость: без явного `repeat_index` (как и раньше,
+    прямые вызовы из тестов без пятого аргумента) декор остаётся вне
+    группы повтора — тот же смысл, что и до этой правки."""
+    element = etree.fromstring(_GRADIENT_DECOR_SHAPE_XML)
+    ref = _ref(Box(0.0, 0.0, 0.1, 0.1), element=element)
+
+    decor = _to_decor(None, {}, ref, _theme(), {})
+
+    assert decor.repeat_group is False
+    assert decor.repeat_index == 0
+
+
+# --- Task 9 повторное ревью, находка №1 ("главная находка"): декор группы
+# повтора должен знать о своей принадлежности группе — та же логика, что уже
+# находит повтор текстовых слотов (`_find_repeat`), применённая к декору
+# (`_decor_repeat_membership`). -------------------------------------------
+
+
+def test_decor_repeat_membership_matches_axis_and_step_of_the_content_repeat():
+    """Шесть декоративных плашек с тем же шагом/осью, что и повтор шести
+    карточек текста, опознаются как ОДНА группа повтора декора — то же
+    структурное правило, что уже находит `_find_repeat` для текстовых
+    слотов (совпадающий размер, постоянный шаг, та же ось), применённое к
+    декору: плашка сидит ПОД карточкой с постоянным отступом, поэтому шаг
+    лево-в-лево у плашек равен шагу у текстовых слотов, даже если сами
+    плашки крупнее слота."""
+    boxes = _row([0.05, 0.24, 0.43, 0.62, 0.81], top=0.3, width=0.15, height=0.1)
+    content = [_ref(b) for b in boxes]
+    tiers = [_tier(step="h2") for _ in boxes]
+    repeat, _ = _find_repeat(content, tiers)
+    assert repeat is not None and repeat.count == 5
+
+    decor_boxes = _row([0.04, 0.23, 0.42, 0.61, 0.80], top=0.28, width=0.17, height=0.14)
+    decor_refs = [_ref(b) for b in decor_boxes]
+
+    membership = _decor_repeat_membership(decor_refs, repeat)
+    assert set(membership) == set(range(5))
+    assert sorted(membership.values()) == [0, 1, 2, 3, 4]
+
+
+def test_decor_repeat_membership_ignores_decor_with_a_different_step():
+    """Декор, чей шаг/ось не совпадает с повтором текстовых слотов (не тот
+    же ряд/сетка — случайный орнамент где-то ещё на слайде), не считается
+    частью группы: иначе два независимых, никак не связанных ряда с
+    похожим числом элементов слились бы ложно."""
+    boxes = _row([0.05, 0.24, 0.43, 0.62, 0.81], top=0.3, width=0.15, height=0.1)
+    content = [_ref(b) for b in boxes]
+    tiers = [_tier(step="h2") for _ in boxes]
+    repeat, _ = _find_repeat(content, tiers)
+
+    unrelated = _row([0.05, 0.5], top=0.8, width=0.1, height=0.05)  # другой шаг, не связан с repeat
+    membership = _decor_repeat_membership([_ref(b) for b in unrelated], repeat)
+    assert membership == {}
+
+
+def test_decor_repeat_membership_empty_without_a_content_repeat():
+    """Нет повтора текстовых слотов на этом слайде (`repeat=None`) — декору
+    физически не с чем сверять шаг, группа повтора не заводится вовсе."""
+    decor_boxes = _row([0.05, 0.24, 0.43], top=0.3, width=0.15, height=0.1)
+    membership = _decor_repeat_membership([_ref(b) for b in decor_boxes], None)
+    assert membership == {}
 
 
 # --- находка №6 (мелочи): _capacity учитывает размер последней карточки ---

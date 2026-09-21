@@ -164,7 +164,23 @@ class DecorShape:
     стоп-точек, для узора — среднее переднего/заднего цвета, для картинки —
     среднее пикселей уменьшенной копии (тот же приём, что
     `layouts._picture_luminance`, только цвет, а не яркость).
-    """
+
+    `repeat_group`/`repeat_index` (Task 9 повторное ревью, находка №1,
+    "главная находка"): принадлежит ли декоративный шейп ТОЙ ЖЕ
+    повторяющейся сетке, что и `Pattern.repeat` текстовых слотов — шесть
+    одинаковых карточных плашек под шестью карточками текста это не шесть
+    независимых украшений, а ОДИН декоративный элемент, повторённый шесть
+    раз (см. `_decor_repeat_membership`). Без этого признака `compose/`
+    физически нечем отличить "эта плашка — часть повтора, разверни её
+    вместе с текстом" от "эта плашка — самостоятельный элемент дизайна,
+    переноси как есть": раньше (до этой правки) ВЕСЬ декор переносился
+    статически, независимо от фактического числа элементов содержания —
+    раскладка, снятая с шести карточек, под два элемента содержания
+    оставляла четыре пустые рамки на слайде. `repeat_index` — позиция
+    декора внутри группы (0-based, по возрастанию координаты вдоль оси
+    повтора), тот же приём, что `expand_repeat` использует для текстовых
+    слотов. `False`/`0` по умолчанию — декор вне группы повтора (логотип,
+    разделительная линия, самостоятельная плашка), переносится КАК ЕСТЬ."""
     kind: str
     box: Box
     rotation: float
@@ -173,6 +189,8 @@ class DecorShape:
     fill_hex: str | None
     has_fill: bool
     fill_kind: str = "unspecified"
+    repeat_group: bool = False
+    repeat_index: int = 0
 
 
 @dataclass(frozen=True)
@@ -404,7 +422,11 @@ def _mine_slide(
     if score < _MIN_SCORE:
         return None
 
-    decor_shapes = [_to_decor(pkg, rels, ref, theme, decor_image_cache) for ref in decor]
+    decor_membership = _decor_repeat_membership(decor, repeat)
+    decor_shapes = [
+        _to_decor(pkg, rels, ref, theme, decor_image_cache, decor_membership.get(i))
+        for i, ref in enumerate(decor)
+    ]
 
     return Pattern(
         pattern_id=f"{Path(slide_part).stem}",
@@ -893,6 +915,55 @@ def _find_repeat(
     # (`slot_roles`), которое может случайно схлопнуться, если несколько
     # элементов группы получили одну и ту же роль.
     return RepeatSpec(axis=axis, count=count, step=step, slot_roles=[], group_size=len(best)), roles_by_index
+
+
+def _decor_repeat_membership(decor: list[ShapeRef], repeat: RepeatSpec | None) -> dict[int, int]:
+    """Декор, принадлежащий ТОЙ ЖЕ повторяющейся сетке, что и `repeat`
+    (уже найденный `_find_repeat` для текстовых слотов ЭТОГО ЖЕ слайда) —
+    Task 9 повторное ревью, находка №1 ("главная находка"): шесть
+    одинаковых карточных плашек под шестью карточками текста — это не
+    шесть независимых украшений, а ОДИН декоративный элемент, повторённый
+    шесть раз, и он часть той же группы, что и текстовые слоты.
+
+    Принадлежность определяется ТЕМ ЖЕ МЕХАНИЗМОМ, что уже находит повтор
+    текстовых слотов (`_find_repeat` выше): одинаковый размер декора
+    (допуск `_SIZE_TOLERANCE`, `_group_by_size`), постоянный шаг вдоль оси
+    (`_spaced`) — и этот шаг обязан совпасть (допуск `_STEP_TOLERANCE`) с
+    ОСЬЮ и ШАГОМ уже найденного `repeat` контентных слотов: плашка карточки
+    сидит ПОД карточкой с постоянным отступом, поэтому шаг между плашками
+    (лево-в-лево/верх-в-верх) равен шагу между текстовыми слотами их
+    карточек, даже если сами плашки крупнее слота (общий отступ сдвигает
+    все плашки на одну и ту же величину, разница шага не меняется). Без
+    привязки к `repeat.axis`/`repeat.step`, а только "нашли ряд одинаковых
+    штук с постоянным шагом" — риск ложно принять за группу повтора
+    декоративный орнамент/сетку линий, шагающую с СОВЕРШЕННО ДРУГИМ шагом,
+    случайно совпавшим по количеству элементов; привязка к уже известному
+    шагу content-повтора устраняет эту двусмысленность.
+
+    Возвращает "индекс шейпа в `decor` -> позиция в группе" (0-based, по
+    возрастанию координаты вдоль оси повтора) только для декора, вошедшего
+    в такую сетку; пустой словарь, если у слайда нет повтора текстовых
+    слотов вовсе, или ни одна группа декора не шагает тем же шагом по той
+    же оси (декор остаётся вне группы — переносится статически, как и
+    раньше)."""
+    if repeat is None or repeat.step <= 0 or not decor:
+        return {}
+    indices = list(range(len(decor)))
+    boxes = [ref.box for ref in decor]
+    for group in _group_by_size(indices, boxes):
+        if len(group) < _MIN_REPEAT_COUNT:
+            continue
+        member_boxes = sorted((boxes[i] for i in group), key=lambda b: (b.left, b.top))
+        spaced = _spaced(member_boxes)
+        if spaced is None:
+            continue
+        axis, step = spaced
+        if axis != repeat.axis or abs(step - repeat.step) > _STEP_TOLERANCE:
+            continue
+        coord = (lambda b: b.left) if axis == "x" else (lambda b: b.top)
+        ordered = sorted(group, key=lambda i: coord(boxes[i]))
+        return {idx: pos for pos, idx in enumerate(ordered)}
+    return {}
 
 
 # --- назначение финальных ролей ---------------------------------------------
@@ -1637,8 +1708,12 @@ def _picture_fill_average_color(
 
 def _to_decor(
     pkg: PptxPackage, rels: dict[str, str], ref: ShapeRef, theme: ThemeInfo,
-    decor_image_cache: dict[str, str | None],
+    decor_image_cache: dict[str, str | None], repeat_index: int | None = None,
 ) -> DecorShape:
+    """`repeat_index` — позиция этого декора в группе повтора
+    (`_decor_repeat_membership`), если он в неё вошёл; `None` (по
+    умолчанию, обратная совместимость с прямыми вызовами из тестов) —
+    декор вне группы повтора, `DecorShape.repeat_group` остаётся `False`."""
     sp_pr = ref.element.find(qn("p:spPr")) if ref.kind in ("shape", "connector") else None
     fill_el = _pick_fill_element(sp_pr) if sp_pr is not None else None
     fill_kind = _FILL_TAG_TO_KIND.get(local_name(fill_el), "unspecified") if fill_el is not None else "unspecified"
@@ -1658,6 +1733,7 @@ def _to_decor(
     return DecorShape(
         kind=ref.kind, box=ref.box, rotation=ref.rotation, flip_h=ref.flip_h, flip_v=ref.flip_v,
         fill_hex=fill_hex, has_fill=has_fill, fill_kind=fill_kind,
+        repeat_group=repeat_index is not None, repeat_index=repeat_index or 0,
     )
 
 
