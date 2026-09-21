@@ -25,7 +25,7 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.template.grid import build_grid
 from deckforge.template.layouts import (
     PlaceholderSlot, _argmax, _effective_master_title_size, _features, _geometry_scores,
-    build_layout_catalog,
+    _load_synonyms, _name_scores, build_layout_catalog,
 )
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 
@@ -449,5 +449,56 @@ def test_effective_master_title_size_reads_master_txstyles():
         font_scheme_degraded=False, text_styles_degraded=True, is_stock_office_palette=False,
     )
     assert _effective_master_title_size(pkg, "ppt/slideMasters/slideMaster1.xml", degraded, canvas) is None
+
+
+def test_two_content_maps_to_two_col_not_content():
+    """Находка №3: 'Two Content' — стандартное имя PowerPoint для
+    двухколоночного макета — содержит подстроку 'content' и раньше попадала
+    в группу контентных, потому что сопоставление шло по первому совпавшему
+    короткому паттерну. Более специфичный (длинный) вариант обязан
+    поглощать более общий."""
+    synonyms = _load_synonyms()
+    assert _name_scores("Two Content", synonyms) == {"two_col": 1.0}
+
+
+def test_title_and_content_does_not_become_title():
+    """Находка №3: 'Title and Content' — стандартное контентное имя
+    PowerPoint — содержит подстроку 'title' и раньше выигрывала бы тай-брейк
+    геометрии как титульный макет (title стоит раньше content в
+    _TIE_BREAK_PRIORITY), если бы 'title' не поглощался более длинным и
+    точным 'title and content'."""
+    synonyms = _load_synonyms()
+    assert _name_scores("Title and Content", synonyms) == {"content": 1.0}
+
+
+def test_genuine_multivalent_name_still_splits_between_groups():
+    """Специфичность не должна ломать честную многозначность (докстрока
+    config/layout-kinds.yaml): 'титул' и 'раздел' — независимые паттерны, ни
+    один не substring другого, оба обязаны остаться в игре."""
+    synonyms = _load_synonyms()
+    assert _name_scores("Титульный слайд раздела", synonyms) == {"title": 0.5, "section": 0.5}
+
+
+def test_standard_powerpoint_layout_names_are_recognized():
+    """Находка №3: полный набор стандартных имён макетов PowerPoint (англ. и
+    локализованных рус.) должен распознаваться словарём — см.
+    config/layout-kinds.yaml."""
+    synonyms = _load_synonyms()
+    expected = {
+        "Title Slide": "title", "Титульный слайд": "title",
+        "Title and Content": "content", "Заголовок и объект": "content",
+        "Section Header": "section", "Заголовок раздела": "section",
+        "Two Content": "two_col", "Два объекта": "two_col",
+        "Comparison": "two_col", "Сравнение": "two_col",
+        "Title Only": "section", "Только заголовок": "section",
+        "Blank": "free", "Пустой слайд": "free",
+        "Content with Caption": "two_col", "Объект с подписью": "two_col",
+        "Picture with Caption": "image", "Рисунок с подписью": "image",
+        "Title and Vertical Text": "content", "Заголовок и вертикальный текст": "content",
+        "Vertical Title and Text": "content", "Вертикальный заголовок и текст": "content",
+    }
+    for name, kind in expected.items():
+        scores = _name_scores(name, synonyms)
+        assert _argmax(scores) == kind, f"{name!r}: ожидали {kind!r}, получили {scores!r}"
 
 

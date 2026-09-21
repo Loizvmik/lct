@@ -402,11 +402,40 @@ def _name_scores(raw_name: str, synonyms: dict[str, list[str]]) -> dict[str, flo
     """Голос имени за каждый kind — 0, если имя не совпало ни с одной
     группой; при совпадении с несколькими группами вес делится поровну
     между ними (см. докстроку config/layout-kinds.yaml про честную
-    многозначность имени, а не ошибку словаря)."""
+    многозначность имени, а не ошибку словаря).
+
+    Находка код-ревью Task 5, п.3: раньше совпадение было "любая подстрока
+    любого паттерна побеждает" — более длинное и специфичное имя проигрывало
+    более короткому и общему, если оба совпадали (стандартное имя PowerPoint
+    "Two Content" содержит подстроку "content" и попадало в группу
+    контентных, а не двухколоночных). Правило специфичности — по ТЕКСТУ, не
+    по одной только длине: совпавший паттерн `p1` поглощается (не участвует
+    в голосовании), если существует ДРУГОЙ совпавший паттерн `p2` из ДРУГОЙ
+    группы, буквально содержащий `p1` целиком (`p1 in p2`) — тогда `p1` не
+    несёт отдельного сигнала, это просто часть более специфичного текста.
+    Паттерны, ни один из которых не substring другого (`"титул"`/`"раздел"`
+    у "Титульный слайд раздела" — независимые, ни один не содержится в
+    другом), остаются оба — это и есть честная многозначность, не то, что
+    специфичность обязана схлопнуть."""
     stripped = _PREFIX_RE.sub("", raw_name).strip().lower()
-    matched = [kind for kind, patterns in synonyms.items() if any(p in stripped for p in patterns)]
-    if not matched:
+
+    hits = [
+        (kind, pattern)
+        for kind, patterns in synonyms.items()
+        for pattern in patterns
+        if pattern in stripped
+    ]
+    if not hits:
         return {}
+
+    survivors = [
+        (kind, pattern) for kind, pattern in hits
+        if not any(
+            other_kind != kind and pattern != other_pattern and pattern in other_pattern
+            for other_kind, other_pattern in hits
+        )
+    ]
+    matched = sorted({kind for kind, _ in survivors})
     share = 1.0 / len(matched)
     return {kind: share for kind in matched}
 
