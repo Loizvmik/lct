@@ -20,7 +20,7 @@ from deckforge.plan.spec import (
     Block, BulletBlock, Card, CardBlock, DeckSpec, Kpi, KpiBlock, QuoteBlock, SlideSpec, TextBlock,
 )
 from deckforge.template.grid import Grid
-from deckforge.template.patterns import Pattern, PatternSlot
+from deckforge.template.patterns import DecorShape, Pattern, PatternSlot
 
 _DEFAULT_BULLET_CHAR = "•"
 
@@ -90,6 +90,18 @@ def _slots_by_role(pattern: Pattern, slide_spec: SlideSpec) -> dict[str, list[Pa
         if slot.role in repeat_roles:
             continue
         by_role.setdefault(slot.role, []).append(slot)
+    # Task 9 повторное ревью, находка №2 ("важное"): слоты одной роли не
+    # были упорядочены по размеру — `_take_one` (см. ниже) брал ПЕРВЫЙ по
+    # порядку мининга слот этой роли, независимо от того, влезает ли в него
+    # содержание. На контрольном ЛЦТ2026 (слайд "two_col") это укладывало
+    # абзац в крошечный слот-подпись у нижнего правого угла, который тот же
+    # паттерн несёт наравне с нормальным слотом "body" — текст резался
+    # краем холста. Сортировка по убыванию площади (тот же приём, что уже
+    # применяет `_pick_body_slot` внутри группы повтора карточек, см. ниже)
+    # гарантирует, что `_take_one` вернёт САМЫЙ ЁМКИЙ слот этой роли первым
+    # — содержание кладётся в тот, что вмещает, а не в первый попавшийся.
+    for slots in by_role.values():
+        slots.sort(key=lambda s: -(s.box.width * s.box.height))
     return by_role
 
 
@@ -249,17 +261,84 @@ def expand_repeat(pattern: Pattern, n: int, grid: Grid) -> list[list[PatternSlot
     # завышенным "свободным" пространством и последняя карточка уезжала за
     # правое поле холста.
     item_size = max(size_of(s.box) for s in template_group)
+    positions = _expand_positions(axis, item_size, n, grid)
 
+    result: list[list[PatternSlot]] = []
+    for pos in positions:
+        result.append([replace(slot, box=with_axis(slot.box, pos)) for slot in template_group])
+    return result
+
+
+def _expand_positions(axis: str, item_size: float, n: int, grid: Grid) -> list[float]:
+    """Позиции (координата вдоль `axis`, доли холста) `n` равномерно
+    распределённых единиц размера `item_size` между полями шаблона —
+    геометрическое ядро, общее для `expand_repeat` (текстовые слоты) и
+    `expand_decor` (декор группы повтора, см. ниже): `new_step = (span -
+    item_size) / (n - 1)`, тот же вывод, что в докстроке `expand_repeat`
+    выше (единственный геометрически осмысленный способ распределить
+    произвольное `n` между двумя фиксированными полями), вынесенный в
+    отдельную функцию, чтобы декор пересчитывался ТЕМ ЖЕ шагом, что и
+    текст, а не отдельной, потенциально разъезжающейся копией формулы."""
     margin_lo = grid.margin_left if axis == "x" else grid.margin_top
     margin_hi = grid.margin_right if axis == "x" else grid.margin_bottom
     span = max(1.0 - margin_lo - margin_hi, 0.0)
     usable = max(span - item_size, 0.0)
     new_step = usable / (n - 1) if n > 1 else 0.0
+    return [margin_lo + i * new_step for i in range(n)]
 
-    result: list[list[PatternSlot]] = []
-    for i in range(n):
-        pos = margin_lo + i * new_step
-        result.append([replace(slot, box=with_axis(slot.box, pos)) for slot in template_group])
+
+def expand_decor(pattern: Pattern, n: int | None, grid: Grid) -> list[DecorShape]:
+    """Разворачивает декор ГРУППЫ ПОВТОРА (`DecorShape.repeat_group`, см.
+    `template/patterns.py::_decor_repeat_membership`) под фактическое число
+    элементов `n` — ВМЕСТЕ с текстовыми слотами (`expand_repeat`) и ТЕМ ЖЕ
+    пересчётом шага (`_expand_positions`, общее геометрическое ядро с
+    `expand_repeat` выше): раскладка, снятая с шести декоративных рамок,
+    под два элемента содержания несёт на слайде ДВЕ рамки, не шесть —
+    лишние повторы (намайненный `RepeatSpec.count` больше `n`) не
+    рисуются вовсе (Task 9 повторное ревью, находка №1, "главная находка":
+    VK Tech, "Риски раскатки" — шесть намайненных рамок, два элемента
+    содержания, четыре оставались пустыми).
+
+    Единица повтора (размер по оси) берётся с САМОЙ ПЕРВОЙ по оси
+    намайненной группы декора (`repeat_index == min(...)`), тот же приём,
+    что `expand_repeat` использует для текстовых слотов (эталон формы
+    карточки/плашки этой раскладки).
+
+    Декор ВНЕ группы повтора (`repeat_group=False` — логотип,
+    разделительная линия, самостоятельная плашка) переносится КАК ЕСТЬ, без
+    изменений: он не связан с числом элементов содержания.
+
+    `n=None` — на слайде нет содержания, которое разворачивает
+    `pattern.repeat` (сегодня это только `CardBlock` с непустыми `items`,
+    единственный вызывающий `expand_repeat`, см. `_assign_cards`) — декор
+    остаётся как намайнен, менять его не под что."""
+    grouped = [d for d in pattern.decor if d.repeat_group]
+    ungrouped = [d for d in pattern.decor if not d.repeat_group]
+    if not grouped or pattern.repeat is None or n is None:
+        return list(pattern.decor)
+    if n <= 0:
+        return ungrouped
+
+    repeat = pattern.repeat
+    axis = repeat.axis
+
+    def with_axis(box: Box, value: float) -> Box:
+        return replace(box, left=value) if axis == "x" else replace(box, top=value)
+
+    def size_of(box: Box) -> float:
+        return box.width if axis == "x" else box.height
+
+    by_index: dict[int, list[DecorShape]] = {}
+    for d in grouped:
+        by_index.setdefault(d.repeat_index, []).append(d)
+    template_group = by_index[min(by_index)]
+    item_size = max(size_of(d.box) for d in template_group)
+    positions = _expand_positions(axis, item_size, n, grid)
+
+    result = list(ungrouped)
+    for i, pos in enumerate(positions):
+        for d in template_group:
+            result.append(replace(d, box=with_axis(d.box, pos), repeat_index=i))
     return result
 
 

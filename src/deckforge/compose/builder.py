@@ -11,7 +11,7 @@ python-pptx (рисование) одновременно — блоки кон�
 """
 from __future__ import annotations
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 
@@ -21,7 +21,7 @@ from pptx.dml.color import RGBColor
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Pt
 
-from deckforge.compose.blocks import Paragraph, SlotContent, assign_content, find_bullet_char
+from deckforge.compose.blocks import Paragraph, SlotContent, assign_content, expand_decor, find_bullet_char
 from deckforge.compose.decor import apply_decor
 from deckforge.compose.textfit import measure, register_template_fonts
 from deckforge.ooxml.geometry import Box
@@ -171,9 +171,25 @@ def place_slide(
 
     canvas_width_emu = profile.canvas_width_emu
     canvas_height_emu = profile.canvas_height_emu
-    apply_decor(slide, pattern.decor, canvas_width_emu, canvas_height_emu)
-
     grid = _grid_from_model(profile.grid)
+
+    # Декор группы повтора (плашки карточек и т.п.) разворачивается под
+    # фактическое число элементов ВМЕСТЕ с текстовыми слотами — правка по
+    # итогам повторного визуального ревью (отчёт задачи, находка №1,
+    # "главная находка"): раньше `pattern.decor` переносился статически,
+    # независимо от того, сколько карточек реально легло на слайд, и
+    # раскладка на шесть карточек под два элемента содержания оставляла
+    # четыре пустые рамки. Декор вне группы повтора (`expand_decor` не
+    # трогает `repeat_group=False`) переносится как и раньше.
+    decor = expand_decor(pattern, _repeat_item_count(slide_spec), grid)
+    apply_decor(slide, decor, canvas_width_emu, canvas_height_emu)
+    # `_local_background_is_dark` ищет охватывающую плашку декора ПОД
+    # слотом (см. её докстроку) — обязана видеть УЖЕ развёрнутые позиции
+    # плашек (`decor`, не статический `pattern.decor`), иначе контраст
+    # карточки №2 может посчитаться от плашки, стоявшей там на
+    # исходном, ненамайненном слайде-примере.
+    effective_pattern = pattern if decor is pattern.decor else replace(pattern, decor=decor)
+
     family = _primary_family(profile)
     for content in assign_content(slide_spec, pattern, grid):
         # Контраст — от фона НЕПОСРЕДСТВЕННО под этим слотом (плашка декора,
@@ -181,7 +197,7 @@ def place_slide(
         # `_local_background_is_dark`.
         _draw_slot(
             slide, slide_spec, content, profile, family, bullet_char, canvas_width_emu, canvas_height_emu,
-            _local_background_is_dark(content.slot.box, pattern),
+            _local_background_is_dark(content.slot.box, effective_pattern),
         )
 
 
@@ -265,6 +281,53 @@ _FILL_RATIO_MIN = 0.25
 _FILL_RATIO_MAX = 0.75
 
 
+def _repeat_item_count(slide_spec: SlideSpec) -> int | None:
+    """Число элементов, которые РЕАЛЬНО развернут `pattern.repeat` на этом
+    слайде — сегодня это только `CardBlock.items` (единственный блок,
+    зовущий `expand_repeat`/`expand_decor`, см. `_assign_cards` в
+    `blocks.py`; `KpiBlock` раздаёт KPI-слоты напрямую, без пересчёта
+    геометрии повтора). `None`, если на слайде нет такого блока — ни
+    подбору паттерна (`_capacity_badness`), ни развороту декора
+    (`place_slide`) не с чем сверять вместимость раскладки."""
+    for block in slide_spec.blocks:
+        if isinstance(block, CardBlock) and block.items:
+            return len(block.items)
+    return None
+
+
+# Вес расхождения вместимости раскладки при ранжировании кандидатов —
+# см. `_capacity_badness`: доля (не абсолютное число) намайненной
+# `Capacity.max_items`, на которую она разошлась с фактическим объёмом
+# содержания. Обоснование доли, а не абсолютной разницы (постановщик,
+# "порог обоснуй долей, а не наблюдением за файлами"): сама ёмкость
+# раскладки — величина шаблон-специфичная (3 карточки у одного шаблона,
+# 8 у другого), абсолютная "на 4 карточки больше" ничего не говорит без
+# знания масштаба самой раскладки, а доля от max_items сразу отвечает на
+# вопрос "во сколько раз раскладка избыточна/недостаточна" одинаково на
+# любом шаблоне: раскладка на 6 под 2 элемента даёт 4/6 ≈ 0.67 — почти
+# такая же избыточность, что и раскладка на 3 под 1 элемент (2/3 ≈ 0.67),
+# хотя абсолютная разница у них разная (4 против 2).
+def _capacity_badness(pattern: Pattern, slide_spec: SlideSpec) -> float:
+    """0.0, когда `Capacity.max_items` раскладки совпадает с фактическим
+    числом элементов содержания слайда (или когда сравнивать не с чем —
+    не card-слайд, см. `_repeat_item_count`), иначе — относительная доля
+    расхождения. Используется только как ранжирующий сигнал `_pick_pattern`
+    (не жёсткий отказ: раскладка с "неидеальной" вместимостью всё ещё
+    может быть единственным кандидатом вида `kind` — лучше неидеальный
+    выбор, чем никакого, тот же принцип, что и `_fill_badness`).
+
+    Находка ревью ("главная находка"): раскладка, рассчитанная на шесть
+    элементов, под два элемента содержания — плохой выбор, ДАЖЕ ЕСЛИ текст
+    формально влезает (`fit.ok`) и не выглядит пустым по `fill_ratio`
+    (`fill_ratio` меряет ЧЕРНИЛА фактически положенного текста, а не число
+    пустых декоративных рамок вокруг него — это разные сигналы, `Capacity.
+    max_items` нужен независимо)."""
+    n = _repeat_item_count(slide_spec)
+    if n is None or pattern.capacity.max_items <= 0:
+        return 0.0
+    return abs(pattern.capacity.max_items - n) / pattern.capacity.max_items
+
+
 def _fill_badness(fill_ratio: float) -> float:
     """0.0, когда `fill_ratio` укладывается в [_FILL_RATIO_MIN,
     _FILL_RATIO_MAX], иначе — на сколько (в долях холста) он вышел за
@@ -328,12 +391,20 @@ def _pick_pattern(
        влезающего;
     2. среди не влезающих — наименьшее `overflow_ratio` (бриф: "если ни
        одна не подходит, выбирай ту, где переполнение наименьшее");
-    3. "не слишком пусто/плотно" (`_fill_badness`, ТЗ D05) — среди влезающих
+    3. вместимость раскладки (`_capacity_badness`, находка повторного
+       визуального ревью, "главная находка") — раскладка, чья `Capacity.
+       max_items` заметно расходится с фактическим числом элементов
+       содержания (шесть слотов повтора под два элемента), хуже раскладки
+       той же вместимости, ДАЖЕ КОГДА содержание формально влезает и не
+       выглядит пустым по `fill_ratio` — иначе выбор физически нечем
+       отличить раскладку, оставляющую четыре пустых декоративных рамки, от
+       нормально заполненной;
+    4. "не слишком пусто/плотно" (`_fill_badness`, ТЗ D05) — среди влезающих
        кандидатов раскладка, где содержание не тонет в пустоте и не
        перегружает холст, предпочтительнее формально влезающей, но
        занимающей четверть холста;
-    4. паттерн с более высоким `score` (майнинг увереннее в нём);
-    5. `Variant.visual`/`Variant.dense` — тот же бонус/штраф за декор, что и
+    5. паттерн с более высоким `score` (майнинг увереннее в нём);
+    6. `Variant.visual`/`Variant.dense` — тот же бонус/штраф за декор, что и
        раньше (временная эвристика Task 13, см. докстроку `Variant`)."""
     candidates = [p for p in patterns if p.kind == slide_spec.kind]
     if not candidates:
@@ -342,7 +413,10 @@ def _pick_pattern(
     def rank(p: Pattern):
         fit = fits(slide_spec, p, profile)
         visual_bias = len(p.decor) if variant is Variant.visual else -len(p.decor)
-        return (0 if fit.ok else 1, fit.overflow_ratio, _fill_badness(fit.fill_ratio), -p.score, -visual_bias)
+        return (
+            0 if fit.ok else 1, fit.overflow_ratio, _capacity_badness(p, slide_spec),
+            _fill_badness(fit.fill_ratio), -p.score, -visual_bias,
+        )
 
     return min(candidates, key=rank)
 
@@ -408,6 +482,7 @@ def _pattern_from_model(model) -> Pattern:
         DecorShape(
             kind=d.kind, box=_box_from_model(d.box), rotation=d.rotation, flip_h=d.flip_h, flip_v=d.flip_v,
             fill_hex=d.fill_hex, has_fill=d.has_fill, fill_kind=d.fill_kind,
+            repeat_group=d.repeat_group, repeat_index=d.repeat_index,
         )
         for d in model.decor
     ]

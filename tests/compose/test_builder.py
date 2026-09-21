@@ -245,7 +245,9 @@ def _grid_stub() -> Grid:
     )
 
 
-def _fake_cards_pattern(pattern_id: str, card_box: Box, score: float = 1.0, extra_slots=()) -> Pattern:
+def _fake_cards_pattern(
+    pattern_id: str, card_box: Box, score: float = 1.0, extra_slots=(), capacity_max_items: int = 6,
+) -> Pattern:
     body_slot = PatternSlot(
         role="card_body", box=card_box, size_pt=16.0 * 1.333, color_hex=None,
         align="l", max_chars=999, wraps=True,
@@ -253,7 +255,10 @@ def _fake_cards_pattern(pattern_id: str, card_box: Box, score: float = 1.0, extr
     return Pattern(
         pattern_id=pattern_id, source_slide_index=[0], layout_id="slideLayout1", kind="cards",
         slots=[body_slot, *extra_slots], repeat=RepeatSpec(axis="x", count=1, step=0.0, slot_roles=["card_body"]),
-        decor=[], capacity=Capacity(max_items=6, max_chars_per_item=999, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        decor=[],
+        capacity=Capacity(
+            max_items=capacity_max_items, max_chars_per_item=999, max_bullets=0, max_series=0, max_rows=0, max_cols=0,
+        ),
         score=score, is_dark=False,
     )
 
@@ -303,6 +308,67 @@ def test_pattern_picker_avoids_a_layout_that_is_mostly_empty_for_this_content():
     )
     picked = _pick_pattern(slide_spec, [sparse, dense], PROFILE, Variant.dense)
     assert picked.pattern_id == "dense"
+
+
+def test_pattern_picker_prefers_the_layout_whose_capacity_matches_the_content_volume():
+    """Task 9 повторное ревью, находка №1 ("главная находка"): раскладка на
+    шесть карточек и раскладка на две карточки формально ОБЕ влезают под
+    два элемента короткого содержания и обе не выглядят пустыми по
+    `fill_ratio` (короткий текст занимает ту же долю ОДИНАКОВОГО по
+    размеру слота в обоих кандидатах, см. одинаковый `card_box`) — подбор
+    обязан предпочесть ту, чья `Capacity.max_items` ближе к фактическому
+    числу элементов, а не первую формально подходящую (иначе раскладка,
+    рассчитанная на шесть элементов, под два — плохой выбор: четыре
+    пустые декоративные рамки, ровно то, что увидел постановщик на VK
+    Tech, "Риски раскатки")."""
+    box = Box(0.1, 0.3, 0.3, 0.3)
+    roomy = _fake_cards_pattern("six-slot", box, capacity_max_items=6)
+    snug = _fake_cards_pattern("two-slot", box, capacity_max_items=2)
+    slide_spec = SlideSpec(
+        index=0, kind="cards", headline="",
+        blocks=[CardBlock(items=[Card(body="Коротко"), Card(body="И ещё короче")])],
+    )
+    picked = _pick_pattern(slide_spec, [roomy, snug], PROFILE, Variant.dense)
+    assert picked.pattern_id == "two-slot"
+
+
+def test_text_block_goes_to_the_biggest_slot_of_its_role_not_the_first_one():
+    """Task 9 повторное ревью, находка №2 ("важное"): на контрольном
+    ЛЦТ2026 (слайд "two_col") паттерн несёт ДВА слота роли "body" ВНЕ
+    группы повтора — один нормального размера, второй крошечный (место
+    под короткую подпись, судя по геометрии, не под абзац). Раньше
+    `_slots_by_role`/`_take_one` отдавали содержание ПЕРВОМУ по порядку
+    мининга слоту этой роли, независимо от размера — абзац утекал в
+    маленький слот у угла холста и резался краем. Содержание обязано лечь
+    в тот слот роли, что вмещает (самый ёмкий по площади), а не в первый
+    попавшийся — тот же приём, что `_pick_body_slot` уже применяет внутри
+    группы повтора карточек."""
+    from deckforge.compose.blocks import assign_content
+
+    tiny = PatternSlot(
+        role="body", box=Box(0.7, 0.85, 0.1, 0.06), size_pt=12.0, color_hex=None,
+        align="l", max_chars=20, wraps=False, sample_text="01",
+    )
+    roomy = PatternSlot(
+        role="body", box=Box(0.1, 0.2, 0.35, 0.5), size_pt=14.0, color_hex=None,
+        align="l", max_chars=400, wraps=True, sample_text="Текст колонки",
+    )
+    pattern = Pattern(
+        pattern_id="p", source_slide_index=[0], layout_id="L", kind="two_col",
+        # Порядок в списке — намеренно "неудобный" (маленький слот первым):
+        # старый код (pop(0) без сортировки) брал бы именно его.
+        slots=[tiny, roomy], repeat=None, decor=[],
+        capacity=Capacity(max_items=1, max_chars_per_item=400, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,
+    )
+    slide_spec = SlideSpec(
+        index=0, kind="two_col", headline="",
+        blocks=[TextBlock(text="Кадровая система отдаёт данные с задержкой")],
+    )
+    result = assign_content(slide_spec, pattern, _grid_stub())
+    body_contents = [c for c in result if c.role_hint == "body"]
+    assert len(body_contents) == 1
+    assert body_contents[0].slot.sample_text == "Текст колонки"
 
 
 def test_cosmetic_truncation_keeps_most_of_the_original_text():
