@@ -1094,15 +1094,24 @@ def _picture_luminance(
 
     try:
         with Image.open(io.BytesIO(pkg.part(target))) as img:
-            pixels = list(img.convert("RGB").resize(_BG_IMAGE_SAMPLE_SIZE).getdata())
+            # `Image.getdata()` уходит в Pillow 14 (DeprecationWarning на
+            # прогоне тестов, брифом задачи — "почини заодно"). `tobytes()`
+            # на RGB-изображении даёт тот же набор пикселей построчно, по 3
+            # байта на пиксель — без промежуточного объекта `ImagingCore`,
+            # который `getdata()` оборачивал.
+            data = img.convert("RGB").resize(_BG_IMAGE_SAMPLE_SIZE).tobytes()
     except Exception:
         cache[target] = None
         return None
-    if not pixels:
+    if not data:
         cache[target] = None
         return None
-    total = sum(_relative_luminance_rgb(r / 255, g / 255, b / 255) for r, g, b in pixels)
-    luminance = total / len(pixels)
+    pixel_count = len(data) // 3
+    total = sum(
+        _relative_luminance_rgb(data[i] / 255, data[i + 1] / 255, data[i + 2] / 255)
+        for i in range(0, pixel_count * 3, 3)
+    )
+    luminance = total / pixel_count
     cache[target] = luminance
     return luminance
 
