@@ -371,6 +371,47 @@ def test_text_block_goes_to_the_biggest_slot_of_its_role_not_the_first_one():
     assert body_contents[0].slot.sample_text == "Текст колонки"
 
 
+def test_decor_shape_fills_use_only_template_colors():
+    """Task 9 повторное ревью, находка №3 ("мелочь"): `test_only_template_
+    colors_and_fonts_are_used` выше проверяет только цвет ТЕКСТА — заливки
+    декоративных фигур формально не покрыты проверкой аудита "цвет не из
+    палитры". Цвет декора приходит из того же снятого `DecorShape.fill_hex`
+    (см. `template/patterns.py::_to_decor`, `resolve_color` против той же
+    `theme.scheme`), что и остальная палитра.
+
+    "Разрешённые" цвета для декора — не только `palette_roles.values()`
+    (найдено проверкой на реальной сборке VK Tech: три декоративные плашки
+    несут `#FAFCFF`/`#FEFFFF`/`#D6ECFF` — это буквально `theme.lt1`/
+    `theme.lt2`/`theme.accent6`, см. вывод `TemplateProfile.theme.scheme`
+    — РЕАЛЬНЫЕ цвета темы шаблона, просто не вошедшие в узкий именованный
+    набор `palette_roles` (~8 ролей на 12 цветов схемы темы). `palette_
+    roles` — курируемое ПОДМНОЖЕСТВО схемы темы для роли ТЕКСТА
+    (`_color_for_role` в builder.py намеренно снаряжает текст только
+    именованными ролями); декор переносится "как есть" (докстрока
+    `decor.py`) и законно использует ЛЮБОЙ цвет схемы темы, не только
+    именованный — это не изобретённый цвет, а буквально то, что было в
+    файле шаблона. Проверка аудита "цвет не из палитры" по духу — про
+    "не выдуман ли цвет", а не "назван ли он ролью"; для декора это
+    `palette_roles.values() | theme.scheme.values()`."""
+    allowed_colors = set(PROFILE.palette_roles.values()) | set(PROFILE.theme.scheme.values())
+    prs = Presentation(str(build_deck(CARDS_SPEC, PROFILE, TEMPLATE, Variant.visual)))
+    checked = 0
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.shape_type != MSO_SHAPE_TYPE.AUTO_SHAPE:
+                continue
+            if shape.fill.type is None:
+                continue
+            try:
+                fore = shape.fill.fore_color
+            except (TypeError, AttributeError):
+                continue
+            if fore.type is not None:
+                checked += 1
+                assert f"#{fore.rgb}" in allowed_colors
+    assert checked > 0, "не нашлось ни одной закрашенной декоративной фигуры для проверки"
+
+
 def test_cosmetic_truncation_keeps_most_of_the_original_text():
     original = "одно два три четыре пять шесть семь восемь девять десять"
     assert _is_cosmetic_truncation(original, "одно два три четыре пять шесть семь восемь…")
