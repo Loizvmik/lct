@@ -14,7 +14,7 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.color import Color
 from deckforge.ooxml.geometry import Canvas
 from deckforge.template.theme import pick_primary_master
-from deckforge.template.usage import NO_BACKGROUND, collect_usage
+from deckforge.template.usage import NO_BACKGROUND, ThemeFallback, collect_usage
 
 
 def load(name):
@@ -187,6 +187,17 @@ def test_mc_alternate_content_branches_are_not_double_counted():
     usage = _usage_from_slide_xml(_ALTERNATE_CONTENT_SLIDE)
     assert usage.total_runs == 2  # одна ветка AlternateContent + контрольный шейп
     assert usage.sizes_pt[18.0] == 1
+
+
+def test_package_without_any_master_records_no_theme_fallbacks():
+    """Пакет вовсе без мастера (EMPTY_THEME, см. докстроку _ThemeGraph) —
+    не тот же случай, что фолбэк на чужую тему первичного мастера (чужой
+    темы, которую тут можно было бы перепутать, попросту не существует):
+    theme_fallbacks обязан остаться пустым, а не засоряться на каждом
+    таком синтетическом пакете (general-purpose-ревью Task 3 повторного
+    ревью — страховка от будущей регрессии в _record_fallback)."""
+    usage = _usage_from_slide_xml(_ALTERNATE_CONTENT_SLIDE)
+    assert usage.theme_fallbacks == []
     assert usage.sizes_pt[12.0] == 1
 
 
@@ -320,7 +331,7 @@ def test_mc_falls_back_when_no_choice_is_understood():
 
 
 # --- Task 3 код-ревью, п.5: run без явного a:rPr считается, а не
-# выбрасывается — символы идут в inherited_chars, не теряются молча.
+# выбрасывается — символы идут в unstyled_chars, не теряются молча.
 
 _MIXED_RPR_SLIDE = """<?xml version="1.0" encoding="UTF-8"?>
 <p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -345,11 +356,48 @@ _MIXED_RPR_SLIDE = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+# --- Task 3 повторное код-ревью, п.4: explicit_style_chars — «есть хоть
+# одно явное свойство», не «шрифт известен». Run с одним sz, без a:latin,
+# должен попасть в explicit_style_chars (свойство есть), но не должен
+# попасть ни в один usage.fonts — шрифт для него так же неизвестен, как у
+# полностью unstyled run'а, и это не должно потеряться за общим названием.
+
+_SIZE_ONLY_SLIDE = """<?xml version="1.0" encoding="UTF-8"?>
+<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+       xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+      <p:sp>
+        <p:nvSpPr><p:cNvPr id="2" name="Text"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>
+        <p:spPr/>
+        <p:txBody>
+          <a:p><a:r><a:rPr lang="en-US" sz="1800"/><a:t>SizeOnly</a:t></a:r></a:p>
+        </p:txBody>
+      </p:sp>
+    </p:spTree>
+  </p:cSld>
+</p:sld>
+"""
+
+
+def test_explicit_style_chars_does_not_imply_known_font():
+    """Run с sz, но без a:latin: символы идут в explicit_style_chars (у
+    run'а есть явное свойство), но не должны попасть ни в один usage.fonts
+    — потребитель не должен прочитать explicit_style_chars как «доля текста
+    с известным шрифтом» (см. докстроку Usage.explicit_style_chars)."""
+    usage = _usage_from_slide_xml(_SIZE_ONLY_SLIDE)
+    assert usage.explicit_style_chars == len("SizeOnly")
+    assert usage.unstyled_chars == 0
+    assert usage.fonts == {}
+
+
 def test_run_without_rpr_is_counted_as_inherited_not_dropped():
     usage = _usage_from_slide_xml(_MIXED_RPR_SLIDE)
     assert usage.total_runs == 2
-    assert usage.explicit_chars == len("Explicit")
-    assert usage.inherited_chars == len("Inherited")
+    assert usage.explicit_style_chars == len("Explicit")
+    assert usage.unstyled_chars == len("Inherited")
     # run без rPr по-прежнему не участвует в счётчиках свойств — наследование
     # по цепочке в этой задаче не резолвится (см. докстроку модуля)
     assert usage.sizes_pt == {18.0: 1}
@@ -361,9 +409,9 @@ def test_runs_without_explicit_rpr_are_counted_on_real_templates():
     for name in ["VK Tech шаблон.pptx", "VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx",
                  "Шаблон презентации VK Education.pptx"]:
         _, usage = load(name)
-        total = usage.explicit_chars + usage.inherited_chars
-        assert total > usage.explicit_chars, name
-        assert usage.inherited_chars > 0, name
+        total = usage.explicit_style_chars + usage.unstyled_chars
+        assert total > usage.explicit_style_chars, name
+        assert usage.unstyled_chars > 0, name
 
 
 # --- Task 3 код-ревью, п.6: фон лейаута наследуется от мастера, если у
@@ -601,7 +649,7 @@ _TABLE_SLIDE = """<?xml version="1.0" encoding="UTF-8"?>
 def test_table_cell_text_and_fill_are_collected():
     usage = _usage_from_slide_xml(_TABLE_SLIDE)
     assert usage.total_runs == 1
-    assert usage.explicit_chars == len("Cell")
+    assert usage.explicit_style_chars == len("Cell")
     assert any(c.hex == "#AABBCC" for c in usage.fill)
     assert usage.text[Color(hex="#112233")] == len("Cell")
 
@@ -733,3 +781,328 @@ def test_master_itself_resolves_own_theme_directly():
     _, usage = load("VK Tech шаблон.pptx")
     assert usage.primary_theme is not None
     assert usage.primary_theme.scheme["accent1"] == "#0077FF"
+
+
+# --- Task 3 повторное код-ревью, п.1: фолбэк на тему первичного мастера
+# (когда связь лейаута с мастером или слайда с лейаутом не резолвится)
+# обязан оставлять запись — раньше был полностью молчаливым, в отличие от
+# unresolved-цветов.
+
+def _single_master_package(*, accent1: str) -> dict[str, str]:
+    """Один мастер, своя тема, без лейаутов вовсе — лейауты/слайды
+    добавляются отдельно каждым тестом ниже, чтобы каждый тест сам решал,
+    какая именно связь у них отсутствует."""
+    return {
+        "_rels/.rels": _rels_xml([("rId1", "officeDocument", "ppt/presentation.xml")]),
+        "ppt/presentation.xml": (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+            'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+            '<p:sldMasterIdLst><p:sldMasterId id="2147483649" r:id="rId1"/></p:sldMasterIdLst>'
+            '<p:sldSz cx="12192000" cy="6858000"/></p:presentation>'
+        ),
+        "ppt/_rels/presentation.xml.rels": _rels_xml([
+            ("rId1", "slideMaster", "slideMasters/slideMaster1.xml"),
+        ]),
+        "ppt/theme/theme1.xml": _theme_xml("Master1Theme", accent1),
+        "ppt/slideMasters/slideMaster1.xml": _MASTER_XML,
+        "ppt/slideMasters/_rels/slideMaster1.xml.rels": _rels_xml([
+            ("rId1", "theme", "../theme/theme1.xml"),
+        ]),
+    }
+
+
+def _package_from_files(files: dict[str, str]) -> PptxPackage:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for path, content in files.items():
+            zf.writestr(path, content)
+    buf.seek(0)
+    return PptxPackage(zipfile.ZipFile(buf, "r"))
+
+
+def _package_with_orphan_layout() -> PptxPackage:
+    """Мастер и тема в полном порядке, лейаут физически есть в пакете, но
+    у его .rels нет relationship slideMaster вовсе — связь просто не
+    резолвится (не "мастер с битой темой", это п.2 ниже)."""
+    files = _single_master_package(accent1="AA0000")
+    files["ppt/slideLayouts/slideLayout1.xml"] = _layout_with_accent1_fill_xml()
+    # намеренно нет ppt/slideLayouts/_rels/slideLayout1.xml.rels
+    return _package_from_files(files)
+
+
+def test_layout_without_master_link_falls_back_with_recorded_reason():
+    pkg = _package_with_orphan_layout()
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+    usage = collect_usage(pkg, canvas)
+
+    # Разбор не падает и не путает цвет — подставлена тема первичного
+    # мастера (единственного в пакете).
+    hexes = {c.hex for c in usage.fill}
+    assert "#AA0000" in hexes
+
+    fallback = next(
+        f for f in usage.theme_fallbacks if f.part == "ppt/slideLayouts/slideLayout1.xml"
+    )
+    assert isinstance(fallback, ThemeFallback)
+    assert fallback.fallback_to == "ppt/slideMasters/slideMaster1.xml"
+    assert fallback.reason  # непусто — человек должен понять, почему
+
+
+def _package_with_orphan_slide() -> PptxPackage:
+    """Мастер и тема в порядке, слайд физически есть, но у его .rels нет
+    relationship slideLayout вовсе."""
+    files = _single_master_package(accent1="BB1100")
+    files["ppt/slides/slide1.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>'
+        '<p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>'
+        '<p:grpSpPr/><p:sp><p:nvSpPr><p:cNvPr id="2" name="Card"/><p:cNvSpPr/><p:nvPr/></p:nvSpPr>'
+        '<p:spPr><a:solidFill><a:schemeClr val="accent1"/></a:solidFill></p:spPr></p:sp>'
+        "</p:spTree></p:cSld></p:sld>"
+    )
+    # намеренно нет ppt/slides/_rels/slide1.xml.rels
+    return _package_from_files(files)
+
+
+def test_slide_without_layout_link_falls_back_with_recorded_reason():
+    pkg = _package_with_orphan_slide()
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+    usage = collect_usage(pkg, canvas)
+
+    hexes = {c.hex for c in usage.fill}
+    assert "#BB1100" in hexes
+
+    fallback = next(f for f in usage.theme_fallbacks if f.part == "ppt/slides/slide1.xml")
+    assert fallback.fallback_to == "ppt/slideMasters/slideMaster1.xml"
+    assert fallback.reason
+
+
+# --- Task 3 повторное код-ревью, п.2: один посторонний мастер с битой
+# связью/темой не должен ронять весь разбор — как в п.1, деградация
+# оставляет запись, но первичный мастер и весь остальной файл разбираются
+# штатно.
+
+def _two_master_package_second_theme_missing() -> PptxPackage:
+    """Второй мастер физически есть, presentation.xml и его rels на него
+    ссылаются штатно, но у его собственного .rels нет relationship theme
+    вовсе — чтение его темы бросает ValueError. Первичный мастер (первый)
+    несёт больше лейаутов и остаётся первичным честно, по правилам
+    pick_primary_master — бытовой сценарий, где сломан именно
+    непервичный, второстепенный мастер (см. п.2 брифа)."""
+    files = _single_master_package(accent1="AA0000")
+    files["ppt/presentation.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<p:sldMasterIdLst><p:sldMasterId id="2147483649" r:id="rId1"/>'
+        '<p:sldMasterId id="2147483650" r:id="rId2"/></p:sldMasterIdLst>'
+        '<p:sldSz cx="12192000" cy="6858000"/></p:presentation>'
+    )
+    files["ppt/_rels/presentation.xml.rels"] = _rels_xml([
+        ("rId1", "slideMaster", "slideMasters/slideMaster1.xml"),
+        ("rId2", "slideMaster", "slideMasters/slideMaster2.xml"),
+    ])
+
+    master1_rels: list[tuple[str, str, str]] = [("rId1", "theme", "../theme/theme1.xml")]
+    for idx in (1, 2, 3):
+        master1_rels.append((f"rId{idx + 1}", "slideLayout", f"../slideLayouts/slideLayout{idx}.xml"))
+        files[f"ppt/slideLayouts/slideLayout{idx}.xml"] = _layout_with_accent1_fill_xml()
+        files[f"ppt/slideLayouts/_rels/slideLayout{idx}.xml.rels"] = _rels_xml([
+            ("rId1", "slideMaster", "../slideMasters/slideMaster1.xml"),
+        ])
+    files["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = _rels_xml(master1_rels)
+
+    files["ppt/slideMasters/slideMaster2.xml"] = _MASTER_XML
+    # намеренно нет relationship theme в .rels мастера 2 — только один
+    # лейаут, меньше, чем у первичного, чтобы выбор первичного не зависел
+    # от отлова этой ошибки.
+    files["ppt/slideLayouts/slideLayout4.xml"] = _layout_with_accent1_fill_xml()
+    files["ppt/slideLayouts/_rels/slideLayout4.xml.rels"] = _rels_xml([
+        ("rId1", "slideMaster", "../slideMasters/slideMaster2.xml"),
+    ])
+    files["ppt/slideMasters/_rels/slideMaster2.xml.rels"] = _rels_xml([
+        ("rId1", "slideLayout", "../slideLayouts/slideLayout4.xml"),
+    ])
+
+    return _package_from_files(files)
+
+
+def test_secondary_master_without_theme_link_does_not_crash_the_parse():
+    pkg = _two_master_package_second_theme_missing()
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+
+    usage = collect_usage(pkg, canvas)
+
+    assert usage.primary_theme is not None
+    assert usage.primary_theme.scheme["accent1"] == "#AA0000"
+
+    fallback = next(
+        f for f in usage.theme_fallbacks if f.part == "ppt/slideMasters/slideMaster2.xml"
+    )
+    assert fallback.fallback_to == "ppt/slideMasters/slideMaster1.xml"
+    assert fallback.reason
+
+
+def _single_master_package_without_theme_link() -> PptxPackage:
+    files = _single_master_package(accent1="AA0000")
+    # Первичный (единственный) мастер — тема заведомо не резолвится.
+    files["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = _rels_xml([])
+    return _package_from_files(files)
+
+
+def test_primary_master_theme_failure_raises_informative_error():
+    """Первичный мастер — особый случай (в отличие от второстепенного
+    выше): если у него самого тема не читается, разбор обязан упасть с
+    внятным сообщением, а не молча подставить фолбэк самому себе."""
+    pkg = _single_master_package_without_theme_link()
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+    with pytest.raises(ValueError, match="slideMaster1"):
+        collect_usage(pkg, canvas)
+
+
+# --- Task 3 повторное код-ревью, находки adversarial-reviewer поверх
+# п.1/п.2: "нет relationship" — не единственный способ, которым чтение
+# темы постороннего мастера может провалиться. relationship theme может
+# быть, но указывать на файл, которого физически нет в архиве (порча при
+# пересборке .pptx) — тогда pkg.xml() бросает KeyError, а не ValueError,
+# и старый except ValueError его не ловит.
+
+def test_secondary_master_with_dangling_theme_target_does_not_crash_the_parse():
+    """У второго мастера relationship theme ЕСТЬ (не отсутствует), но
+    Target указывает на файл, которого нет в zip — типичная порча при
+    частичной пересборке .pptx. Раньше это ронялось необработанным
+    KeyError (except ловил только ValueError); теперь — честный фолбэк."""
+    files: dict[str, str] = _single_master_package(accent1="AA0000")
+    files["ppt/presentation.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<p:sldMasterIdLst><p:sldMasterId id="2147483649" r:id="rId1"/>'
+        '<p:sldMasterId id="2147483650" r:id="rId2"/></p:sldMasterIdLst>'
+        '<p:sldSz cx="12192000" cy="6858000"/></p:presentation>'
+    )
+    files["ppt/_rels/presentation.xml.rels"] = _rels_xml([
+        ("rId1", "slideMaster", "slideMasters/slideMaster1.xml"),
+        ("rId2", "slideMaster", "slideMasters/slideMaster2.xml"),
+    ])
+    master1_rels: list[tuple[str, str, str]] = [("rId1", "theme", "../theme/theme1.xml")]
+    for idx in (1, 2, 3):
+        master1_rels.append((f"rId{idx + 1}", "slideLayout", f"../slideLayouts/slideLayout{idx}.xml"))
+        files[f"ppt/slideLayouts/slideLayout{idx}.xml"] = _layout_with_accent1_fill_xml()
+        files[f"ppt/slideLayouts/_rels/slideLayout{idx}.xml.rels"] = _rels_xml([
+            ("rId1", "slideMaster", "../slideMasters/slideMaster1.xml"),
+        ])
+    files["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = _rels_xml(master1_rels)
+
+    files["ppt/slideMasters/slideMaster2.xml"] = _MASTER_XML
+    files["ppt/slideMasters/_rels/slideMaster2.xml.rels"] = _rels_xml([
+        # Target указывает на несуществующий файл — relationship theme
+        # физически есть, но за ней ничего нет.
+        ("rId1", "theme", "../theme/theme_MISSING.xml"),
+    ])
+
+    pkg = _package_from_files(files)
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+
+    usage = collect_usage(pkg, canvas)
+
+    assert usage.primary_theme is not None
+    assert usage.primary_theme.scheme["accent1"] == "#AA0000"
+    fallback = next(
+        f for f in usage.theme_fallbacks if f.part == "ppt/slideMasters/slideMaster2.xml"
+    )
+    assert fallback.fallback_to == "ppt/slideMasters/slideMaster1.xml"
+    assert fallback.reason
+
+
+def test_secondary_master_with_malformed_theme_xml_does_not_crash_the_parse():
+    """Тема второго мастера физически есть в архиве и связь на неё
+    резолвится, но содержимое — не well-formed XML (та же порча).
+    lxml.etree.fromstring бросает XMLSyntaxError, не ValueError."""
+    files = _single_master_package(accent1="AA0000")
+    files["ppt/presentation.xml"] = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<p:sldMasterIdLst><p:sldMasterId id="2147483649" r:id="rId1"/>'
+        '<p:sldMasterId id="2147483650" r:id="rId2"/></p:sldMasterIdLst>'
+        '<p:sldSz cx="12192000" cy="6858000"/></p:presentation>'
+    )
+    files["ppt/_rels/presentation.xml.rels"] = _rels_xml([
+        ("rId1", "slideMaster", "slideMasters/slideMaster1.xml"),
+        ("rId2", "slideMaster", "slideMasters/slideMaster2.xml"),
+    ])
+    master1_rels: list[tuple[str, str, str]] = [("rId1", "theme", "../theme/theme1.xml")]
+    for idx in (1, 2, 3):
+        master1_rels.append((f"rId{idx + 1}", "slideLayout", f"../slideLayouts/slideLayout{idx}.xml"))
+        files[f"ppt/slideLayouts/slideLayout{idx}.xml"] = _layout_with_accent1_fill_xml()
+        files[f"ppt/slideLayouts/_rels/slideLayout{idx}.xml.rels"] = _rels_xml([
+            ("rId1", "slideMaster", "../slideMasters/slideMaster1.xml"),
+        ])
+    files["ppt/slideMasters/_rels/slideMaster1.xml.rels"] = _rels_xml(master1_rels)
+
+    files["ppt/slideMasters/slideMaster2.xml"] = _MASTER_XML
+    files["ppt/theme/theme_broken.xml"] = "<not><valid></xml"
+    files["ppt/slideMasters/_rels/slideMaster2.xml.rels"] = _rels_xml([
+        ("rId1", "theme", "../theme/theme_broken.xml"),
+    ])
+
+    pkg = _package_from_files(files)
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+
+    usage = collect_usage(pkg, canvas)
+
+    assert usage.primary_theme is not None
+    assert usage.primary_theme.scheme["accent1"] == "#AA0000"
+    fallback = next(
+        f for f in usage.theme_fallbacks if f.part == "ppt/slideMasters/slideMaster2.xml"
+    )
+    assert fallback.fallback_to == "ppt/slideMasters/slideMaster1.xml"
+    assert fallback.reason
+
+
+# --- Task 3 повторное код-ревью, находка adversarial-reviewer: лейаут
+# может резолвить свою связь slideMaster на мастер, который физически есть
+# в архиве и сам по себе читается штатно, но который НЕ входит в
+# presentation.xml → slideMaster вовсе ("осиротевший" мастер, не
+# перечисленный в p:sldMasterIdLst). Раньше это молча резолвилось в тему
+# первичного мастера БЕЗ записи в theme_fallbacks — потому что
+# _layout_theme считал "master not in self._master_theme" синонимом
+# "чтение master уже провалилось и уже записано в __init__", что здесь
+# неверно: master вообще не пытались читать, потому что цикл в __init__
+# идёт только по all_masters.
+
+def test_layout_pointing_to_master_outside_presentation_list_falls_back_with_record():
+    files = _single_master_package(accent1="AA0000")
+    # presentation.xml ссылается ТОЛЬКО на master1 — master2 не входит в
+    # p:sldMasterIdLst вовсе.
+    files["ppt/slideMasters/slideMaster2.xml"] = _MASTER_XML
+    files["ppt/theme/theme2.xml"] = _theme_xml("Master2Theme", "00FF00")
+    files["ppt/slideMasters/_rels/slideMaster2.xml.rels"] = _rels_xml([
+        ("rId1", "theme", "../theme/theme2.xml"),
+    ])
+    # Лейаут физически ссылается на master2 напрямую, в обход официального
+    # списка мастеров презентации.
+    files["ppt/slideLayouts/slideLayout1.xml"] = _layout_with_accent1_fill_xml()
+    files["ppt/slideLayouts/_rels/slideLayout1.xml.rels"] = _rels_xml([
+        ("rId1", "slideMaster", "../slideMasters/slideMaster2.xml"),
+    ])
+
+    pkg = _package_from_files(files)
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+
+    usage = collect_usage(pkg, canvas)
+
+    # Честный фолбэк на тему первичного мастера — НЕ тихая подмена на
+    # "чужую" тему master2 (#00FF00), которую человек не увидит в записи.
+    hexes = {c.hex for c in usage.fill}
+    assert "#AA0000" in hexes
+    assert "#00FF00" not in hexes
+
+    fallback = next(
+        f for f in usage.theme_fallbacks if f.part == "ppt/slideMasters/slideMaster2.xml"
+    )
+    assert fallback.fallback_to == "ppt/slideMasters/slideMaster1.xml"
+    assert fallback.reason

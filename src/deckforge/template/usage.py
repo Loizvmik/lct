@@ -17,6 +17,16 @@ Tech и VK Education по два мастера; если у второстеп�
 который unresolved вообще может поймать: цвет резолвится успешно, просто
 не в тот hex).
 
+Часть, для которой связь до её темы не резолвится (нет relationship
+slideMaster/slideLayout, либо связанная часть есть, но её тема не читается
+— нет relationship theme или тема без a:themeElements), получает тему
+первичного мастера как честный фолбэк — и эта подстановка ОБЯЗАНА оставить
+запись в Usage.theme_fallbacks (см. ThemeFallback), по тому же принципу,
+что и Usage.unresolved для цветов: сама подстановка не роняет разбор, но
+не должна остаться незаметной для человека, который смотрит на результат
+(Task 3 повторное код-ревью, п.1 и п.2 — раньше это было полностью
+молчаливым: ни счётчика, ни записи, ни следа).
+
 Шрифт бренда виден только в a:latin внутри run'ов (fontScheme в теме —
 тоже заглушка Google, см. theme.py) — поэтому шрифт каждого run'а читается
 напрямую из a:rPr/a:latin, без обращения к lstStyle/txStyles: и то, и
@@ -35,14 +45,20 @@ run'а. Run без хотя бы одного из этих свойств (a:rP
 run → абзац → lstStyle шейпа → плейсхолдер макета → txStyles мастера → тема
 в этой задаче не реализуется, это работа следующих задач. Но количество
 символов такого run'а не теряется: оно всегда попадает либо в
-Usage.explicit_chars, либо в Usage.inherited_chars (см. _has_explicit_props)
-— так видно, какая доля текста разобрана явно, а какая осталась за
-скобками, вместо того чтобы делать вид, что непокрытого текста не было
-вовсе. На трёх реальных шаблонах доля inherited_chars — 8.5% (Education) —
-16.4% (VK Tech), ненулевая на каждом; для нативного шаблона с защиты она
-может быть выше (там чаще встречается run без a:rPr буквально, чего в этих
-трёх Google-экспортах не нашлось ни разу — там rPr технически присутствует,
-но иногда пуст).
+Usage.explicit_style_chars, либо в Usage.unstyled_chars (см.
+_has_explicit_props) — так видно, какая доля текста разобрана явно, а какая
+осталась за скобками, вместо того чтобы делать вид, что непокрытого текста
+не было вовсе. Task 3 повторное код-ревью, п.4: explicit_style_chars значит
+буквально «у run'а есть явно хотя бы ОДНО из пяти свойств» — не «шрифт для
+него известен». Run с одним только sz, без a:latin, целиком попадает в
+explicit_style_chars, хотя шрифт у него так же неизвестен, как у run'а без
+единого явного свойства; за долей текста с известным ИМЕННО ШРИФТОМ — в
+Usage.fonts (там символы считаются только там, где a:latin реально был).
+На трёх реальных шаблонах доля unstyled_chars — 8.5% (Education) — 16.4%
+(VK Tech), ненулевая на каждом; для нативного шаблона с защиты она может
+быть выше (там чаще встречается run без a:rPr буквально, чего в этих трёх
+Google-экспортах не нашлось ни разу — там rPr технически присутствует, но
+иногда пуст).
 
 Известное ограничение: полноценный разбор таблиц (a:tbl) не реализован —
 геометрия колонок/строк, объединённые ячейки (gridSpan/rowSpan/hMerge/
@@ -94,6 +110,35 @@ class _NoBackground:
 NO_BACKGROUND = _NoBackground()
 
 
+@dataclass(frozen=True)
+class ThemeFallback:
+    """Часть пакета, которой при резолве темы подставлена тема ЧУЖОГО
+    (первичного) мастера, а не её собственная — по аналогии с
+    UnresolvedColor (см. её докстроку в ooxml/color.py) и Usage.unresolved:
+    сама подстановка не ошибка разбора, collect_usage не падает, но должна
+    быть видна человеку, а не выглядеть как штатно прочитанная связь.
+
+    Два случая (Task 3 повторное код-ревью, п.1 и п.2, см. докстроку
+    _ThemeGraph):
+    - у самой части (лейаута/слайда) нет нужной связи (relationship) до
+      мастера/лейаута — записывается часть с оборванной связью;
+    - связь есть и резолвится, но тема мастера, на который она указывает,
+      не читается (нет relationship theme, часть без a:themeElements) —
+      записывается сам этот мастер, один раз, а не каждый лейаут/слайд,
+      который на него опирается (их может быть много, и все они получают
+      ту же тему первичного мастера транзитивно через тот же мастер).
+
+    part — часть пакета, получившая чужую тему.
+    reason — текст исключения, объясняющий, почему собственная связь/тема
+    не резолвилась (не код ошибки — читается человеком как есть).
+    fallback_to — часть мастера, чья тема подставлена вместо собственной
+    (первичный мастер пакета).
+    """
+    part: str
+    reason: str
+    fallback_to: str
+
+
 @dataclass
 class FontUsage:
     family: str
@@ -123,12 +168,16 @@ class Usage:
     # молча (см. докстроку UnresolvedColor в ooxml/color.py).
     no_fill_shapes: int = 0
     unresolved: list[UnresolvedColor] = field(default_factory=list)
-    # Task 3 код-ревью (п.5): число символов run'ов, у которых свойства
-    # (sz/latin/fill/b/i) были явно заданы на самом run'е, и число символов
-    # тех, у кого их нет вовсе (наследуются от контекста, который этот
-    # модуль не резолвит) — см. докстроку модуля.
-    explicit_chars: int = 0
-    inherited_chars: int = 0
+    # Task 3 код-ревью (п.5), переименовано в Task 3 повторном код-ревью
+    # (п.4, см. докстроку модуля): число символов run'ов, у которых явно
+    # задано хотя бы одно из пяти читаемых свойств (sz/latin/fill/b/i) —
+    # НЕ "доля текста с известным шрифтом", это разные вещи (см.
+    # _has_explicit_props). explicit_style_chars — символы run'ов с хотя бы
+    # одним явным свойством, unstyled_chars — у которых нет ни одного
+    # (свойства наследуются от контекста, который этот модуль не
+    # резолвит).
+    explicit_style_chars: int = 0
+    unstyled_chars: int = 0
     # Task 3 код-ревью (п.2): тема первичного мастера — раньше единственный
     # параметр collect_usage(theme=...), теперь вычисляется внутри и
     # уточняется по фактическому употреблению шрифта (см.
@@ -137,6 +186,12 @@ class Usage:
     # шаблона в целом, для потребителей, которым нужен единый ответ
     # (например, отчёт о деградации).
     primary_theme: ThemeInfo | None = None
+    # Task 3 повторное код-ревью (п.1, п.2): части, которым подставлена
+    # тема первичного мастера ВМЕСТО их собственной — потому что связь до
+    # неё не резолвилась (нет relationship) либо связанная часть есть, но
+    # её тема не читается. По тому же принципу, что unresolved для цветов
+    # — см. ThemeFallback и докстроку модуля.
+    theme_fallbacks: list[ThemeFallback] = field(default_factory=list)
 
 
 def collect_usage(pkg: PptxPackage, canvas: Canvas) -> Usage:
@@ -155,9 +210,22 @@ def collect_usage(pkg: PptxPackage, canvas: Canvas) -> Usage:
     theme); p:sldLayout сам по себе — так же, через свой мастер; сам
     p:sldMaster — по своей теме напрямую. Часть, для которой связь не
     резолвится (нет мастера/лейаута в rels — сирота или синтетический
-    фрагмент пакета в тестах), получает тему первичного мастера как честный
-    фолбэк, а не падает; пакет вовсе без единого мастера получает
-    `theme.EMPTY_THEME` (см. её докстроку).
+    фрагмент пакета в тестах, либо связь есть, но тема на другом её конце
+    сама не читается — битый непервичный мастер), получает тему первичного
+    мастера как честный фолбэк, а не падает, и ОСТАВЛЯЕТ ЗАПИСЬ об этом в
+    `Usage.theme_fallbacks` (Task 3 повторное код-ревью, п.1 и п.2 — раньше
+    это было полностью молчаливым: ни счётчика, ни записи, ни следа, хотя
+    для нераспознанных цветов ровно тот же принцип уже был — см.
+    `Usage.unresolved`). Пакет вовсе без единого мастера получает
+    `theme.EMPTY_THEME` (см. её докстроку) — это другой, уже
+    задокументированный случай, не "фолбэк на чужую тему" (чужой темы,
+    которую можно было бы перепутать с этой частью, там попросту не
+    существует), поэтому в `theme_fallbacks` не попадает.
+
+    Первичный мастер — особый случай: если не читается именно его
+    собственная тема, `collect_usage` обязан упасть с внятным сообщением
+    (его даёт `theme.read_theme`), а не подставить фолбэк самому себе —
+    молчаливая порча здесь хуже честного падения.
 
     Тема первичного мастера (раньше — единственный аргумент `theme`)
     доступна отдельно как `Usage.primary_theme` — уточнённая по фактическому
@@ -178,31 +246,87 @@ def collect_usage(pkg: PptxPackage, canvas: Canvas) -> Usage:
 
     font_chars = {family: fu.chars for family, fu in usage.fonts.items()}
     usage.primary_theme = refine_font_scheme_degraded(theme_graph.primary_theme, font_chars)
+    usage.theme_fallbacks = theme_graph.fallbacks
     return usage
 
 
 class _ThemeGraph:
     """Тема для каждой части пакета — по связям, не по единственному
-    "первичному" мастеру (см. докстроку collect_usage)."""
+    "первичному" мастеру (см. докстроку collect_usage).
+
+    Task 3 повторное код-ревью, п.2: темы всех мастеров читались одним
+    словарным включением ДО блока, ловящего ошибку резолва первичной темы
+    — если у любого НЕпервичного мастера не было связи с темой, или его
+    тема была без a:themeElements, чтение бросало ошибку, и collect_usage
+    падал целиком, хотя первичный мастер и весь остальной файл были в
+    порядке. Теперь первичный мастер определяется и читается первым (и
+    только его неудача — настоящее падение, см. докстроку collect_usage),
+    а темы остальных мастеров читаются по одному, с отловом ошибки на
+    каждого: сбой одного постороннего мастера не мешает ни первичной теме,
+    ни любому другому мастеру/лейауту/слайду — только записывает фолбэк на
+    самого этого мастера (см. ThemeFallback) и деградирует именно его."""
 
     def __init__(self, pkg: PptxPackage) -> None:
         self._pkg = pkg
         presentation_part = pkg.presentation_part()
-        self._master_theme: dict[str, ThemeInfo] = {
-            master: read_theme(pkg, master)
-            for master in pkg.related(presentation_part, "slideMaster")
-        }
+        all_masters = pkg.related(presentation_part, "slideMaster")
+        self.fallbacks: list[ThemeFallback] = []
+        self._fallback_recorded: set[str] = set()
+
         try:
             primary_master = pick_primary_master(pkg)
-            self.primary_theme = self._master_theme.get(primary_master) or read_theme(pkg, primary_master)
         except ValueError:
             # Пакет вовсе без мастера — невозможно для настоящего .pptx (по
             # OOXML мастер обязателен), но синтетическим фрагментам пакета в
             # тестах (обход mc:AlternateContent/blipFill и т.п.) мастер не
             # нужен вовсе — не должны падать на резолве темы, которая им
-            # безразлична.
+            # безразлична. См. докстроку collect_usage о том, почему этот
+            # случай не попадает в theme_fallbacks.
+            self._primary_master: str | None = None
             self.primary_theme = EMPTY_THEME
+            self._master_theme: dict[str, ThemeInfo] = {}
+            self._layout_master_cache: dict[str, str | None] = {}
+            return
+
+        # Первичный мастер — особый случай (см. докстроку collect_usage):
+        # его собственная тема должна читаться без отлова ошибки, чтобы
+        # неудача была настоящим, внятным падением, а не молчаливой
+        # деградацией самого важного мастера в пакете.
+        self._primary_master = primary_master
+        self.primary_theme = read_theme(pkg, primary_master)
+        self._master_theme = {primary_master: self.primary_theme}
+
+        for master in all_masters:
+            if master == primary_master:
+                continue
+            try:
+                self._master_theme[master] = read_theme(pkg, master)
+            except Exception as exc:
+                # Task 3 повторное код-ревью, находка adversarial-reviewer:
+                # ValueError — не единственный способ, которым чтение темы
+                # постороннего мастера может провалиться (см. докстроку
+                # theme._is_master_stock — тот же класс порчи: dangling
+                # relationship target даёт KeyError при чтении из zip,
+                # невалидный XML даёт lxml.etree.XMLSyntaxError). Ловим
+                # широко здесь совершенно сознательно: мастер уже не
+                # первичный (тот читается пятью строками выше, без этого
+                # try/except — там любая ошибка обязана падать честно), и
+                # цель этого блока — не дать ОДНОМУ постороннему, побитому
+                # как угодно мастеру уронить разбор целиком.
+                self._record_fallback(master, str(exc))
+
         self._layout_master_cache: dict[str, str | None] = {}
+
+    def _record_fallback(self, part: str, reason: str) -> None:
+        if self._primary_master is None:
+            # Пакет вовсе без мастера уже целиком резолвится в EMPTY_THEME
+            # (см. докстроку collect_usage) — чужой темы, которую здесь
+            # можно было бы перепутать с этой частью, попросту нет.
+            return
+        if part in self._fallback_recorded:
+            return
+        self._fallback_recorded.add(part)
+        self.fallbacks.append(ThemeFallback(part=part, reason=reason, fallback_to=self._primary_master))
 
     def theme_for(self, part_name: str) -> ThemeInfo:
         if part_name in self._master_theme:
@@ -221,13 +345,47 @@ class _ThemeGraph:
 
     def _layout_theme(self, layout_part: str) -> ThemeInfo:
         master = self._master_of_layout(layout_part)
-        if master is not None and master in self._master_theme:
+        if master is None:
+            # У лейаута нет самой связи slideMaster — не путать со случаем
+            # ниже, где связь есть, но она ведёт на мастер, тема которого
+            # недоступна.
+            self._record_fallback(
+                layout_part,
+                "нет relationship slideMaster у лейаута — связь не резолвится",
+            )
+            return self.primary_theme
+        if master in self._master_theme:
             return self._master_theme[master]
+        # Связь у лейаута есть и резолвится в конкретный мастер, но его
+        # темы нет в self._master_theme. Task 3 повторное код-ревью,
+        # находка adversarial-reviewer: раньше это молча читалось как "чтение
+        # этого master уже провалилось и фолбэк на него уже записан в
+        # __init__" — неверно для второго случая: master физически есть в
+        # архиве, его СОБСТВЕННАЯ тема прекрасно читается, но сам master не
+        # перечислен в presentation.xml → slideMaster (p:sldMasterIdLst) —
+        # лейаут ссылается на него в обход официального списка мастеров
+        # презентации ("осиротевший" мастер). _record_fallback дедуплицирует
+        # по имени master, поэтому для случая "master уже сломан и записан
+        # в __init__" здесь ничего не добавится повторно — а для случая
+        # "master просто вне графа" появится первая и единственная запись.
+        # Тема этого master сюда сознательно НЕ подтягивается: presentation.xml
+        # — единственный источник истины о том, какие мастера вообще есть
+        # у пакета, а не то, до чего можно физически дотянуться связью в
+        # обход него.
+        self._record_fallback(
+            master,
+            "мастер лейаута недоступен (тема не прочитана либо мастер не "
+            "входит в presentation.xml → slideMaster)",
+        )
         return self.primary_theme
 
     def _slide_theme(self, slide_part: str) -> ThemeInfo:
         layouts = self._pkg.related(slide_part, "slideLayout")
         if not layouts:
+            self._record_fallback(
+                slide_part,
+                "нет relationship slideLayout у слайда — связь не резолвится",
+            )
             return self.primary_theme
         return self._layout_theme(layouts[0])
 
@@ -539,7 +697,13 @@ def _has_explicit_props(r_pr) -> bool:
     `<a:rPr lang="ru-RU" dirty="0"/>` без sz/latin/fill/b/i технически
     присутствует, но не даёт прочитать ничего: по эффекту для сборщика это
     то же самое, что и полное отсутствие a:rPr, и должно точно так же
-    попадать в inherited_chars, а не в explicit_chars."""
+    попадать в Usage.unstyled_chars, а не в Usage.explicit_style_chars.
+
+    Ключевое слово — "хоть одно": run с одним только sz, без a:latin, тоже
+    даёт True здесь и уходит в explicit_style_chars, хотя шрифт для него
+    так же неизвестен, как у run'а совсем без свойств (Task 3 повторное
+    код-ревью, п.4) — explicit_style_chars значит "у run'а есть явный
+    стиль хоть в чём-то", не "шрифт для него известен"."""
     if r_pr is None:
         return False
     return (
@@ -563,12 +727,12 @@ def _collect_run(
         # Ни sz, ни latin, ни заливки, ни b/i — либо a:rPr нет вовсе, либо
         # он пуст содержательно. Свойства наследуются от лейаута/мастера/
         # темы, что этот модуль не резолвит (см. докстроку). Символы при
-        # этом не теряются: идут в inherited_chars, а не пропадают из
+        # этом не теряются: идут в unstyled_chars, а не пропадают из
         # статистики молча (Task 3 код-ревью, п.5 — раньше run без rPr не
         # учитывался нигде).
-        usage.inherited_chars += chars
+        usage.unstyled_chars += chars
         return
-    usage.explicit_chars += chars
+    usage.explicit_style_chars += chars
 
     if r_pr.get("b") == "1":
         usage.bold_runs += 1
