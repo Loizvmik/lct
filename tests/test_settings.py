@@ -1,9 +1,23 @@
 from pathlib import Path
 import pytest
-from deckforge.settings import Settings
+from deckforge.settings import RenderConfig, Settings
 
 ROOT = Path(__file__).resolve().parents[1]
 APP_YAML = ROOT / "config" / "app.yaml"
+
+
+def _soffice_available() -> bool:
+    """Как в @live для сетевых тестов: не роняем тест на машине без LibreOffice."""
+    try:
+        RenderConfig().resolve_soffice()
+        return True
+    except RuntimeError:
+        return False
+
+
+needs_soffice = pytest.mark.skipif(
+    not _soffice_available(), reason="soffice не найден автопоиском на этой машине"
+)
 
 
 def test_load_reads_app_yaml():
@@ -63,6 +77,7 @@ render:
     assert settings.render.resolve_soffice() == str(fake_soffice)
 
 
+@needs_soffice
 def test_soffice_autodiscovery_when_not_configured(tmp_path):
     config_path = tmp_path / "app.yaml"
     config_path.write_text(
