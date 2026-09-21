@@ -3,22 +3,36 @@
 контрольный шаблон для защиты, в тестах не участвует (см. test_theme.py).
 
 `_all_modules` для `test_profile_never_falls_back_to_hardcoded_vk_values`
-намеренно смотрит только на `profile.py` и `naming.py` — два файла, которые
-эта задача добавляет, — а не на весь пакет `deckforge.template`. Остальные
-модули (theme.py, usage.py, typography.py, grid.py, layouts.py, assets.py,
-patterns.py) уже прошли собственные код-ревью в Task 3-7 и их докстроки
-намеренно ссылаются на реальные имена шаблонов как раз для ОБОСНОВАНИЯ
-порогов ("не подобрано по наблюдению за файлом, а вот почему") — то есть
-свидетельство добросовестности, а не хардкода поведения. Хардкод, которого
-боится этот тест ("решение не заточено под три шаблона"), — это код,
-который принимает решение ПО ИМЕНИ шаблона; риск для него — именно в новой
-сборке (profile.py) и в нoвом обращении к модели (naming.py), где так легко
-было бы подсмотреть у трёх образцов, а не разобраться по данным.
+сканирует ВЕСЬ пакет `deckforge.template` (все модули разбора, не только
+`profile.py`/`naming.py`, добавленные этой задачей) — страж требования
+«решение не заточено под три шаблона» обязан видеть весь пакет, иначе он
+ничего не стережёт за пределами двух файлов.
+
+Раньше здесь было сужение до двух файлов, потому что буквальное сравнение
+исходного текста модуля падало: докстроки theme.py/usage.py/typography.py/
+grid.py/layouts.py/assets.py/patterns.py (Task 3-7, отдельные код-ревью)
+честно ссылаются на реальные имена шаблонов как обоснование калибровки
+порогов ("не подобрано по наблюдению за файлом, а вот почему") — это
+свидетельство добросовестности, а не хардкод поведения. Хардкод, которого
+боится этот тест, — это код, который принимает решение ПО ИМЕНИ шаблона в
+исполняемой части модуля, а не упоминание имени в докстроке/комментарии как
+пояснение калибровки.
+
+Правильное решение — не сужать область сканирования, а сузить то, что
+сравнивается: `_executable_source` разбирает модуль через `ast`, отбрасывает
+докстроки (первый `Expr`-константа-строка в теле module/class/def) и
+вырезает построчные комментарии (`tokenize`), оставляя только то, что
+реально исполняется. Строковый литерал вроде `"VK Tech"` в исполняемом коде
+(сравнение, ключ словаря, дефолт параметра) по-прежнему поймается; то же имя
+в докстроке или в `# комментарии` — нет.
 """
-import inspect
+import ast
 import importlib
+import inspect
+import io
 import os
 import time
+import tokenize
 from pathlib import Path
 
 import pytest
@@ -32,10 +46,78 @@ live = pytest.mark.skipif(not os.getenv("YANDEX_API_KEY"), reason="нет YANDEX
 
 
 def _all_modules(pkg):
-    return [
-        importlib.import_module(f"{pkg.__name__}.profile"),
-        importlib.import_module(f"{pkg.__name__}.naming"),
+    """Все модули пакета разбора — включая theme/usage/typography/grid/
+    layouts/assets/patterns (Task 3-7), не только profile.py/naming.py."""
+    module_names = [
+        "theme", "usage", "typography", "grid", "layouts", "assets",
+        "patterns", "profile", "naming",
     ]
+    return [importlib.import_module(f"{pkg.__name__}.{name}") for name in module_names]
+
+
+def _docstring_spans(tree: ast.AST) -> set[tuple[int, int]]:
+    """Позиции (начальная, конечная строка) строковых констант-докстрок
+    (module/class/def) в дереве — их видит ast (первый `Expr` в теле —
+    строковый литерал), но не видит tokenize (для него докстрока — обычный
+    STRING-токен). Только номера строк, не колонки: `ast.col_offset` — байтовый
+    UTF-8-офсет, `tokenize` — офсет в кодовых точках, для кириллицы (весь этот
+    пакет) они расходятся; совпадения строки начала и конца достаточно —
+    два разных строковых литерала, занимающих ровно тот же диапазон строк в
+    одном файле, на практике не встречаются."""
+    spans: set[tuple[int, int]] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = getattr(node, "body", None) or []
+        if not body:
+            continue
+        first = body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            doc = first.value
+            spans.add((doc.lineno, doc.end_lineno))
+    return spans
+
+
+def _executable_source(source: str) -> str:
+    """`source` без докстрок и без построчных комментариев — то, что реально
+    исполняется. Докстрока определена через `ast` (позиция первого
+    `Expr`-строки в теле module/class/def), комментарии вырезаны через
+    `tokenize.COMMENT`. Всё остальное (включая строковые константы вне
+    докстрок — сравнения, ключи словарей, литералы по умолчанию) остаётся
+    и участвует в проверке на хардкод."""
+    tree = ast.parse(source)
+    doc_spans = _docstring_spans(tree)
+
+    kept: list[str] = []
+    for tok in tokenize.generate_tokens(io.StringIO(source).readline):
+        if tok.type == tokenize.COMMENT:
+            continue
+        if tok.type == tokenize.STRING:
+            span = (tok.start[0], tok.end[0])
+            if span in doc_spans:
+                continue
+        kept.append(tok.string)
+    return "\n".join(kept)
+
+
+def test_executable_source_strips_docstrings_and_comments():
+    """Красный тест на само извлечение (находка код-ревью 1): имя шаблона в
+    докстроке модуля/функции и в комментарии должно исчезнуть, а то же имя
+    в исполняемом строковом литерале — остаться."""
+    source = (
+        '"""Модуль про VK Tech — докстрока, безобидно."""\n'
+        "# comment about VK Tech — тоже безобидно\n"
+        "def f():\n"
+        '    """Докстрока функции про VK Tech — тоже безобидно."""\n'
+        '    x = "VK Tech"  # это настоящий хардкод\n'
+        "    return x\n"
+    )
+    cleaned = _executable_source(source)
+    assert cleaned.count("VK Tech") == 1
 
 
 def test_profile_is_json_roundtrippable():
@@ -59,10 +141,12 @@ def test_warnings_flag_degraded_sources():
 
 
 def test_profile_never_falls_back_to_hardcoded_vk_values():
-    """Страж требования «решение не заточено под три шаблона»."""
-    source = "".join(inspect.getsource(m) for m in _all_modules(pkg))
+    """Страж требования «решение не заточено под три шаблона» — весь пакет
+    разбора, но только исполняемый код (докстроки и комментарии отброшены,
+    см. докстроку модуля)."""
+    source = "".join(_executable_source(inspect.getsource(m)) for m in _all_modules(pkg))
     for forbidden in ["#0077FF", "Play", "VK Tech", "VK Education", "WorkSpace"]:
-        assert forbidden not in source, f"в парсере захардкожено {forbidden}"
+        assert forbidden not in source, f"в исполняемом коде парсера захардкожено {forbidden}"
 
 
 def test_parsing_is_fast_enough():
