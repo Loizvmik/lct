@@ -228,22 +228,62 @@ def test_budget_escalation_never_exceeds_cap(monkeypatch):
     assert len(captured) == 2
 
 
-def test_truncated_nonempty_content_does_not_trigger_escalation(monkeypatch):
-    """Непустой, но обрезанный content (finish_reason=length) — это не тот
-    случай, что пустой content: эскалация не должна запускаться, обработка
-    идёт по старой ветке (JSONDecodeError -> внятная RuntimeError), и
-    _post вызывается ровно один раз."""
+def test_truncated_json_with_schema_triggers_escalation_and_resolves(monkeypatch):
+    """Находка Task 8: непустой, но обрезанный на середине JSON (бюджет
+    исчерпан не на пустом content, а внутри него) при запрошенной схеме
+    обязан запускать ту же эскалацию, что и пустой content — иначе клиент
+    бросает ошибку, даже не попробовав больший бюджет (замерено на живых
+    вызовах именования палитры: 1 прогон из 3 падал именно так)."""
     provider = _offline_provider()
     captured = _stub_post_sequence(
         monkeypatch,
-        [{"choices": [{"message": {"content": '{"city": "Пар'}, "finish_reason": "length"}]}],
+        [
+            {"choices": [{"message": {"content": '{"city": "Пар'}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"content": '{"city": "Париж"}'}, "finish_reason": "stop"}]},
+        ],
     )
-    with pytest.raises(RuntimeError):
-        provider.complete(
-            [{"role": "user", "content": "Столица Франции"}],
-            schema={"type": "object"},
-            max_tokens=10,
-        )
+    out = provider.complete(
+        [{"role": "user", "content": "Столица Франции"}],
+        schema={"type": "object"},
+        max_tokens=300,
+    )
+    assert json.loads(out)["city"] == "Париж"
+    assert len(captured) == 2
+    assert captured[0]["max_tokens"] == 300
+    assert captured[1]["max_tokens"] == 600
+
+
+def test_truncated_text_without_schema_does_not_trigger_escalation(monkeypatch):
+    """Без запрошенной схемы судить о пригодности обрезанного content нечем
+    (это не JSON, а произвольный текст) — эскалация не запускается,
+    _post вызывается ровно один раз, обрезанный текст возвращается как есть."""
+    provider = _offline_provider()
+    captured = _stub_post_sequence(
+        monkeypatch,
+        [{"choices": [{"message": {"content": "Столица Франции — Пар"}, "finish_reason": "length"}]}],
+    )
+    out = provider.complete(
+        [{"role": "user", "content": "Столица Франции"}], max_tokens=10,
+    )
+    assert out == "Столица Франции — Пар"
+    assert len(captured) == 1
+
+
+def test_valid_json_at_length_finish_reason_does_not_trigger_escalation(monkeypatch):
+    """Ответ разобрался как валидный JSON, хотя finish_reason=length (модель
+    уложилась ровно в границу бюджета) — эскалация не должна запускаться на
+    уже пригодном ответе."""
+    provider = _offline_provider()
+    captured = _stub_post_sequence(
+        monkeypatch,
+        [{"choices": [{"message": {"content": '{"city": "Париж"}'}, "finish_reason": "length"}]}],
+    )
+    out = provider.complete(
+        [{"role": "user", "content": "Столица Франции"}],
+        schema={"type": "object"},
+        max_tokens=300,
+    )
+    assert json.loads(out)["city"] == "Париж"
     assert len(captured) == 1
 
 

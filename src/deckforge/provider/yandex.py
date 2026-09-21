@@ -138,7 +138,9 @@ class YandexProvider(LLMProvider, VisionProvider):
             "model": self.model_uri, "messages": messages,
             "max_tokens": max_tokens, "temperature": temperature,
         }
-        payload, tried_budgets = self._post_with_budget_escalation(body, deadline_at=deadline_at)
+        payload, tried_budgets = self._post_with_budget_escalation(
+            body, deadline_at=deadline_at, expects_json=schema is not None,
+        )
         content = self._extract(payload, tried_budgets=tried_budgets)
         if schema is not None:
             # Второй вид нехватки бюджета: content непустой, но обрезан на
@@ -226,14 +228,25 @@ class YandexProvider(LLMProvider, VisionProvider):
             f"бюджеты max_tokens: {tried_budgets}. {reason}."
         )
 
-    def _post_with_budget_escalation(self, body: dict, *, deadline_at: float) -> tuple[dict, list[int]]:
-        """Отправляет запрос; если бюджет весь ушёл в reasoning_content
-        (content пуст, finish_reason="length"), повторяет с удвоенным
-        max_tokens — не больше MAX_BUDGET_ESCALATIONS раз и не выше
-        MAX_TOKENS_BUDGET_CAP. Возвращает финальный payload и список
-        испробованных max_tokens (для диагностики в _extract и в логах).
-        deadline_at действует на все попытки внутри — и HTTP-ретраи, и
-        эскалации бюджета — единым отсчётом от начала complete()/ask_image()."""
+    def _post_with_budget_escalation(
+        self, body: dict, *, deadline_at: float, expects_json: bool = False,
+    ) -> tuple[dict, list[int]]:
+        """Отправляет запрос; если бюджет весь ушёл в reasoning_content и
+        результат непригоден, повторяет с удвоенным max_tokens — не больше
+        MAX_BUDGET_ESCALATIONS раз и не выше MAX_TOKENS_BUDGET_CAP.
+        Возвращает финальный payload и список испробованных max_tokens (для
+        диагностики в _extract и в логах). deadline_at действует на все
+        попытки внутри — и HTTP-ретраи, и эскалации бюджета — единым
+        отсчётом от начала complete()/ask_image().
+
+        Признак «бюджет исчерпан» (Task 8 код-ревью, находка 1) — это
+        finish_reason="length" и результат непригоден: либо content пуст,
+        либо (когда запрошена схема, expects_json=True) content не
+        разбирается как JSON. Второй случай раньше не запускал эскалацию —
+        content непустой сам по себе ещё не значит, что бюджета хватило,
+        если это обрезанный на середине JSON. Без запрошенной схемы судить
+        о пригодности обрезанного текста нечем — expects_json=False держит
+        эскалацию выключенной для этого случая, как и раньше."""
         tried_budgets = [body["max_tokens"]]
         attempt_counter = [0]
         payload = self._post(
@@ -241,7 +254,7 @@ class YandexProvider(LLMProvider, VisionProvider):
             attempt_counter=attempt_counter,
         )
         for _ in range(MAX_BUDGET_ESCALATIONS):
-            if not self._budget_exhausted(payload):
+            if not self._budget_exhausted(payload, expects_json=expects_json):
                 if len(tried_budgets) > 1:
                     logger.warning(
                         "ответ получен после эскалации бюджета max_tokens: %s",
@@ -254,7 +267,7 @@ class YandexProvider(LLMProvider, VisionProvider):
                 # не изменит, дальше эскалировать некуда.
                 break
             logger.warning(
-                "модель вернула пустой content при finish_reason=length "
+                "бюджет max_tokens исчерпан при finish_reason=length "
                 "(max_tokens=%s) — поднимаю бюджет до %s",
                 body["max_tokens"], next_tokens,
             )
@@ -267,11 +280,20 @@ class YandexProvider(LLMProvider, VisionProvider):
         return payload, tried_budgets
 
     @staticmethod
-    def _budget_exhausted(payload: dict) -> bool:
+    def _budget_exhausted(payload: dict, *, expects_json: bool = False) -> bool:
         message = payload["choices"][0]["message"]
         content = (message.get("content") or "").strip()
         finish_reason = payload["choices"][0].get("finish_reason")
-        return not content and finish_reason == "length"
+        if finish_reason != "length":
+            return False
+        if not content:
+            return True
+        if expects_json:
+            try:
+                json.loads(content)
+            except json.JSONDecodeError:
+                return True
+        return False
 
     @staticmethod
     def _extract(payload: dict, *, tried_budgets: list[int] | None = None) -> str:
