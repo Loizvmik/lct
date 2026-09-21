@@ -41,8 +41,13 @@ class ShapeRef:
     element: Any          # lxml-элемент шейпа: p:sp, p:pic, p:graphicFrame, p:cxnSp, p:grpSp
     kind: str              # "shape" | "picture" | "graphic_frame" | "connector" | "group"
     box: Box | None        # доли холста, аффинное преобразование групп уже применено;
-                            # None, если у шейпа нет a:xfrm (координаты наследуются от
-                            # плейсхолдера лейаута — резолв наследования вне этого слоя)
+                            # None по двум независимым причинам: (1) у шейпа нет собственного
+                            # a:xfrm, и координаты должны наследоваться от плейсхолдера лейаута —
+                            # резолв наследования вне этого слоя; (2) группа (или предок выше)
+                            # сломана (нет валидного a:xfrm), и координаты шейпа разместить на
+                            # слайде нельзя ни наследованием, ни восстановлением. Из ShapeRef
+                            # невозможно отличить одну причину от другой — понадобится отдельное
+                            # поле, если это различие критично для вызывающего
     name: str               # p:cNvPr/@name, пустая строка если нет
     shape_id: str           # p:cNvPr/@id
     rotation: float          # градусы (a:xfrm/@rot — в OOXML 1/60000 градуса)
@@ -227,14 +232,13 @@ def _walk_container(
 
         if kind == "group":
             frame = _read_group_frame(element)
-            own_broken = broken or frame is None
-            ref = _shape_ref(element, kind, canvas, chain, depth, force_none_box=own_broken)
+            group_broken = broken or frame is None
+            ref = _shape_ref(element, kind, canvas, chain, depth, force_none_box=group_broken)
             if include_groups:
                 yield ref
-            child_broken = broken or frame is None
             child_chain = chain if frame is None else chain + (frame,)
             yield from _walk_container(
-                element, canvas, child_chain, depth + 1, include_groups, broken=child_broken,
+                element, canvas, child_chain, depth + 1, include_groups, broken=group_broken,
             )
         else:
             ref = _shape_ref(element, kind, canvas, chain, depth, force_none_box=broken)
@@ -256,6 +260,11 @@ def walk_shapes(
     По умолчанию отдаёт только листья (include_groups=False). При
     include_groups=True отдаёт и сами группы (kind="group") до их содержимого,
     чтобы вызывающий мог пропустить поддерево.
+
+    ShapeRef.box == None указывает, что координаты шейпа либо наследуются от
+    плейсхолдера лейаута (у шейпа нет a:xfrm), либо не могут быть вычислены,
+    так как группа-предок сломана (нет валидного a:xfrm) — см. описание
+    ShapeRef.box для деталей. Из самого ShapeRef отличить оба случая нельзя.
     """
     sp_tree = _sp_tree_of(tree_root)
     yield from _walk_container(sp_tree, canvas, (), 0, include_groups)

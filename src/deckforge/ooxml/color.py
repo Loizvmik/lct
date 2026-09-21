@@ -175,8 +175,6 @@ def _resolve_color_element(
     base = _base_hex(tag, val, el, scheme, clr_map)
     if isinstance(base, UnresolvedColor):
         return base
-    if base is None:
-        return None
 
     # Вся цепочка модификаторов считается в float (0..1 на канал) один раз,
     # без промежуточных round() и без промежуточных возвратов в 8-битный
@@ -221,7 +219,7 @@ def _resolve_color_element(
 
 def _base_hex(
     tag: str, val: str | None, el, scheme: dict[str, str], clr_map: dict[str, str],
-) -> str | UnresolvedColor | None:
+) -> str | UnresolvedColor:
     """Базовый (до модификаторов) hex цвета — либо маркер «не распознан».
 
     Возвращает `str` (`"#RRGGBB"`), когда цвет разрешён; `UnresolvedColor`,
