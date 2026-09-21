@@ -24,9 +24,10 @@ from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.package import PptxPackage
 from deckforge.template.grid import build_grid
 from deckforge.template.layouts import (
-    PlaceholderSlot, _argmax, _features, _geometry_scores, build_layout_catalog,
+    PlaceholderSlot, _argmax, _effective_master_title_size, _features, _geometry_scores,
+    build_layout_catalog,
 )
-from deckforge.template.theme import pick_primary_master, read_theme
+from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 
 
 def test_every_layout_gets_a_kind(profile_fixture):
@@ -385,5 +386,68 @@ def test_largest_area_share_still_finds_real_dominant_content_block():
     ]
     f = _features(placeholders, display=0.0, refs=[], canvas=canvas)
     assert f.largest_area_share == pytest.approx(0.56)
+
+
+def test_master_title_size_fallback_is_used_when_layout_defines_no_own_size():
+    """Находка №6: `title_size_ratio` — вырожден (None) на нативном шаблоне,
+    где кегль заголовка задан не в лейауте, а в `p:txStyles` мастера (20 из
+    23 макетов контрольного ЛЦТ2026). Когда лейаут не задаёт свой кегль
+    заголовка, `_features` обязан подняться до кегля мастера, переданного
+    вызывающим как `master_title_size`."""
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+    placeholders = [PlaceholderSlot(ph_type="TITLE", box=Box(0.1, 0.5, 0.8, 0.2))]
+    f = _features(placeholders, display=40.0, refs=[], canvas=canvas, master_title_size=20.0)
+    assert f.title_size_ratio == pytest.approx(0.5)
+
+
+def test_effective_master_title_size_reads_master_txstyles():
+    """`_effective_master_title_size` читает
+    `p:txStyles/p:titleStyle/a:lvl1pPr/a:defRPr/@sz` мастера, нормируя к
+    холсту тем же множителем, что и везде в модуле."""
+    master_xml = """<?xml version="1.0" encoding="UTF-8"?>
+<p:sldMaster xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"
+             xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main">
+  <p:cSld>
+    <p:spTree>
+      <p:nvGrpSpPr><p:cNvPr id="1" name=""/><p:cNvGrpSpPr/><p:nvPr/></p:nvGrpSpPr>
+      <p:grpSpPr/>
+    </p:spTree>
+  </p:cSld>
+  <p:txStyles>
+    <p:titleStyle><a:lvl1pPr><a:defRPr sz="4000"/></a:lvl1pPr></p:titleStyle>
+  </p:txStyles>
+</p:sldMaster>
+"""
+    files = {
+        "_rels/.rels": (
+            f'{_RELS_HEADER}<Relationships {_RELS_NS}>'
+            f'<Relationship Id="rId1" Type="{_REL_BASE}/officeDocument" Target="ppt/presentation.xml"/>'
+            "</Relationships>"
+        ),
+        "ppt/presentation.xml": (
+            f'{_RELS_HEADER}'
+            '<p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"/>'
+        ),
+        "ppt/slideMasters/slideMaster1.xml": master_xml,
+    }
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for path, content in files.items():
+            zf.writestr(path, content)
+    buf.seek(0)
+    pkg = PptxPackage(zipfile.ZipFile(buf, "r"))
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+
+    not_degraded = ThemeInfo(
+        scheme={}, clr_map={}, major_font="", minor_font="", scheme_name="",
+        font_scheme_degraded=False, text_styles_degraded=False, is_stock_office_palette=False,
+    )
+    assert _effective_master_title_size(pkg, "ppt/slideMasters/slideMaster1.xml", not_degraded, canvas) == 40.0
+
+    degraded = ThemeInfo(
+        scheme={}, clr_map={}, major_font="", minor_font="", scheme_name="",
+        font_scheme_degraded=False, text_styles_degraded=True, is_stock_office_palette=False,
+    )
+    assert _effective_master_title_size(pkg, "ppt/slideMasters/slideMaster1.xml", degraded, canvas) is None
 
 

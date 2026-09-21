@@ -481,6 +481,7 @@ class _Features:
 
 def _features(
     placeholders: list[PlaceholderSlot], display: float, refs: list[ShapeRef], canvas: Canvas,
+    master_title_size: float | None = None,
 ) -> _Features:
     content_ph = [p for p in placeholders if p.ph_type not in _FURNITURE_PH_TYPES]
     has_title = any(p.ph_type in _TITLE_PH_TYPES for p in placeholders)
@@ -506,6 +507,16 @@ def _features(
         (r for r in refs if r.is_placeholder and _canon_ph_type(r.ph_type) in _TITLE_PH_TYPES), None,
     )
     title_sz = _placeholder_defrpr_sz(title_ref.element, canvas) if title_ref is not None else None
+    if title_sz is None:
+        # Находка код-ревью Task 5, п.6: на нативном шаблоне кегль
+        # заголовка часто задан не в лейауте, а в `p:txStyles` мастера (20
+        # из 23 макетов контрольного ЛЦТ2026) — без фолбэка title_size_ratio
+        # вырождается в None почти всюду. `master_title_size` — уже
+        # посчитанный вызывающим (`_effective_master_title_size`) кегль
+        # мастера, честно `None`, если стили мастера деградировали (см. её
+        # докстроку) — тогда здесь фолбэка нет, и None остаётся честным
+        # ответом, а не выдумкой из заглушки Google-экспорта.
+        title_sz = master_title_size
     title_size_ratio = (title_sz / display) if title_sz is not None and display else None
 
     dominant = title_slot or max(content_ph, key=lambda p: p.box.area, default=None)
@@ -936,6 +947,39 @@ def _theme_for_master(
         resolved = fallback
     cache[master_part] = resolved
     return resolved
+
+
+def _master_title_size(pkg: PptxPackage, master_part: str, canvas: Canvas) -> float | None:
+    """Кегль заголовка из `p:txStyles/p:titleStyle/a:lvl1pPr/a:defRPr/@sz`
+    мастера — тот же путь и та же нормировка (`canvas.norm`), что и
+    `_placeholder_defrpr_sz` для лейаута, только на уровень выше в цепочке
+    наследования OOXML (лейаут → мастер). Маленький независимый хелпер, не
+    импорт приватной `theme.py::_style_level_triples` поперёк модулей —
+    тот же сознательный выбор, что и у `_placeholder_defrpr_sz` (см. её
+    докстроку)."""
+    master_root = pkg.xml(master_part)
+    tx_styles = master_root.find(qn("p:txStyles"))
+    title_style = tx_styles.find(qn("p:titleStyle")) if tx_styles is not None else None
+    lvl1 = title_style.find(qn("a:lvl1pPr")) if title_style is not None else None
+    def_rpr = lvl1.find(qn("a:defRPr")) if lvl1 is not None else None
+    sz_raw = def_rpr.get("sz") if def_rpr is not None else None
+    return (int(sz_raw) / 100 * canvas.norm) if sz_raw is not None else None
+
+
+def _effective_master_title_size(
+    pkg: PptxPackage, master_part: str | None, theme: ThemeInfo, canvas: Canvas,
+) -> float | None:
+    """Кегль заголовка мастера, ГОТОВЫЙ к использованию как фолбэк для
+    `_features` (находка код-ревью Task 5, п.6) — `None`, если мастер не
+    резолвится ВООБЩЕ, либо его `p:txStyles` деградировал (заглушка
+    Google-экспорта, `theme.text_styles_degraded` — см. её докстроку в
+    theme.py): на трёх учебных шаблонах `txStyles` — одна и та же тройка на
+    всех девяти уровнях, и подставлять оттуда кегль значило бы выдавать
+    заглушку за измерение. На нативном шаблоне (не деградировавшем) это
+    настоящий источник — см. отчёт Task 5."""
+    if master_part is None or theme.text_styles_degraded:
+        return None
+    return _master_title_size(pkg, master_part, canvas)
 
 
 def _resolve_placeholder_box(
