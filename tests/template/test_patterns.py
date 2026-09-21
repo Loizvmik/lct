@@ -23,6 +23,7 @@ from deckforge.template.patterns import (
     RepeatSpec,
     _TierInfo,
     _capacity,
+    _classify_kind,
     _find_repeat,
     _shape_text,
     _slide_is_dark,
@@ -473,3 +474,60 @@ def test_capacity_accounts_for_last_item_own_footprint_not_only_step():
     # старая формула (без учёта item_size): int(0.9/0.2) + 1 = 5 (переоценка)
     # новая формула: int((0.9 - 0.15)/0.2) + 1 = int(3.75) + 1 = 4
     assert capacity.max_items == 4
+
+
+# === Task 7 повторное ревью — дефект №1: карточки по структуре, не по
+# типографике (найдено предыдущим исполнителем на слайде 9 контрольного
+# ЛЦТ2026: сетка из пяти карточек участников, каждая — три строки ОДНОГО
+# кегля, ни одна не набрана заголовочным кеглем) ===========================
+
+
+def _card_slot(role: str, left: float, top: float, *, width: float = 0.15, height: float = 0.03) -> PatternSlot:
+    return PatternSlot(
+        role=role, box=Box(left=left, top=top, width=width, height=height),
+        size_pt=14.0, color_hex=None, align="l", max_chars=10, wraps=False, sample_text="x",
+    )
+
+
+def test_classify_kind_recognizes_cards_by_repeat_structure_not_typography():
+    """Пять карточек по три элемента одного кегля — карточку делает
+    СТРУКТУРА повтора (число групп и число элементов на группу), не
+    заголовочный кегль внутри карточки. Slot_roles повтора здесь --
+    ['card_body'] целиком, БЕЗ card_title/kpi_value — старое условие
+    (`_CARD_TITLE_LIKE_ROLES & repeat_roles`) на этих данных было бы
+    красным по существу, не по сигнатуре."""
+    lefts = [0.05, 0.24, 0.43, 0.62, 0.81]
+    slots = [
+        _card_slot("card_body", left, top)
+        for left in lefts
+        for top in (0.30, 0.36, 0.42)
+    ]
+    slots.append(PatternSlot(
+        role="headline", box=Box(left=0.05, top=0.05, width=0.6, height=0.1),
+        size_pt=32.0, color_hex=None, align="l", max_chars=20, wraps=False, sample_text="Заголовок",
+    ))
+    repeat = RepeatSpec(axis="x", count=5, step=0.19, slot_roles=["card_body"], group_size=3)
+    roles_present = {"card_body", "headline"}
+
+    kind = _classify_kind([], slots, repeat, roles_present, _CANVAS)
+
+    assert kind == "cards"
+
+
+def test_classify_kind_does_not_treat_repeat_of_single_lines_as_cards():
+    """Повтор из пяти ОДИНОЧНЫХ строк (одна строка на элемент, group_size=1)
+    карточками не считается — структуре не хватает "нескольких элементов в
+    каждой группе", одного заголовочного кегля тоже нет, чтобы притянуть
+    старое условие."""
+    lefts = [0.05, 0.24, 0.43, 0.62, 0.81]
+    slots = [_card_slot("bullet", left, 0.30) for left in lefts]
+    slots.append(PatternSlot(
+        role="headline", box=Box(left=0.05, top=0.05, width=0.6, height=0.1),
+        size_pt=32.0, color_hex=None, align="l", max_chars=20, wraps=False, sample_text="Заголовок",
+    ))
+    repeat = RepeatSpec(axis="x", count=5, step=0.19, slot_roles=["bullet"], group_size=1)
+    roles_present = {"bullet", "headline"}
+
+    kind = _classify_kind([], slots, repeat, roles_present, _CANVAS)
+
+    assert kind != "cards"

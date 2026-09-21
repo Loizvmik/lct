@@ -114,6 +114,17 @@ class RepeatSpec:
     count: int
     step: float
     slot_roles: list[str] = field(default_factory=list)
+    # Число слотов, слитых в ОДНУ повторяющуюся единицу — карточку/строку
+    # (заголовок карточки + тело карточки = 2, одна строка списка = 1) — см.
+    # `_find_repeat` (там же `len(best)`, число смёрженных кандидатов одной
+    # физической сетки). Task 7 повторное ревью №2, находка №1: структурный
+    # признак "карточки" (несколько элементов в каждой повторяющейся
+    # группе), в отличие от `slot_roles`, не может случайно схлопнуться в
+    # единицу, когда несколько элементов группы получили ОДНУ И ТУ ЖЕ роль
+    # (пять карточек участников команды, где имя/роль/ник набраны одним
+    # кеглем — `slot_roles` был бы {"card_body"}, притом что элементов в
+    # группе два и больше).
+    group_size: int = 1
 
 
 @dataclass(frozen=True)
@@ -873,7 +884,15 @@ def _find_repeat(
         for idx in c.indices:
             roles_by_index[idx] = c.prelim_role
 
-    return RepeatSpec(axis=axis, count=count, step=step, slot_roles=[]), roles_by_index
+    # `len(best)` — число смёрженных кандидатов ОДНОЙ физической сетки, то
+    # есть число слотов на одну повторяющуюся единицу (см. `RepeatSpec.
+    # group_size`): каждый элемент `best` — самостоятельный кандидат
+    # (заголовок карточки, тело карточки, ...), слитый в эту сетку именно
+    # потому, что его члены выровнены с остальными вдоль оси повтора
+    # (`_aligned`) — не то же самое, что число РАЗЛИЧНЫХ ролей
+    # (`slot_roles`), которое может случайно схлопнуться, если несколько
+    # элементов группы получили одну и ту же роль.
+    return RepeatSpec(axis=axis, count=count, step=step, slot_roles=[], group_size=len(best)), roles_by_index
 
 
 # --- назначение финальных ролей ---------------------------------------------
@@ -887,6 +906,12 @@ def _find_repeat(
 # должен означать kind="two_col" (см. отчёт задачи, регрессия на находку
 # ручной проверки).
 _TWO_COL_ROLES = frozenset({"body", "bullet", "card_body", "subhead"})
+
+# Минимум "несколько" (бриф Task 7 повторного ревью №2, находка №1: карточку
+# делает структура повтора — "несколько групп... и несколько элементов в
+# каждой"). Одного слота на группу мало, чтобы называть повтор "карточками",
+# двух уже достаточно (заголовок+тело или две строки внутри карточки).
+_MIN_CARD_GROUP_SIZE = 2
 
 
 def _column_pair(slots: list[PatternSlot]) -> tuple[int, int] | None:
@@ -1089,24 +1114,29 @@ def estimate_slot_chars(box: Box, canvas: Canvas, size_pt: float) -> int:
 # --- классификация kind (бриф, Step 2, п.5, порядок приоритета дословно) ---
 
 
-#  Роли, играющие роль "заголовка карточки" внутри повтора — не только
-# буквальный card_title: пронумерованная карточка ("1"/"2"/"3"...) несёт ту
-# же композиционную роль числом вместо слова (VK Education, "Нумерация") —
-# см. _prelim_repeat_role, где numeric-тир внутри повтора маркируется
-# kpi_value, а не card_title, именно потому что по смыслу это число, а не
-# заголовок; для классификации kind оба варианта равноценно образуют пару
-# "заголовок карточки + тело карточки".
-_CARD_TITLE_LIKE_ROLES = frozenset({"card_title", "kpi_value"})
-
-
 def _classify_kind(
     content: list[ShapeRef], slots: list[PatternSlot], repeat: RepeatSpec | None,
     roles_present: set[str], canvas: Canvas,
 ) -> str:
-    if repeat is not None and repeat.axis == "x" and repeat.count >= 3:
-        repeat_roles = _repeat_roles(repeat)
-        if repeat_roles & _CARD_TITLE_LIKE_ROLES and "card_body" in repeat_roles:
-            return "cards"
+    # Task 7 повторное ревью №2, находка №1: карточку делает СТРУКТУРА
+    # повтора — несколько групп (>= 3, по горизонтали) с НЕСКОЛЬКИМИ
+    # элементами в каждой (`group_size >= _MIN_CARD_GROUP_SIZE`), а не
+    # присутствие заголовочного кегля внутри карточки. Раньше условие
+    # требовало буквально card_title/kpi_value среди ролей повтора — верно
+    # для трёх учебных файлов, где карточки случайно оказались с
+    # заголовками, но ложно для слайда 9 контрольного ЛЦТ2026 (сетка из
+    # пяти карточек участников команды, все три строки одного кегля, без
+    # заголовочного кегля внутри карточки вовсе). Заголовочный кегль
+    # (card_title/kpi_value как отдельная РОЛЬ на слайде) по-прежнему
+    # повышает уверенность в результате — но уже не через это условие, а
+    # тем, что он расширяет `roles_present` и напрямую поднимает
+    # `role_score` в `_score` (см. её докстроку): типографика влияет на
+    # SCORE раскладки, не на её KIND.
+    if (
+        repeat is not None and repeat.axis == "x" and repeat.count >= 3
+        and repeat.group_size >= _MIN_CARD_GROUP_SIZE
+    ):
+        return "cards"
 
     if _column_pair(slots) is not None:
         return "two_col"
@@ -1144,10 +1174,6 @@ def _classify_kind(
         return "table"
 
     return "bullets"
-
-
-def _repeat_roles(repeat: RepeatSpec) -> set[str]:
-    return set(repeat.slot_roles) if repeat.slot_roles else set()
 
 
 # --- проверки качества (бриф, "Требования к работе") ------------------------
