@@ -14,7 +14,8 @@ VK Tech, `theme2.xml` у Education) — стоковая «Тема Office», н
 мастеру и его теме через rels, а не гадает по порядку файлов в архиве.
 """
 from __future__ import annotations
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 
 from deckforge.ooxml.color import Color, UnresolvedColor, resolve_color
 from deckforge.ooxml.ns import local_name, qn
@@ -30,10 +31,16 @@ _STOCK_OFFICE_ACCENTS = {
     "accent4": "#FFC000", "accent5": "#5B9BD5", "accent6": "#70AD47",
 }
 
-# Шрифты, которыми Google Slides (и не только) забивает fontScheme, когда
-# реального выбора шрифта не было. Сюда же "+mn-lt" — токен на минорный
-# шрифт темы, который в такой ситуации тоже указывает сам на себя.
-_DEGRADED_FONT_NAMES = {"Arial", "Calibri", "+mn-lt"}
+# Порог «заметно» для третьего условия деградации (см. refine_font_scheme_
+# degraded): шрифт темы должен набрать БОЛЬШИНСТВО реального текста (>50%
+# символов с явно резолвящимся шрифтом), чтобы считаться настоящим, а не
+# заглушкой. Не более мягкий порог: у VK Education (Task 3 код-ревью, п.4)
+# Arial встречается в четверти-трети текста — заметно, но не доминирует —
+# и деградация обязана остаться True, потому что реально доминирует Play.
+# Только "шрифт темы — большинство" однозначно отличает случай "тема и
+# текст согласны" (синтетика: 100% Arial → не деградация) от случая
+# "шрифт темы просто где-то мелькает, но не описывает шаблон".
+_THEME_FONT_MAJORITY_SHARE = 0.5
 
 _CLR_SCHEME_SLOTS = (
     "dk1", "lt1", "dk2", "lt2",
@@ -49,6 +56,18 @@ class ThemeInfo:
     major_font: str
     minor_font: str
     scheme_name: str
+    # Как отдаёт read_theme() — только структурный сигнал: fontScheme/@name
+    # == "Office" И majorFont == minorFont. Этого достаточно, чтобы решить,
+    # что тема ПОХОЖА на заглушку Google-экспорта, но недостаточно для
+    # уверенности: Arial/Calibri в корпоративном шаблоне бывают осознанным
+    # выбором дизайнера. Третье, решающее условие — "шрифт темы не
+    # встречается в фактическом тексте заметно" — требует текста слайдов,
+    # которого read_theme не видит (это работа usage.py). Поэтому это поле
+    # здесь — предварительное значение; окончательное получается вызовом
+    # refine_font_scheme_degraded(theme, font_chars) после collect_usage
+    # (см. Usage.primary_theme в usage.py, где это уже сделано автоматически).
+    # major_font/minor_font при этом резолвятся из темы всегда, независимо
+    # от значения этого флага — флаг ничего не обнуляет, только объясняет.
     font_scheme_degraded: bool
     text_styles_degraded: bool
     is_stock_office_palette: bool
@@ -58,6 +77,57 @@ class ThemeInfo:
     # UnresolvedColor в ooxml/color.py). Для clrScheme темы это скорее
     # подстраховка: на трёх реальных шаблонах здесь всегда чистый srgbClr.
     unresolved: list[UnresolvedColor] = field(default_factory=list)
+
+
+EMPTY_THEME = ThemeInfo(
+    scheme={}, clr_map={}, major_font="", minor_font="", scheme_name="",
+    font_scheme_degraded=False, text_styles_degraded=False, is_stock_office_palette=False,
+)
+"""Нейтральный фолбэк для частей пакета, у которых нет резолвимой темы (см.
+usage.py::_ThemeGraph) — не «правильный ответ» ни для какого настоящего
+.pptx (мастер там обязателен по OOXML), а честный нейтральный элемент:
+schemeClr не резолвится (уйдёт в unresolved), токены шрифта не резолвятся
+ни во что осмысленное, флаги деградации — False (нечего деградировать)."""
+
+
+def _is_font_scheme_stub_shaped(font_scheme_name: str, major_font: str, minor_font: str) -> bool:
+    """Структурный сигнал «похоже на заглушку Google-экспорта»: имя схемы
+    шрифтов — дефолтное "Office", и majorFont совпадает с minorFont (Google
+    всегда пишет туда Arial/Arial). Сам по себе не значит деградацию —
+    финальное решение см. refine_font_scheme_degraded."""
+    return font_scheme_name == "Office" and bool(major_font) and major_font == minor_font
+
+
+def refine_font_scheme_degraded(theme: ThemeInfo, font_chars: Mapping[str, int]) -> ThemeInfo:
+    """Уточняет ThemeInfo.font_scheme_degraded по фактическому употреблению шрифта.
+
+    read_theme даёт только структурный сигнал (fontScheme/@name == "Office" и
+    majorFont == minorFont) — этого достаточно, чтобы заподозрить заглушку, но
+    недостаточно для уверенности: в корпоративном шаблоне Arial/Calibri тоже
+    бывают осознанным выбором дизайнера. Третье условие требует фактического
+    текста слайдов, которого read_theme не видит, — поэтому вызывается
+    отдельно, уже после collect_usage (в usage.py это делается автоматически
+    для Usage.primary_theme).
+
+    `font_chars` — {имя_шрифта: число_символов}, как в Usage.fonts (после
+    разрешения токенов +mj-lt/+mn-lt — см. usage.py, они резолвятся в имя
+    шрифта темы всегда, вне зависимости от текущего значения этого флага).
+    Если шрифт темы набирает больше `_THEME_FONT_MAJORITY_SHARE` (см. её
+    докстроку) всего текста с явно резолвящимся шрифтом — это его реальное
+    большинство, не заглушка, и флаг снимается, даже если структурный сигнал
+    был True. Нет структурного сигнала — снимать нечего, флаг остаётся как
+    есть (False). Текста нет вовсе — сравнивать не с чем, доверяем
+    структурному сигналу без изменений.
+    """
+    if not theme.font_scheme_degraded:
+        return theme
+    total = sum(font_chars.values())
+    if total == 0:
+        return theme
+    theme_font_chars = font_chars.get(theme.major_font, 0)
+    if theme_font_chars / total > _THEME_FONT_MAJORITY_SHARE:
+        return replace(theme, font_scheme_degraded=False)
+    return theme
 
 
 def is_stock_office(scheme: dict[str, str]) -> bool:
@@ -119,10 +189,7 @@ def read_theme(pkg: PptxPackage, master_part: str) -> ThemeInfo:
     body_style = tx_styles.find(qn("p:bodyStyle")) if tx_styles is not None else None
     text_styles_degraded = _is_style_degenerate(title_style) and _is_style_degenerate(body_style)
 
-    font_scheme_degraded = (
-        (major_font == minor_font and major_font in _DEGRADED_FONT_NAMES)
-        or font_scheme_name == "Office"
-    )
+    font_scheme_degraded = _is_font_scheme_stub_shaped(font_scheme_name, major_font, minor_font)
 
     return ThemeInfo(
         scheme=scheme,
