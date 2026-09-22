@@ -230,35 +230,57 @@ def _assign_kpis(block: KpiBlock, by_role: dict[str, list[PatternSlot]]) -> list
     # не должен снова достаться другому, см. их докстроки).
     value_slots.sort(key=lambda s: (round(s.box.top, 3), s.box.left))
     label_slots.sort(key=lambda s: (round(s.box.top, 3), s.box.left))
-    n = min(len(block.items), len(value_slots))
+
+    # Task 13 продолжение, дефект обязательной проверки (контрольный
+    # шаблон, слайд 6: "крупные цифры разбросаны без подписей"). Раньше `n`
+    # считался ТОЛЬКО по числу `kpi_value`-слотов (`n = min(len(items),
+    # len(value_slots))`), а подпись метрики `i` подставлялась, только если
+    # `i < len(label_slots)` — на раскладке с 4 `kpi_value`, но только 2
+    # `kpi_label` (реальный случай контрольного шаблона) третья и четвёртая
+    # метрика получали крупное число В СЛОТ, а их подпись просто МОЛЧА
+    # терялась — значение и подпись ОДНОЙ метрики расходились по разным
+    # судьбам: одна половина на слайде, другая нигде. Пара ЗНАЧЕНИЕ+ПОДПИСЬ
+    # теперь либо целиком уходит в свои kpi_value/kpi_label слоты, либо
+    # (когда не хватает подписи или самого value-слота) целиком уходит в
+    # текстовый фолбэк ниже — они никогда не разъезжаются по разным путям.
     result: list[SlotContent] = []
-    for i in range(n):
-        item = block.items[i]
-        result.append(SlotContent(value_slots[i], "kpi_value", [Paragraph(item.value)]))
-        if i < len(label_slots):
-            result.append(SlotContent(label_slots[i], "kpi_label", [Paragraph(item.label)]))
-    del value_slots[:n]
-    del label_slots[:min(n, len(label_slots))]
+    fallback_items: list = []
+    vi = li = 0
+    for item in block.items:
+        if vi >= len(value_slots):
+            fallback_items.append(item)
+            continue
+        needs_label = bool(item.label)
+        if needs_label and li >= len(label_slots):
+            fallback_items.append(item)
+            continue
+        result.append(SlotContent(value_slots[vi], "kpi_value", [Paragraph(item.value)]))
+        vi += 1
+        if needs_label:
+            result.append(SlotContent(label_slots[li], "kpi_label", [Paragraph(item.label)]))
+            li += 1
+    del value_slots[:vi]
+    del label_slots[:li]
 
     # Task 13, находка обязательной проверки (живой прогон на queue-latency,
     # VK Tech): раскладку `kind="kpi"` шаблон может не нести вовсе (VK Tech
     # — 0 раскладок этого kind из 20), а `plan.variants.apply_variant`
     # обязан всё равно выбрать КАКУЮ-ТО раскладку (`kind_pool` деградирует
     # на любой доступный `kind` варианта, а не оставляет слайд несобранным)
-    # — не-kpi раскладка не несёт `kpi_value`/`kpi_label` вовсе, и n=0
+    # — не-kpi раскладка не несёт `kpi_value`/`kpi_label` вовсе, и `vi=li=0`
     # оставляло KpiBlock ПОЛНОСТЬЮ потерянным (слайд с одним заголовком без
     # единой цифры — находка: пустые карточки на живом рендере, ни один
     # факт не попал на слайд). Запасной вариант — тот же приём, что уже
     # применяют `_assign_block` для BulletBlock ("card_body" как запасная
     # роль) и `_assign_quote` для QuoteBlock без роли "quote": метрики, не
-    # уместившиеся (или не уместившиеся вовсе) в kpi-слоты, рендерятся
-    # строкой "значение — подпись" в обычном текстовом слоте — хуже
-    # выделенного KPI-блока визуально, но не теряет ни один факт молча.
-    remaining = block.items[n:]
-    if remaining:
+    # уместившиеся (или не уместившиеся вовсе, ИЛИ не нашедшие пары) в
+    # kpi-слоты, рендерятся строкой "значение — подпись" в обычном текстовом
+    # слоте — хуже выделенного KPI-блока визуально, но не теряет ни один
+    # факт молча и не разрывает пару значение/подпись.
+    if fallback_items:
         fallback_slot = _take_one(by_role, "bullet") or _take_one(by_role, "body") or _take_one(by_role, "card_body")
         if fallback_slot is not None:
-            lines = [f"{item.value} — {item.label}" if item.label else item.value for item in remaining]
+            lines = [f"{item.value} — {item.label}" if item.label else item.value for item in fallback_items]
             result.append(SlotContent(fallback_slot, "bullets", [Paragraph(line, bullet=True) for line in lines]))
 
     return result

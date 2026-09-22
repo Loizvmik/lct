@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import pytest
 
-from deckforge.compose.blocks import expand_decor, expand_repeat
+from deckforge.compose.blocks import assign_content, expand_decor, expand_repeat
 from deckforge.ooxml.geometry import Box
+from deckforge.plan.spec import Kpi, KpiBlock, SlideSpec
 from deckforge.template.grid import Grid
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
 
@@ -117,3 +118,101 @@ def test_decor_without_a_repeat_consuming_block_is_left_as_mined():
     pattern = _six_card_pattern()
     result = expand_decor(pattern, None, _grid())
     assert len(result) == len(pattern.decor)
+
+
+# ---------------------------------------------------------------------------
+# Укладка KpiBlock (Task 13, продолжение — обязательная проверка на
+# контрольном шаблоне поймала слайд 6: "крупные цифры разбросаны без
+# подписей", хотя раскладка несёт парные kpi_value/kpi_label слоты).
+# ---------------------------------------------------------------------------
+
+
+def _kpi_pattern(n_value_slots: int, n_label_slots: int) -> Pattern:
+    """`kind="kpi"`-паттерн с `n_value_slots` слотов роли `kpi_value` и
+    `n_label_slots` слотов роли `kpi_label` (заведомо МЕНЬШЕ, чем
+    `kpi_value`, когда `n_label_slots < n_value_slots` — воспроизводит
+    находку обязательной проверки: раскладка несёт больше мест под крупное
+    число, чем под подпись к нему), плюс запасной текстовый слот для
+    фолбэка непарных метрик."""
+    value_slots = [
+        PatternSlot(
+            role="kpi_value", box=Box(0.05 + i * 0.23, 0.2, 0.2, 0.15), size_pt=32.0, color_hex=None,
+            align="ctr", max_chars=10, wraps=False,
+        )
+        for i in range(n_value_slots)
+    ]
+    label_slots = [
+        PatternSlot(
+            role="kpi_label", box=Box(0.05 + i * 0.23, 0.37, 0.2, 0.08), size_pt=12.0, color_hex=None,
+            align="ctr", max_chars=30, wraps=True,
+        )
+        for i in range(n_label_slots)
+    ]
+    fallback = PatternSlot(
+        role="body", box=Box(0.05, 0.5, 0.9, 0.3), size_pt=14.0, color_hex=None,
+        align="l", max_chars=400, wraps=True,
+    )
+    return Pattern(
+        pattern_id="kpi-pattern", source_slide_index=[0], layout_id="L", kind="kpi",
+        slots=[*value_slots, *label_slots, fallback], repeat=None, decor=[],
+        capacity=Capacity(
+            max_items=n_value_slots, max_chars_per_item=10, max_bullets=0, max_series=0, max_rows=0, max_cols=0,
+        ),
+        score=1.0, is_dark=False,
+    )
+
+
+def test_kpi_value_and_label_of_the_same_metric_always_land_in_a_paired_slot_or_neither():
+    """Task 13 продолжение, дефект отчёта (слайд 6, контрольный шаблон):
+    раскладка несёт 4 слота `kpi_value`, но только 2 слота `kpi_label` —
+    раньше `_assign_kpis` клала ЗНАЧЕНИЕ третьей и четвёртой метрики в
+    свободный `kpi_value`-слот, а её подпись просто терялась (`if i <
+    len(label_slots)`) — на слайде оставались голые числа без подписи.
+    Метрика, для которой не хватило ПАРЫ (и значения, и подписи), обязана
+    уйти ЦЕЛИКОМ в текстовый фолбэк "значение — подпись", а не разойтись
+    по разным слотам/судьбам."""
+    pattern = _kpi_pattern(n_value_slots=4, n_label_slots=2)
+    slide = SlideSpec(
+        index=0, kind="kpi", headline="",
+        blocks=[KpiBlock(items=[
+            Kpi(value="-80%", label="сквозное время"),
+            Kpi(value="-35 п.п.", label="доля вручную"),
+            Kpi(value="-17 п.п.", label="доля с ошибкой"),
+            Kpi(value="+1,3", label="удовлетворённость"),
+        ])],
+    )
+    result = assign_content(slide, pattern, _grid())
+
+    kpi_values = [c for c in result if c.role_hint == "kpi_value"]
+    kpi_labels = [c for c in result if c.role_hint == "kpi_label"]
+    # Ровно две метрики уместились ПАРОЙ (у раскладки только 2 kpi_label) —
+    # ни одно значение не осталось без своей подписи.
+    assert len(kpi_values) == 2
+    assert len(kpi_labels) == 2
+    assert {p.text for c in kpi_values for p in c.paragraphs} == {"-80%", "-35 п.п."}
+    assert {p.text for c in kpi_labels for p in c.paragraphs} == {"сквозное время", "доля вручную"}
+
+    # Оставшиеся две метрики (значение И подпись ВМЕСТЕ) ушли в фолбэк —
+    # не потерялись и не разошлись по разным местам.
+    fallback = [c for c in result if c.role_hint == "bullets"]
+    assert len(fallback) == 1
+    joined = "\n".join(p.text for p in fallback[0].paragraphs)
+    assert "-17 п.п." in joined and "доля с ошибкой" in joined
+    assert "+1,3" in joined and "удовлетворённость" in joined
+
+
+def test_kpi_pairing_is_unaffected_when_labels_are_plentiful():
+    """Регрессия: когда слотов `kpi_label` хватает на все метрики — прежнее
+    поведение (все пары в свои слоты, фолбэка нет) не меняется."""
+    pattern = _kpi_pattern(n_value_slots=4, n_label_slots=4)
+    slide = SlideSpec(
+        index=0, kind="kpi", headline="",
+        blocks=[KpiBlock(items=[
+            Kpi(value="-80%", label="сквозное время"),
+            Kpi(value="-35 п.п.", label="доля вручную"),
+        ])],
+    )
+    result = assign_content(slide, pattern, _grid())
+    assert len([c for c in result if c.role_hint == "kpi_value"]) == 2
+    assert len([c for c in result if c.role_hint == "kpi_label"]) == 2
+    assert not [c for c in result if c.role_hint == "bullets"]
