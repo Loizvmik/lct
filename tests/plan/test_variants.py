@@ -168,6 +168,44 @@ def profile_fixture_without_image_patterns() -> TemplateProfile:
     return PROFILE.model_copy(update={"patterns": [p for p in PROFILE.patterns if p.kind != "image"]})
 
 
+def profile_fixture_without_section_patterns() -> TemplateProfile:
+    """Копия `PROFILE` без единого паттерна `kind="section"` — тот же приём,
+    что `profile_fixture_without_image_patterns` ниже, воспроизводит на
+    разрешённом тестами шаблоне (VK Tech) состав контрольного ЛЦТ2026
+    (bullets/two_col/cards/kpi — БЕЗ единого `section`, см. отчёт задачи,
+    ручная проверка): дефект №2 отчёта проявляется именно тогда, когда
+    желаемый `kind="section"` (безблочный слайд) не представлен в шаблоне
+    вовсе."""
+    return PROFILE.model_copy(update={"patterns": [p for p in PROFILE.patterns if p.kind != "section"]})
+
+
+def test_content_without_cards_or_kpi_never_degrades_into_those_kinds():
+    """Task 13, дефект отчёта задачи №2 (важное, ручная проверка ЛЦТ2026):
+    когда шаблон не несёт ни одного паттерна `kind="section"`, безблочный
+    слайд (только заголовок — `DECK.slides[0]`/`[11]`) раньше деградировал
+    через `kind_pool = [k for k in priority if k in available]` — список
+    ПО ВКУСУ варианта, БЕЗ учёта того, что содержание физически не несёт
+    блока для этого `kind`. У `dense` "cards" первая по вкусу — слайд без
+    единой карточки садился на `kind="cards"`, `compose.blocks._assign_
+    cards` требует `CardBlock` (её докстрока: `pattern.repeat is None or
+    not block.items -> []`), четыре карточных плашки декора оставались
+    пустыми рамками (живой разбор ЛЦТ2026, слайд 4 макета "Содержание_1",
+    координатор). Правило (уже применялось в проекте для несовместимых по
+    вместимости раскладок, см. `_pattern_rank_key`): если содержание не
+    укладывается в раскладку, берём другую раскладку, а не пустые рамки —
+    здесь то же самое, но для СТРУКТУРНОЙ, не размерной несовместимости."""
+    poor = profile_fixture_without_section_patterns()
+    spec = apply_variant(DECK, poor, Variant.dense)
+    section_slides = [s for s in DECK.slides if s.kind == "section" and not s.blocks]
+    assert section_slides, "тест предполагает, что DECK несёт хотя бы один безблочный section-слайд"
+    for original in section_slides:
+        rebuilt = next(s for s in spec.slides if s.index == original.index)
+        assert rebuilt.kind not in ("cards", "kpi", "table"), (
+            f"слайд {rebuilt.index} без блоков деградировал на kind={rebuilt.kind!r}, "
+            "требующий содержимого, которого на слайде нет"
+        )
+
+
 def test_three_variants_are_visually_distinct():
     specs = [apply_variant(DECK, PROFILE, v) for v in Variant]
     pattern_sets = [{s.pattern_id for s in spec.slides} for spec in specs]

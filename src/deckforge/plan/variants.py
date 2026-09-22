@@ -343,6 +343,21 @@ def _pattern_rank_key(
     return (fit_bucket, avoid_penalty, kind_rank, decor_bias, capacity_bias, roominess_bias, -p.score)
 
 
+# `kind`, чей `Pattern.repeat`/визуал требует контента, который приносит
+# ТОЛЬКО соответствующий блок (`CardBlock`/`KpiBlock`/`TableVisual`) — см.
+# `_compatible_kinds`: без такого блока `compose.blocks._assign_cards`/
+# `_assign_kpis`/`builder._place_table_visual` физически нечем заполнить
+# повторяющиеся слоты этого `kind`, они останутся пустыми декоративными
+# рамками (Task 13, дефект отчёта задачи №2, ручная проверка ЛЦТ2026:
+# безблочный слайд деградировал на "cards", т.к. это первый по вкусу `kind`
+# в списке предпочтения `dense`, — четыре пустые карточные плашки на
+# слайде "Содержание_1"). Используется ТОЛЬКО в деградации `_choose_kind_
+# and_pattern` ниже, когда совместимый `kind` не представлен в шаблоне —
+# обычный (не деградирующий) путь и так никогда не выбирает эти `kind` без
+# нужного блока (`_compatible_kinds` их просто не предлагает).
+_HARD_REQUIREMENT_KINDS = frozenset({"cards", "kpi", "table"})
+
+
 def _choose_kind_and_pattern(
     slide: SlideSpec, profile, variant: Variant, *, avoid: frozenset[str] = frozenset(),
 ) -> tuple[str, str | None]:
@@ -363,10 +378,19 @@ def _choose_kind_and_pattern(
 
     Деградация (тест брифа `test_variant_falls_back_when_template_lacks_a_
     pattern_kind`): если ни один СОВМЕСТИМЫЙ `kind` не представлен в этом
-    шаблоне вовсе — берутся кандидаты ЛЮБОГО `kind` из предпочтения
-    варианта; если и таких нет — буквально любой `kind`, какой в шаблоне
-    есть. `pattern_id=None` — только если у профиля вообще нет ни одного
-    паттерна ни одного `kind` (пустой шаблон, честный крайний случай)."""
+    шаблоне вовсе — берутся кандидаты `kind` из предпочтения варианта, но
+    НИКОГДА `kind` из `_HARD_REQUIREMENT_KINDS` (`cards`/`kpi`/`table`),
+    если содержание структурно не несёт нужного блока (Task 13, дефект
+    отчёта задачи №2 — раньше эта деградация брала ЛЮБОЙ `kind` из вкуса
+    варианта без разбора, и безблочный слайд на шаблоне без `kind="section"`
+    садился на "cards" только потому, что она первая по вкусу `dense`,
+    оставляя карточные слоты пустыми). Если и БЕЗОПАСНЫХ кандидатов нет
+    (шаблон целиком состоит из `cards`/`kpi`/`table`) — берётся ЛЮБОЙ `kind`
+    из предпочтения варианта (тот же путь, что и раньше: неидеальный выбор
+    лучше никакого); если и таких нет — буквально любой `kind`, какой в
+    шаблоне есть. `pattern_id=None` — только если у профиля вообще нет ни
+    одного паттерна ни одного `kind` (пустой шаблон, честный крайний
+    случай)."""
     compatible = _compatible_kinds(slide)
     priority = _VARIANT_KIND_PRIORITY[variant]
     available = {p.kind for p in profile.patterns}
@@ -374,7 +398,12 @@ def _choose_kind_and_pattern(
     char_len = _content_char_len(slide)
 
     ordered = [k for k in priority if k in compatible] + [k for k in compatible if k not in priority]
-    kind_pool = [k for k in ordered if k in available] or [k for k in priority if k in available]
+    kind_pool = [k for k in ordered if k in available]
+    if not kind_pool:
+        safe_priority = [k for k in priority if k not in _HARD_REQUIREMENT_KINDS or k in compatible]
+        kind_pool = [k for k in safe_priority if k in available]
+    if not kind_pool:
+        kind_pool = [k for k in priority if k in available]
     if not kind_pool:
         if not available:
             return slide.kind, None
