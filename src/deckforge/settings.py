@@ -54,6 +54,10 @@ class LLMConfig(BaseModel):
     # deadline_seconds (например, собранные вручную в тестах) не переставали
     # парситься.
     deadline_seconds: float = 60.0
+    # Дефолт дублирует `plan.writer.DEFAULT_WRITER_MAX_WORKERS` — см.
+    # комментарий про происхождение числа в app.yaml. Со значением по
+    # умолчанию по той же причине, что и `deadline_seconds` выше.
+    slide_writer_max_workers: int = 4
 
     def model_for(self, role: str) -> str:
         """Модель для роли; если роль не описана явно — модель по умолчанию."""

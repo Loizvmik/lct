@@ -1,6 +1,8 @@
 """Тесты `plan.writer.write_slides`/`pick_patterns` (Task 13, Step 3 брифа)."""
 from __future__ import annotations
 import json
+import threading
+import time
 
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec, validate_deck_spec
@@ -58,7 +60,13 @@ def test_write_slides_uses_model_response_when_valid(PROFILE):
     outline = _outline(3)
     llm = _QueueLLM([_valid_slide_json("Заголовок один"), _valid_slide_json("Заголовок два"), _valid_slide_json("Заголовок три")])
     sources = [SourceDoc(name="sources.md", text="Сквозная медиана — 6,2 часа")]
-    deck = write_slides(outline, sources, PROFILE, llm=llm)
+    # max_workers=1: тест проверяет ЛОГИКУ (repair/fallback/happy path), не
+    # параллельность — `_QueueLLM` отдаёт ответы строго по очереди (FIFO),
+    # и с несколькими воркерами порядок обращения к очереди зависит от
+    # планировщика потоков, а не от индекса слайда (реальную параллельность
+    # и то, что порядок ИТОГОВОЙ колоды от неё не зависит, проверяют
+    # отдельные тесты ниже, "параллельность write_slides").
+    deck = write_slides(outline, sources, PROFILE, llm=llm, max_workers=1)
     assert [s.headline for s in deck.slides] == ["Заголовок один", "Заголовок два", "Заголовок три"]
     assert validate_deck_spec(deck) == []
     assert deck.title == "Колода"
@@ -75,7 +83,7 @@ def test_write_slides_repairs_once_then_falls_back_to_valid_answer(PROFILE):
     ]}, ensure_ascii=False)  # цифра есть, source_note нет — невалидно
     good = _valid_slide_json("Заголовок исправлен", with_number=True)
     llm = _QueueLLM([_valid_slide_json("Первый"), bad, good, _valid_slide_json("Третий")])
-    deck = write_slides(outline, [], PROFILE, llm=llm)
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)  # см. комментарий выше — FIFO нужен последовательно
     assert deck.slides[1].headline == "Заголовок исправлен"
     assert validate_deck_spec(deck) == []
 
@@ -87,7 +95,7 @@ def test_write_slides_falls_back_when_model_keeps_sending_invalid_json(PROFILE):
     # или упасть.
     bad = json.dumps({"kind": "bullets", "headline": "X", "unknown_field": 1}, ensure_ascii=False)
     llm = _QueueLLM([_valid_slide_json("Первый"), bad, bad, _valid_slide_json("Третий")])
-    deck = write_slides(outline, [], PROFILE, llm=llm)
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)  # FIFO — см. комментарий выше
     assert validate_deck_spec(deck) == []
     assert deck.slides[1].findings  # запасной вариант помечен честно
 
@@ -95,9 +103,102 @@ def test_write_slides_falls_back_when_model_keeps_sending_invalid_json(PROFILE):
 def test_write_slides_falls_back_on_network_error(PROFILE):
     outline = _outline(2)
     llm = _QueueLLM([RuntimeError("сеть недоступна"), RuntimeError("сеть недоступна")])
-    deck = write_slides(outline, [], PROFILE, llm=llm)
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)  # FIFO — см. комментарий выше
     assert validate_deck_spec(deck) == []
     assert all(s.findings for s in deck.slides)
+
+
+# ---------------------------------------------------------------------------
+# Параллельность write_slides (это задача: слайды пишутся по очереди — 23с
+# на слайд, слайды друг от друга не зависят, писать нужно параллельно).
+# ---------------------------------------------------------------------------
+
+
+class _SlowIndexAwareLLM(LLMProvider):
+    """Читает `position.index` из ЗАПРОСА (не угадывает по порядку вызова —
+    у параллельных потоков порядок обращения непредсказуем) и отвечает
+    валидным слайдом, чей заголовок несёт этот индекс. `delay_by_index`
+    позволяет заставить более поздние слайды отвечать РАНЬШЕ более ранних —
+    единственный честный способ проверить, что итоговый порядок колоды не
+    зависит от того, кто ответил первым (не просто "порядок не менялся",
+    что было бы правдой и без всякой сортировки по индексу)."""
+
+    def __init__(self, delay_by_index=None, fail_indices: set[int] = frozenset()):
+        self._delay_by_index = delay_by_index or (lambda i: 0.0)
+        self._fail_indices = fail_indices
+        self.concurrent_calls = 0
+        self.max_concurrent_calls = 0
+        self._lock = threading.Lock()
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        payload = json.loads(messages[1]["content"])
+        index = payload["position"]["index"]
+
+        with self._lock:
+            self.concurrent_calls += 1
+            self.max_concurrent_calls = max(self.max_concurrent_calls, self.concurrent_calls)
+        try:
+            time.sleep(self._delay_by_index(index))
+            if index in self._fail_indices:
+                raise RuntimeError(f"слайд {index}: модель недоступна (тест)")
+            # with_number=True: заголовок несёт цифру индекса ("Заголовок 0"
+            # и т.п.) — без source_note такой слайд невалиден
+            # (`slide_spec_problems`, "цифра без источника"), с ним — валиден.
+            return _valid_slide_json(f"Заголовок {index}", with_number=True)
+        finally:
+            with self._lock:
+                self.concurrent_calls -= 1
+
+
+def test_write_slides_calls_the_model_concurrently_not_one_at_a_time(PROFILE):
+    """Ловит именно параллельность, не просто факт вызова: пять слайдов,
+    каждый вызов модели держит поток 0.2с. Последовательно это заняло бы
+    ~1.0с; при реальном распараллеливании (max_workers=5) — ~0.2с. Порог
+    0.6с — с большим запасом от 1.0с (последовательно) и от 0.2с
+    (идеально параллельно), не хрупкий к дрожанию таймингов CI."""
+    outline = _outline(5)
+    llm = _SlowIndexAwareLLM(delay_by_index=lambda i: 0.2)
+
+    started = time.monotonic()
+    write_slides(outline, [], PROFILE, llm=llm, max_workers=5)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.6, f"write_slides заняло {elapsed:.2f}с — похоже, слайды пишутся по очереди, не параллельно"
+    assert llm.max_concurrent_calls > 1, "ни разу не было больше одного активного вызова модели одновременно"
+
+
+def test_write_slides_keeps_outline_order_even_when_later_slides_answer_first(PROFILE):
+    """Порядок слайдов в готовой колоде не должен зависеть от того, кто
+    ответил первым — слайд с БОЛЬШИМ индексом намеренно отвечает БЫСТРЕЕ
+    (задержка обратно пропорциональна индексу), и всё равно должен оказаться
+    на своём месте в конце `deck.slides`, а не в начале."""
+    outline = _outline(5)
+    llm = _SlowIndexAwareLLM(delay_by_index=lambda i: (4 - i) * 0.05)
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=5)
+
+    assert [s.headline for s in deck.slides] == [f"Заголовок {i}" for i in range(5)]
+    assert [s.index for s in deck.slides] == [0, 1, 2, 3, 4]
+
+
+def test_write_slides_one_slide_failing_does_not_bring_down_the_rest_under_concurrency(PROFILE):
+    """Отказ одного слайда не должен ронять всю колоду, даже когда остальные
+    слайды пишутся параллельно с ним — сохраняется честная деградация
+    (заголовок + пометка в findings) на месте, а не пропуск слайда или
+    падение всей колоды."""
+    outline = _outline(5)
+    llm = _SlowIndexAwareLLM(delay_by_index=lambda i: 0.02, fail_indices={2})
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=5)
+
+    assert len(deck.slides) == 5
+    assert [s.index for s in deck.slides] == [0, 1, 2, 3, 4]
+    for i, slide in enumerate(deck.slides):
+        if i == 2:
+            assert slide.findings, "неудачный слайд обязан остаться с честной пометкой, не пропасть"
+        else:
+            assert slide.headline == f"Заголовок {i}"
+    assert validate_deck_spec(deck) == []
 
 
 # ---------------------------------------------------------------------------

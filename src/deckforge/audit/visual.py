@@ -61,6 +61,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import yaml
 from PIL import Image, ImageDraw, ImageFont
@@ -415,16 +416,55 @@ def _malformed_finding(slide_index: int | None, exc: Exception, raw_answer: str 
     )
 
 
+# Замечено в живой проверке задачи (task-12-report.md, "Слайды 6 и 7 —
+# самое важное наблюдение сессии"): именно на самых кривых слайдах колоды
+# (где вердикт нужнее всего) модель чаще молчит вовсе — весь бюджет
+# `max_tokens` уходит в `reasoning_content`. Ответ недетерминирован, и
+# повторный запрос ТЕМ ЖЕ промптом часто отвечает содержательно там, где
+# первый не ответил ничего (тот же живой прогон: три изолированных повтора
+# после падения `test_missing_body_is_caught` сразу прошли успешно). Это
+# НЕ замена наращиванию `max_tokens` (тот путь уже испробован — см.
+# докстроки `_PER_SLIDE_MAX_TOKENS`/`_DECK_LEVEL_MAX_TOKENS` выше, — 20480/
+# 40960 не гарантируют ответ ни на каком разумном потолке) — здесь второй
+# ПОЛНЫЙ заход (свежий вызов `ask_image`, не переиспользование пустого
+# ответа), а не третья, четвёртая... попытка: диминишинг ретёрн такой же,
+# как у `MAX_BUDGET_ESCALATIONS` в `provider/yandex.py` (одна эскалация
+# закрывает почти все случаи, вторая — редкий повторный перекос, дальше уже
+# не "бюджета мало").
+_MAX_MODEL_ATTEMPTS = 2
+
+
+def _ask_and_parse_with_retry(
+    ask: Callable[[], str], expected_keys: tuple[str, ...],
+) -> tuple[dict[str, tuple[bool, str | None]] | None, Exception | None, str | None]:
+    """До `_MAX_MODEL_ATTEMPTS` ПОЛНЫХ заходов (вызов модели + разбор
+    ответа) по одному и тому же запросу — первый успешный разбор
+    возвращается сразу, последняя ошибка/сырой ответ возвращаются, только
+    если ВСЕ попытки не удались (вызывающий код превращает их в один
+    `Finding(check_id="C00")`, не в один на попытку)."""
+    last_exc: Exception | None = None
+    last_raw: str | None = None
+    for _attempt in range(_MAX_MODEL_ATTEMPTS):
+        try:
+            raw = ask()
+        except Exception as exc:  # noqa: BLE001 — сеть/модель посреди аудита колоды не должна обрывать проверку остальных слайдов
+            last_exc, last_raw = exc, None
+            continue
+        try:
+            return _parse_answer(raw, expected_keys), None, None
+        except Exception as exc:  # noqa: BLE001 — см. докстроку модуля, "Невалидный ответ модели — находка, не исключение"
+            last_exc, last_raw = exc, raw
+    return None, last_exc, last_raw
+
+
 def _run_one_slide(vlm, agent_body: str, index: int, total: int, spec: DeckSpec,
                     png_path: Path, slide: SlideSpec, pairs: list, source_text: str) -> list[Finding]:
     prompt = _build_slide_prompt(agent_body, index, total, spec, slide, pairs, source_text)
-    try:
-        raw = vlm.ask_image(Path(png_path).read_bytes(), prompt, max_tokens=_PER_SLIDE_MAX_TOKENS)
-    except Exception as exc:  # noqa: BLE001 — сеть/модель посреди аудита колоды не должна обрывать проверку остальных слайдов
-        return [_malformed_finding(index, exc, None)]
-    try:
-        answers = _parse_answer(raw, PER_SLIDE_CHECK_IDS)
-    except Exception as exc:  # noqa: BLE001 — см. докстроку модуля, "Невалидный ответ модели — находка, не исключение"
+    png_bytes = Path(png_path).read_bytes()
+    answers, exc, raw = _ask_and_parse_with_retry(
+        lambda: vlm.ask_image(png_bytes, prompt, max_tokens=_PER_SLIDE_MAX_TOKENS), PER_SLIDE_CHECK_IDS,
+    )
+    if answers is None:
         return [_malformed_finding(index, exc, raw)]
     return _findings_from_answers(index, answers)
 
@@ -432,13 +472,13 @@ def _run_one_slide(vlm, agent_body: str, index: int, total: int, spec: DeckSpec,
 def _run_deck_level(vlm, agent_body: str, spec: DeckSpec, pngs: list[Path], pairs: list) -> list[Finding]:
     try:
         collage = _build_collage(pngs)
-        prompt = _build_deck_prompt(agent_body, spec, pairs)
-        raw = vlm.ask_image(collage, prompt, max_tokens=_DECK_LEVEL_MAX_TOKENS)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — сборка коллажа сама (не сеть) не должна обрывать остальной аудит
         return [_malformed_finding(None, exc, None)]
-    try:
-        answers = _parse_answer(raw, DECK_LEVEL_CHECK_IDS)
-    except Exception as exc:  # noqa: BLE001
+    prompt = _build_deck_prompt(agent_body, spec, pairs)
+    answers, exc, raw = _ask_and_parse_with_retry(
+        lambda: vlm.ask_image(collage, prompt, max_tokens=_DECK_LEVEL_MAX_TOKENS), DECK_LEVEL_CHECK_IDS,
+    )
+    if answers is None:
         return [_malformed_finding(None, exc, raw)]
     return _findings_from_answers(None, answers)
 

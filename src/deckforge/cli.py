@@ -12,7 +12,6 @@
 """
 from __future__ import annotations
 import argparse
-import dataclasses
 import json
 import shutil
 import sys
@@ -21,13 +20,17 @@ from pathlib import Path
 
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
+from deckforge.audit.report import AuditReport
+from deckforge.audit.visual import run_visual
 from deckforge.compose.builder import build_deck
 from deckforge.plan.outline import build_outline, load_content_pack
+from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import write_slides
+from deckforge.plan.writer import DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
+from deckforge.render.soffice import to_pngs
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
 
@@ -60,6 +63,28 @@ def _build_namer() -> LLMProvider | None:
     return _build_role_provider("palette_namer")
 
 
+def _build_vlm() -> LLMProvider | None:
+    """Мультимодальный провайдер для аудита по картинке (роль
+    `content_audit`) — та же честная деградация до `None`, что и у ролей
+    выше: `deckforge audit-visual` без ключа не падает, а сообщает через
+    `VisualAuditResult.skipped_reason` (см. `audit.visual.run_visual`),
+    почему проверка не выполнялась."""
+    return _build_role_provider("content_audit")
+
+
+def _writer_max_workers() -> int:
+    """Число слайдов, чей текст пишется одновременно (`plan.writer.write_
+    slides`) — из `config/app.yaml` (`llm.slide_writer_max_workers`, см. её
+    комментарий там про происхождение числа); без читаемого конфига —
+    запасной дефолт модуля (`DEFAULT_WRITER_MAX_WORKERS`), тот же принцип,
+    что и у `_build_role_provider` (сеть/конфиг недоступны — пайплайн
+    продолжает работать, не падает)."""
+    try:
+        return Settings.load(APP_YAML_PATH).llm.slide_writer_max_workers
+    except Exception:
+        return DEFAULT_WRITER_MAX_WORKERS
+
+
 def _cmd_parse(args: argparse.Namespace) -> int:
     namer = _build_namer()
     started = time.monotonic()
@@ -84,25 +109,23 @@ def _cmd_parse(args: argparse.Namespace) -> int:
     return 0
 
 
-def _spec_to_json(obj):
-    """Датаклассы `plan.spec` в JSON-совместимую форму — только для отладки
-    (`generate` дампит написанное `DeckSpec` рядом с собранными `.pptx`,
-    чтобы был виден текст, который реально ушёл в сборку каждого варианта,
-    без повторного дорогого вызова модели)."""
-    if dataclasses.is_dataclass(obj):
-        return {f.name: _spec_to_json(getattr(obj, f.name)) for f in dataclasses.fields(obj)}
-    if isinstance(obj, (list, tuple)):
-        return [_spec_to_json(v) for v in obj]
-    return obj
-
-
 def _cmd_generate(args: argparse.Namespace) -> int:
     """Весь путь от брифа до готовой презентации (Task 13, "эта задача
     замыкает пайплайн"): разбор шаблона -> структура -> текст слайдов ->
     три варианта вёрстки -> сборка -> детерминированный аудит каждого
     варианта. Без ключа модели (`.env`) продолжает работать запасными
     вариантами на каждом шаге (`build_outline`/`write_slides` без `llm`) —
-    результат хуже по содержанию, но пайплайн не падает."""
+    результат хуже по содержанию, но пайплайн не падает.
+
+    НЕ зовёт модельный аудит по картинке (C01-C11, `audit.visual.
+    run_visual`) — ТЗ отводит пять минут на ГЕНЕРАЦИЮ колоды, а не на
+    генерацию вместе с модельной проверкой смысла (живой замер задачи,
+    `task-12-report.md`: 302.8с генерация + 152.8с аудит по картинке =
+    455.6с, почти вдвое дольше бюджета). Аудит по картинке — отдельный шаг,
+    `deckforge audit-visual`, который человек запускает на уже готовом
+    файле (см. её docstring); эта функция честно печатает, что он не
+    выполнялся и как его запустить — молчаливая тишина хуже отсутствия
+    (то же правило, что и `VisualAuditResult.skipped_reason`)."""
     namer = _build_namer()
     outline_llm = _build_role_provider("outline")
     writer_llm = _build_role_provider("writer")
@@ -121,7 +144,12 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     outlined_at = time.monotonic()
     print(f"Структура: {len(outline.slides)} слайдов за {outlined_at - parsed_at:.1f}с")
 
-    deck = write_slides(outline, sources, profile, writer_llm)
+    # Текст слайдов пишется ПАРАЛЛЕЛЬНО (max_workers — config/app.yaml,
+    # `llm.slide_writer_max_workers`) — слайды друг от друга не зависят, а
+    # последовательное написание было девяноста процентами времени всей
+    # генерации (живой замер, docstring `write_slides`/`task-12-report.md`).
+    writer_max_workers = args.writer_max_workers if args.writer_max_workers is not None else _writer_max_workers()
+    deck = write_slides(outline, sources, profile, writer_llm, max_workers=writer_max_workers)
     written_at = time.monotonic()
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
 
@@ -129,7 +157,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     debug_path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__deck-t13.json"
-    debug_path.write_text(json.dumps(_spec_to_json(deck), ensure_ascii=False, indent=2), encoding="utf-8")
+    debug_path.write_text(json.dumps(deck_spec_to_dict(deck), ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Содержание (для отладки) записано в {debug_path}")
     variants = [Variant[v] for v in args.variants] if args.variants else list(Variant)
 
@@ -161,6 +189,78 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             print(f"  находки сборки (усечения/переполнения): {len(slide_findings)}")
 
     print(f"\nВсего: {time.monotonic() - started:.1f}с")
+    print(
+        "\nМодельный аудит по картинке (C01-C11) НЕ выполнялся — вынесен из генерации "
+        "(ТЗ отводит 5 минут на генерацию колоды, не на генерацию вместе с модельной "
+        "проверкой смысла; см. .superpowers/sdd/task-12-report.md). Запустите его отдельно "
+        "на готовом .pptx из этого прогона:\n"
+        f"  deckforge audit-visual {args.template} <один из .pptx выше> {debug_path} "
+        f"--content-pack {args.content_pack}"
+    )
+    return 0
+
+
+def _cmd_audit_visual(args: argparse.Namespace) -> int:
+    """Модельный аудит по картинке (C01-C11, `audit.visual.run_visual`) —
+    ОТДЕЛЬНО от `generate` (см. её docstring: ТЗ даёт пять минут на
+    генерацию, не на генерацию вместе с модельной проверкой смысла).
+    Работает на уже готовом `.pptx` и сохранённом `DeckSpec` (json,
+    `deckforge generate` пишет его рядом с каждой колодой,
+    `deck_spec_to_dict`) — `run_visual` не зависит от сборки (`compose.
+    builder`), поэтому колода не пересобирается и модель для написания
+    текста заново не вызывается. Печатает сводный отчёт (`AuditReport.
+    merge`) — оба аудита, детерминированный и визуальный, вместе."""
+    profile = TemplateProfile.from_file(args.template)
+    spec = deck_spec_from_debug_dict(json.loads(args.deck_json.read_text(encoding="utf-8")))
+
+    sources = []
+    if args.content_pack is not None:
+        _brief, sources, _meta = load_content_pack(args.content_pack)
+
+    config = AuditConfig.load()
+    started = time.monotonic()
+    det_findings = run_deterministic(args.pptx, profile, config)
+    det_at = time.monotonic()
+    print(f"Детерминированный аудит: {len(det_findings)} находок за {det_at - started:.1f}с")
+
+    # Рендер PNG-превью нужен только модельному аудиту — без провайдера
+    # (`_build_vlm() is None`) `run_visual` всё равно вернёт честный
+    # `skipped_reason` и не посмотрит ни на один PNG, так что рендерить их
+    # заранее было бы потраченным впустую временем (soffice — не бесплатно,
+    # `render.soffice._SOFFICE_TIMEOUT_SECONDS`).
+    vlm = _build_vlm()
+    pngs: list[Path] = []
+    if vlm is not None:
+        preview_dir = args.pptx.parent / f"{args.pptx.stem}__audit-preview"
+        pngs = to_pngs(args.pptx, preview_dir)
+        if len(pngs) != len(spec.slides):
+            print(
+                f"! Внимание: PNG-превью ({len(pngs)}) и слайдов в {args.deck_json.name} "
+                f"({len(spec.slides)}) не совпадают — {args.deck_json.name} собран не из "
+                f"{args.pptx.name}?"
+            )
+
+    max_workers = args.max_workers if args.max_workers is not None else 4
+    vis_result = run_visual(pngs, spec, profile, vlm, sources=sources, max_workers=max_workers)
+    if vis_result.skipped_reason:
+        print(f"Модельный аудит по картинке: не выполнялся — {vis_result.skipped_reason}")
+    else:
+        print(
+            f"Модельный аудит по картинке: {vis_result.slides_checked} слайдов, "
+            f"{vis_result.model_calls} вызовов модели за {vis_result.elapsed_seconds:.1f}с"
+        )
+
+    report = AuditReport.merge(det_findings, vis_result)
+    print(
+        f"\nСводный отчёт: {len(report.findings)} находок "
+        f"(детерминированных: {report.deterministic_count}, визуальных: {report.visual_count})"
+    )
+    print(f"  по серьёзности: {report.by_severity() or '(нет)'}")
+    print(f"  по видам: {dict(sorted(report.by_check().items()))}")
+    for f in report.findings:
+        where = f"слайд {f.slide_index}" if f.slide_index is not None else "колода"
+        print(f"  [{f.severity}] {f.check_id} ({where}): {f.message}")
+
     return 0
 
 
@@ -182,7 +282,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--variant", dest="variants", action="append", choices=[v.value for v in Variant],
         help="Собрать только этот вариант (можно повторять); по умолчанию — все три",
     )
+    generate_cmd.add_argument(
+        "--writer-max-workers", type=int, default=None,
+        help=(
+            "Число слайдов, чей текст пишется одновременно (по умолчанию — "
+            "config/app.yaml, llm.slide_writer_max_workers); значение 1 — для "
+            "замера 'до' против параллельной записи"
+        ),
+    )
     generate_cmd.set_defaults(func=_cmd_generate)
+
+    audit_cmd = sub.add_parser(
+        "audit-visual",
+        help="Прогнать модельный аудит по картинке (C01-C11) на готовом .pptx вместе с детерминированным аудитом",
+    )
+    audit_cmd.add_argument("template", type=Path, help="Путь к .pptx-шаблону (нужен для детерминированного аудита)")
+    audit_cmd.add_argument("pptx", type=Path, help="Готовый собранный .pptx (например, из deckforge generate)")
+    audit_cmd.add_argument(
+        "deck_json", type=Path,
+        help="DeckSpec в JSON, сохранённый deckforge generate (<шаблон>__<пакет>__deck-t13.json)",
+    )
+    audit_cmd.add_argument(
+        "--content-pack", type=Path, default=None,
+        help="Каталог контент-пакета — для сверки цифр с исходниками (C04); необязателен",
+    )
+    audit_cmd.add_argument(
+        "--max-workers", type=int, default=None,
+        help="Число параллельных вызовов модели на слайд (по умолчанию — 4, как у run_visual)",
+    )
+    audit_cmd.set_defaults(func=_cmd_audit_visual)
 
     return parser
 

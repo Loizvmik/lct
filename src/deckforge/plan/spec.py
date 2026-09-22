@@ -416,3 +416,127 @@ def deck_spec_from_dict(data: dict) -> DeckSpec:
     _check_keys(data, _DECK_ALLOWED, _DECK_REQUIRED, where)
     slides = [slide_spec_from_dict(s, i) for i, s in enumerate(data["slides"])]
     return DeckSpec(title=data["title"], language=data["language"], slides=slides, meta=dict(data.get("meta", {}) or {}))
+
+
+# ---------------------------------------------------------------------------
+# deck_spec_to_dict / deck_spec_from_debug_dict — round-trip сериализация
+# СОБСТВЕННОГО (не модельного) `DeckSpec`, отдельно от `*_from_dict` выше.
+#
+# `*_from_dict` (выше) — граница с МОДЕЛЬЮ: строгая (типоопечатка в поле —
+# ошибка, не тишина, `_check_keys`), и намеренно не несёт `index`/`findings`/
+# `pattern_id` (`_SLIDE_ALLOWED`) — эти поля модель не пишет, их проставляет
+# код (docstring `SlideSpec`). Пара ниже — граница с ДИСКОМ: `cli._cmd_
+# generate` уже дампит написанный `DeckSpec` в JSON "для отладки"
+# (`debug_path`); этой задаче (вынос аудита по картинке в отдельную
+# команду) нужно этот же дамп полноценно ЧИТАТЬ ОБРАТНО — `deckforge
+# audit-visual` запускается на уже готовом `.pptx` без повторного похода к
+# модели (`run_visual` не зависит от сборки, см. docstring команды в
+# `cli.py`), а для промпта аудита (заголовок колоды/языка/соседних слайдов,
+# `audit.visual._build_slide_prompt`) нужен настоящий `DeckSpec`, не только
+# .pptx-геометрия. Свой формат (JSON-объект с `"type"` у каждого блока,
+# те же имена полей, что и `*_from_dict`) — не совпадает буквально с сырым
+# дампом `dataclasses.fields` (там раньше был `cli._spec_to_json`: без тега
+# `"type"` у блока `{"text": ...}` неотличим от `TextBlock` и `QuoteBlock`
+# без `author`) — не доверять типовому выводу небезопасно, дамп/загрузка
+# должны быть ПАРОЙ одного формата, а не угадыванием по форме словаря.
+# Не валидирует чужой ввод (в отличие от `*_from_dict`) — источник данных
+# всегда файл, который написал этот же код мгновением раньше, разбор
+# по смыслу ближе к десериализации, а не к проверке чужого JSON.
+# ---------------------------------------------------------------------------
+
+
+def _block_to_dict(block: Block) -> dict:
+    if isinstance(block, TextBlock):
+        return {"type": "text", "text": block.text}
+    if isinstance(block, BulletBlock):
+        return {"type": "bullets", "items": list(block.items)}
+    if isinstance(block, CardBlock):
+        return {"type": "cards", "items": [{"title": c.title, "body": c.body} for c in block.items]}
+    if isinstance(block, KpiBlock):
+        return {"type": "kpi", "items": [{"value": k.value, "label": k.label} for k in block.items]}
+    if isinstance(block, QuoteBlock):
+        return {"type": "quote", "text": block.text, "author": block.author}
+    raise TypeError(f"deck_spec_to_dict: неизвестный тип блока {type(block).__name__}")
+
+
+def _block_from_debug_dict(data: dict) -> Block:
+    kind = data["type"]
+    if kind == "text":
+        return TextBlock(text=data["text"])
+    if kind == "bullets":
+        return BulletBlock(items=list(data["items"]))
+    if kind == "cards":
+        return CardBlock(items=[Card(body=c["body"], title=c.get("title", "")) for c in data["items"]])
+    if kind == "kpi":
+        return KpiBlock(items=[Kpi(value=k["value"], label=k["label"]) for k in data["items"]])
+    if kind == "quote":
+        return QuoteBlock(text=data["text"], author=data.get("author"))
+    raise ValueError(f"deck_spec_from_debug_dict: неизвестный тип блока в дампе {kind!r}")
+
+
+def _visual_to_dict(visual: Visual | None) -> dict | None:
+    if visual is None:
+        return None
+    table = {"rows": [list(row) for row in visual.table.rows]} if visual.table is not None else None
+    chart = None
+    if visual.chart is not None:
+        c = visual.chart
+        chart = {
+            "kind": c.kind, "categories": list(c.categories),
+            "series": [{"name": s.name, "values": list(s.values)} for s in c.series],
+            "unit": c.unit, "highlight_index": c.highlight_index,
+            "axis_titles": list(c.axis_titles) if c.axis_titles else None,
+        }
+    return {"kind": visual.kind, "caption": visual.caption, "table": table, "chart": chart}
+
+
+def _visual_from_debug_dict(data: dict | None) -> Visual | None:
+    if data is None:
+        return None
+    table = TableVisual(rows=[list(row) for row in data["table"]["rows"]]) if data.get("table") else None
+    chart = None
+    if data.get("chart"):
+        c = data["chart"]
+        chart = ChartVisual(
+            kind=c["kind"], categories=list(c["categories"]),
+            series=[ChartSeriesData(name=s["name"], values=list(s["values"])) for s in c["series"]],
+            unit=c.get("unit"), highlight_index=c.get("highlight_index"),
+            axis_titles=tuple(c["axis_titles"]) if c.get("axis_titles") else None,
+        )
+    return Visual(kind=data["kind"], caption=data.get("caption"), table=table, chart=chart)
+
+
+def slide_spec_to_dict(slide: SlideSpec) -> dict:
+    return {
+        "index": slide.index, "kind": slide.kind, "headline": slide.headline, "subhead": slide.subhead,
+        "blocks": [_block_to_dict(b) for b in slide.blocks],
+        "visual": _visual_to_dict(slide.visual),
+        "source_note": slide.source_note, "speaker_notes": slide.speaker_notes,
+        "findings": list(slide.findings), "pattern_id": slide.pattern_id,
+    }
+
+
+def slide_spec_from_debug_dict(data: dict) -> SlideSpec:
+    return SlideSpec(
+        index=data["index"], kind=data["kind"], headline=data["headline"], subhead=data.get("subhead"),
+        blocks=[_block_from_debug_dict(b) for b in (data.get("blocks") or [])],
+        visual=_visual_from_debug_dict(data.get("visual")),
+        source_note=data.get("source_note"), speaker_notes=data.get("speaker_notes"),
+        findings=list(data.get("findings") or []), pattern_id=data.get("pattern_id"),
+    )
+
+
+def deck_spec_to_dict(spec: DeckSpec) -> dict:
+    return {
+        "title": spec.title, "language": spec.language,
+        "slides": [slide_spec_to_dict(s) for s in spec.slides],
+        "meta": dict(spec.meta),
+    }
+
+
+def deck_spec_from_debug_dict(data: dict) -> DeckSpec:
+    return DeckSpec(
+        title=data["title"], language=data["language"],
+        slides=[slide_spec_from_debug_dict(s) for s in data["slides"]],
+        meta=dict(data.get("meta") or {}),
+    )

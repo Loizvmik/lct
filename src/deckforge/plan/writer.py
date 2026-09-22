@@ -28,6 +28,7 @@
 from __future__ import annotations
 import json
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import yaml
@@ -49,6 +50,25 @@ AGENT_PATH_PICKER = Path(__file__).resolve().parents[3] / "agents" / "pattern-pi
 # нужного бюджета только теряет время на лишний HTTP-круг.
 WRITER_MAX_TOKENS = 6144
 PICKER_MAX_TOKENS = 2048
+
+# Слайды пишутся моделью ПАРАЛЛЕЛЬНО, не по очереди — живой замер задачи
+# (task-12-report.md): 23с на слайд, 12 слайдов подряд дали 273.7с из
+# 302.8с всей генерации (90% времени), при том что содержание одного
+# слайда не зависит от другого (свой пункт структуры, свои исходные
+# материалы) — последовательный порядок был архитектурной случайностью
+# первой версии `write_slides`, не требованием.
+#
+# Число — из `config/app.yaml` (`llm.slide_writer_max_workers`), это здесь
+# только запасной дефолт, если вызывающий код не передал `max_workers` явно
+# (прямые вызовы `write_slides` из тестов и т.п.) — тот же приём, что и
+# `audit.visual.run_visual(..., max_workers=4)`. Значение подобрано тем же
+# рассуждением, что и там: не "чем больше, тем быстрее" — провайдер (Yandex
+# Cloud) не любит слишком много одновременных запросов, и в колоде и так
+# уже есть запас на сетевые ретраи (`deadline_seconds`) на КАЖДЫЙ вызов;
+# 4 — тот же порядок, что уже проверен живьём в визуальном аудите
+# (`_PER_SLIDE_MAX_TOKENS`/`ThreadPoolExecutor(max_workers=4)`, тот же
+# провайдер, тот же класс нагрузки), не гадание с нуля.
+DEFAULT_WRITER_MAX_WORKERS = 4
 
 # Запасная вместимость для `kind`, которого нет вовсе ни в одном паттерне
 # профиля (шаблон бедный, или тестовая синтетика) — round-number, того же
@@ -208,45 +228,86 @@ def _ask_slide_writer(prompt_body: str, payload: dict, index: int, llm: LLMProvi
     return slide
 
 
-def write_slides(outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None) -> DeckSpec:
+def _write_one_slide(
+    index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
+) -> SlideSpec:
+    """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
+    чтобы её можно было независимо запускать в пуле потоков (слайды друг от
+    друга не зависят: свой пункт структуры, свои исходные материалы — тот
+    же аргумент, что уже обосновал параллельность `audit.visual.run_visual`
+    по слайдам). Не трогает ничего снаружи себя (не пишет в общий список,
+    не читает состояние других слайдов) — единственное, что нужно для
+    безопасного вызова из нескольких потоков одновременно."""
+    desired_kind = _OUTLINE_KIND_TO_SLIDE_KIND.get(item.kind, "bullets")
+    capacity = _kind_capacity(desired_kind, profile)
+    payload = {
+        "slide_kind_hint": item.kind,
+        "intent": item.intent,
+        "needs": item.needs,
+        "layout_kind": desired_kind,
+        "capacity": capacity,
+        "max_headline_chars": _headline_capacity(desired_kind, profile),
+        "sources": source_text,
+        "position": {"index": index, "total": total},
+    }
+
+    slide: SlideSpec | None = None
+    if llm is not None:
+        slide = _ask_slide_writer(prompt_body, payload, index, llm)
+        if slide is not None:
+            problems = slide_spec_problems(slide)
+            if problems:
+                # Один шанс на исправление — код показывает модели её
+                # собственные ошибки (брифом: "валидатор ловит то, что
+                # иначе всплывёт при сборке" — здесь оно ловится ДО
+                # сборки и ДО того, как испортит остальную колоду).
+                repaired = _ask_slide_writer(prompt_body, payload, index, llm, repair=problems)
+                slide = repaired if repaired is not None and not slide_spec_problems(repaired) else None
+
+    if slide is None:
+        slide = _fallback_slide(desired_kind, index, item.intent, item.needs)
+
+    return slide
+
+
+def write_slides(
+    outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None,
+    *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS,
+) -> DeckSpec:
+    """Пишет текст всех слайдов ПАРАЛЛЕЛЬНО (см. `DEFAULT_WRITER_MAX_
+    WORKERS` — до `max_workers` одновременных вызовов модели), не по
+    очереди — слайды друг от друга не зависят. Два инварианта, за которые
+    отвечает именно эта функция (а не `_write_one_slide`, который ничего не
+    знает про порядок и про соседей):
+
+    1. Порядок слайдов в готовой колоде не зависит от того, кто ответил
+       первым — результаты собираются в массив по ИНДЕКСУ (`slides[index]
+       = ...`), не в порядке `as_completed`, и уже упорядоченный список
+       уходит дальше (`_flag_repeated_headlines`, `DeckSpec.slides`).
+    2. Отказ одного слайда (исключение/невалидный ответ внутри
+       `_write_one_slide`) не роняет всю колоду — `_write_one_slide` сама
+       никогда не бросает исключение по вине модели (та же деградация, что
+       и раньше, до параллельности: `_ask_slide_writer` ловит любую ошибку
+       вызова и возвращает `None`, дальше в ход идёт `_fallback_slide`);
+       здесь это свойство только ПЕРЕЖИВАЕТ переезд в пул потоков, не
+       создаётся заново."""
     _meta, prompt_body = _load_agent_prompt(AGENT_PATH_WRITER)
     source_text = "\n\n".join(f"### {s.name}\n{s.text}" for s in sources)
+    total = len(outline.slides)
 
-    slides: list[SlideSpec] = []
-    for index, item in enumerate(outline.slides):
-        desired_kind = _OUTLINE_KIND_TO_SLIDE_KIND.get(item.kind, "bullets")
-        capacity = _kind_capacity(desired_kind, profile)
-        payload = {
-            "slide_kind_hint": item.kind,
-            "intent": item.intent,
-            "needs": item.needs,
-            "layout_kind": desired_kind,
-            "capacity": capacity,
-            "max_headline_chars": _headline_capacity(desired_kind, profile),
-            "sources": source_text,
-            "position": {"index": index, "total": len(outline.slides)},
+    slides: list[SlideSpec | None] = [None] * total
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+        futures = {
+            pool.submit(_write_one_slide, index, item, profile, prompt_body, source_text, total, llm): index
+            for index, item in enumerate(outline.slides)
         }
+        for future in as_completed(futures):
+            index = futures[future]
+            slides[index] = future.result()
 
-        slide: SlideSpec | None = None
-        if llm is not None:
-            slide = _ask_slide_writer(prompt_body, payload, index, llm)
-            if slide is not None:
-                problems = slide_spec_problems(slide)
-                if problems:
-                    # Один шанс на исправление — код показывает модели её
-                    # собственные ошибки (брифом: "валидатор ловит то, что
-                    # иначе всплывёт при сборке" — здесь оно ловится ДО
-                    # сборки и ДО того, как испортит остальную колоду).
-                    repaired = _ask_slide_writer(prompt_body, payload, index, llm, repair=problems)
-                    slide = repaired if repaired is not None and not slide_spec_problems(repaired) else None
-
-        if slide is None:
-            slide = _fallback_slide(desired_kind, index, item.intent, item.needs)
-
-        slides.append(slide)
-
-    _flag_repeated_headlines(slides)
-    return DeckSpec(title=outline.title, language=outline.language, slides=slides)
+    ordered_slides: list[SlideSpec] = slides  # type: ignore[assignment] — каждый индекс заполнен ровно один раз выше
+    _flag_repeated_headlines(ordered_slides)
+    return DeckSpec(title=outline.title, language=outline.language, slides=ordered_slides)
 
 
 # Слово короче этой длины (предлоги, союзы, частицы — «и», «на», «за») не

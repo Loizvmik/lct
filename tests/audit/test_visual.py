@@ -291,6 +291,82 @@ def test_malformed_model_answer_does_not_crash_the_pipeline():
             p.unlink(missing_ok=True)
 
 
+class _FailFirstThenOkProvider(VisionProvider):
+    """Первый вызов по каждому ОТДЕЛЬНОМУ промпту (слайд/коллаж — у них
+    разный текст промпта) отказывает так же, как qwen3.6 на пустом
+    reasoning-ответе (`RuntimeError`, не JSON) — второй вызов по тому же
+    промпту отвечает валидно. Ключ по ТЕКСТУ промпта, не по счётчику вызовов
+    вообще — так тест не зависит от того, в каком порядке параллельные
+    потоки пришли к провайдеру, только от того, что у КАЖДОГО отдельного
+    запроса будет ровно одна повторная попытка."""
+
+    def __init__(self):
+        self.attempts_by_prompt: dict[str, int] = {}
+
+    def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+        n = self.attempts_by_prompt.get(prompt, 0) + 1
+        self.attempts_by_prompt[prompt] = n
+        if n == 1:
+            raise RuntimeError("будто весь бюджет max_tokens ушёл в reasoning, content пуст")
+        keys = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])["answer_only_keys"]
+        return json.dumps({k: {"ok": True} for k in keys})
+
+    @property
+    def total_calls(self) -> int:
+        return sum(self.attempts_by_prompt.values())
+
+
+class _AlwaysFailProvider(VisionProvider):
+    """Отказывает на КАЖДОЙ попытке — проверяет, что повтор не превращается
+    в бесконечный цикл и что после исчерпания попытки находка всё равно
+    ровно одна на слайд/коллаж (не по одной на попытку)."""
+
+    def __init__(self):
+        self.call_count = 0
+
+    def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+        self.call_count += 1
+        raise RuntimeError("модель недоступна (тест)")
+
+
+def test_model_silence_gets_one_retry_and_succeeds_on_second_attempt():
+    """Бриф задачи: qwen3.6 иногда тратит весь бюджет на рассуждение и не
+    отвечает вовсе — именно на самых кривых слайдах, где вердикт нужнее
+    всего. Один повторный запрос (не наращивание max_tokens) часто
+    срабатывает — второй заход обязан вернуть настоящий вердикт, а не
+    C00, если он валиден."""
+    spec = _tiny_spec(1)
+    pngs = [_tiny_png()]
+    provider = _FailFirstThenOkProvider()
+    try:
+        result = run_visual(pngs, spec, PROFILE, provider, max_workers=1)
+        assert result.skipped_reason is None
+        assert list(result) == [], "второй (успешный) заход обязан дать вердикт, а не находку C00"
+        # слайд: 1 неудачная попытка + 1 удачная; коллаж: тоже отказывает
+        # первый раз (тот же провайдер на всё) + удачная — итого 4 попытки.
+        assert provider.total_calls == 4
+    finally:
+        pngs[0].unlink(missing_ok=True)
+
+
+def test_model_silence_persisting_through_the_retry_still_yields_exactly_one_c00_per_unit():
+    """Если и второй заход пуст — находка остаётся C00, РОВНО одна на
+    слайд/коллаж (не по одной на попытку, и не молчание)."""
+    spec = _tiny_spec(2)
+    pngs = [_tiny_png(), _tiny_png((5, 5, 5))]
+    provider = _AlwaysFailProvider()
+    try:
+        result = run_visual(pngs, spec, PROFILE, provider, max_workers=2)
+        findings = list(result)
+        assert len(findings) == 3, "2 слайда + 1 коллаж = 3 честные находки C00, не 6 (по одной на попытку)"
+        assert all(f.check_id == "C00" for f in findings)
+        # 2 попытки на КАЖДЫЙ из 3 запросов (2 слайда + коллаж) = 6 вызовов.
+        assert provider.call_count == 6
+    finally:
+        for p in pngs:
+            p.unlink(missing_ok=True)
+
+
 def test_run_visual_makes_n_plus_one_model_calls():
     """N слайдов -> N вызовов по одному на слайд + 1 вызов на коллаж всей
     колоды (C09/C11) — не 11×N (докстрока `visual.py`)."""
