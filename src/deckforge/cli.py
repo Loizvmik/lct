@@ -22,7 +22,7 @@ from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.report import AuditReport
 from deckforge.audit.visual import run_visual
-from deckforge.compose.builder import build_deck
+from deckforge.compose.builder import build_deck, count_embedded_photos
 from deckforge.plan.outline import build_outline, load_content_pack
 from deckforge.plan.photos import assign_photos, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
@@ -189,9 +189,19 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     deck, photo_report = assign_photos(deck, photos, photo_llm)
     photos_at = time.monotonic()
     if photos:
+        # Task 22, отчёт задачи, находка "пайплайн рапортует не то, что в
+        # файле": ЭТО число — план планировщика (`assign_photos`, слайд
+        # получил `Visual.photo_name`), не факт вставки. У раскладки,
+        # которую слайду в итоге даст `apply_variant`, может не найтись
+        # слота под картинку — тогда `compose.builder._place_picture_
+        # visual` честно не вставляет фотографию (см. её докстроку), и
+        # факт расходится с планом. Сколько РЕАЛЬНО легло на слайды —
+        # печатается отдельно, ПОСЛЕ сборки каждого варианта ниже (там же,
+        # где известен готовый `.pptx`), не здесь.
         print(
             f"Фотографии контент-пакета: {len(photos)} пришло, "
-            f"{photo_report.placed_count} распределено моделью за {photos_at - written_at:.1f}с"
+            f"{photo_report.placed_count} распределено планировщиком (план, не факт вставки) "
+            f"за {photos_at - written_at:.1f}с"
         )
         for note in photo_report.notes:
             print(f"  ! {note}")
@@ -233,6 +243,33 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         slide_findings = [s for v in variant_deck.slides for s in v.findings]
         if slide_findings:
             print(f"  находки сборки (усечения/переполнения): {len(slide_findings)}")
+
+        # Task 22: сколько фотографий контент-пакета РЕАЛЬНО легло на
+        # слайды ЭТОГО варианта — считано по байтам уже сохранённого
+        # `.pptx` (`count_embedded_photos`), не взято из плана
+        # `assign_photos` (см. комментарий у печати плана выше). Число не
+        # обязано совпадать с планом: у dense/airy/visual разные раскладки
+        # на один и тот же слайд, и у части из них может не быть слота под
+        # фото, даже если у другого варианта того же слайда — есть.
+        if photos:
+            embedded = count_embedded_photos(path, user_photos)
+            not_embedded_findings = [
+                f for f in slide_findings if "фотограф" in f.lower() and "не вставлен" in f.lower()
+            ]
+            print(
+                f"  фотографий физически на слайдах: {embedded} из {photo_report.placed_count} "
+                "распределённых планировщиком"
+            )
+            if embedded < photo_report.placed_count:
+                if not_embedded_findings:
+                    print("  ! не вставлены (нет слота в выбранной раскладке):")
+                    for f in not_embedded_findings:
+                        print(f"    - {f}")
+                else:
+                    print(
+                        "  ! расхождение план/факт есть, но причина не найдена среди находок "
+                        "сборки — требует разбора."
+                    )
 
     print(f"\nВсего: {time.monotonic() - started:.1f}с")
     print(

@@ -18,7 +18,7 @@ from deckforge.audit.config import AuditConfig
 from deckforge.compose.builder import (
     Variant, _avoid_decor_overlap, _best_contrast_color, _clear_sample_slides, _is_cosmetic_truncation,
     _local_background_luminance, _overlap_ratio, _pick_pattern, _place_best_candidate, _relative_luminance,
-    _SelectionHistory, build_deck, fits,
+    _SelectionHistory, build_deck, count_embedded_photos, fits,
 )
 from deckforge.compose.textfit import measure
 from deckforge.ooxml.geometry import Box, Canvas
@@ -842,7 +842,14 @@ def test_slide_audit_retry_budget_is_capped():
     bad2 = _overlapping_section_pattern("bad-2")
     bad3 = _overlapping_section_pattern("bad-3")
     perfect = _clean_section_pattern("perfect-4th")
-    slide_spec = SlideSpec(index=0, kind="section", headline="Заголовок", subhead="Подзаголовок")
+    # `headline`/`subhead` — реальные слова, не «Заголовок»/«Подзаголовок»
+    # (см. докстроку `test_slide_is_never_left_empty_when_no_candidate_
+    # passes_the_audit` про `_placeholder_text_hit`, Task 22): с текстом-
+    # заглушкой ни headline, ни subhead не легли бы на слайд вовсе, и L02
+    # (наложение) — за отсутствием ДВУХ нарисованных блоков — не сработал
+    # бы на первом же кандидате, а весь смысл теста в том, что он ДОЛЖЕН
+    # сработать и быть отклонён.
+    slide_spec = SlideSpec(index=0, kind="section", headline="Итоги квартала", subhead="Что изменилось")
     prs, canvas, audit_config = _new_deck_in_progress()
 
     chosen, notes = _place_best_candidate(
@@ -864,8 +871,11 @@ def test_slide_audit_picks_the_least_bad_candidate_when_none_pass():
     )
     worse = replace(worse, slots=[*worse.slots, extra])
     better = _overlapping_section_pattern("better")
+    # `headline`/`subhead` — не текст-заглушка, той же причиной, что у
+    # `test_slide_audit_retry_budget_is_capped` выше: без реально
+    # нарисованного текста наложению (L02) нечего накладывать.
     slide_spec = SlideSpec(
-        index=0, kind="section", headline="Заголовок", subhead="Подзаголовок", source_note="Источник данных",
+        index=0, kind="section", headline="Итоги квартала", subhead="Что изменилось", source_note="Источник данных",
     )
     prs, canvas, audit_config = _new_deck_in_progress()
 
@@ -878,9 +888,17 @@ def test_slide_audit_picks_the_least_bad_candidate_when_none_pass():
 def test_slide_is_never_left_empty_when_no_candidate_passes_the_audit():
     """Тест брифа: "если ни один кандидат не прошёл, слайд всё равно
     собирается лучшим из возможных ... пустого слайда быть не должно
-    никогда" — плюс "результат перебора логируй"."""
+    никогда" — плюс "результат перебора логируй".
+
+    `headline`/`subhead` — реальные слова, не «Заголовок»/«Подзаголовок»
+    (Task 22, отчёт задачи: ровно эти два слова с этой задачи — маркеры
+    текста-заглушки в `config/audit.yaml::integrity.placeholder_patterns`,
+    `place_slide` теперь не кладёт такой текст на слайд вовсе, см.
+    `builder._placeholder_text_hit` — со старым текстом фикстуры оба слота
+    остались бы пустыми и тест ложно проверял бы уже не то, что заявлено в
+    докстроке)."""
     bad = _overlapping_section_pattern("only-bad")
-    slide_spec = SlideSpec(index=0, kind="section", headline="Заголовок", subhead="Подзаголовок")
+    slide_spec = SlideSpec(index=0, kind="section", headline="Итоги квартала", subhead="Что изменилось")
     prs, canvas, audit_config = _new_deck_in_progress()
 
     chosen, notes = _place_best_candidate(prs, slide_spec, [bad], PROFILE, canvas, audit_config, bullet_char="•")
@@ -890,3 +908,69 @@ def test_slide_is_never_left_empty_when_no_candidate_passes_the_audit():
     texts = [s.text_frame.text for s in prs.slides[0].shapes if s.has_text_frame and s.text_frame.text.strip()]
     assert texts, "слайд не должен оставаться пустым, даже если ни один кандидат не прошёл аудит"
     assert notes, "результат перебора обязан быть залогирован"
+
+
+# ---------------------------------------------------------------------------
+# Task 22, отчёт задачи: текст-заглушка не должен попасть на слайд вообще
+# ---------------------------------------------------------------------------
+
+
+def test_placeholder_looking_text_is_not_drawn_on_the_slide():
+    """Слайд, у которого `headline`/`subhead` содержат маркер из
+    `config/audit.yaml::integrity.placeholder_patterns` (регистронезависимое
+    вхождение подстроки — тот же критерий, что и у постфактум-аудита I02),
+    не должен получить этот текст на холсте вовсе: `place_slide` обязана
+    пропустить такой слот и оставить честную находку (`_placeholder_text_
+    hit`), а не полагаться на то, что I02 поймает уже собранный файл
+    постфактум (находка отчёта задачи — «Титульный слайд презентации» на
+    первом слайде контрольного ЛЦТ2026 ушло на защиту, живьём)."""
+    pattern = _clean_section_pattern("clean")
+    slide_spec = SlideSpec(index=0, kind="section", headline="Заголовок", subhead="Подзаголовок")
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    _, notes = _place_best_candidate(prs, slide_spec, [pattern], PROFILE, canvas, audit_config, bullet_char="•")
+
+    texts = [s.text_frame.text for s in prs.slides[0].shapes if s.has_text_frame and s.text_frame.text.strip()]
+    assert texts == [], f"текст-заглушка не должен был попасть на слайд, а попал: {texts!r}"
+    # `_place_best_candidate` копит находки на своей ВНУТРЕННЕЙ копии спека
+    # (`trial_spec = replace(slide_spec, findings=[])`) и возвращает их
+    # ВЫЗЫВАЮЩЕЙ СТОРОНЕ через `notes`, не пишет назад в переданный
+    # `slide_spec` — `build_deck` сам делает `slide_spec.findings.extend
+    # (notes)`, тест проверяет тот же контракт напрямую.
+    assert any("похож" in n and "заглушк" in n for n in notes), (
+        f"расхождение обязано остаться честной находкой: {notes!r}"
+    )
+
+
+def test_count_embedded_photos_matches_by_content_not_by_name(tmp_path):
+    """Task 22, отчёт задачи, находка "пайплайн рапортует не то, что в
+    файле": `count_embedded_photos` — единственный источник правды о том,
+    что физически легло на слайды (по байтам `.pptx`), не о том, что
+    РАСПРЕДЕЛИЛ планировщик (`plan.photos.PhotoAssignmentReport.placed_
+    count`) — эти два числа теперь намеренно печатаются раздельно, и в
+    `cli.py`, и в `scripts/build_submission.py` (см. их докстроки у места
+    вызова). Сравнение — по байтам (sha256), не по имени файла: python-pptx
+    переименовывает media при вставке (`ppt/media/imageN.ext`), имя файла
+    контент-пакета внутри архива не сохраняется — тест вставляет фото под
+    ДРУГИМ путём/именем, чем то, с которым его ищет вызывающий код, ровно
+    как это происходит в реальной сборке."""
+    from PIL import Image
+
+    embedded_src = tmp_path / "source-team.jpg"
+    Image.new("RGB", (400, 300), color=(10, 20, 30)).save(embedded_src)
+    not_embedded_src = tmp_path / "source-approver.jpg"
+    Image.new("RGB", (400, 300), color=(200, 30, 60)).save(not_embedded_src)
+
+    prs = Presentation(str(TEMPLATE))
+    slide = prs.slides.add_slide(prs.slide_layouts[0])
+    slide.shapes.add_picture(str(embedded_src), 0, 0, width=100, height=100)
+    out_path = tmp_path / "manual.pptx"
+    prs.save(str(out_path))
+
+    # `team.jpg` — контент-пакетное имя, разное с `source-team.jpg` на
+    # диске (как в реальной сборке, где имя файла контент-пакета и имя
+    # внутри архива никогда не совпадают) — счётчик обязан найти его по
+    # содержимому.
+    user_photos = {"team.jpg": embedded_src, "approver.jpg": not_embedded_src}
+    assert count_embedded_photos(out_path, user_photos) == 1
+    assert count_embedded_photos(out_path, {}) == 0, "без фотографий контент-пакета — честный ноль, не падение"

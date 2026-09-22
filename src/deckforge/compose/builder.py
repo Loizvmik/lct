@@ -10,8 +10,10 @@ python-pptx (рисование) одновременно — блоки кон�
 и декор (`compose.decor`) сами python-pptx не касаются.
 """
 from __future__ import annotations
+import hashlib
 import io
 import re
+import zipfile
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -193,8 +195,8 @@ def build_deck(
 
 
 def place_slide(
-    prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, *, bullet_char: str = "•",
-    user_photos: dict[str, Path] | None = None,
+    prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, audit_config: AuditConfig,
+    *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
 ) -> None:
     layout = _find_layout(prs, pattern.layout_id)
     if layout is None:
@@ -238,6 +240,32 @@ def place_slide(
 
     family = _primary_family(profile)
     for content in assign_content(slide_spec, pattern, grid):
+        # Текст-заглушка — та же проверка, что и аудит I02 (`audit.
+        # deterministic._check_I02`, тот же `audit_config.integrity.
+        # placeholder_patterns`), но здесь она стоит ДО отрисовки, не после
+        # (Task 22, отчёт задачи: находка "текст-рыба шаблона утекает на
+        # слайды" — контрольный ЛЦТ2026, первый слайд, заголовок «Титульный
+        # слайд презентации»). Разбор задачи 22 показал, что этот конкретный
+        # текст пришёл не из `PatternSlot.sample_text` раскладки (у
+        # реально выбранного паттерна этот слот — `sample_text=None`,
+        # слайд-пример шаблона был пуст), а из содержания, написанного
+        # моделью, — но принцип "не клади на холст то, что похоже на
+        # заглушку" не обязан знать, ОТКУДА взялся такой текст: что бы ни
+        # прислало содержание для этого слота (сама модель, будущий
+        # фолбэк на `sample_text`, ручной ввод), заглушечный текст сюда не
+        # попадает вовсе — слот остаётся незаполненным (`_remove_empty_
+        # placeholders` уберёт унаследованный плейсхолдер лейаута, тем же
+        # путём, что и для контента, которого не пришло вовсе — см.
+        # докстроку `blocks.assign_content`), а не заглушкой на слайде,
+        # которую потом отдельно ловит только пост-фактум аудит.
+        placeholder_hit = _placeholder_text_hit(content, audit_config)
+        if placeholder_hit is not None:
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: текст слота «{content.role_hint}» похож на "
+                f"текст-заглушку шаблона («{placeholder_hit}») — не отрисован, слот оставлен "
+                "пустым."
+            )
+            continue
         # Наложение — не занято ли место декором раскладки (Task 10 отчёт,
         # находка №2: заголовок налез на плашку декора) — проверяется и
         # чинится (сдвигом) ДО замера/отрисовки, слот замеряется уже по
@@ -255,6 +283,27 @@ def place_slide(
 
     _place_visual(slide, slide_spec, pattern, profile, user_photos)
     _remove_empty_placeholders(slide)
+
+
+def _placeholder_text_hit(content: SlotContent, audit_config: AuditConfig) -> str | None:
+    """Совпал ли текст, который вот-вот ляжет в этот слот, с одним из
+    маркеров текста-заглушки (`audit_config.integrity.placeholder_patterns`,
+    `config/audit.yaml`) — регистронезависимое вхождение подстроки, ТА ЖЕ
+    проверка, что `audit.deterministic._check_I02` делает постфактум по
+    уже собранному файлу (намеренно тот же конфиг, не отдельный список —
+    два места, где "похоже на заглушку" может разойтись по критерию, хуже
+    одного). Возвращает найденный маркер (для текста находки) или `None`,
+    если текст чистый.
+
+    Проверяется ВЕСЬ склеенный текст слота (все параграфы, не только
+    первый) — многострочный буллет-список, где заглушкой оказался только
+    один пункт из трёх, всё равно достаточно испорчен, чтобы не класть его
+    на слайд как есть (тот же принцип "решает код, не гадание по одному
+    параграфу")."""
+    text = " ".join(p.text for p in content.paragraphs).strip().lower()
+    if not text:
+        return None
+    return next((p for p in audit_config.integrity.placeholder_patterns if p.lower() in text), None)
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +576,48 @@ def _place_picture_visual(
     slide.shapes.add_picture(
         io.BytesIO(data), Emu(pic_left), Emu(pic_top), Emu(max(1, pic_width)), Emu(max(1, pic_height)),
     )
+
+
+def count_embedded_photos(pptx_path: Path, user_photos: dict[str, Path]) -> int:
+    """Сколько ПОЛЬЗОВАТЕЛЬСКИХ фотографий контент-пакета реально легли на
+    слайды УЖЕ СОБРАННОГО `.pptx` — Task 22, отчёт задачи, находка "пайплайн
+    рапортует не то, что в файле": `plan.photos.assign_photos` честно
+    называет, сколько фотографий она РАСПРЕДЕЛИЛА по слайдам (`plan.spec.
+    Visual.photo_name` проставлен), но раскладка, которую слайду в итоге
+    выбрал `apply_variant`/`_place_best_candidate`, может не нести слота
+    под картинку вовсе — тогда `_place_picture_visual` честно пишет находку
+    в `slide_spec.findings` и не вставляет байты (см. её докстроку), а
+    "распределено" и "вставлено" расходятся. Пользователь, читающий только
+    итоговое число, видит план модели, а не то, что физически есть в файле,
+    — этот счётчик отвечает на вопрос "а что физически в файле" по самому
+    файлу, а не по плану.
+
+    Сравнение по СОДЕРЖИМОМУ (sha256), не по имени — `python-pptx`
+    переименовывает media-файлы при вставке (`ppt/media/imageN.ext`), имя
+    файла контент-пакета внутри архива не сохраняется (тот же приём и то
+    же обоснование, что `scripts/build_submission.py::_count_embedded_
+    photos` использовал до переезда сюда — общее место для `cli.py` и
+    submission-скрипта, а не два независимых куска одной и той же
+    логики)."""
+    if not user_photos:
+        return 0
+    wanted = set()
+    for path in user_photos.values():
+        try:
+            wanted.add(hashlib.sha256(Path(path).read_bytes()).hexdigest())
+        except OSError:
+            continue
+    if not wanted:
+        return 0
+    found = set()
+    with zipfile.ZipFile(pptx_path) as zf:
+        for name in zf.namelist():
+            if not name.startswith("ppt/media/"):
+                continue
+            digest = hashlib.sha256(zf.read(name)).hexdigest()
+            if digest in wanted:
+                found.add(digest)
+    return len(found)
 
 
 def _emu_visual_box(box: Box, profile: TemplateProfile) -> tuple[int, int, int, int]:
@@ -976,7 +1067,9 @@ def _place_best_candidate(
 
     for attempt, pattern in enumerate(tried, start=1):
         trial_spec = replace(slide_spec, findings=[])
-        place_slide(prs, trial_spec, pattern, profile, bullet_char=bullet_char, user_photos=user_photos)
+        place_slide(
+            prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char, user_photos=user_photos,
+        )
         errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index)
         if not errors:
             if attempt > 1:
@@ -997,7 +1090,9 @@ def _place_best_candidate(
 
     best_errors, best_pattern, best_ids = best
     trial_spec = replace(slide_spec, findings=[])
-    place_slide(prs, trial_spec, best_pattern, profile, bullet_char=bullet_char, user_photos=user_photos)
+    place_slide(
+        prs, trial_spec, best_pattern, profile, audit_config, bullet_char=bullet_char, user_photos=user_photos,
+    )
     notes.append(
         f"Слайд {slide_spec.index}: ни один из {len(tried)} проверенных кандидатов не прошёл аудит "
         f"без находок — выбрана раскладка {best_pattern.pattern_id!r} с наименьшим числом находок "

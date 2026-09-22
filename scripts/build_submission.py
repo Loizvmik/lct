@@ -29,7 +29,7 @@ sys.path.insert(0, str(REPO_ROOT / "src"))
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.cli import _build_namer, _build_pattern_kind_vlm, _build_role_provider, _writer_agent_max_steps, _writer_max_workers
-from deckforge.compose.builder import build_deck
+from deckforge.compose.builder import build_deck, count_embedded_photos
 from deckforge.export.bundle import export_bundle
 from deckforge.plan.outline import build_outline, load_content_pack
 from deckforge.plan.photos import assign_photos, load_content_pack_photos
@@ -94,7 +94,17 @@ def main() -> int:
     t_photos = time.monotonic()
     photos_s = t_photos - t_written
     placed = photo_report.placed_count if photos else 0
-    print(f"[{template.name}] фотографии: {len(photos)} пришло, {placed} распределено за {photos_s:.1f}с", flush=True)
+    # Task 22, отчёт задачи: это ПЛАН планировщика (`assign_photos`), не
+    # факт вставки — у выбранной для слайда раскладки может не найтись
+    # слота под фото, тогда `compose.builder._place_picture_visual` честно
+    # не вставляет её. Сколько РЕАЛЬНО легло в файл — печатается и
+    # сохраняется в stats ОТДЕЛЬНО, на каждый вариант, ниже (см.
+    # `count_embedded_photos`/`photos_embedded`/`photos_not_embedded`).
+    print(
+        f"[{template.name}] фотографии: {len(photos)} пришло, {placed} распределено планировщиком "
+        f"(план, не факт вставки) за {photos_s:.1f}с",
+        flush=True,
+    )
     user_photos = {p.name: p.path for p in photos}
 
     config = AuditConfig.load()
@@ -135,8 +145,20 @@ def main() -> int:
 
         # Сколько фотографий контент-пакета реально встало в финальный .pptx
         # этого варианта (не план, а факт: разные варианты могут выбрать
-        # раскладку без картиночного слота под уже назначенную фотографию).
-        placed_in_pptx = _count_embedded_photos(pptx_path, user_photos)
+        # раскладку без картиночного слота под уже назначенную фотографию;
+        # общий счётчик с `cli.py` — `compose.builder.count_embedded_
+        # photos`, см. её докстроку).
+        placed_in_pptx = count_embedded_photos(pptx_path, user_photos)
+        # Причина расхождения план/факт — по каждому слайду, где фото не
+        # легло из-за отсутствия слота в раскладке (`_place_picture_visual`
+        # пишет находку в `slide_spec.findings`, см. её докстроку) — Task
+        # 22, отчёт задачи: раньше этот текст нигде не сохранялся, в лог
+        # уходил только агрегированный отчёт `assign_photos` (план), и
+        # причина расхождения терялась безвозвратно после прогона.
+        not_embedded_findings = [
+            f for s in variant_deck.slides for f in s.findings
+            if "фотограф" in f.lower() and "не вставлен" in f.lower()
+        ]
 
         export_started = time.monotonic()
         bundle = export_bundle(pptx_path, profile, variant_dir, deck_spec=variant_deck)
@@ -152,7 +174,14 @@ def main() -> int:
         )
         print(f"  находки по серьёзности: {by_severity or '(нет)'}", flush=True)
         print(f"  находки по видам: {dict(sorted(by_check.items()))}", flush=True)
-        print(f"  фотографий в файле: {placed_in_pptx}", flush=True)
+        print(f"  фотографий физически в файле: {placed_in_pptx} из {placed} распределённых планировщиком", flush=True)
+        if placed_in_pptx < placed:
+            if not_embedded_findings:
+                print("  ! не вставлены (нет слота в выбранной раскладке):", flush=True)
+                for f in not_embedded_findings:
+                    print(f"    - {f}", flush=True)
+            else:
+                print("  ! расхождение план/факт без найденной причины в находках сборки.", flush=True)
         if bundle.warnings:
             print(f"  предупреждения экспорта: {bundle.warnings}", flush=True)
 
@@ -165,7 +194,9 @@ def main() -> int:
             "findings_by_severity": by_severity,
             "findings_by_check": by_check,
             "findings_total": len(findings),
+            "photos_distributed_by_planner": placed,
             "photos_embedded": placed_in_pptx,
+            "photos_not_embedded_reasons": not_embedded_findings,
             "pptx": str(pptx_path.relative_to(REPO_ROOT)),
             "pdf": str(bundle.pdf.relative_to(REPO_ROOT)),
             "html": str(bundle.html.relative_to(REPO_ROOT)),
@@ -180,35 +211,6 @@ def main() -> int:
     args.stats_out.write_text(json.dumps(stats, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"[{template.name}] всего по шаблону: {total_wall:.1f}с", flush=True)
     return 0
-
-
-def _count_embedded_photos(pptx_path: Path, user_photos: dict[str, Path]) -> int:
-    """Считает, сколько байтовых пар совпало между `ppt/media/*` собранного
-    .pptx и файлами контент-пакета (по содержимому, не по имени — python-pptx
-    переименовывает медиа при вставке, имя файла контент-пакета не сохраняется
-    внутри архива)."""
-    import hashlib
-    import zipfile
-
-    if not user_photos:
-        return 0
-    wanted = set()
-    for path in user_photos.values():
-        try:
-            wanted.add(hashlib.sha256(Path(path).read_bytes()).hexdigest())
-        except OSError:
-            continue
-    if not wanted:
-        return 0
-    found = set()
-    with zipfile.ZipFile(pptx_path) as zf:
-        for name in zf.namelist():
-            if not name.startswith("ppt/media/"):
-                continue
-            digest = hashlib.sha256(zf.read(name)).hexdigest()
-            if digest in wanted:
-                found.add(digest)
-    return len(found)
 
 
 if __name__ == "__main__":
