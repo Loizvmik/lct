@@ -24,6 +24,7 @@ from deckforge.audit.report import AuditReport
 from deckforge.audit.visual import run_visual
 from deckforge.compose.builder import build_deck
 from deckforge.plan.outline import build_outline, load_content_pack
+from deckforge.plan.photos import assign_photos, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
@@ -177,6 +178,27 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     written_at = time.monotonic()
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
 
+    # Task 20: распределение фотографий контент-пакета по слайдам — ПОСЛЕ
+    # текста (нужны уже написанные заголовки/содержание, см. `plan.photos.
+    # assign_photos`) и ДО `apply_variant`/`build_deck` (`_compatible_kinds`
+    # смотрит на `SlideSpec.visual.kind`, проставленный здесь, при выборе
+    # финальной раскладки — см. докстроку `plan.variants._compatible_
+    # kinds`). Один вызов модели на всю колоду, не на слайд (бриф задачи).
+    photos = load_content_pack_photos(args.content_pack)
+    photo_llm = _build_role_provider("photo_picker") if photos else None
+    deck, photo_report = assign_photos(deck, photos, photo_llm)
+    photos_at = time.monotonic()
+    if photos:
+        print(
+            f"Фотографии контент-пакета: {len(photos)} пришло, "
+            f"{photo_report.placed_count} распределено моделью за {photos_at - written_at:.1f}с"
+        )
+        for note in photo_report.notes:
+            print(f"  ! {note}")
+        if photo_report.placed_count == 0:
+            print("  ! Ни одна фотография не попала ни на один слайд — см. находки выше.")
+    user_photos = {p.name: p.path for p in photos}
+
     config = AuditConfig.load()
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -188,7 +210,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     for variant in variants:
         step_started = time.monotonic()
         variant_deck = apply_variant(deck, profile, variant)
-        built_path = build_deck(variant_deck, profile, args.template, variant)
+        built_path = build_deck(variant_deck, profile, args.template, variant, user_photos=user_photos)
         built_at = time.monotonic()
         path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-t13.pptx"
         shutil.copy2(built_path, path)
