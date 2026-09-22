@@ -147,18 +147,29 @@ def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, va
     canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
     audit_config = AuditConfig.load()
     patterns = [_pattern_from_model(m) for m in profile.patterns]
+    # Task 18: история выбора раскладки растёт по ходу цикла — вход штрафа
+    # за повтор (`_diversity_penalty`, см. докстроку `_SelectionHistory`).
+    # Большинство слайдов приходят с уже проставленным `slide_spec.
+    # pattern_id` (`plan.variants.apply_variant`, реальный выбор — см. её
+    # докстроку), и `_resolve_pattern` ставит его первым БЕЗУСЛОВНО (штраф
+    # здесь на такие слайды не действует вовсе, это ожидаемо — история нужна
+    # для случаев, когда `pattern_id` не проставлен или не прошёл аудит
+    # `_place_best_candidate` и цикл довыбирает раскладку сам, см. докстроку
+    # `_resolve_pattern`).
+    history = _SelectionHistory()
     for slide_spec in spec.slides:
-        candidates = _resolve_pattern(slide_spec, patterns, profile, variant)
+        candidates = _resolve_pattern(slide_spec, patterns, profile, variant, history)
         if not candidates:
             slide_spec.findings.append(
                 f"Слайд {slide_spec.index}: для kind={slide_spec.kind!r} не нашлось ни одного "
                 "паттерна этого шаблона — слайд не собран."
             )
             continue
-        _pattern, notes = _place_best_candidate(
+        pattern, notes = _place_best_candidate(
             prs, slide_spec, candidates, profile, canvas, audit_config, bullet_char=bullet_char,
         )
         slide_spec.findings.extend(notes)
+        history = history.with_choice(pattern.pattern_id)
 
     out_path = _output_path(spec, template_path, variant)
     out_path.parent.mkdir(parents=True, exist_ok=True)

@@ -490,6 +490,30 @@ def _pattern_model(pattern: Pattern) -> PatternModel:
 # TemplateProfile
 # ---------------------------------------------------------------------------
 
+# Часовой для "параметр `cache_dir` не передан вовсе" — отличим от
+# `cache_dir=None`, переданного ЯВНО. Найдено этой задачей (Task 18): до
+# этой правки `from_file` не различал "не передан" и "передан None" (оба
+# читались как `cache_dir if cache_dir is not None else _default_cache_dir()`
+# — то есть `cache_dir=None` молча ПОДМЕНЯЛСЯ каталогом кеша по умолчанию,
+# а не отключал кеш, как ожидали ЧЕТЫРЕ conftest.py (`tests/plan/`,
+# `tests/compose/`, `tests/render/`, `tests/export/`) — все они зовут
+# `from_file(TEMPLATE, cache_dir=None)`, рассчитывая на свежий, изолированный
+# от диск-кеша профиль. Пока `vision`/`namer` не меняли `Pattern.kind`
+# (до Task 18), эта путаница была безвредна — кеш-хит с чужого прогона нёс
+# ТЕ ЖЕ геометрические паттерны, что и свежий разбор. С Task 18 `Pattern.
+# kind` в кеше может отличаться от геометрии (вид уточнён моделью в чужом
+# прогоне `deckforge parse`/`generate` с ключом) — `tests/export/test_html.
+# py::test_html_slides_are_text_not_screenshots` реально поймал это на живом
+# прогоне обязательной проверки этой задачи: `_profile()` получил ИЗ
+# ОБЩЕГО кеша профиль с раскладками, `kind` которых сменила модель, и
+# `build_deck` положил тестовый контент на другую, не ту раскладку, под
+# которую написан хардкодный `DeckSpec` теста. Теперь `cache_dir=None`,
+# переданный ЯВНО, действительно отключает кеш (`effective_cache_dir`
+# остаётся `None`) — так, как и предполагали все четыре conftest.py с
+# самого начала.
+_CACHE_DIR_UNSET = object()
+
+
 def _default_cache_dir() -> Path | None:
     """Каталог диск-кеша профилей по умолчанию — `paths.profile_cache` из
     `config/app.yaml` (единственная точка настройки, как и всё остальное в
@@ -551,7 +575,7 @@ class TemplateProfile(BaseModel):
     @classmethod
     def from_file(
         cls, path: Path, *, namer: LLMProvider | None = None, vision: VisionProvider | None = None,
-        cache_dir: Path | None = None,
+        cache_dir: Path | None = _CACHE_DIR_UNSET,  # type: ignore[assignment]
     ) -> "TemplateProfile":
         """Разбирает `.pptx`-шаблон целиком, ровно один проход по пакету.
 
@@ -583,14 +607,18 @@ class TemplateProfile(BaseModel):
         по пути `path` не менялся (тот же sha256, см. `.fingerprint`) и в
         каталоге кеша уже лежит профиль с этим отпечатком, ВЫЗЫВАЮЩАЯ
         СТОРОНА ПОЛУЧАЕТ ГОТОВЫЙ ПРОФИЛЬ ИЗ КЕША — ни разбор пакета, ни
-        (если он был бы нужен) сетевой вызов именования палитры не
-        повторяются. Каталог кеша — `cache_dir`, если передан явно, иначе
+        (если он был бы нужен) сетевой вызов именования палитры/вида
+        раскладки не повторяются. Каталог кеша — `cache_dir`, если параметр
+        передан вовсе (ЛЮБЫМ значением, включая `None` — см. `_CACHE_DIR_
+        UNSET` ниже, Task 18: `cache_dir=None`, переданный ЯВНО, ОТКЛЮЧАЕТ
+        кеш полностью, а не подменяется каталогом по умолчанию, как было до
+        этой правки), иначе (параметр вовсе не указан вызывающим кодом) —
         `paths.profile_cache` из `config/app.yaml` (см. `_default_cache_dir`
-        ниже); если конфиг недоступен или каталог кеша не задан — кеш просто
-        не используется, разбор идёт как обычно (кеш — оптимизация
-        повторного вызова на одном и том же файле, а не обязательное
-        условие сборки профиля). Повреждённый файл кеша не роняет вызов —
-        профиль пересчитывается заново и перезаписывает его.
+        ниже); если конфиг недоступен или каталог кеша по умолчанию не
+        настроен — кеш просто не используется, разбор идёт как обычно (кеш —
+        оптимизация повторного вызова на одном и том же файле, а не
+        обязательное условие сборки профиля). Повреждённый файл кеша не
+        роняет вызов — профиль пересчитывается заново и перезаписывает его.
 
         Ключ кеша — только отпечаток ФАЙЛА, без учёта `namer` (Task 8
         код-ревью, находка 2). Раньше это значило: первый вызов на файле без
@@ -607,7 +635,7 @@ class TemplateProfile(BaseModel):
         path = Path(path)
         fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
 
-        effective_cache_dir = cache_dir if cache_dir is not None else _default_cache_dir()
+        effective_cache_dir = cache_dir if cache_dir is not _CACHE_DIR_UNSET else _default_cache_dir()
         cache_file = (
             effective_cache_dir / f"{fingerprint}.json" if effective_cache_dir is not None else None
         )
