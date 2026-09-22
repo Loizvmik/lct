@@ -180,7 +180,21 @@ class DecorShape:
     декора внутри группы (0-based, по возрастанию координаты вдоль оси
     повтора), тот же приём, что `expand_repeat` использует для текстовых
     слотов. `False`/`0` по умолчанию — декор вне группы повтора (логотип,
-    разделительная линия, самостоятельная плашка), переносится КАК ЕСТЬ."""
+    разделительная линия, самостоятельная плашка), переносится КАК ЕСТЬ.
+
+    `prst`/`adj` (Task 10 код-ревью, находка №1): `a:prstGeom`/@prst и
+    степень скругления (`a:avLst` `adj`) декора — независимая копия того
+    же разбора, что `template/shapes.py::_prst_geom` (не импорт чужой
+    приватной функции, тот же принцип модульной границы, что уже
+    применён во всём `template/`, см. докстроку модуля про `_layouts`).
+    Заполняются ТОЛЬКО для `kind == "shape"` (`p:sp` несёт `a:prstGeom`;
+    коннектор/картинка/graphicFrame — нет). Нужны, чтобы `build_shape_
+    vocabulary` могло строить словарь автофигур ИМЕННО по декору групп
+    повтора (карточные плашки), а не по переписи всех автофигур шаблона
+    (см. докстроку `template/shapes.py`) — без формы у самого декора
+    опираться было бы физически не на что. `None` — декор не несёт
+    `a:prstGeom` (не `kind == "shape"`, либо `p:custGeom` — произвольный
+    контур, ни один известный прест ему не соответствует)."""
     kind: str
     box: Box
     rotation: float
@@ -191,6 +205,8 @@ class DecorShape:
     fill_kind: str = "unspecified"
     repeat_group: bool = False
     repeat_index: int = 0
+    prst: str | None = None
+    adj: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1749,11 +1765,46 @@ def _to_decor(
     elif fill_kind == "picture":
         fill_hex = _picture_fill_average_color(pkg, rels, fill_el, decor_image_cache)
 
+    prst, adj = _decor_prst_geom(ref.element) if ref.kind == "shape" else (None, None)
+
     return DecorShape(
         kind=ref.kind, box=ref.box, rotation=ref.rotation, flip_h=ref.flip_h, flip_v=ref.flip_v,
         fill_hex=fill_hex, has_fill=has_fill, fill_kind=fill_kind,
         repeat_group=repeat_index is not None, repeat_index=repeat_index or 0,
+        prst=prst, adj=adj,
     )
+
+
+def _decor_prst_geom(element) -> tuple[str | None, float | None]:
+    """(`prst`, степень скругления) автофигуры-декора из `a:prstGeom` —
+    независимая копия разбора `template/shapes.py::_prst_geom` (см.
+    докстроку `DecorShape.prst`/`adj` про то, почему копия, а не импорт).
+    `None, None`, если у шейпа нет `a:spPr`/`a:prstGeom`/`@prst` вовсе
+    (например, `p:custGeom` — произвольный контур)."""
+    sp_pr = element.find(qn("p:spPr"))
+    if sp_pr is None:
+        return None, None
+    geom = sp_pr.find(qn("a:prstGeom"))
+    if geom is None:
+        return None, None
+    prst = geom.get("prst")
+    if not prst:
+        return None, None
+
+    adj: float | None = None
+    av_lst = geom.find(qn("a:avLst"))
+    if av_lst is not None:
+        for gd in av_lst.findall(qn("a:gd")):
+            if gd.get("name") != "adj":
+                continue
+            fmla = (gd.get("fmla") or "").split()
+            if len(fmla) == 2 and fmla[0] == "val":
+                try:
+                    adj = int(fmla[1]) / 100000
+                except ValueError:
+                    adj = None
+            break
+    return prst, adj
 
 
 # --- дедупликация (бриф, Step 2, п.8) ---------------------------------------
