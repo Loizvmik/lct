@@ -137,6 +137,31 @@ uv run pytest tests/ -v
 | Аудит готовой колоды, 24 проверки | доли секунды |
 | Модельный аудит по картинке, 11 проверок (`audit-visual`) | ≈150с — поэтому вынесен из `generate` отдельной командой |
 
+## Демонстрационный пакет (`submission/`)
+
+Для промежуточной сдачи собирается один контент-пакет
+(`fixtures/content-packs/queue-latency`) на трёх учебных шаблонах, по три
+варианта вёрстки каждый (девять презентаций), плюс отдельно контрольный
+`ЛЦТ2026 Шаблон презентации.pptx` (незнакомый файл, не использовался в
+разработке) — десятая. Каждая выгружена в `.pptx`/`.pdf`/`.html` плюс
+постраничные PNG-превью. Пакет не в git (сотни мегабайт, см. `.gitignore`),
+воспроизводится локально:
+
+```bash
+set -a && source .env && set +a
+uv run python scripts/build_submission.py \
+  "dataset/templates/<шаблон>.pptx" \
+  fixtures/content-packs/queue-latency \
+  submission/<каталог-шаблона> \
+  --variants dense airy visual \
+  --stats-out scratchpad/stats/<шаблон>.json
+```
+
+(скрипт — тонкая обвязка над `deckforge generate` + `export.bundle.
+export_bundle` на каждый вариант; сам генератор пакета собирается по
+образцу `cli._cmd_generate`). Подробности — `submission/README.md` внутри
+собранного пакета и `.superpowers/sdd/task-21-report.md`.
+
 ## Ограничения
 
 - **SmartArt не создаётся по-настоящему.** Формат `dgm:` не поддержан ни
