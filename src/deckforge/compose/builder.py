@@ -29,6 +29,7 @@ from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.decor import apply_decor
 from deckforge.compose.tables import TableSpec, add_table
 from deckforge.compose.textfit import measure, register_template_fonts
+from deckforge.ooxml.customprops import write_custom_property
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
@@ -39,9 +40,16 @@ from deckforge.template.grid import ColumnAxis, Grid
 from deckforge.template.naming import MIN_CONTRAST
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
 from deckforge.template.profile import LayoutEntryModel, TemplateProfile
+from deckforge.workflow.versions import manifest as workflow_manifest
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 EMU_PER_INCH = 914400
+
+# Task 15 (ТЗ п.2.4): на защите отвечает на вопрос "а этот файл каким кодом
+# собран" — имя пользовательского свойства документа (`docProps/custom.xml`,
+# см. `deckforge.ooxml.customprops`), в которое пишется реестр версий
+# промптов/конфигов, собравших конкретный .pptx.
+WORKFLOW_PROPERTY_NAME = "deckforge_workflow"
 
 # `Variant` теперь определён один раз в `plan.variants` (Task 13) — `compose`
 # уже зависит от `plan` (импортирует `plan.spec` для типов содержания), тот
@@ -155,6 +163,7 @@ def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, va
     out_path = _output_path(spec, template_path, variant)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(str(out_path))
+    write_custom_property(out_path, WORKFLOW_PROPERTY_NAME, workflow_manifest().as_property_value())
     return out_path
 
 
