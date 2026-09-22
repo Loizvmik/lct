@@ -614,9 +614,10 @@ def test_classify_kind_recognizes_cards_by_repeat_structure_not_typography():
     repeat = RepeatSpec(axis="x", count=5, step=0.19, slot_roles=["card_body"], group_size=3)
     roles_present = {"card_body", "headline"}
 
-    kind = _classify_kind([], slots, repeat, roles_present, _CANVAS)
+    kind, confidence = _classify_kind([], slots, repeat, roles_present, _CANVAS)
 
     assert kind == "cards"
+    assert confidence == 1.0
 
 
 def test_classify_kind_does_not_treat_repeat_of_single_lines_as_cards():
@@ -633,7 +634,7 @@ def test_classify_kind_does_not_treat_repeat_of_single_lines_as_cards():
     repeat = RepeatSpec(axis="x", count=5, step=0.19, slot_roles=["bullet"], group_size=1)
     roles_present = {"bullet", "headline"}
 
-    kind = _classify_kind([], slots, repeat, roles_present, _CANVAS)
+    kind, _confidence = _classify_kind([], slots, repeat, roles_present, _CANVAS)
 
     assert kind != "cards"
 

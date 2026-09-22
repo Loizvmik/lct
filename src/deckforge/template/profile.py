@@ -131,7 +131,19 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # `kpi_caption` (`config/pattern-kinds.yaml`) — без бампа старый кеш молча
 # продолжал бы отдавать только семь геометрических видов, даже когда
 # сейчас передан ключ модели и разбор мог бы дать больше разнообразия.
-PROFILE_SCHEMA_VERSION = 8
+# 8 -> 9: задача "разбор незнакомого шаблона в бюджет" — `PatternModel`
+# несёт новое поле `kind_confidence` (зеркало `patterns.Pattern.
+# kind_confidence`, см. её докстроку) — `template.vision_kind.classify_
+# patterns_by_vision` теперь спрашивает модель ТОЛЬКО про паттерны с низкой
+# уверенностью геометрии, а не про каждый паттерн подряд. Старый кеш (до
+# этой правки) несёт паттерны БЕЗ этого поля — pydantic тихо подставил бы
+# дефолт `1.0` ("уверен целиком"), и КАЖДЫЙ паттерн старого кеша читался бы
+# как "геометрия уверена, модель звать не нужно" — молчаливая потеря самого
+# смысла этой задачи (часть раскладок, которые раньше честно уточнялись
+# моделью, перестала бы спрашиваться вовсе). Бамп версии заставляет такой
+# кеш пересобраться заново, с настоящей уверенностью по ветвям `_classify_
+# kind`, а не с фиктивной единицей.
+PROFILE_SCHEMA_VERSION = 9
 
 # Ниже какой уверенности число из разбора попадает в предупреждения, а не
 # только в тело отчёта. 0.5 — не наблюдение за тремя файлами, а сама природа
@@ -473,6 +485,15 @@ class PatternModel(BaseModel):
     capacity: CapacityModel
     score: float
     is_dark: bool
+    # Задача "разбор незнакомого шаблона в бюджет": уверенность
+    # ГЕОМЕТРИЧЕСКОГО классификатора в своём `kind` (см. докстроку
+    # `patterns.Pattern.kind_confidence`/`patterns._classify_kind`) —
+    # `template.vision_kind.classify_patterns_by_vision` спрашивает модель
+    # только про паттерны ниже порога уверенности, не про все. Дефолт `1.0`
+    # — обратная совместимость со старым диск-кешем без этого поля (тот же
+    # принцип, что и у `RepeatSpecModel.group_size`/`DecorShapeModel.
+    # repeat_group` выше в этом файле).
+    kind_confidence: float = 1.0
 
 
 def _pattern_model(pattern: Pattern) -> PatternModel:
@@ -483,6 +504,7 @@ def _pattern_model(pattern: Pattern) -> PatternModel:
         repeat=_repeat_spec_model(pattern.repeat),
         decor=[_decor_shape_model(d) for d in pattern.decor],
         capacity=_capacity_model(pattern.capacity), score=pattern.score, is_dark=pattern.is_dark,
+        kind_confidence=pattern.kind_confidence,
     )
 
 

@@ -236,6 +236,22 @@ class Pattern:
     capacity: Capacity
     score: float
     is_dark: bool
+    # Уверенность ГЕОМЕТРИЧЕСКОГО классификатора (`_classify_kind` ниже) в
+    # своём выборе `kind` — НЕ то же самое, что `score` (пригодность
+    # паттерна к повторному использованию вообще). Нужна отдельному проходу
+    # `template.vision_kind.classify_patterns_by_vision`: находка задачи
+    # ("Спрашивать модель не про все раскладки") — геометрия уверена, когда
+    # структурный сигнал сам по себе однозначен (повтор ≥3 групп по ≥2
+    # элемента — это карточки, настоящая `<a:tbl>` — это таблица), и
+    # колеблется там, где несколько РАЗНЫХ смысловых видов геометрически
+    # неотличимы (headline-only слайд может быть и section, и quote, и
+    # kpi_caption — см. `config/pattern-kinds.yaml`). Значения по ветвям
+    # `_classify_kind`, каждое обосновано в её докстроке; дефолт `1.0`
+    # (обратная совместимость со старым диск-кешем/тестовыми фикстурами,
+    # не задающими поле явно, — то же поведение, что и у `RepeatSpec.
+    # group_size`/`DecorShape.repeat_group` в этом же модуле, см. их
+    # докстроки про "кеш без поля валидируется как..." принцип).
+    kind_confidence: float = 1.0
 
 
 # --- геометрические допуски (бриф, Step 2, п.4 — оба числа литералом) ------
@@ -425,7 +441,7 @@ def _mine_slide(
         repeat = replace(repeat, slot_roles=sorted({slots[i].role for i in repeat_roles_by_index}))
 
     roles_present = {s.role for s in slots}
-    kind = _classify_kind(content, slots, repeat, roles_present, canvas)
+    kind, kind_confidence = _classify_kind(content, slots, repeat, roles_present, canvas)
 
     if "headline" not in roles_present and kind not in _HEADLINE_EXEMPT_KINDS:
         # Раскладка без заголовка (и не героического типа section/image) —
@@ -464,6 +480,7 @@ def _mine_slide(
         capacity=capacity,
         score=score,
         is_dark=is_dark,
+        kind_confidence=kind_confidence,
     )
 
 
@@ -1293,7 +1310,42 @@ def estimate_slot_chars(box: Box, canvas: Canvas, size_pt: float) -> int:
 def _classify_kind(
     content: list[ShapeRef], slots: list[PatternSlot], repeat: RepeatSpec | None,
     roles_present: set[str], canvas: Canvas,
-) -> str:
+) -> tuple[str, float]:
+    """Возвращает `(kind, confidence)` — `confidence` (задача "разбор
+    незнакомого шаблона в бюджет", находка №2) размечает КАЖДУЮ ветвь этой
+    функции отдельно, по тому, насколько структурный сигнал ветви сам по
+    себе однозначен, а не подобрана под три учебных файла:
+
+    - 1.0 (`cards`/`table`) — сигнал структурный и прямой: настоящий повтор
+      ≥3 групп по ≥2 элемента, либо реальный `<a:tbl>` в содержимом. Спутать
+      их геометрически почти не с чем — `config/pattern-kinds.yaml` не
+      несёт вида, который выглядел бы так же.
+    - 0.8 (`two_col`) — тоже структурный сигнал (выровненные по центру
+      колонки текста), но мягче: основан на кластеризации с допуском
+      (`_column_groups`/`_columns`), не на точном совпадении шага повтора.
+    - 0.75 (`image`, весь слайд без единого текстового слота) — ролей
+      кроме image/icon/chart нет вовсе, спутать с `photo_text` (который по
+      определению словаря "фото И текст оба несут смысл") нечем — текста на
+      слайде просто нет.
+    - 0.45 (`kpi`, `image` с конкурирующим текстом) — реальный сигнал есть
+      (числовой слот; картинка держит заметную площадь), но словарь видов
+      прямо называет соседний вид, неотличимый ЭТИМ сигналом: `kpi_caption`
+      (то же число, просто с развёрнутой подписью) и `photo_text` (та же
+      картинка рядом с текстом, просто меньше формального порога площади).
+    - 0.4 (`section`) — headline без единого содержательного тела: ИМЕННО
+      этот случай назвала находка №1 брифа задачи 18 ("слайд с цитатой...
+      геометрически неотличим от section") — самый частый источник
+      схлопывания видов.
+    - 0.3 (`bullets`) — буквально запасной вариант этой функции (последний
+      `return`, когда ни одна из веток выше не подошла) — брифом задачи
+      прямо назван как "запасной вариант «список»", наименее уверенный
+      случай по построению, не по измерению.
+
+    Порог, ниже которого паттерн стоит переспросить моделью, — забота
+    `template.vision_kind` (0.5, см. её докстроку про ту же "половина —
+    уже не увереннее монетки" логику, что и `profile._LOW_CONFIDENCE_
+    THRESHOLD`), не этой функции: она размечает уверенность КАЖДОЙ ветви,
+    а не решает, что с этой уверенностью делать дальше."""
     # Task 7 повторное ревью №2, находка №1: карточку делает СТРУКТУРА
     # повтора — несколько групп (>= 3, по горизонтали) с НЕСКОЛЬКИМИ
     # элементами в каждой (`group_size >= _MIN_CARD_GROUP_SIZE`), а не
@@ -1312,16 +1364,16 @@ def _classify_kind(
         repeat is not None and repeat.axis == "x" and repeat.count >= 3
         and repeat.group_size >= _MIN_CARD_GROUP_SIZE
     ):
-        return "cards"
+        return "cards", 1.0
 
     if len(_columns(slots)) >= 2:
-        return "two_col"
+        return "two_col", 0.8
 
     if "kpi_value" in roles_present and repeat is None:
-        return "kpi"
+        return "kpi", 0.45
 
     if "headline" in roles_present and not ({"body", "bullet", "card_body", "card_title"} & roles_present):
-        return "section"
+        return "section", 0.4
 
     # Слайд целиком без текста (весь контент — картинка/иконка/график) —
     # доминирующая картинка/график по определению, независимо от площади:
@@ -1331,7 +1383,7 @@ def _classify_kind(
     # контрольном ЛЦТ2026 одиночный график с полями/легендой занимает
     # ~30% площади, меньше порога, но текста рядом всё равно нет).
     if roles_present and roles_present <= {"image", "icon", "chart"}:
-        return "image"
+        return "image", 0.75
 
     for slot in slots:
         # "chart" здесь же, не отдельным kind'ом: интерфейс брифа (Step 2)
@@ -1344,12 +1396,12 @@ def _classify_kind(
         # контрольном ЛЦТ2026 (несколько слайдов "только график, без
         # заголовка"), и там это тот же случай, не отдельная категория.
         if slot.role in ("image", "chart") and slot.box.area > _IMAGE_AREA_KIND_THRESHOLD:
-            return "image"
+            return "image", 0.45
 
     if "table" in roles_present:
-        return "table"
+        return "table", 1.0
 
-    return "bullets"
+    return "bullets", 0.3
 
 
 # --- проверки качества (бриф, "Требования к работе") ------------------------

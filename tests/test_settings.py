@@ -29,6 +29,15 @@ def test_load_reads_app_yaml():
     assert settings.paths.artifacts.name == "artifacts"
 
 
+def test_pattern_kind_max_workers_is_read_from_app_yaml():
+    """Задача "разбор незнакомого шаблона в бюджет", находка №4 — число
+    потоков уточнения вида раскладки (`template.vision_kind`) теперь
+    настройка, как и `slide_writer_max_workers`, а не хардкод-константа
+    модуля."""
+    settings = Settings.load(APP_YAML)
+    assert settings.llm.pattern_kind_max_workers == 4
+
+
 def test_llm_roles_resolve_to_allowed_models():
     from deckforge.provider.registry import assert_allowed
 

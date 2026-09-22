@@ -66,6 +66,15 @@ class LLMConfig(BaseModel):
     # комментарий про происхождение числа в app.yaml. Со значением по
     # умолчанию по той же причине, что и `deadline_seconds` выше.
     slide_writer_max_workers: int = 4
+    # Задача "разбор незнакомого шаблона в бюджет", находка №4 ("Гонять
+    # оставшиеся обращения параллельно... число потоков лежит в
+    # config/app.yaml. Сделай так же") — то же самое для уточнения вида
+    # раскладки по картинке (`template.vision_kind.classify_patterns_by_
+    # vision`): раньше число потоков было хардкод-константой модуля
+    # (`DEFAULT_MAX_WORKERS`), теперь настройка, как и у `slide_writer_max_
+    # workers`. Дефолт дублирует `vision_kind.DEFAULT_MAX_WORKERS` — см.
+    # комментарий про происхождение числа в app.yaml.
+    pattern_kind_max_workers: int = 4
 
     def model_for(self, role: str) -> str:
         """Модель для роли; если роль не описана явно — модель по умолчанию."""

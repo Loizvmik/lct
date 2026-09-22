@@ -1006,6 +1006,7 @@ def _pattern_from_model(model) -> Pattern:
         pattern_id=model.pattern_id, source_slide_index=list(model.source_slide_index),
         layout_id=model.layout_id, kind=model.kind, slots=slots, repeat=repeat, decor=decor,
         capacity=capacity, score=model.score, is_dark=model.is_dark,
+        kind_confidence=model.kind_confidence,
     )
 
 
