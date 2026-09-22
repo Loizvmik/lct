@@ -1,3 +1,12 @@
+# Реестр моделей, допущенных к использованию (`deckforge.provider.registry.
+# assert_allowed`, ТЗ: лицензия Apache-2.0/MIT, потолок 35B параметров).
+#
+# `version` (Task 15, версионирование конфигов воркфлоу) — поднимается при
+# добавлении/запрете модели, читается `deckforge.workflow.versions.
+# manifest()`; `_registry` читает только ключи `models`/`denied`, `version`
+# рядом ему не мешает.
+version: 1.0.0
+
 models:
   - id: qwen3.6-35b-a3b
     provider: yandex
