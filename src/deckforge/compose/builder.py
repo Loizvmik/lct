@@ -10,9 +10,9 @@ python-pptx (рисование) одновременно — блоки кон�
 и декор (`compose.decor`) сами python-pptx не касаются.
 """
 from __future__ import annotations
+import io
 import re
 from dataclasses import dataclass, replace
-from enum import Enum
 from pathlib import Path
 
 from lxml import etree
@@ -22,12 +22,15 @@ from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Pt
 
 from deckforge.compose.blocks import Paragraph, SlotContent, assign_content, expand_decor, find_bullet_char
+from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.decor import apply_decor
+from deckforge.compose.tables import TableSpec, add_table
 from deckforge.compose.textfit import measure, register_template_fonts
 from deckforge.ooxml.geometry import Box
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock
+from deckforge.plan.variants import Variant
 from deckforge.settings import Settings
 from deckforge.template.grid import ColumnAxis, Grid
 from deckforge.template.naming import MIN_CONTRAST
@@ -37,17 +40,14 @@ from deckforge.template.profile import LayoutEntryModel, TemplateProfile
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 EMU_PER_INCH = 914400
 
-
-class Variant(Enum):
-    """Плотность/визуальность сборки — влияет только на выбор ПАТТЕРНА
-    среди нескольких кандидатов одного `kind` (см. `_pick_pattern`):
-    `visual` предпочитает раскладки с бОльшим числом декоративных фигур,
-    `dense` — раскладки победнее декором (обычно вместительнее по тексту).
-    Первый грубый проход — настоящий подбор паттерна по смыслу содержания
-    сделает Task 13 (`pattern_picker`, см. `config/app.yaml`)."""
-
-    dense = "dense"
-    visual = "visual"
+# `Variant` теперь определён один раз в `plan.variants` (Task 13) — `compose`
+# уже зависит от `plan` (импортирует `plan.spec` для типов содержания), тот
+# же однонаправленный порядок зависимостей, только для варианта вёрстки, а
+# не для схемы данных. Реэкспорт (`from ... import Variant` выше) сохраняет
+# `deckforge.compose.builder.Variant` рабочим для существующего кода/тестов,
+# которые импортировали его именно отсюда (Task 9-10, до этой задачи) —
+# `Variant.dense`/`Variant.visual` те же самые объекты, что и в `plan.
+# variants.Variant`, `Variant.airy` — новый третий вариант оттуда же.
 
 
 @dataclass(frozen=True)
@@ -135,7 +135,7 @@ def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, va
 
     patterns = [_pattern_from_model(m) for m in profile.patterns]
     for slide_spec in spec.slides:
-        pattern = _pick_pattern(slide_spec, patterns, profile, variant)
+        pattern = _resolve_pattern(slide_spec, patterns, profile, variant)
         if pattern is None:
             slide_spec.findings.append(
                 f"Слайд {slide_spec.index}: для kind={slide_spec.kind!r} не нашлось ни одного "
@@ -221,6 +221,173 @@ def place_slide(
             slide, slide_spec, content, profile, family, bullet_char, canvas_width_emu, canvas_height_emu,
             _local_background_luminance(content.slot.box, effective_pattern, layout_bg_luminance),
         )
+
+    _place_visual(slide, slide_spec, pattern, profile)
+
+
+# ---------------------------------------------------------------------------
+# Визуал слайда (Task 13) — таблица/график/фото/иконка. `plan.spec.Visual`
+# несёт только СОДЕРЖАНИЕ (числа таблицы, ряды графика, "какой ассет по
+# смыслу"), КАК это лечь на холст — решает этот модуль, тем же принципом,
+# что и текстовые слоты (`_draw_slot`): единственное место, трогающее и
+# `TemplateProfile`, и python-pptx одновременно для визуала, — здесь, не в
+# `plan/` и не в `compose.charts`/`compose.tables` (те двое уже готовы,
+# Task 9-10, и НЕ знают о `plan.spec.Visual` вовсе — принимают свои
+# собственные `ChartSpec`/`TableSpec`, этот модуль их строит).
+# ---------------------------------------------------------------------------
+
+
+def _visual_slot(pattern: Pattern, role: str) -> PatternSlot | None:
+    """Самый ёмкий (по площади) слот `pattern` этой роли — тот же приём,
+    что `blocks._slots_by_role` использует для текстовых слотов (см. её
+    докстроку про Task 9 повторное ревью, находка №2): визуал кладётся в
+    слот, который реально вмещает контент, а не в первый попавшийся."""
+    candidates = [s for s in pattern.slots if s.role == role]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda s: s.box.width * s.box.height)
+
+
+def _place_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile) -> None:
+    visual = slide_spec.visual
+    if visual is None:
+        return
+
+    if visual.kind == "table" and visual.table is not None:
+        _place_table_visual(slide, slide_spec, pattern, profile, visual.table)
+    elif visual.kind == "chart" and visual.chart is not None:
+        _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart)
+    elif visual.kind in ("photo", "icon"):
+        _place_picture_visual(slide, slide_spec, pattern, profile, visual.kind)
+
+
+def _place_table_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, table) -> None:
+    slot = _visual_slot(pattern, "table")
+    if slot is None:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: в раскладке {pattern.pattern_id!r} нет слота под таблицу "
+            "— TableVisual не отрисован."
+        )
+        return
+    if not table.rows:
+        return
+
+    header, body_rows = table.rows[0], table.rows[1:]
+    cap = pattern.capacity
+    truncated = False
+    if cap.max_cols and len(header) > cap.max_cols:
+        header = header[: cap.max_cols]
+        body_rows = [row[: cap.max_cols] for row in body_rows]
+        truncated = True
+    max_body_rows = max(cap.max_rows - 1, 1) if cap.max_rows else len(body_rows)
+    if len(body_rows) > max_body_rows:
+        body_rows = body_rows[:max_body_rows]
+        truncated = True
+    if truncated:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: таблица усечена до вместимости раскладки "
+            f"({pattern.pattern_id!r}, max_rows={cap.max_rows}, max_cols={cap.max_cols})."
+        )
+
+    align = ["r" if all(_looks_numeric(c) for c in [h] + [r[i] for r in body_rows if i < len(r)])
+             else "l" for i, h in enumerate(header)]
+    add_table(slide, slot.box, TableSpec(header=header, rows=body_rows, align=align), profile)
+
+
+_NUMERIC_CELL_RE = re.compile(r"^[+-]?[\d\s.,%]+[a-zа-яё%]*$", re.IGNORECASE)
+
+
+def _looks_numeric(cell: str) -> bool:
+    return bool(_NUMERIC_CELL_RE.match(cell.strip())) if cell and cell.strip() else False
+
+
+def _place_chart_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, chart) -> None:
+    slot = _visual_slot(pattern, "chart") or _visual_slot(pattern, "table") or _visual_slot(pattern, "image")
+    if slot is None:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: в раскладке {pattern.pattern_id!r} нет слота под график "
+            "— ChartVisual не отрисован."
+        )
+        return
+    if not chart.series:
+        return
+
+    cap = pattern.capacity
+    series = chart.series
+    if cap.max_series and len(series) > cap.max_series:
+        series = series[: cap.max_series]
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: график усечён до {cap.max_series} рядов по вместимости "
+            f"раскладки {pattern.pattern_id!r}."
+        )
+
+    # I05 (аудит): подписи осей/единиц обязательны для немаркерных типов —
+    # чем бы ни ответила модель (или её не было вовсе), ось не должна
+    # остаться безымянной, тот же принцип "код не доверяет слепо", что и у
+    # `_color_for_role`/`_best_contrast_color` выше в этом файле.
+    axis_titles = chart.axis_titles
+    if not axis_titles or not axis_titles[0] or not axis_titles[1]:
+        axis_titles = ("Категория", chart.unit or "Значение")
+
+    spec = ChartSpec(
+        kind=chart.kind, categories=list(chart.categories),
+        series=[Series(name=s.name, values=list(s.values)) for s in series],
+        unit=chart.unit, highlight_index=chart.highlight_index, axis_titles=axis_titles,
+    )
+    try:
+        add_chart(slide, slot.box, spec, profile)
+    except ValueError as exc:
+        slide_spec.findings.append(f"Слайд {slide_spec.index}: график не построен ({exc}).")
+
+
+def _place_picture_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, kind: str) -> None:
+    slot = (
+        _visual_slot(pattern, "image") if kind == "photo" else _visual_slot(pattern, "icon")
+    ) or _visual_slot(pattern, "image") or _visual_slot(pattern, "icon")
+    if slot is None:
+        return  # раскладка не несёт визуального слота вовсе — нечего заполнять, не находка
+
+    catalog = list(profile.assets.photos if kind == "photo" else profile.assets.icons)
+    if not catalog:
+        catalog = list(profile.assets.photos) + list(profile.assets.icons)
+    if not catalog or not profile.source_path:
+        return  # у шаблона нет своих фото/иконок (или профиль без source_path) — честно ничего не подставляем
+
+    asset = max(catalog, key=lambda a: a.confidence)
+    left, top, width, height = _emu_visual_box(slot.box, profile)
+
+    try:
+        with PptxPackage.open(Path(profile.source_path)) as pkg:
+            data = pkg.part(asset.part_name)
+    except Exception:
+        return
+
+    pic_left, pic_top, pic_width, pic_height = left, top, width, height
+    if asset.width and asset.height:
+        # "Contain", не растяжение на весь слот (L07 аудита следит именно
+        # за отклонением placed_aspect/native_aspect) — картинка вписывается
+        # в слот целиком по большей стороне и центрируется по меньшей.
+        native_aspect = asset.width / asset.height
+        slot_aspect = width / height if height else native_aspect
+        if native_aspect > slot_aspect:
+            pic_width = width
+            pic_height = round(width / native_aspect)
+            pic_top = top + (height - pic_height) // 2
+        else:
+            pic_height = height
+            pic_width = round(height * native_aspect)
+            pic_left = left + (width - pic_width) // 2
+
+    slide.shapes.add_picture(
+        io.BytesIO(data), Emu(pic_left), Emu(pic_top), Emu(max(1, pic_width)), Emu(max(1, pic_height)),
+    )
+
+
+def _emu_visual_box(box: Box, profile: TemplateProfile) -> tuple[int, int, int, int]:
+    return (
+        round(box.left * profile.canvas_width_emu), round(box.top * profile.canvas_height_emu),
+        round(box.width * profile.canvas_width_emu), round(box.height * profile.canvas_height_emu),
+    )
 
 
 def fits(slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile) -> Fit:
@@ -434,13 +601,47 @@ def _pick_pattern(
 
     def rank(p: Pattern):
         fit = fits(slide_spec, p, profile)
-        visual_bias = len(p.decor) if variant is Variant.visual else -len(p.decor)
+        # `airy` не смещает выбор по декору вовсе (0) — её плотность решает
+        # `kind`, уже проставленный `plan.variants.apply_variant` ДО того,
+        # как сюда дошёл вызов (см. докстроку `Variant` и `_resolve_pattern`
+        # ниже: при заданном `pattern_id` этот ранжир вообще не вызывается,
+        # он остаётся запасным путём для `pattern_id=None`).
+        if variant is Variant.visual:
+            visual_bias = len(p.decor)
+        elif variant is Variant.dense:
+            visual_bias = -len(p.decor)
+        else:
+            visual_bias = 0
         return (
             0 if fit.ok else 1, fit.overflow_ratio, _capacity_badness(p, slide_spec),
             _fill_badness(fit.fill_ratio), -p.score, -visual_bias,
         )
 
     return min(candidates, key=rank)
+
+
+def _resolve_pattern(
+    slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
+) -> Pattern | None:
+    """Раскладка для `slide_spec` — предпочитает `slide_spec.pattern_id`
+    (Task 13: проставлен `plan.variants.apply_variant`, детерминированно по
+    вместимости, и/или уточнён `plan.writer.pick_patterns` моделью), но
+    НЕ доверяет ему слепо: `pattern_id` обязан существовать в ЭТОМ профиле,
+    нести ТОТ ЖЕ `kind`, что и `slide_spec.kind`, и реально вмещать
+    содержание (`fits().ok`, замер текста, которого нет ни у `apply_variant`,
+    ни у `pick_patterns` — оба живут в `plan/`, не знающем координат/текстфита).
+    Когда что-то из этого не выполняется — код берёт раскладку САМ,
+    `_pick_pattern`, тем же путём, каким собирались `SAMPLE_SPEC`/`CARDS_
+    SPEC` в `tests/compose/test_builder.py` (Task 9-10, до этой задачи;
+    `pattern_id=None` там — обратная совместимость сохранена буквально)."""
+    if slide_spec.pattern_id:
+        candidate = next(
+            (p for p in patterns if p.pattern_id == slide_spec.pattern_id and p.kind == slide_spec.kind),
+            None,
+        )
+        if candidate is not None and fits(slide_spec, candidate, profile).ok:
+            return candidate
+    return _pick_pattern(slide_spec, patterns, profile, variant)
 
 
 # ---------------------------------------------------------------------------
