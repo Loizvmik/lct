@@ -16,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from lxml import etree
+from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import PP_PLACEHOLDER
@@ -136,7 +137,19 @@ _ROLE_COLOR = {
 # ---------------------------------------------------------------------------
 
 
-def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, variant: Variant) -> Path:
+def build_deck(
+    spec: DeckSpec, profile: TemplateProfile, template_path: Path, variant: Variant,
+    *, user_photos: dict[str, Path] | None = None,
+) -> Path:
+    """`user_photos` (Task 20) — словарь `Visual.photo_name -> путь на диске`
+    фотографий контент-пакета (`plan.photos.ContentPhoto`), собранный
+    вызывающим кодом (`cli.py`, после `plan.photos.assign_photos`); `None`
+    (запасное значение) — ни один слайд не несёт `photo_name`, поведение
+    не отличается от того, что было до этой задачи (все существующие
+    вызовы `build_deck` в тестах/`api/jobs.py` продолжают работать без
+    правок). Дальше уходит в `place_slide` -> `_place_visual` -> `_place_
+    picture_visual`, единственное место, которое реально читает файл с
+    диска и вставляет его вместо ассета каталога шаблона."""
     register_template_fonts(template_path)
     with PptxPackage.open(template_path) as pkg:
         bullet_char = find_bullet_char(pkg)
@@ -166,7 +179,8 @@ def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, va
             )
             continue
         pattern, notes = _place_best_candidate(
-            prs, slide_spec, candidates, profile, canvas, audit_config, bullet_char=bullet_char,
+            prs, slide_spec, candidates, profile, canvas, audit_config,
+            bullet_char=bullet_char, user_photos=user_photos,
         )
         slide_spec.findings.extend(notes)
         history = history.with_choice(pattern.pattern_id)
@@ -180,6 +194,7 @@ def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, va
 
 def place_slide(
     prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, *, bullet_char: str = "•",
+    user_photos: dict[str, Path] | None = None,
 ) -> None:
     layout = _find_layout(prs, pattern.layout_id)
     if layout is None:
@@ -238,7 +253,7 @@ def place_slide(
             _local_background_luminance(content.slot.box, effective_pattern, layout_bg_luminance),
         )
 
-    _place_visual(slide, slide_spec, pattern, profile)
+    _place_visual(slide, slide_spec, pattern, profile, user_photos)
     _remove_empty_placeholders(slide)
 
 
@@ -319,7 +334,10 @@ def _visual_slot(pattern: Pattern, role: str) -> PatternSlot | None:
     return max(candidates, key=lambda s: s.box.width * s.box.height)
 
 
-def _place_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile) -> None:
+def _place_visual(
+    slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile,
+    user_photos: dict[str, Path] | None = None,
+) -> None:
     visual = slide_spec.visual
     if visual is None:
         return
@@ -329,7 +347,7 @@ def _place_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: Templ
     elif visual.kind == "chart" and visual.chart is not None:
         _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart)
     elif visual.kind in ("photo", "icon"):
-        _place_picture_visual(slide, slide_spec, pattern, profile, visual.kind)
+        _place_picture_visual(slide, slide_spec, pattern, profile, visual.kind, user_photos)
 
 
 def _place_table_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, table) -> None:
@@ -411,12 +429,82 @@ def _place_chart_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile:
         slide_spec.findings.append(f"Слайд {slide_spec.index}: график не построен ({exc}).")
 
 
-def _place_picture_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, kind: str) -> None:
+def _contain_box(
+    left: int, top: int, width: int, height: int, native_width: float, native_height: float,
+) -> tuple[int, int, int, int]:
+    """"Contain", не растяжение на весь слот (L07 аудита следит именно за
+    отклонением placed_aspect/native_aspect) — картинка вписывается в слот
+    целиком по большей стороне и центрируется по меньшей. Общая для
+    ассетов каталога шаблона и пользовательских фотографий (Task 20) —
+    один и тот же механизм вписывания, разное происхождение байтов."""
+    native_aspect = native_width / native_height
+    slot_aspect = width / height if height else native_aspect
+    if native_aspect > slot_aspect:
+        pic_width = width
+        pic_height = round(width / native_aspect)
+        pic_top = top + (height - pic_height) // 2
+        pic_left = left
+    else:
+        pic_height = height
+        pic_width = round(height * native_aspect)
+        pic_left = left + (width - pic_width) // 2
+        pic_top = top
+    return pic_left, pic_top, pic_width, pic_height
+
+
+def _place_picture_visual(
+    slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, kind: str,
+    user_photos: dict[str, Path] | None = None,
+) -> None:
     slot = (
         _visual_slot(pattern, "image") if kind == "photo" else _visual_slot(pattern, "icon")
     ) or _visual_slot(pattern, "image") or _visual_slot(pattern, "icon")
+
+    # Task 20: пользовательская фотография контент-пакета — вместо ассета
+    # каталога шаблона, а не вдобавок к нему. `photo_name` заполняет
+    # `plan.photos.assign_photos`, только когда решила, что ЭТОТ слайд
+    # получит ИМЕННО эту фотографию (см. её докстроку) — если так, отсюда
+    # и до конца функции обрабатывается ТОЛЬКО она; на каталог шаблона
+    # код падает единственный раз, когда `photo_name` не проставлен вовсе
+    # (обычный путь до этой задачи, ассет ШАБЛОНА — коллаж/иконка/лого).
+    photo_name = slide_spec.visual.photo_name if slide_spec.visual is not None else None
+    user_photo_path = (user_photos or {}).get(photo_name) if photo_name else None
+
     if slot is None:
-        return  # раскладка не несёт визуального слота вовсе — нечего заполнять, не находка
+        if user_photo_path is not None:
+            # Раскладка под фото не нашлась (бриф задачи, п.3: "либо
+            # выбирается раскладка, где такой слот есть, либо фотография
+            # не ставится — но об этом надо сказать находкой") — в отличие
+            # от ассета ШАБЛОНА (декоративная картинка, отсутствие слота
+            # молча ожидаемо на бедной раскладке), пользователь принёс
+            # ЭТУ фотографию специально, и её потеря должна быть видна.
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: в раскладке {pattern.pattern_id!r} нет слота под фото/"
+                f"иконку — пользовательская фотография {photo_name!r} не вставлена."
+            )
+        return  # раскладка не несёт визуального слота вовсе — для ассета шаблона это не находка
+
+    left, top, width, height = _emu_visual_box(slot.box, profile)
+
+    if user_photo_path is not None:
+        try:
+            data = user_photo_path.read_bytes()
+            with Image.open(io.BytesIO(data)) as img:
+                native_width, native_height = img.size
+        except Exception as exc:
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: пользовательская фотография {photo_name!r} "
+                f"({user_photo_path}) не читается ({exc}) — не вставлена."
+            )
+            return
+        pic_left, pic_top, pic_width, pic_height = (
+            _contain_box(left, top, width, height, native_width, native_height)
+            if native_width and native_height else (left, top, width, height)
+        )
+        slide.shapes.add_picture(
+            io.BytesIO(data), Emu(pic_left), Emu(pic_top), Emu(max(1, pic_width)), Emu(max(1, pic_height)),
+        )
+        return
 
     catalog = list(profile.assets.photos if kind == "photo" else profile.assets.icons)
     if not catalog:
@@ -425,7 +513,6 @@ def _place_picture_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profil
         return  # у шаблона нет своих фото/иконок (или профиль без source_path) — честно ничего не подставляем
 
     asset = max(catalog, key=lambda a: a.confidence)
-    left, top, width, height = _emu_visual_box(slot.box, profile)
 
     try:
         with PptxPackage.open(Path(profile.source_path)) as pkg:
@@ -435,19 +522,7 @@ def _place_picture_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profil
 
     pic_left, pic_top, pic_width, pic_height = left, top, width, height
     if asset.width and asset.height:
-        # "Contain", не растяжение на весь слот (L07 аудита следит именно
-        # за отклонением placed_aspect/native_aspect) — картинка вписывается
-        # в слот целиком по большей стороне и центрируется по меньшей.
-        native_aspect = asset.width / asset.height
-        slot_aspect = width / height if height else native_aspect
-        if native_aspect > slot_aspect:
-            pic_width = width
-            pic_height = round(width / native_aspect)
-            pic_top = top + (height - pic_height) // 2
-        else:
-            pic_height = height
-            pic_width = round(height * native_aspect)
-            pic_left = left + (width - pic_width) // 2
+        pic_left, pic_top, pic_width, pic_height = _contain_box(left, top, width, height, asset.width, asset.height)
 
     slide.shapes.add_picture(
         io.BytesIO(data), Emu(pic_left), Emu(pic_top), Emu(max(1, pic_width)), Emu(max(1, pic_height)),
@@ -874,7 +949,7 @@ def _remove_last_slide(prs) -> None:
 
 def _place_best_candidate(
     prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
-    audit_config: AuditConfig, *, bullet_char: str = "•",
+    audit_config: AuditConfig, *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
 ) -> tuple[Pattern, list[str]]:
     """Собрали слайд — проверили — не понравилось — взяли другую раскладку
     и пересобрали (бриф, дословно). Пробует кандидатов `candidates` по
@@ -901,7 +976,7 @@ def _place_best_candidate(
 
     for attempt, pattern in enumerate(tried, start=1):
         trial_spec = replace(slide_spec, findings=[])
-        place_slide(prs, trial_spec, pattern, profile, bullet_char=bullet_char)
+        place_slide(prs, trial_spec, pattern, profile, bullet_char=bullet_char, user_photos=user_photos)
         errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index)
         if not errors:
             if attempt > 1:
@@ -922,7 +997,7 @@ def _place_best_candidate(
 
     best_errors, best_pattern, best_ids = best
     trial_spec = replace(slide_spec, findings=[])
-    place_slide(prs, trial_spec, best_pattern, profile, bullet_char=bullet_char)
+    place_slide(prs, trial_spec, best_pattern, profile, bullet_char=bullet_char, user_photos=user_photos)
     notes.append(
         f"Слайд {slide_spec.index}: ни один из {len(tried)} проверенных кандидатов не прошёл аудит "
         f"без находок — выбрана раскладка {best_pattern.pattern_id!r} с наименьшим числом находок "
