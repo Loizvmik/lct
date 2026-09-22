@@ -31,10 +31,12 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.provider.base import LLMProvider
 from deckforge.settings import Settings
 from deckforge.template.assets import AssetCatalog, AssetRef, Placement, build_asset_catalog
+from deckforge.template.chart_palette import build_chart_series
 from deckforge.template.grid import ColumnAxis, Grid, build_grid
 from deckforge.template.layouts import Background, LayoutEntry, PlaceholderSlot, build_layout_catalog
 from deckforge.template.naming import PaletteNote, name_palette_roles_report
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec, mine_patterns
+from deckforge.template.shapes import ShapeVocabEntry, build_shape_vocabulary
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale, build_type_scale
 from deckforge.template.usage import Usage, collect_usage
@@ -43,6 +45,20 @@ from deckforge.template.usage import Usage, collect_usage
 # проекте (см. cli.py: тот же путь, тот же parents[N] от файла до корня
 # репозитория — profile.py на один уровень глубже cli.py, отсюда [3], не [2]).
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
+
+# Task 10: словарь автофигур шаблона — зеркало `ShapeVocabEntry`
+# (template/shapes.py), нужен `compose/diagrams.py`, чтобы рисовать
+# карточки схем формами, которые реально есть в шаблоне (см. докстроку
+# shapes.py).
+class ShapeVocabEntryModel(BaseModel):
+    prst: str
+    count: int
+    avg_adj: float = 0.0
+
+
+def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
+    return ShapeVocabEntryModel(prst=entry.prst, count=entry.count, avg_adj=entry.avg_adj)
+
 
 # Версия СХЕМЫ `TemplateProfile` — Task 10 отчёт, находка №5: диск-кеш
 # (`cache/profiles/<fingerprint>.json`) ключуется ТОЛЬКО отпечатком файла
@@ -58,7 +74,20 @@ APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 # `AssetCatalogModel`, ...) — см. `from_file`, где версия сверяется ДО
 # полной pydantic-валидации кеша, и разбор идёт заново при несовпадении
 # (или отсутствии поля вовсе — кеш, записанный до появления этой версии).
-PROFILE_SCHEMA_VERSION = 2
+# Task 10: версия поднята 2 -> 3 — добавлены поля `shape_vocabulary`,
+# `chart_series`, `source_path` (см. докстроку выше про то, почему это
+# ОБЯЗАТЕЛЬНО при любом изменении формы/смысла модели: без бампа старый
+# диск-кеш подставил бы пустой список форм/цветов рядов молча, и
+# `compose/diagrams.py`/`compose/charts.py` рисовали бы без словаря
+# шаблона). 3 -> 4: смысл `chart_series` изменился ПОСЛЕ первого прогона
+# смок-теста этой же задачи на этом же коде — живой замер на VK Tech
+# отдавал `#C4C4C4`/`#FEFFFF` первыми двумя цветами (серый и почти-белый
+# декоративный полутон, ни один не совпадает буквально ни с одной из
+# hex-заливок нейтральных ролей палитры, поэтому фильтр по строковому
+# совпадению их не ловил), см. `chart_palette._is_usable_series_color`
+# (фильтр по насыщенности/светлоте). Без бампа локальный `cache/profiles/`
+# этой же машины молча продолжал бы отдавать цвета ДО фикса.
+PROFILE_SCHEMA_VERSION = 4
 
 # Ниже какой уверенности число из разбора попадает в предупреждения, а не
 # только в тело отчёта. 0.5 — не наблюдение за тремя файлами, а сама природа
@@ -433,6 +462,17 @@ class TemplateProfile(BaseModel):
     и аудиту, работающим по профилю (следующие задачи), нечем пользоваться."""
 
     source_name: str
+    # Task 10: путь к файлу шаблона на момент разбора (абсолютный,
+    # `Path.resolve()`) — единственное, чего не хватало downstream-коду
+    # (`compose/diagrams.py::add_pictogram_row`), чтобы вставить в новый
+    # слайд РЕАЛЬНЫЕ байты иконки шаблона: `TemplateProfile` — pydantic-
+    # модель из примитивов JSON (докстрока выше), сырых байт media в ней
+    # нет и не будет, а `source_name` (голое имя файла) недостаточно, чтобы
+    # найти файл на диске повторно. Портируется только пока файл шаблона не
+    # переехал на диске — честное ограничение, не хуже прежнего отсутствия
+    # пути вовсе (раньше вставить иконку из шаблона в новый слайд было
+    # нечем).
+    source_path: str = ""
     canvas_width_emu: int
     canvas_height_emu: int
     theme: ThemeModel
@@ -445,6 +485,16 @@ class TemplateProfile(BaseModel):
     layouts: list[LayoutEntryModel]
     assets: AssetCatalogModel
     patterns: list[PatternModel]
+    # Task 10: словарь автофигур шаблона (`ShapeVocabEntry`, по убыванию
+    # частоты) — `compose/diagrams.py` рисует карточки схем ТОЛЬКО формами
+    # из этого списка (см. докстроку `template/shapes.py`), никогда не
+    # придумывая скругление, которого нет в шаблоне.
+    shape_vocabulary: list[ShapeVocabEntryModel] = []
+    # Task 10: явная палитра рядов графика — цветные токены шаблона по
+    # весу, достроенные оттенками `brand` (см. `template/chart_palette.py`).
+    # `compose/charts.py` красит каждый ряд/точку ТОЛЬКО этими цветами —
+    # без этого `python-pptx` отдаёт раскраску стоковой теме Office.
+    chart_series: list[str] = []
     provenance: list[str]
     warnings: list[str]
     fingerprint: str
@@ -542,6 +592,7 @@ class TemplateProfile(BaseModel):
             )
             assets = build_asset_catalog(pkg, canvas, layouts)
             patterns = mine_patterns(pkg, canvas, grid, type_scale, assets)
+            shape_vocabulary = build_shape_vocabulary(pkg, canvas)
 
         # Тема для отчёта и именования палитры — уточнённая по фактическому
         # тексту слайдов (`Usage.primary_theme`, см. theme.
@@ -552,6 +603,7 @@ class TemplateProfile(BaseModel):
         theme = usage.primary_theme or theme_for_layouts
 
         palette_report = name_palette_roles_report(usage, theme, namer)
+        chart_series = build_chart_series(usage, dict(palette_report.roles))
 
         provenance = _build_provenance(
             master_part=master_part, theme_part=theme_part, theme=theme, usage=usage,
@@ -564,7 +616,7 @@ class TemplateProfile(BaseModel):
         )
 
         profile = cls(
-            source_name=path.name,
+            source_name=path.name, source_path=str(path.resolve()),
             canvas_width_emu=canvas.width_emu, canvas_height_emu=canvas.height_emu,
             theme=_theme_model(theme), theme_part=theme_part, master_part=master_part,
             palette_roles=dict(palette_report.roles),
@@ -573,6 +625,8 @@ class TemplateProfile(BaseModel):
             layouts=[_layout_entry_model(entry) for entry in layouts],
             assets=_asset_catalog_model(assets),
             patterns=[_pattern_model(p) for p in patterns],
+            shape_vocabulary=[_shape_vocab_entry_model(e) for e in shape_vocabulary],
+            chart_series=chart_series,
             provenance=provenance, warnings=warnings, fingerprint=fingerprint,
             schema_version=PROFILE_SCHEMA_VERSION,
         )
@@ -609,6 +663,13 @@ class TemplateProfile(BaseModel):
             theme = usage.primary_theme or read_theme(pkg, cached.master_part)
 
         palette_report = name_palette_roles_report(usage, theme, namer)
+        # Task 10: палитра рядов графика зависит от того, какой цвет назван
+        # "brand" (достройка оттенками, см. chart_palette.py) и какие роли
+        # признаны нейтральными (фильтр из палитры рядов) — обе зависят от
+        # ролей, которые здесь только что могли смениться с запасного
+        # варианта на ответ модели, поэтому пересчитывается вместе с ними,
+        # а не наследуется из кеша как есть.
+        chart_series = build_chart_series(usage, dict(palette_report.roles))
 
         provenance = [
             line for line in cached.provenance if not line.startswith("Роли палитры: ")
@@ -628,6 +689,7 @@ class TemplateProfile(BaseModel):
         return cached.model_copy(update={
             "palette_roles": dict(palette_report.roles),
             "palette_roles_source": palette_report.source,
+            "chart_series": chart_series,
             "provenance": provenance,
             "warnings": warnings,
         })

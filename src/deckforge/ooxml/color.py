@@ -285,3 +285,24 @@ def _frgb_to_hex(r: float, g: float, b: float) -> str:
     """(r, g, b) в 0..1 → `"#RRGGBB"` — единственное место, где канал округляется до байта."""
     r, g, b = (min(255, max(0, round(c * 255))) for c in (r, g, b))
     return f"#{r:02X}{g:02X}{b:02X}"
+
+
+def lighten(hex_color: str, amount: float) -> str:
+    """Осветляет `hex_color` линейной интерполяцией каждого канала к белому
+    на долю `amount` (0..1) — та же арифметика, что `a:tint` в
+    `_resolve_color_element` выше (смешение с белым), но как самостоятельная
+    функция без узла OOXML: используется Task 10 для достройки палитры
+    рядов графика оттенками `brand`, когда цветных токенов шаблона не
+    хватает (см. `template/chart_palette.py`)."""
+    r, g, b = _hex_to_frgb(hex_color)
+    r, g, b = (min(1.0, max(0.0, c + (1.0 - c) * amount)) for c in (r, g, b))
+    return _frgb_to_hex(r, g, b)
+
+
+def darken(hex_color: str, amount: float) -> str:
+    """Затемняет `hex_color` линейной интерполяцией каждого канала к чёрному
+    на долю `amount` (0..1) — та же арифметика, что `a:shade` выше, как
+    самостоятельная функция (см. докстроку `lighten`)."""
+    r, g, b = _hex_to_frgb(hex_color)
+    r, g, b = (min(1.0, max(0.0, c * (1.0 - amount))) for c in (r, g, b))
+    return _frgb_to_hex(r, g, b)
