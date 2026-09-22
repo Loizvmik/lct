@@ -14,13 +14,15 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from deckforge.compose.builder import (
-    Variant, _is_cosmetic_truncation, _local_background_is_dark, _pick_pattern, build_deck, fits,
+    Variant, _avoid_decor_overlap, _best_contrast_color, _is_cosmetic_truncation, _local_background_luminance,
+    _overlap_ratio, _pick_pattern, _relative_luminance, build_deck, fits,
 )
 from deckforge.compose.textfit import measure
 from deckforge.ooxml.geometry import Box
 from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock
 from deckforge.template.grid import Grid
+from deckforge.template.naming import MIN_CONTRAST, contrast_ratio
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
 from deckforge.template.profile import TemplateProfile
 
@@ -538,14 +540,10 @@ def test_text_box_has_no_internal_margins():
 
 def test_text_color_follows_the_local_plaque_not_the_whole_pattern():
     """Находка ручной проверки v2 (ЛЦТ2026, слайд "cards"): паттерн в целом
-    тёмный (`pattern.is_dark=True`, общий фон слайда — тёмно-фиолетовый),
-    но карточки — БЕЛЫЕ плашки декора (`DecorShape` с `fill_hex="#FFFFFF"`)
-    поверх этого тёмного фона. Старая логика брала цвет текста ТОЛЬКО от
-    общего `pattern.is_dark` — слот `card_body`, лежащий ВНУТРИ белой
-    плашки, получал БЕЛЫЙ текст (полюс "для тёмного фона"), невидимый на
-    такой же белой плашке. Контраст обязан считаться от цвета плашки
-    НЕПОСРЕДСТВЕННО под слотом, если она есть, а не от фона всего
-    паттерна."""
+    тёмный, но карточки — БЕЛЫЕ плашки декора (`DecorShape` с
+    `fill_hex="#FFFFFF"`) поверх этого тёмного фона. Фон под слотом обязан
+    браться от цвета плашки НЕПОСРЕДСТВЕННО под слотом, если она есть, а не
+    от фона всего паттерна/макета."""
     slot_box = Box(0.15, 0.2, 0.15, 0.3)
     white_plaque = DecorShape(
         kind="shape", box=Box(0.1, 0.15, 0.25, 0.4), rotation=0.0, flip_h=False, flip_v=False,
@@ -557,20 +555,91 @@ def test_text_color_follows_the_local_plaque_not_the_whole_pattern():
         capacity=Capacity(max_items=4, max_chars_per_item=200, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
         score=1.0, is_dark=True,
     )
-    # Тёмный слот-фон паттерна (is_dark=True) должен уступить светлой плашке
-    # НЕПОСРЕДСТВЕННО под слотом — итог обязан быть "не тёмный" (на светлой
-    # плашке нужен тёмный текст).
-    assert not _local_background_is_dark(slot_box, pattern)
+    # Тёмный фон макета (layout_bg_luminance=0.0) должен уступить светлой
+    # плашке НЕПОСРЕДСТВЕННО под слотом — итог обязан быть светлым.
+    assert _local_background_luminance(slot_box, pattern, 0.0) == _relative_luminance("#FFFFFF")
 
     # Без плашки под слотом (карточка "висит в воздухе" на самом фоне
-    # паттерна) решает общий `pattern.is_dark`, как и раньше.
+    # макета) решает фон макета, как и должен.
     pattern_no_plaque = Pattern(
         pattern_id="p2", source_slide_index=[0], layout_id="L", kind="cards",
         slots=[], repeat=None, decor=[],
         capacity=Capacity(max_items=4, max_chars_per_item=200, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
         score=1.0, is_dark=True,
     )
-    assert _local_background_is_dark(slot_box, pattern_no_plaque)
+    assert _local_background_luminance(slot_box, pattern_no_plaque, 0.05) == 0.05
+
+
+def test_layout_background_overrides_the_pattern_own_darkness_flag():
+    """Task 10 отчёт, находка №1 — воспроизводит найденную причину дословно:
+    контрольный файл, слайд "Риски раскатки (детали)" — раскладка снята со
+    СВЕТЛОГО слайда-примера (`pattern.is_dark=False`), но кладётся на
+    ТЁМНЫЙ макет шаблона. Источник истины обязан быть фон МАКЕТА
+    (`layout_bg_luminance`, из `profile.layouts`), а не `pattern.is_dark`
+    примера, с которого раскладка снята — иначе текст остаётся в цвете
+    "для светлого фона" (тёмный/чёрный) на фактически тёмном фоне."""
+    slot_box = Box(0.1, 0.1, 0.3, 0.1)  # без плашки декора под слотом
+    pattern = Pattern(
+        pattern_id="p", source_slide_index=[0], layout_id="L", kind="bullets",
+        slots=[], repeat=None, decor=[],
+        capacity=Capacity(max_items=1, max_chars_per_item=999, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,  # раскладка "думает", что она светлая
+    )
+    dark_purple_luminance = _relative_luminance("#26123F")
+    luminance = _local_background_luminance(slot_box, pattern, dark_purple_luminance)
+    assert luminance == dark_purple_luminance, "фон макета обязан победить pattern.is_dark примера"
+
+    # Цвет, выбранный по этой яркости, обязан реально контрастировать с
+    # фактическим тёмно-фиолетовым фоном — не просто "не быть чёрным".
+    chosen = _best_contrast_color("#000000", luminance, PROFILE)
+    assert contrast_ratio("#26123F", chosen) >= MIN_CONTRAST
+
+
+def test_best_contrast_color_is_taken_from_the_template_palette_and_reaches_wcag_aa():
+    """Бриф: "не ограничивайся признаком тёмный/светлый — считай контраст
+    пары и выбирай из палитры шаблона тот цвет, который даёт контраст не
+    ниже 4.5 к фактическому фону". Прямая проверка числа, не косвенного
+    признака: фон — знакомый нечитаемый тёмно-фиолетовый из контрольного
+    файла, кандидат — чёрный (как было в найденном браке); итог обязан
+    прийти ИЗ ПАЛИТРЫ шаблона и реально пройти WCAG AA (4.5:1)."""
+    bg_hex = "#2B1147"
+    bg_luminance = _relative_luminance(bg_hex)
+    chosen = _best_contrast_color("#000000", bg_luminance, PROFILE)
+    assert chosen in set(PROFILE.palette_roles.values())
+    assert contrast_ratio(bg_hex, chosen) >= MIN_CONTRAST
+
+
+def test_headline_slot_is_moved_off_a_partially_overlapping_decor_plaque():
+    """Task 10 отчёт, находка №2 (воспроизводит контрольный файл дословно):
+    заголовок «Риски раскатки (детали)» стоял поверх розовой плашки декора
+    в шапке слайда — координаты сняты с реального разбора ЛЦТ2026
+    ("PARTIAL headline/decor overlap"). Проверяется НАЛОЖЕНИЕ напрямую
+    (площадь пересечения), не косвенный признак."""
+    headline_box = Box(0.0431, 0.0666, 0.8090, 0.0548)
+    badge = DecorShape(
+        kind="shape", box=Box(0.0284, 0.0473, 0.3077, 0.0905), rotation=0.0, flip_h=False, flip_v=False,
+        fill_hex="#FF0053", has_fill=True, fill_kind="solid",
+    )
+    assert _overlap_ratio(headline_box, badge.box) > 0.5, "фикстура обязана воспроизводить реальное наложение"
+
+    grid = _grid_stub()
+    moved = _avoid_decor_overlap(headline_box, [badge], grid)
+    assert _overlap_ratio(moved, badge.box) <= 0.1, "после починки слот не должен значимо наезжать на декор"
+    assert (moved.width, moved.height) == (headline_box.width, headline_box.height), "размер слота не меняется"
+
+
+def test_slot_fully_nested_in_its_own_plaque_is_not_treated_as_a_collision():
+    """Карточная плашка-фон под своим же текстом (слот ПОЛНОСТЬЮ внутри
+    декора) — легитимное намеренное расположение, не брак наложения; сдвиг
+    здесь не нужен и был бы ошибкой (увёл бы текст с его собственной
+    карточки)."""
+    slot_box = Box(0.15, 0.2, 0.15, 0.3)
+    own_plaque = DecorShape(
+        kind="shape", box=Box(0.1, 0.15, 0.25, 0.4), rotation=0.0, flip_h=False, flip_v=False,
+        fill_hex="#FFFFFF", has_fill=True, fill_kind="solid",
+    )
+    grid = _grid_stub()
+    assert _avoid_decor_overlap(slot_box, [own_plaque], grid) == slot_box
 
 
 def test_findings_recorded_when_content_does_not_fit():

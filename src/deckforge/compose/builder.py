@@ -30,8 +30,9 @@ from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 from deckforge.settings import Settings
 from deckforge.template.grid import ColumnAxis, Grid
+from deckforge.template.naming import MIN_CONTRAST
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
-from deckforge.template.profile import TemplateProfile
+from deckforge.template.profile import LayoutEntryModel, TemplateProfile
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 EMU_PER_INCH = 914400
@@ -190,14 +191,35 @@ def place_slide(
     # исходном, ненамайненном слайде-примере.
     effective_pattern = pattern if decor is pattern.decor else replace(pattern, decor=decor)
 
+    # Источник истины для фона под слотом — МАКЕТ, на который слайд реально
+    # ставится (`profile.layouts`, разобран надёжно: наследование от
+    # мастера, градиенты, фоновые фото — Task 6/8), а НЕ `pattern.is_dark`
+    # (Task 10 отчёт, находка №1: раскладка, снятая со светлого
+    # слайда-примера, но положенная на тёмный макет, несла `is_dark=False`
+    # от примера — чёрный текст ложился на тёмно-фиолетовый фон макета,
+    # нечитаемо). `layout_bg_luminance` — `None`, если макет пропал из
+    # каталога (не должно случаться на профиле, разобранном с того же
+    # файла) или у него самого не резолвился фон — тогда
+    # `_local_background_luminance` честно падает на `pattern.is_dark` как
+    # на последний осмысленный сигнал.
+    layout_entry = _layout_entry(profile, pattern.layout_id)
+    layout_bg_luminance = layout_entry.background.luminance if layout_entry is not None else None
+
     family = _primary_family(profile)
     for content in assign_content(slide_spec, pattern, grid):
+        # Наложение — не занято ли место декором раскладки (Task 10 отчёт,
+        # находка №2: заголовок налез на плашку декора) — проверяется и
+        # чинится (сдвигом) ДО замера/отрисовки, слот замеряется уже по
+        # исправленному боксу.
+        box = _avoid_decor_overlap(content.slot.box, effective_pattern.decor, grid)
+        if box is not content.slot.box:
+            content = replace(content, slot=replace(content.slot, box=box))
         # Контраст — от фона НЕПОСРЕДСТВЕННО под этим слотом (плашка декора,
-        # если слот на ней стоит), не от `pattern.is_dark` вслепую — см.
-        # `_local_background_is_dark`.
+        # если слот на ней стоит, иначе фон макета) — см.
+        # `_local_background_luminance`.
         _draw_slot(
             slide, slide_spec, content, profile, family, bullet_char, canvas_width_emu, canvas_height_emu,
-            _local_background_is_dark(content.slot.box, effective_pattern),
+            _local_background_luminance(content.slot.box, effective_pattern, layout_bg_luminance),
         )
 
 
@@ -534,26 +556,46 @@ def _relative_luminance(hex_color: str) -> float:
     return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
 
 
-def _contrast_adjusted(color_hex: str, is_dark: bool, profile: TemplateProfile) -> str:
-    """Раскладка живёт СВОИМ фоном (`pattern.is_dark`), который может не
-    совпадать с доминирующим фоном шаблона, на котором `palette_roles.
-    surface`/`on_surface` калибровались (`naming.py`) — увидено руками на
-    рендере: "cards"-паттерн со светлым фоном получал белый ("on_surface")
-    текст того же цвета, что и фон, буквально нечитаемый. Меняем местами
-    ТОЛЬКО когда цвет — один из двух полюсов пары фон/текст
-    (`surface`/`on_surface`): более тёмный полюс — для светлого фона,
-    более светлый — для тёмного; остальные роли палитры (brand/accent/
-    muted/...) не трогаем — они не привязаны к контрасту с фоном тем же
-    образом."""
-    surface = profile.palette_roles.get("surface")
-    on_surface = profile.palette_roles.get("on_surface")
-    if not surface or not on_surface or color_hex not in (surface, on_surface):
-        return color_hex
-    dark_pole, light_pole = (
-        (surface, on_surface) if _relative_luminance(surface) < _relative_luminance(on_surface)
-        else (on_surface, surface)
-    )
-    return light_pole if is_dark else dark_pole
+def _contrast_ratio_from_luminance(l_a: float, l_b: float) -> float:
+    """Контраст WCAG между двумя ОТНОСИТЕЛЬНЫМИ ЯРКОСТЯМИ (не цветами) —
+    та же формула, что `naming.contrast_ratio`, но берёт готовую яркость
+    напрямую: фон под слотом не всегда несёт цвет (фоновое фото даёт только
+    усреднённую яркость, см. `layouts.Background.luminance`), контраст
+    WCAG зависит только от яркости, не от оттенка, так что усреднённого
+    значения достаточно, чтобы честно посчитать пару."""
+    lighter, darker = max(l_a, l_b), min(l_a, l_b)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+def _best_contrast_color(candidate_hex: str, bg_luminance: float, profile: TemplateProfile) -> str:
+    """Цвет текста, дающий контраст WCAG не ниже `naming.MIN_CONTRAST`
+    (4.5:1) к ФАКТИЧЕСКОЙ яркости фона под слотом — Task 10 отчёт, находка
+    №1: раньше решение было бинарным ("тёмный/светлый фон" ->
+    `surface`/`on_surface` полюс), не численным, и не проверяло реальный
+    контраст итоговой пары — раскладка, снятая со светлого примера и
+    положенная на тёмный макет, несла `is_dark=False`, полюс не менялся,
+    чёрный текст ложился на тёмно-фиолетовый фон.
+
+    Если `candidate_hex` (роль, которую предложил `_color_for_role`) уже
+    даёт нужный контраст — используется он, чтобы не менять цвет там, где
+    и так всё читаемо (кегль/роль сохраняют смысл: kpi_value остаётся
+    брендовым цветом, если он и так контрастен). Иначе — берётся цвет
+    ИЗ ПАЛИТРЫ ШАБЛОНА (`profile.palette_roles`, не произвольный чёрный/
+    белый — брифом: "выбирай из палитры шаблона"), дающий НАИЛУЧШИЙ
+    контраст к этому фону; если даже лучший из палитры не дотягивает до
+    4.5:1 (редкий случай — фон декора вне откалиброванной пары
+    surface/on_surface), берётся всё равно лучший из худших — это не хуже
+    прежнего поведения и не изобретает цвет вне дизайн-системы шаблона."""
+    palette = list(dict.fromkeys(v for v in profile.palette_roles.values() if v))
+    if not palette:
+        return candidate_hex
+
+    def contrast(hex_c: str) -> float:
+        return _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(hex_c))
+
+    if candidate_hex in palette and contrast(candidate_hex) >= MIN_CONTRAST:
+        return candidate_hex
+    return max(palette, key=contrast)
 
 
 def _contains(outer: Box, inner: Box, tolerance: float = 0.01) -> bool:
@@ -581,32 +623,122 @@ def _plaque_under(box: Box, decor: list[DecorShape]) -> DecorShape | None:
     return min(candidates, key=lambda d: d.box.width * d.box.height)
 
 
-def _local_background_is_dark(slot_box: Box, pattern: Pattern) -> bool:
-    """Тёмный ли фон НЕПОСРЕДСТВЕННО под слотом — находка визуального
-    ревью (ЛЦТ2026, "cards": паттерн в целом тёмный, `pattern.is_dark=True`
-    считается по доминирующему фону ВСЕГО паттерна/слайда, но конкретная
-    карточка — БЕЛАЯ плашка декора поверх этого тёмного фона; контраст
-    текста внутри такой плашки обязан считаться от ЕЁ цвета, а не от фона
-    всего паттерна — иначе белый ("для тёмного фона") текст ложится на
-    такую же белую плашку и становится невидим).
+def _layout_entry(profile: TemplateProfile, layout_id: str) -> LayoutEntryModel | None:
+    return next((entry for entry in profile.layouts if entry.layout_id == layout_id), None)
 
-    Если под слотом не нашлось охватывающей плашки с известным цветом —
-    решает `pattern.is_dark`, как и раньше (это сам фон слайда под слотом,
-    без декора)."""
+
+def _local_background_luminance(
+    slot_box: Box, pattern: Pattern, layout_bg_luminance: float | None,
+) -> float:
+    """Относительная яркость WCAG фона НЕПОСРЕДСТВЕННО под слотом.
+
+    Порядок источников (Task 10 отчёт, находка №1 — правка по итогам
+    визуального ревью v3, ЛЦТ2026, "Риски раскатки (детали)": чёрный текст
+    на тёмно-фиолетовом фоне; раскладка снята со светлого слайда-примера
+    (`pattern.is_dark=False`), но положена на ТЁМНЫЙ макет шаблона):
+
+    1. Плашка декора НЕПОСРЕДСТВЕННО под слотом (`_plaque_under`), если
+       она есть — текст лежит на плашке, а не на фоне слайда, фоном
+       служит ОНА (находка визуального ревью v2, ЛЦТ2026, "cards": белая
+       плашка поверх тёмного фона паттерна).
+    2. Иначе — фон МАКЕТА, на который слайд реально ставится
+       (`layout_bg_luminance`, из `profile.layouts`, посчитан надёжно: с
+       учётом наследования от мастера, градиентов и фоновых фото, Task
+       6/8) — ИСТОЧНИК ИСТИНЫ, не `pattern.is_dark`: раскладка снята со
+       слайда-примера и может не совпадать по фону с макетом, на который
+       её ставит подбор паттерна.
+    3. Только если фон макета в принципе не резолвился (`None` — не
+       должно случаться на профиле, разобранном с того же файла, но
+       честный крайний случай) — `pattern.is_dark`, как единственный
+       оставшийся сигнал."""
     plaque = _plaque_under(slot_box, pattern.decor)
     if plaque is not None and plaque.fill_hex:
-        return _relative_luminance(plaque.fill_hex) < 0.5
-    return pattern.is_dark
+        return _relative_luminance(plaque.fill_hex)
+    if layout_bg_luminance is not None:
+        return layout_bg_luminance
+    return 0.0 if pattern.is_dark else 1.0
 
 
-def _color_for_role(role_hint: str, slot: PatternSlot, profile: TemplateProfile, is_dark: bool) -> str:
+def _color_for_role(role_hint: str, slot: PatternSlot, profile: TemplateProfile, bg_luminance: float) -> str:
     values = set(profile.palette_roles.values())
     if slot.color_hex and slot.color_hex in values:
-        return _contrast_adjusted(slot.color_hex, is_dark, profile)
+        return _best_contrast_color(slot.color_hex, bg_luminance, profile)
     color = profile.palette_roles.get(_ROLE_COLOR.get(role_hint, "on_surface"))
     if color:
-        return _contrast_adjusted(color, is_dark, profile)
+        return _best_contrast_color(color, bg_luminance, profile)
     return next(iter(values)) if values else "#000000"
+
+
+# ---------------------------------------------------------------------------
+# Наложение слота на декор раскладки
+# ---------------------------------------------------------------------------
+
+# Порог "площадь пересечения уже значимая, а не игра округления" — доля
+# площади МЕНЬШЕЙ из двух фигур (тот же принцип, что `_FIT_TOLERANCE_IN`/
+# `_LINE_THICKNESS_SHARE` в этом файле: округлая отсечка на порядок больше
+# погрешности вычислений с плавающей точкой, не подгонка под конкретный
+# файл). 10% площади меньшей фигуры — уже заметное на глаз наложение
+# (буквы текста реально ложатся на чужой декор), пересечение на доли
+# процента — то же самое, что перекрытие рамок при округлении EMU.
+_OVERLAP_MIN_AREA_SHARE = 0.1
+
+
+def _overlap_ratio(a: Box, b: Box) -> float:
+    ix = max(0.0, min(a.left + a.width, b.left + b.width) - max(a.left, b.left))
+    iy = max(0.0, min(a.top + a.height, b.top + b.height) - max(a.top, b.top))
+    inter = ix * iy
+    if inter <= 0.0:
+        return 0.0
+    return inter / min(a.width * a.height, b.width * b.height)
+
+
+def _colliding_decor(box: Box, decor: list[DecorShape]) -> DecorShape | None:
+    """Первая закрашенная фигура декора, которая ЧАСТИЧНО перекрывает
+    `box` площадью выше `_OVERLAP_MIN_AREA_SHARE` — коллизия, которую
+    нужно чинить (Task 10 отчёт, находка №2: заголовок налез на плашку
+    декора). ПОЛНОЕ содержание (`_contains` в любую сторону) — не
+    коллизия, а легитимный случай "слот стоит на своей плашке-фоне"
+    (тот же тест, что уже применяет `_plaque_under` для контраста)."""
+    for shape in decor:
+        if not shape.has_fill:
+            continue
+        if _contains(shape.box, box) or _contains(box, shape.box):
+            continue
+        if _overlap_ratio(box, shape.box) > _OVERLAP_MIN_AREA_SHARE:
+            return shape
+    return None
+
+
+def _avoid_decor_overlap(box: Box, decor: list[DecorShape], grid: Grid) -> Box:
+    """Сдвигает `box`, если он значимо наезжает на декор раскладки — ТЗ
+    (Task 10 отчёт, находка №2): "перед тем как положить текст в слот,
+    проверь, не занято ли это место декором... если занято — сдвигай".
+    Пробует по очереди: вниз (очистить нижний край мешающей фигуры),
+    вправо, влево — первый сдвиг, который снимает коллизию и остаётся в
+    полях шаблона, побеждает. Если ни один не помогает (декор шире всего
+    слота целиком) — возвращает `box` как есть, это честный крайний
+    случай, не более скрытый, чем прежнее поведение (наложение оставалось
+    всегда)."""
+    blocking = _colliding_decor(box, decor)
+    if blocking is None:
+        return box
+    d = blocking.box
+    margin_bottom_limit = 1.0 - grid.margin_bottom
+    margin_right_limit = 1.0 - grid.margin_right
+
+    below = replace(box, top=d.top + d.height)
+    if below.top + below.height <= margin_bottom_limit + 0.001 and _colliding_decor(below, decor) is None:
+        return below
+
+    right = replace(box, left=d.left + d.width)
+    if right.left + right.width <= margin_right_limit + 0.001 and _colliding_decor(right, decor) is None:
+        return right
+
+    left = replace(box, left=max(grid.margin_left, d.left - box.width))
+    if left.left >= grid.margin_left - 0.001 and _colliding_decor(left, decor) is None:
+        return left
+
+    return box
 
 
 def _shrink_sequence(profile: TemplateProfile, slot_size_pt: float) -> list[float]:
@@ -724,7 +856,7 @@ def _apply_bullet(paragraph, bullet_char: str, family: str) -> None:
 
 def _draw_slot(
     slide, slide_spec: SlideSpec, content: SlotContent, profile: TemplateProfile, family: str,
-    bullet_char: str, canvas_width_emu: int, canvas_height_emu: int, is_dark: bool,
+    bullet_char: str, canvas_width_emu: int, canvas_height_emu: int, bg_luminance: float,
 ) -> None:
     box = content.slot.box
     left = round(box.left * canvas_width_emu)
@@ -787,7 +919,7 @@ def _draw_slot(
             )
 
     display_paragraphs = _split_back(chosen_text, content.paragraphs)
-    color_hex = _color_for_role(content.role_hint, content.slot, profile, is_dark)
+    color_hex = _color_for_role(content.role_hint, content.slot, profile, bg_luminance)
     align = _ALIGN_MAP.get(content.slot.align, PP_ALIGN.LEFT)
     bold = profile.type_scale.bold_is_idiomatic and content.role_hint in _HEADING_ROLES
 
