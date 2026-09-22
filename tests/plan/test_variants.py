@@ -301,3 +301,37 @@ def test_quote_block_survives_apply_variant_as_a_quote_kind_when_the_template_ha
     kind, pattern_id = _choose_kind_and_pattern(quote_slide, with_quote, Variant.airy)
     assert kind == "quote"
     assert pattern_id == "synthetic-quote"
+
+
+def test_section_slide_with_one_short_text_block_keeps_its_authored_kind():
+    """Задача "разбор незнакомого шаблона в бюджет", находка №6 (живой
+    дефект рендера): слайд, который outline/slide-writer осознанно написали
+    `kind="section"` (герой-заголовок + ОДНА короткая мысль — обычный стиль
+    открывающего слайда), раньше терял этот выбор здесь целиком —
+    `_compatible_kinds` считал "section" совместимым ТОЛЬКО с полностью
+    безблочным слайдом, а единственный `TextBlock` сразу уводил в
+    `("bullets", "two_col")`. На шаблоне, где у "two_col" есть слот под
+    ВТОРУЮ колонку (которую нечем заполнить — контент всего один блок),
+    раскладка реально собиралась с пустым декором второй колонки (найдено
+    живым прогоном на VK Education, `Pattern` ниже — синтетическая копия
+    того же устройства: `body`+`headline` слева, `bullet` справа, декор
+    справа — сплошная плашка). Теперь "section" остаётся в пуле кандидатов
+    (наравне с запасным "bullets" — какой из двух победит внутри пула,
+    решает вкус варианта, `_VARIANT_KIND_PRIORITY`, не эта находка), а
+    "two_col" с пустой второй колонкой в пул вообще не попадает и не
+    побеждает никогда, ни на `dense`, ни на `airy`."""
+    section_pattern = PROFILE.patterns[0].model_copy(update={
+        "pattern_id": "synthetic-section", "kind": "section",
+    })
+    two_col_pattern = PROFILE.patterns[0].model_copy(update={
+        "pattern_id": "synthetic-two-col-empty-second-column", "kind": "two_col",
+    })
+    with_both = PROFILE.model_copy(update={"patterns": [*PROFILE.patterns, section_pattern, two_col_pattern]})
+    section_slide = SlideSpec(
+        index=0, kind="section", headline="Сокращаем время согласования заявок на 80%",
+        blocks=[TextBlock(text="Раскатка на 11 подразделений: старт в сентябре.")],
+    )
+    for variant in (Variant.dense, Variant.airy, Variant.visual):
+        kind, pattern_id = _choose_kind_and_pattern(section_slide, with_both, variant)
+        assert kind in ("section", "bullets"), f"{variant}: получили {kind!r}"
+        assert pattern_id != "synthetic-two-col-empty-second-column", f"{variant}: выбрал two_col с пустой колонкой"

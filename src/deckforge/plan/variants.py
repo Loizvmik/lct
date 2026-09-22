@@ -178,6 +178,8 @@ def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
     kpi_block = next((b for b in slide.blocks if isinstance(b, KpiBlock) and b.items), None)
     has_table = slide.visual is not None and slide.visual.table is not None
     has_quote = any(isinstance(b, QuoteBlock) and b.text.strip() for b in slide.blocks)
+    n_text = sum(1 for b in slide.blocks if isinstance(b, TextBlock))
+    has_bullets = any(isinstance(b, BulletBlock) and b.items for b in slide.blocks)
 
     if has_card:
         return ("cards",)
@@ -196,6 +198,27 @@ def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
         return ("quote", "section", "bullets")
     if not slide.blocks and slide.visual is None:
         return ("section",)
+    # Найдено этой задачей ("разбор незнакомого шаблона в бюджет", находка
+    # №6, дефект рендера): слайд, который outline/slide-writer осознанно
+    # написали `kind="section"` (герой-заголовок + ОДНА короткая мысль —
+    # обычный стиль открывающего/переходного слайда, не список), раньше сюда
+    # не доходил вовсе — "section" был совместим ТОЛЬКО с полностью
+    # безблочным слайдом (проверка `not slide.blocks` строкой выше), а
+    # единственный `TextBlock` сразу проваливался в ветку ниже
+    # (`n_text >= 1 -> ("bullets", "two_col")"), теряя авторский выбор
+    # `kind` целиком. На богатом шаблоне (VK Education) это выбирало
+    # раскладку `two_col` — ДВЕ колонки контента под ОДИН текстовый блок:
+    # первая колонка получала контент, вторая (`bullet`-слот справа) —
+    # ничего, и на слайде оставался пустой декор второй колонки (в этом
+    # конкретном шаблоне — сплошная чёрная плашка-подложка без текста,
+    # живой дефект обязательной проверки этой задачи). "section" — ровно та
+    # раскладка, слот которой (`body`/`caption`) рассчитан на одну короткую
+    # мысль без второй колонки; `bullets` остаётся запасным вариантом на
+    # случай, если у шаблона вовсе нет `section`-раскладки с подходящей
+    # вместимостью (`two_col` НЕ в пуле — её вторая колонка не про этот
+    # случай, см. выше, а не смежный вариант вкуса).
+    if slide.kind == "section" and not has_bullets and n_text <= 1 and slide.visual is None:
+        return ("section", "bullets")
     if slide.visual is not None and slide.visual.kind in ("photo", "icon"):
         n_text_with_photo = sum(1 for b in slide.blocks if isinstance(b, (TextBlock, BulletBlock)) and _block_has_text(b))
         if n_text_with_photo >= 1:
@@ -206,8 +229,6 @@ def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
             return ("photo_text", "image", "bullets", "two_col")
         return ("image", "bullets", "two_col")
 
-    n_text = sum(1 for b in slide.blocks if isinstance(b, TextBlock))
-    has_bullets = any(isinstance(b, BulletBlock) and b.items for b in slide.blocks)
     if n_text >= 2:
         return ("two_col", "bullets")
     if has_bullets or n_text >= 1:
