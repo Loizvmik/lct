@@ -18,6 +18,8 @@ class LayoutThresholds(BaseModel):
     margin_tolerance: float
     grid_tolerance: float
     aspect_tolerance: float
+    text_fit_tolerance_in: float
+    grid_axis_min_support_share: float
 
 
 class TemplateThresholds(BaseModel):
@@ -44,6 +46,7 @@ class IntegrityThresholds(BaseModel):
     placeholder_patterns: list[str]
     duplicate_similarity: float
     single_picture_coverage: float
+    min_duplicate_check_text_len: int
 
 
 class AuditConfig(BaseModel):
