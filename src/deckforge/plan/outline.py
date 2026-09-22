@@ -166,6 +166,37 @@ def _clamp_slide_count(slides: list[OutlineSlide], target: int) -> list[OutlineS
     return slides
 
 
+def _summarize_available_forms(profile) -> list[dict]:
+    """Вместимость реальных раскладок ЭТОГО шаблона, по виду (`Pattern.
+    kind`) — Task 18, находка №2 брифа: "модель не знает, какие формы умеет
+    шаблон", структуру планировали вслепую и без оглядки на то, что шаблон
+    физически может показать (цитата, крупный фактоид с подписью, ряд
+    карточек). Та же величина, что `writer._kind_capacity` считает для
+    ОДНОГО выбранного вида (максимум по всем паттернам вида — самая
+    вместительная раскладка, не средняя и не минимум, см. её докстроку про
+    происхождение этого выбора), здесь — сразу по ВСЕМ видам, которые в
+    шаблоне реально есть, чтобы outline-writer видел общую картину раньше,
+    чем решать, сколько текстовых пунктов подряд ставить.
+
+    `profile is None` (без разобранного шаблона — синтетика тестов, ручной
+    вызов без template) -> пустой список: структура тогда планируется, как и
+    раньше этой задачи, без оглядки на форму (нечего показывать)."""
+    if profile is None:
+        return []
+    by_kind: dict[str, list] = {}
+    for p in profile.patterns:
+        by_kind.setdefault(p.kind, []).append(p)
+    forms = []
+    for kind, patterns in sorted(by_kind.items()):
+        forms.append({
+            "kind": kind,
+            "count": len(patterns),
+            "max_items": max((p.capacity.max_items for p in patterns), default=0),
+            "max_chars_per_item": max((p.capacity.max_chars_per_item for p in patterns), default=0),
+        })
+    return forms
+
+
 def build_outline(
     brief: str,
     sources: list[SourceDoc],
@@ -176,13 +207,18 @@ def build_outline(
     title: str = "",
     language: str = "ru",
 ) -> Outline:
-    """Разбирает бриф+источники в структуру колоды. `profile` в сигнатуре —
-    контракт интерфейса брифа Task 13 дословно; сама структура (сколько
-    слайдов, о чём) от шаблона не зависит (это решает содержание слайда и
-    раскладка под него — следующие шаги), параметр принят и не используется
-    здесь намеренно, той же логикой, что и неиспользуемые типизированные
-    параметры в других местах проекта, где интерфейс шире, чем нужно одному
-    конкретному шагу."""
+    """Разбирает бриф+источники в структуру колоды. `profile` — контракт
+    интерфейса брифа Task 13 дословно; сама структура (сколько слайдов, о
+    чём) от шаблона напрямую не зависит (`OutlineSlide.kind` — семантическая
+    тема пункта, "problem"/"data"/"case", не вид раскладки), но с Task 18
+    `profile` больше не игнорируется целиком: модели передаётся сводка
+    доступных ФОРМ шаблона (`_summarize_available_forms`), чтобы структура
+    планировалась с оглядкой на то, что шаблон физически умеет показать
+    (бриф: "если в шаблоне есть цитата и фактоид, разумно их использовать, а
+    не делать двенадцать текстовых слайдов подряд") — см. правило в
+    `agents/outline-writer/AGENT.md`. `profile=None` (синтетика тестов,
+    вызов без разобранного шаблона) по-прежнему работает — сводка тогда
+    пустая, поведение не отличается от того, что было до Task 18."""
     n = _clamp_target(target_slides)
 
     if llm is None:
@@ -193,6 +229,7 @@ def build_outline(
         "brief": brief,
         "sources": [{"name": s.name, "text": s.text} for s in sources],
         "target_slides": n,
+        "available_forms": _summarize_available_forms(profile),
     }
     messages = [
         {"role": "system", "content": prompt_body},

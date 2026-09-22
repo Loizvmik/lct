@@ -90,14 +90,17 @@ _FALLBACK_CAPACITY = {
 _FALLBACK_HEADLINE_CHARS = 70
 
 # Пункт структуры (`OutlineSlide.kind`, словарь outline-writer) -> желаемый
-# `SlideSpec.kind` (закрытые семь значений `plan.spec.SLIDE_KINDS`) —
-# грубое, но детерминированное первое приближение вёрстки, нужное ДО того,
-# как известна конкретная раскладка (`pick_patterns`/`variants.apply_
-# variant` идут следующими шагами): slide-writer обязан знать примерный
-# лимит длины текста уже сейчас, а лимит приходит из вместимости раскладки
-# ИМЕННО этого `kind` (см. `_kind_capacity`). Сам `kind` в ответе модели
-# может отличаться от этой подсказки (AGENT.md разрешает это явно), если
-# контент содержательно не ложится в предложенный тип.
+# `SlideSpec.kind` (закрытый список `plan.spec.SLIDE_KINDS`, десять значений
+# с Task 18) — грубое, но детерминированное первое приближение вёрстки,
+# нужное ДО того, как известна конкретная раскладка (`pick_patterns`/
+# `variants.apply_variant` идут следующими шагами): slide-writer обязан
+# знать примерный лимит длины текста уже сейчас, а лимит приходит из
+# вместимости раскладки ИМЕННО этого `kind` (см. `_kind_capacity`). Сам
+# `kind` в ответе модели может отличаться от этой подсказки (AGENT.md
+# разрешает это явно), если контент содержательно не ложится в
+# предложенный тип — с Task 18 у модели для этого есть не только право, но
+# и данные: `_all_kind_capacities` показывает ей вместимость ВСЕХ видов
+# шаблона, не только подсказанного здесь.
 _OUTLINE_KIND_TO_SLIDE_KIND: dict[str, str] = {
     "title": "section", "closing": "section", "ask": "section",
     "agenda": "bullets", "context": "bullets", "problem": "bullets", "risks": "bullets",
@@ -171,6 +174,35 @@ def _headline_capacity(kind: str, profile) -> int:
         for s in p.slots if s.role == "headline" and s.max_chars > 0
     ]
     return max(lengths) if lengths else _FALLBACK_HEADLINE_CHARS
+
+
+def _all_kind_capacities(profile) -> list[dict]:
+    """Вместимость ВСЕХ видов раскладки, которые реально есть в этом
+    шаблоне — не только подсказанного `desired_kind` (`_kind_capacity`
+    выше, та же арифметика на один вид за раз). Task 18, находка №2 брифа:
+    "модель пишет прозу, потому что ей никто не сказал, что этот шаблон
+    умеет показать ряд из трёх карточек... крупное число с подписью, фото
+    с подписью, цитату" — до этой правки slide-writer видел вместимость
+    ТОЛЬКО того вида, который код заранее выбрал `_OUTLINE_KIND_TO_SLIDE_
+    KIND` (грубая эвристика по семантике пункта структуры, не по
+    содержанию, которое модель ещё не написала) — увидеть, что шаблон,
+    скажем, умеет цитату, было решительно неоткуда, даже когда AGENT.md уже
+    прямо разрешает `kind` ответа отличаться от подсказки `layout_kind`.
+
+    `profile is None` (синтетика/ручной вызов без шаблона) -> пустой список,
+    та же честная деградация, что и `outline._summarize_available_forms`."""
+    if profile is None:
+        return []
+    kinds_present = sorted({p.kind for p in profile.patterns})
+    return [
+        {
+            "kind": kind,
+            "count": sum(1 for p in profile.patterns if p.kind == kind),
+            **_kind_capacity(kind, profile),
+            "max_headline_chars": _headline_capacity(kind, profile),
+        }
+        for kind in kinds_present
+    ]
 
 
 def _fallback_slide(kind: str, index: int, intent: str, needs: list[str]) -> SlideSpec:
@@ -247,6 +279,11 @@ def _write_one_slide(
         "layout_kind": desired_kind,
         "capacity": capacity,
         "max_headline_chars": _headline_capacity(desired_kind, profile),
+        # Task 18: ВСЕ виды раскладки, которые реально есть в шаблоне, с их
+        # вместимостью — не только подсказанный `layout_kind` (см.
+        # `_all_kind_capacities`) — модель решает, что из материала ложится
+        # в цитату/крупный фактоид/карточки/фото, а не только в прозу.
+        "available_kinds": _all_kind_capacities(profile),
         "sources": source_text,
         "position": {"index": index, "total": total},
     }

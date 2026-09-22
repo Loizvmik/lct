@@ -87,6 +87,51 @@ def test_build_outline_falls_back_on_malformed_json():
     assert MIN_SLIDES <= len(outline.slides) <= MAX_SLIDES
 
 
+class _RecordingLLM(LLMProvider):
+    """Запоминает `messages` последнего вызова — нужен, чтобы проверить, ЧТО
+    именно код кладёт в payload модели (Task 18: `available_forms`), не
+    только что ответ модели разбирается."""
+
+    def __init__(self, response: str):
+        self._response = response
+        self.last_messages = None
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        self.last_messages = messages
+        return self._response
+
+
+def test_build_outline_tells_the_model_about_available_template_forms(PROFILE):
+    """Task 18, находка №2 брифа: структуру планируют "с оглядкой" на то,
+    что шаблон физически умеет показать — `available_forms` в payload
+    обязано нести хотя бы те виды, которые реально есть в разобранном
+    профиле (`kind`/`count`/вместимость), а не быть пустым списком, когда
+    профиль передан."""
+    llm = _RecordingLLM(_valid_outline_json(12))
+    build_outline("бриф", [], PROFILE, llm, target_slides=12)
+    assert llm.last_messages is not None
+    payload = json.loads(llm.last_messages[1]["content"])
+    forms = payload["available_forms"]
+    assert forms, "available_forms пуст, хотя передан разобранный профиль"
+    kinds_seen = {f["kind"] for f in forms}
+    actual_kinds = {p.kind for p in PROFILE.patterns}
+    assert kinds_seen == actual_kinds
+    for f in forms:
+        assert f["count"] > 0
+        assert f["max_items"] >= 0
+        assert f["max_chars_per_item"] >= 0
+
+
+def test_build_outline_without_a_profile_sends_an_empty_available_forms():
+    """`profile=None` (синтетика/ручной вызов без шаблона, как в остальных
+    тестах этого файла) — та же честная деградация, что описана в
+    докстроке `_summarize_available_forms`: пустой список, не падение."""
+    llm = _RecordingLLM(_valid_outline_json(12))
+    build_outline("бриф", [], None, llm, target_slides=12)
+    payload = json.loads(llm.last_messages[1]["content"])
+    assert payload["available_forms"] == []
+
+
 def test_load_content_pack_reads_frontmatter_and_sources():
     brief, sources, meta = load_content_pack(CONTENT_PACK)
     assert "маршрутизации заявок" in brief

@@ -7,8 +7,8 @@ Task 11-13) и работой кода (версткой, `deckforge.compose`, �
 буллет-символ шаблона). Поэтому здесь нет ни одного поля, несущего
 координату, цвет, шрифт или кегль — ни в блоках, ни в `SlideSpec` целиком;
 единственная отсылка к вёрстке — `SlideSpec.kind`, и та ссылается на
-`Pattern.kind` (один из семи закрытых типов раскладки: "cards" | "two_col"
-| "kpi" | "section" | "image" | "table" | "bullets"), а не на конкретный
+`Pattern.kind` (закрытый список видов раскладки, `SLIDE_KINDS` ниже — до
+Task 18 их было семь, теперь десять, см. её докстроку), а не на конкретный
 `layout_id`/`pattern_id` — выбор КОНКРЕТНОГО паттерна под этот `kind`
 (подбор по вместимости) — работа `compose.builder`, не плана.
 
@@ -20,11 +20,23 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-# Замкнутый список — тот же семь значений, что и `Pattern.kind` в
-# `template/patterns.py` (KINDS), план ссылается на него по смыслу, не по
-# импорту (импорт `template.patterns` сюда добавил бы плану знание о
-# майнинге раскладок — задача этого модуля куда уже: описать содержание).
-SLIDE_KINDS = ("cards", "two_col", "kpi", "section", "image", "table", "bullets")
+# Замкнутый список — тот же набор значений, что и допустимые `Pattern.kind`
+# (геометрические семь из `template/patterns.py::KINDS` плюс три вида Task
+# 18 — `quote`/`photo_text`/`kpi_caption`, `config/pattern-kinds.yaml`,
+# уточняются мультимодальной моделью поверх геометрии, см. `template.
+# vision_kind`), план ссылается на него по смыслу, не по импорту (импорт
+# `template.patterns`/чтение YAML сюда добавил бы плану знание о майнинге
+# раскладок — задача этого модуля куда уже: описать содержание). Три новых
+# вида — не произвольное расширение: `quote`/`kpi_caption` уже совпадают
+# ролями, которые `patterns.ROLES` несёт (`"quote"`) или которые снимает
+# геометрия (`kpi_value`+`kpi_label`), `photo_text` — содержательно то же
+# самое, что уже собирает `compose.blocks` под `Visual(kind="photo")` плюс
+# текстовый блок, просто раскладка шаблона под это сочетание раньше не
+# отличалась от обычного текстового слайда (`bullets`) и терялась в подборе.
+SLIDE_KINDS = (
+    "cards", "two_col", "kpi", "section", "image", "table", "bullets",
+    "quote", "photo_text", "kpi_caption",
+)
 
 
 @dataclass(frozen=True)

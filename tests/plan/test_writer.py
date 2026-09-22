@@ -253,6 +253,46 @@ def test_flag_repeated_headlines_does_not_fire_on_unrelated_headlines_with_incid
 # ---------------------------------------------------------------------------
 # pick_patterns
 # ---------------------------------------------------------------------------
+# Task 18, находка №2 брифа: slide-writer должен видеть вместимость ВСЕХ
+# видов раскладки шаблона, не только подсказанного `layout_kind` — иначе
+# ему физически неоткуда узнать, что шаблон умеет цитату/крупный фактоид с
+# подписью/фото с текстом, и он раз за разом пишет прозу под ту же
+# подсказку.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLLM(LLMProvider):
+    """Запоминает `messages` каждого вызова, ключом — `position.index` из
+    payload (слайды пишутся параллельно, ThreadPoolExecutor — порядок
+    вызовов не совпадает с порядком слайдов, см. `write_slides`)."""
+
+    def __init__(self, response: str):
+        self._response = response
+        self.messages_by_index: dict[int, list] = {}
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        payload = json.loads(messages[1]["content"])
+        self.messages_by_index[payload["position"]["index"]] = messages
+        return self._response
+
+
+def test_write_slides_shows_every_slide_the_capacity_of_all_kinds_the_template_has(PROFILE):
+    outline = _outline(3)
+    llm = _RecordingLLM(_valid_slide_json("Заголовок"))
+    write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+    assert len(llm.messages_by_index) == 3
+    actual_kinds = {p.kind for p in PROFILE.patterns}
+    for messages in llm.messages_by_index.values():
+        payload = json.loads(messages[1]["content"])
+        available = payload["available_kinds"]
+        assert available, "available_kinds пуст, хотя PROFILE несёт паттерны"
+        assert {a["kind"] for a in available} == actual_kinds
+        # Подсказанный `layout_kind` тоже обязан присутствовать среди
+        # `available_kinds` (он и есть один из видов шаблона) — иначе модель
+        # видела бы противоречивые числа для одного и того же вида.
+        hinted = next(a for a in available if a["kind"] == payload["layout_kind"])
+        assert hinted["max_chars_per_item"] == payload["capacity"]["max_chars_per_item"]
+        assert hinted["max_headline_chars"] == payload["max_headline_chars"]
 
 
 def _cards_deck() -> DeckSpec:
