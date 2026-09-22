@@ -21,6 +21,18 @@ _SOFFICE_CANDIDATES = (
     "/usr/bin/soffice",
 )
 
+# Task 14 (и task-12-brief, раздел про soffice): LibreOffice на этой машине
+# не видит системные шрифты (в т.ч. шрифт шаблона `Play`, установленный в
+# `~/Library/Fonts/`) без явного `FONTCONFIG_PATH` — без него рендерит
+# слайд шрифтом с засечками вместо шрифта шаблона, и PDF/PNG расходятся с
+# .pptx. Автопоиск по типичным путям Homebrew/системного fontconfig, тем же
+# приёмом, что и `_SOFFICE_CANDIDATES` выше.
+_FONTCONFIG_CANDIDATES = (
+    "/opt/homebrew/etc/fonts",
+    "/usr/local/etc/fonts",
+    "/etc/fonts",
+)
+
 
 class LLMRoles(BaseModel):
     """Модель для каждой роли LLM-конвейера."""
@@ -63,6 +75,10 @@ class PathsConfig(BaseModel):
 
 class RenderConfig(BaseModel):
     soffice_path: str | None = None
+    # Каталог fontconfig, который видит шрифты шаблона (см. докстроку
+    # `_FONTCONFIG_CANDIDATES`). `None` — автопоиск; пустая строка — явно
+    # не передавать FONTCONFIG_PATH вовсе (унаследовать окружение как есть).
+    fontconfig_path: str | None = None
 
     def resolve_soffice(self) -> str:
         """Путь к soffice: из конфига, иначе автопоиском по типичным путям и PATH."""
@@ -78,6 +94,17 @@ class RenderConfig(BaseModel):
             "soffice не найден автопоиском. Укажите render.soffice_path в config/app.yaml "
             "или установите LibreOffice."
         )
+
+    def resolve_fontconfig(self) -> str | None:
+        """Каталог `FONTCONFIG_PATH` для вызова soffice, либо `None`, если
+        ни явного значения, ни одного из типичных путей не нашлось (soffice
+        в этом случае наследует окружение процесса как есть)."""
+        if self.fontconfig_path is not None:
+            return self.fontconfig_path or None
+        for candidate in _FONTCONFIG_CANDIDATES:
+            if Path(candidate).is_dir():
+                return candidate
+        return None
 
 
 class Settings(BaseModel):
