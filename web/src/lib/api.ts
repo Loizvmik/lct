@@ -41,6 +41,7 @@ export interface TemplateProfile {
 
 export interface JobResponse {
   job_id: string;
+  template_id: string;
   status: JobStatus;
   stage: Stage | null;
   stages: Stage[];
@@ -188,7 +189,7 @@ export function exportUrl(deckId: string, variant: VariantName, format: "pptx" |
 
 export const STAGE_LABELS: Record<Stage, string> = {
   parse: "Разбор шаблона",
-  outline: "Структура колоды",
+  outline: "Структура презентации",
   write: "Текст слайдов",
   compose: "Вёрстка трёх вариантов",
   audit: "Детерминированный аудит",

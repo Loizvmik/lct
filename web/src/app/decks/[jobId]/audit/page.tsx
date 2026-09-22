@@ -1,11 +1,13 @@
 "use client";
 
+import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useEffect, useMemo, useState } from "react";
 import {
   applyFix,
   assetUrl,
   Finding,
+  getJob,
   getVariants,
   SEVERITY_LABELS,
   VariantName,
@@ -25,6 +27,12 @@ function AuditScreen() {
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [applying, setApplying] = useState(false);
   const [lastResult, setLastResult] = useState<{ applied: number; skipped: number } | null>(null);
+  const [templateId, setTemplateId] = useState<string | null>(null);
+
+  useEffect(() => {
+    getJob(params.jobId).then((job) => setTemplateId(job.template_id)).catch(() => undefined);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [params.jobId]);
 
   function load() {
     getVariants(params.jobId)
@@ -111,7 +119,7 @@ function AuditScreen() {
       <h1>Шаг 4 — аудит: {VARIANT_LABELS[variant.variant]} вариант</h1>
       <p className="muted">
         Рамки поверх превью — находки детерминированного аудита по координатам
-        (доли холста). Отметьте, что чинить, и нажмите «Исправить выбранное» — колода
+        (доли холста). Отметьте, что чинить, и нажмите «Исправить выбранное» — презентация
         пересоберётся и аудит пройдёт заново.
       </p>
 
@@ -125,6 +133,11 @@ function AuditScreen() {
             {VARIANT_LABELS[name]}
           </button>
         ))}
+        {templateId && (
+          <Link className="button secondary" href={`/templates/${templateId}/brief`}>
+            ← Изменить бриф и сгенерировать заново
+          </Link>
+        )}
       </div>
 
       {lastResult && (
@@ -202,7 +215,7 @@ function AuditScreen() {
 
           {deckWideFindings.length > 0 && (
             <div className="card">
-              <h2>Находки колоды целиком ({deckWideFindings.length})</h2>
+              <h2>Находки презентации целиком ({deckWideFindings.length})</h2>
               {deckWideFindings.map(renderFindingRow)}
             </div>
           )}

@@ -1,4 +1,6 @@
 import type { Metadata } from "next";
+import Link from "next/link";
+import StepNav from "@/components/StepNav";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -14,12 +16,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           <div className="brand">
             Deck<span>Forge</span>
           </div>
-          <div className="steps">
-            <span className="step">1. Шаблон</span>
-            <span className="step">2. Бриф</span>
-            <span className="step">3. Варианты</span>
-            <span className="step">4. Аудит</span>
-          </div>
+          <StepNav />
+          <Link className="button restart-button" href="/" title="Начать с чистого листа: новая загрузка шаблона и новый бриф">
+            + Новая презентация
+          </Link>
         </div>
         <div className="shell">{children}</div>
       </body>

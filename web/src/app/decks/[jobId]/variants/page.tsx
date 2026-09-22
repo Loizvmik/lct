@@ -6,6 +6,7 @@ import { useEffect, useState } from "react";
 import {
   assetUrl,
   exportUrl,
+  getJob,
   getVariants,
   SEVERITY_LABELS,
   VariantSummary,
@@ -17,9 +18,11 @@ export default function VariantsPage() {
   const [variants, setVariants] = useState<VariantSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [activeSlide, setActiveSlide] = useState<Record<string, number>>({});
+  const [templateId, setTemplateId] = useState<string | null>(null);
 
   useEffect(() => {
     getVariants(params.jobId).then(setVariants).catch((err) => setError(err.message));
+    getJob(params.jobId).then((job) => setTemplateId(job.template_id)).catch(() => undefined);
   }, [params.jobId]);
 
   if (error) return <div className="error-banner">{error}</div>;
@@ -33,6 +36,14 @@ export default function VariantsPage() {
         визуальный (упор на изображения/иконографику) — сравните и выберите, с каким
         работать дальше на экране аудита.
       </p>
+
+      <div className="row-actions" style={{ marginBottom: 16 }}>
+        {templateId && (
+          <Link className="button secondary" href={`/templates/${templateId}/brief`}>
+            ← Изменить бриф и сгенерировать заново
+          </Link>
+        )}
+      </div>
 
       <div className="grid-3">
         {variants.map((variant) => {

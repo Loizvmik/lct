@@ -140,9 +140,13 @@ class JobRecord:
         # адресуется тем же идентификатором с самого создания, а не только
         # когда экспорт готов; эндпоинты, которым нужны данные варианта
         # (variants/fix/export), сами проверяют готовность (`get_deck`).
+        # `template_id` нужен интерфейсу (Task 16, п.1): вернувшись на экран
+        # брифа с экрана вариантов/аудита, генерировать заново по уже
+        # разобранному шаблону, не загружая .pptx повторно.
         return {
-            "job_id": self.job_id, "status": self.status, "stage": self.stage,
-            "stages": list(self.stages), "deck_id": self.job_id, "error": self.error,
+            "job_id": self.job_id, "template_id": self.template_id, "status": self.status,
+            "stage": self.stage, "stages": list(self.stages), "deck_id": self.job_id,
+            "error": self.error,
         }
 
     def subscribe(self) -> asyncio.Queue:

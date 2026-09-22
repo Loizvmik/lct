@@ -45,6 +45,7 @@ class DeckCreateResponse(BaseModel):
 
 class JobResponse(BaseModel):
     job_id: str
+    template_id: str
     status: JobStatus
     stage: Stage | None
     stages: list[Stage]

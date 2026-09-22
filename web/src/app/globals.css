@@ -80,6 +80,24 @@ a:hover {
   background: var(--brand-dim);
 }
 
+.steps a.step.clickable {
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: border-color 0.1s ease, color 0.1s ease;
+}
+
+.steps a.step.clickable:hover {
+  color: var(--text);
+  border-color: var(--brand);
+  text-decoration: none;
+}
+
+.topbar .restart-button {
+  padding: 8px 14px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -150,6 +168,36 @@ label {
   font-size: 13px;
   color: var(--text-dim);
   margin: 14px 0 6px;
+}
+
+.field-hint {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--text-dim);
+  margin: -8px 0 14px;
+}
+
+.field-hint b,
+.field-hint strong {
+  color: var(--text);
+}
+
+.field-hint.warn {
+  color: var(--major);
+}
+
+.field-hint .good::before {
+  content: "✓ ";
+  color: var(--ok);
+}
+
+.field-hint .bad::before {
+  content: "✗ ";
+  color: var(--critical);
+}
+
+.example-fill {
+  margin: -6px 0 14px;
 }
 
 .dropzone {
