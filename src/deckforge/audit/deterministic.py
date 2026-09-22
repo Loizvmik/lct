@@ -426,6 +426,51 @@ def _check_L01(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
 
 
 # ---------------------------------------------------------------------------
+# Внутренние поля текстовой рамки (`a:bodyPr` lIns/tIns/rIns/bIns)
+# ---------------------------------------------------------------------------
+
+# Дефолты ECMA-376 Part 1, §21.1.2.1.1 (CT_TextBodyProperties) для
+# lIns/rIns/tIns/bIns, когда атрибут в разметке отсутствует — 0.1″/0.1″/
+# 0.05″/0.05″ (в EMU). НАША сборка обнуляет их явно (`compose/builder.py::
+# _draw_slot` — единственная причина, по которой `measure()` там мерит по
+# ПОЛНОЙ ширине/высоте фигуры и это корректно), но аудит применяется к
+# ПРОИЗВОЛЬНОМУ чужому файлу — там поля почти наверняка НЕ нулевые (Task 11
+# повторное ревью, находка №2: `python-pptx` без явного `tf.margin_*`
+# оставляет их на этом самом дефолте). Без вычитания полей замер видит
+# больше места, чем реально доступно тексту, и "не влезает"/"обрезан
+# краем" (L03/L04) и заполненность (L02/D05, через `_effective_box`)
+# молчат там, где реально должны сработать.
+_DEFAULT_LINS_EMU = 91440
+_DEFAULT_TINS_EMU = 45720
+_DEFAULT_RINS_EMU = 91440
+_DEFAULT_BINS_EMU = 45720
+
+
+def _text_frame_insets_in(sp_element) -> tuple[float, float, float, float]:
+    """(left, top, right, bottom) внутренних полей `a:bodyPr` в дюймах —
+    ЯВНОЕ значение атрибута, если задано, иначе дефолт спецификации (см.
+    докстроку выше). Отсутствие `p:txBody`/`a:bodyPr` — тот же дефолт: текст
+    без явной рамки всё равно рисуется с дефолтными полями, это не "нулевые
+    поля" по умолчанию."""
+    tx_body = sp_element.find(qn("p:txBody"))
+    body_pr = tx_body.find(qn("a:bodyPr")) if tx_body is not None else None
+
+    def _inset(attr: str, default_emu: int) -> float:
+        raw = body_pr.get(attr) if body_pr is not None else None
+        if raw is None:
+            return default_emu / EMU_PER_INCH
+        try:
+            return int(raw) / EMU_PER_INCH
+        except ValueError:
+            return default_emu / EMU_PER_INCH
+
+    return (
+        _inset("lIns", _DEFAULT_LINS_EMU), _inset("tIns", _DEFAULT_TINS_EMU),
+        _inset("rIns", _DEFAULT_RINS_EMU), _inset("bIns", _DEFAULT_BINS_EMU),
+    )
+
+
+# ---------------------------------------------------------------------------
 # L02 — два блока наложились друг на друга
 # ---------------------------------------------------------------------------
 
@@ -449,18 +494,30 @@ def _effective_box(item: _Item, canvas: Canvas) -> Box:
     D05 на реальной demo-колоде (Task 11, обязательный осмотр) занижал
     заполненность слайда со схемой "process" вчетверо (11% вместо
     фактических ~37% чёрных карточек) и грозил ложным "слайд почти пуст"
-    там, где на рендере холст занят заметно."""
+    там, где на рендере холст занят заметно.
+
+    Правка Task 11 повторного ревью (находка №2): ширина/высота, которыми
+    мерится текст, теперь за вычетом внутренних полей рамки (`a:bodyPr`,
+    см. `_text_frame_insets_in`) — на нашей сборке поля нулевые, ничего не
+    меняется, на чужом файле с полями по умолчанию текст меряется по
+    реально доступному месту, не по полной рамке. Эффективная высота
+    после капа ДОБАВЛЯЕТ поля обратно (контент-высота — это не вся видимая
+    площадь блока, вокруг неё ещё есть поля) — так на нулевых полях
+    поведение бит-в-бит прежнее."""
     if item.kind != "shape" or not item.text.strip() or item.has_fill:
         return item.box
     style = _dominant_run_style(item.element)
     if style is None:
         return item.box
     family, size_pt, _bold = style
-    box_width_in = item.box.width * canvas.width_in
+    l_in, t_in, r_in, b_in = _text_frame_insets_in(item.element)
+    box_width_in = max(0.0, item.box.width * canvas.width_in - l_in - r_in)
     line_spacing = _first_paragraph_line_spacing(item.element)
     metrics = measure(item.text, family, size_pt, box_width_in, line_spacing=line_spacing)
-    declared_height_in = item.box.height * canvas.height_in
-    effective_height_in = min(metrics.height_in, declared_height_in)
+    declared_full_height_in = item.box.height * canvas.height_in
+    available_height_in = max(0.0, declared_full_height_in - t_in - b_in)
+    effective_content_height_in = min(metrics.height_in, available_height_in)
+    effective_height_in = min(effective_content_height_in + t_in + b_in, declared_full_height_in)
     effective_height = effective_height_in / canvas.height_in if canvas.height_in else item.box.height
     return Box(left=item.box.left, top=item.box.top, width=item.box.width, height=effective_height)
 
@@ -474,7 +531,7 @@ def _overlap_ratio(a: Box, b: Box) -> float:
     return inter / min(a.width * a.height, b.width * b.height)
 
 
-def _fully_contains(outer: Box, inner: Box, tolerance: float = 0.005) -> bool:
+def _fully_contains(outer: Box, inner: Box, tolerance: float) -> bool:
     return (
         outer.left - tolerance <= inner.left and outer.top - tolerance <= inner.top
         and inner.right <= outer.right + tolerance and inner.bottom <= outer.bottom + tolerance
@@ -521,9 +578,9 @@ def _check_L02(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
             # НЕ-плашку (например, текст поверх графика/картинки) — тот же
             # брак, что и частичное наложение, не исключение: контент
             # заслоняет контент независимо от того, торчит ли он за края.
-            if _is_background(item_a) and _fully_contains(box_a, box_b):
+            if _is_background(item_a) and _fully_contains(box_a, box_b, cfg.margin_tolerance):
                 continue
-            if _is_background(item_b) and _fully_contains(box_b, box_a):
+            if _is_background(item_b) and _fully_contains(box_b, box_a, cfg.margin_tolerance):
                 continue
             ratio = _overlap_ratio(box_a, box_b)
             if ratio <= cfg.overlap_ratio:
@@ -554,8 +611,6 @@ def _check_L02(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
 # ---------------------------------------------------------------------------
 # L03 — текст не поместился в свою рамку / L04 — обрезан краем слайда
 # ---------------------------------------------------------------------------
-
-_TEXT_FIT_TOLERANCE_IN = 0.02
 
 
 def _dominant_run_style(sp_element) -> tuple[str, float, bool] | None:
@@ -614,15 +669,17 @@ def _check_L03(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
         if style is None:
             continue
         family, size_pt, _bold = style
-        box_width_in = item.box.width * ctx.canvas.width_in
+        l_in, t_in, r_in, b_in = _text_frame_insets_in(item.element)
+        box_width_in = max(0.0, item.box.width * ctx.canvas.width_in - l_in - r_in)
         line_spacing = _first_paragraph_line_spacing(item.element)
         metrics = measure(item.text, family, size_pt, box_width_in, line_spacing=line_spacing)
-        declared_height_in = item.box.height * ctx.canvas.height_in
-        if metrics.height_in > declared_height_in + _TEXT_FIT_TOLERANCE_IN:
+        declared_height_in = max(0.0, item.box.height * ctx.canvas.height_in - t_in - b_in)
+        if metrics.height_in > declared_height_in + config.layout.text_fit_tolerance_in:
             findings.append(_finding(
                 "L03", "major", ctx, item,
                 f"Текст «{item.name or item.shape_id}» не помещается в свою рамку "
-                f"(нужно {metrics.height_in:.2f}″, доступно {declared_height_in:.2f}″).",
+                f"(нужно {metrics.height_in:.2f}″, доступно {declared_height_in:.2f}″"
+                f"{' за вычетом внутренних полей рамки' if (t_in or b_in) else ''}).",
                 item.box, True, "Уменьшить кегль по шкале шаблона или увеличить рамку слота.",
             ))
     return findings
@@ -642,10 +699,16 @@ def _check_L04(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
         if style is None:
             continue
         family, size_pt, _bold = style
-        box_width_in = item.box.width * ctx.canvas.width_in
+        l_in, t_in, r_in, b_in = _text_frame_insets_in(item.element)
+        box_width_in = max(0.0, item.box.width * ctx.canvas.width_in - l_in - r_in)
         line_spacing = _first_paragraph_line_spacing(item.element)
         metrics = measure(item.text, family, size_pt, box_width_in, line_spacing=line_spacing)
-        effective_height_in = max(metrics.height_in, item.box.height * ctx.canvas.height_in)
+        # Полная вертикальная протяжённость содержимого — поля рамки ПЛЮС
+        # измеренный текст (см. `_text_frame_insets_in`/докстроку
+        # `_effective_box`) — сравнивается с объявленной высотой рамки, берём
+        # большее (та же логика, что была, теперь с учётом полей).
+        content_height_in = t_in + metrics.height_in + b_in
+        effective_height_in = max(content_height_in, item.box.height * ctx.canvas.height_in)
         effective_bottom = item.box.top + effective_height_in / ctx.canvas.height_in
         if effective_bottom > 1 + _BOUNDS_EPS:
             findings.append(_finding(
@@ -662,25 +725,55 @@ def _check_L04(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
 # L05 — блоки не выровнены по направляющим макета
 # ---------------------------------------------------------------------------
 
-# Сколько колонных осей брать в направляющие L05 — `Grid.columns`
-# отсортирован по уверенности (docstring `template/grid.py`), но на
-# насыщенном шаблоне (VK Tech — свыше 80 кластеров-кандидатов, разведано
-# живым замером) длинный хвост из низкоуверенных кластеров покрывает почти
-# весь диапазон 0..1 — при допуске в несколько долей процента ЛЮБАЯ
-# координата случайно попадает рядом хоть с одним из них, и проверка
-# перестаёт что-либо различать. Верхушка по уверенности — настоящие
-# структурные колонны шаблона (видно по резкому спаду веса кластера в самом
-# начале отсортированного списка), а не шум совпадений.
-_MAX_COLUMN_GUIDES = 4
-
-
+# Порог "достойная ось" для L05 — доля ВСЕХ left-измерений шаблона,
+# поддержавших колонную ось (`ColumnAxis.confidence`, см. её докстроку в
+# `template/grid.py`).
+#
+# Найдено повторным код-ревью (Task 11): раньше L05 брал не "достойные" оси,
+# а первые четыре ПО СПИСКУ `Grid.columns` (тот отсортирован по confidence)
+# — и явные направляющие (`p:guide`) занимали все четыре места чужой
+# уверенностью, форсированной в 1.0 независимо от реальной поддержки (см.
+# исправленную докстроку `ColumnAxis` в grid.py), выталкивая настоящие
+# кластерные колонны с поддержкой на порядки больше. Правильный критерий —
+# содержательный, не позиционный: ось ДОСТОЙНА направляющей для L05, если
+# она либо явная направляющая из файла (`source == "guide"` — её поставил
+# дизайнер, порог поддержки на неё не распространяется, см. `_check_L05`
+# ниже), либо кластерная ось с ДОСТАТОЧНОЙ статистической поддержкой.
+#
+# Это НЕ то же самое, что порог существования оси в `Grid.columns`
+# (`grid._MIN_COLUMN_AXIS_SUPPORT_SHARE = 0.0015`, 0.15%) — тот отвечает на
+# другой вопрос ("есть ли в шаблоне вообще такая архитектурная колонна",
+# намеренно терпимый к редким, но легитимным раскладкам типа карточной
+# сетки VK Tech на 63.61%, поддержанной лишь ~0.24% измерений). L05
+# спрашивает более строгое: "выравнивается ли по этой оси заметная доля
+# содержания шаблона, так что попадание в неё — сигнал намеренного
+# выравнивания, а не шум". На насыщенном шаблоне (VK Tech — свыше 80
+# кластеров-кандидатов, разведано живым замером) длинный хвост
+# низкоподдержанных кластеров покрывает почти весь диапазон 0..1 при
+# допуске `grid_tolerance` — порог 0.15% пропустил бы их все, и проверка
+# перестала бы что-либо различать (та же болезнь, которую раньше "лечили"
+# порочным отбором первых четырёх по списку).
+#
+# 0.01 (1%) — на порядок строже порога существования оси (0.15%), тот же
+# порядок величины и то же обоснование, что и `grid._MIN_MARGIN_CLUSTER_
+# SUPPORT_SHARE` (тоже 1%, тоже "обычная, не выведенная из конкретного
+# числового ответа точка отсечения, на порядок больше, чем может дать
+# случайное совпадение одного-двух измерений, но не требующая почти
+# безусловного доминирования одной координаты"). Проверено, что порог не
+# отбрасывает ровно тот случай, который он обязан пропускать (обязательный
+# осмотр задачи): на VK WorkSpace реальная колонная ось с поддержкой 9
+# измерений из 352 (confidence≈2.6%) проходит порог 1% с заметным запасом.
 def _check_L05(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
     tol = config.layout.grid_tolerance
     grid_model = profile.grid
-    top_columns = grid_model.columns[:_MAX_COLUMN_GUIDES]
+    min_share = config.layout.grid_axis_min_support_share
+    worthy_columns = [
+        c for c in grid_model.columns
+        if c.source == "guide" or c.confidence >= min_share
+    ]
 
-    references_left = [grid_model.margin_left] + [c.center for c in top_columns]
-    references_right = [1.0 - grid_model.margin_right] + [c.center for c in top_columns]
+    references_left = [grid_model.margin_left] + [c.center for c in worthy_columns]
+    references_right = [1.0 - grid_model.margin_right] + [c.center for c in worthy_columns]
 
     findings = []
     for item in ctx.items:
@@ -784,7 +877,6 @@ def _check_L07(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
 
 def _check_T01(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
     allowed = set(profile.type_scale.families) | set(profile.type_scale.mono)
-    used_by_shape: dict[str, set[str]] = {}
     foreign: dict[str, tuple[_Item, set[str]]] = {}
     all_families: set[str] = set()
 
@@ -792,7 +884,17 @@ def _check_T01(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
         families = _all_run_families(item.element)
         if not families:
             continue
-        used_by_shape[item.shape_id] = families
+        all_families |= families
+        bad = families - allowed
+        if bad:
+            foreign[item.shape_id] = (item, bad)
+
+    # Task 11 повторное ревью, находка №6 — та же проверка ВНУТРИ таблиц/
+    # графиков (см. докстроку раздела "Текст внутри таблиц и графиков").
+    for item in _aux_items(ctx):
+        families = {r.family for r in _aux_style_records(item, ctx.scheme, ctx.clr_map) if r.family}
+        if not families:
+            continue
         all_families |= families
         bad = families - allowed
         if bad:
@@ -832,6 +934,155 @@ def _all_run_families(sp_element) -> set[str]:
 
 def _text_shapes(ctx: _SlideContext):
     return [item for item in ctx.items if item.kind == "shape" and item.text.strip()]
+
+
+# ---------------------------------------------------------------------------
+# Текст ВНУТРИ таблиц и графиков — T01/T02/T03/T06 читают его тоже
+# ---------------------------------------------------------------------------
+#
+# Найдено повторным код-ревью (Task 11): `graphic_frame` (таблица/график)
+# исключён из `_text_shapes` намеренно (докстрока `_make_item`/`_Item` — там
+# текст собирается только для I06/D02 через `_table_text`), и до этой
+# правки T01 (шрифт)/T02 (кегль)/T03 (цвет)/T06 (контраст) физически не
+# видели НИ СИМВОЛА текста внутри таблиц и графиков — а это заметная часть
+# типичного слайда, и ИМЕННО там нашёлся реальный денормированный кегль
+# (Task 10, см. `TemplateProfile.denorm_pt`/коммит "денормировать кегль
+# шкалы шаблона в графиках/таблицах/схемах") — проверки, которые обязаны
+# были такое ловить, его не видели ПРИНЦИПИАЛЬНО, не по случайности.
+#
+# Источники текста двух РАЗНЫХ устройств:
+#   - таблица: `a:tc/a:txBody/a:p/a:r` — буквальные ряды с собственным
+#     `a:rPr`, СТРУКТУРНО идентичные ряду обычного текстового шейпа
+#     (`p:txBody/a:p/a:r`) — та же арифметика голосования по числу
+#     символов работает без изменений, не только тэг обёртки другой
+#     (`a:txBody` вместо `p:txBody`).
+#   - график: DrawingML-текст встречается в ДВУХ разных формах.
+#     Буквальные ряды (`c:rich/a:p/a:r/a:rPr`) — заголовок графика и
+#     заголовки осей (`_apply_axes`/`_color_title_runs` в `compose/
+#     charts.py` пишут именно так). Область "стиль по умолчанию для
+#     текста, у которого нет собственных символов в разметке"
+#     (`c:txPr/a:p/a:pPr/a:defRPr`) — подписи делений осей, легенда,
+#     подписи данных: и `_apply_axes` (`axis.tick_labels.font...`), и
+#     дефолтный `c:chart/c:txPr`, который наследует легенда без
+#     собственного оформления, устроены именно так в OOXML — там НЕТ
+#     буквального `a:r/a:t`, есть только "если появится текст, он будет
+#     таким". Собирать оба вида отдельным путём НА КАЖДОЕ из трёх мест
+#     (подписи оси, легенда, подписи данных) избыточно и хрупко — вместо
+#     этого обходится ВЕСЬ XML графика (`chart.element.iter(...)`) в
+#     поиске ЛЮБОГО `c:rich` и ЛЮБОГО `c:txPr`, где бы они ни лежали:
+#     признак сам по себе однозначен ("здесь есть текстовое оформление"),
+#     и полный обход надёжнее точечного перечисления путей, которое на
+#     незнакомом чужом файле неизбежно забыло бы какое-то из мест.
+#
+# Известное ограничение (честно, не молча): виден только текст, у которого
+# ГДЕ-ТО в разметке есть явный атрибут (`a:rPr`/`a:defRPr` с `sz`/`a:latin`/
+# `a:solidFill`) — тот же принцип, что и для обычных текстовых шейпов
+# (`_dominant_run_style`/`_dominant_run_color` точно так же пропускают run
+# без явного `a:rPr`, см. их докстроки). Гарнитура/кегль/цвет, унаследованные
+# ЦЕЛИКОМ от темы презентации без единого явного атрибута где-либо в файле
+# (крайне редкий случай — и `compose/charts.py`/`tables.py` всегда пишут
+# явные атрибуты, и типичный чужой файл, отредактированный вручную в
+# PowerPoint, тоже почти всегда получает явный `sz`/цвет при любом
+# форматировании) — этим способом не увидеть; тот же класс ограничения,
+# что уже документирован для обычного текста, не новая дыра.
+
+
+@dataclass(frozen=True)
+class _StyleRecord:
+    """Один найденный (гарнитура, кегль, полужирность, цвет) — из
+    буквального `a:rPr` ряда ИЛИ из `a:defRPr` области стиля по умолчанию
+    (см. докстроку раздела выше). Любое поле может отсутствовать (`None`),
+    если конкретный атрибут не задан явно в разметке — потребитель сам
+    решает, какие поля ему нужны."""
+    family: str | None
+    size_pt: float | None
+    bold: bool
+    color: Color | UnresolvedColor | None
+
+
+def _style_from_rpr(rpr_el, scheme: dict, clr_map: dict) -> _StyleRecord:
+    """`a:rPr` (ряд) и `a:defRPr` (стиль по умолчанию области) — один и тот
+    же набор атрибутов/дочерних элементов по схеме OOXML (оба — вариант
+    `CT_TextCharacterProperties`), эта функция читает оба одинаково."""
+    sz_raw = rpr_el.get("sz")
+    size_pt = int(sz_raw) / 100 if sz_raw is not None else None
+    latin = rpr_el.find(qn("a:latin"))
+    family = latin.get("typeface") if latin is not None else None
+    bold = rpr_el.get("b") == "1"
+    fill_node = _find_fill_node(rpr_el)
+    color = resolve_color(fill_node, scheme, clr_map) if fill_node is not None else None
+    return _StyleRecord(family=family, size_pt=size_pt, bold=bold, color=color)
+
+
+def _table_style_records(table, scheme: dict, clr_map: dict) -> list[_StyleRecord]:
+    records = []
+    for row in table.rows:
+        for cell in row.cells:
+            container = cell.text_frame._txBody  # noqa: SLF001 — см. докстроку раздела: `a:tc/a:txBody`, тот же тег, что и у обычного текстового шейпа, просто под `a:`, не `p:`
+            for r in container.iter(qn("a:r")):
+                r_pr = r.find(qn("a:rPr"))
+                if r_pr is None:
+                    continue
+                records.append(_style_from_rpr(r_pr, scheme, clr_map))
+    return records
+
+
+def _chart_style_records(chart, scheme: dict, clr_map: dict) -> list[_StyleRecord]:
+    root = chart.element
+    records = []
+    for rich in root.iter(qn("c:rich")):
+        for r in rich.iter(qn("a:r")):
+            r_pr = r.find(qn("a:rPr"))
+            if r_pr is None:
+                continue
+            records.append(_style_from_rpr(r_pr, scheme, clr_map))
+    for tx_pr in root.iter(qn("c:txPr")):
+        for d in tx_pr.iter(qn("a:defRPr")):
+            records.append(_style_from_rpr(d, scheme, clr_map))
+    return records
+
+
+def _aux_style_records(item: _Item, scheme: dict, clr_map: dict) -> list[_StyleRecord]:
+    """Пустой список для обычных текстовых шейпов (они уже покрыты
+    `_text_shapes`/`_dominant_run_*`/`_all_run_*`) — непусто только для
+    таблиц/графиков (см. докстроку раздела)."""
+    if item.is_table and item.pptx_shape is not None:
+        try:
+            return _table_style_records(item.pptx_shape.table, scheme, clr_map)
+        except Exception:  # noqa: BLE001 — битая/недоступная таблица не должна ронять весь аудит слайда
+            return []
+    if item.is_chart and item.pptx_shape is not None:
+        try:
+            return _chart_style_records(item.pptx_shape.chart, scheme, clr_map)
+        except Exception:  # noqa: BLE001 — битый/недоступный график не должен ронять весь аудит слайда
+            return []
+    return []
+
+
+def _dominant_aux_style(records: list[_StyleRecord]) -> tuple[str, float, bool] | None:
+    """Аналог `_dominant_run_style`, но голосование по ЧИСЛУ ЗАПИСЕЙ, не по
+    числу символов — у `a:defRPr`-записей (см. `_StyleRecord`) нет
+    привязанного текста, чтобы посчитать его длину, только сам факт
+    "область такого-то размера оформлена так-то"."""
+    votes: dict[tuple[str, float, bool], int] = {}
+    for r in records:
+        if r.family and r.size_pt:
+            key = (r.family, r.size_pt, r.bold)
+            votes[key] = votes.get(key, 0) + 1
+    if not votes:
+        return None
+    return max(votes.items(), key=lambda kv: kv[1])[0]
+
+
+def _dominant_aux_color(records: list[_StyleRecord]) -> Color | UnresolvedColor | None:
+    for r in records:
+        if isinstance(r.color, Color):
+            return r.color
+    return None
+
+
+def _aux_items(ctx: _SlideContext):
+    return [item for item in ctx.items if item.is_table or item.is_chart]
 
 
 # ---------------------------------------------------------------------------
@@ -881,6 +1132,23 @@ def _check_T02(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
                 item.box, True, "Заменить кегль на ближайшую ступень шкалы шаблона.",
             ))
             break  # один finding на шейп достаточно, даже если офф-шкальных кеглей несколько
+
+    # Task 11 повторное ревью, находка №6 — та же проверка ВНУТРИ таблиц/
+    # графиков (см. докстроку раздела "Текст внутри таблиц и графиков").
+    # Именно здесь на демонстрационной колоде находился реальный
+    # денормированный кегль (Task 10 фикс) — T02 раньше физически не мог
+    # его увидеть.
+    for item in _aux_items(ctx):
+        sizes = {r.size_pt for r in _aux_style_records(item, ctx.scheme, ctx.clr_map) if r.size_pt}
+        for size_pt in sizes:
+            if any(abs(size_pt - a) <= tol for a in allowed):
+                continue
+            findings.append(_finding(
+                "T02", "major", ctx, item,
+                f"Кегль {size_pt:g}pt внутри таблицы/графика не входит в типографическую шкалу шаблона.",
+                item.box, True, "Заменить кегль на ближайшую ступень шкалы шаблона.",
+            ))
+            break
     return findings
 
 
@@ -934,6 +1202,19 @@ def _check_T03(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
                     "не входит в палитру шаблона.",
                     item.box, True, "Заменить заливку на цвет из палитры шаблона.",
                 ))
+        elif item.is_table or item.is_chart:
+            # Task 11 повторное ревью, находка №6 — та же проверка цвета
+            # ТЕКСТА внутри таблиц/графиков (см. докстроку раздела "Текст
+            # внутри таблиц и графиков"). Заливка ячеек/точек графика — вне
+            # объёма этой правки (не была запрошена и не является текстом).
+            for rec in _aux_style_records(item, ctx.scheme, ctx.clr_map):
+                if isinstance(rec.color, Color) and rec.color.hex.upper() not in text_allowed:
+                    findings.append(_finding(
+                        "T03", "major", ctx, item,
+                        f"Цвет текста {rec.color.hex} внутри таблицы/графика не входит в палитру шаблона.",
+                        item.box, True, "Заменить цвет на ближайший из палитры шаблона.",
+                    ))
+                    break
     return findings
 
 
@@ -1031,24 +1312,51 @@ def _check_T06(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
     for item in _text_shapes(ctx):
         style = _dominant_run_style(item.element)
         text_color = _dominant_run_color(item.element, ctx.scheme, ctx.clr_map)
-        if style is None or not isinstance(text_color, Color):
-            continue
-        _family, size_pt, bold = style
-        bg_hex, bg_luminance = _background_under(item, ctx)
-        if bg_hex is not None:
-            ratio = contrast_ratio(bg_hex, text_color.hex)
-        else:
-            ratio = _contrast_from_luminance(_relative_luminance(text_color.hex), bg_luminance)
-        is_large = size_pt >= cfg.large_text_pt or (bold and size_pt >= cfg.large_bold_pt)
-        threshold = cfg.min_contrast_large if is_large else cfg.min_contrast_small
-        if ratio < threshold:
-            findings.append(_finding(
-                "T06", "critical", ctx, item,
-                f"Контраст текста «{item.name or item.shape_id}» к фону {ratio:.1f}:1 "
-                f"ниже требуемых {threshold:.1f}:1.",
-                item.box, True, "Заменить цвет текста на контрастный цвет из палитры шаблона.",
-            ))
+        finding = _contrast_finding(ctx, item, style, text_color, config, "")
+        if finding is not None:
+            findings.append(finding)
+
+    # Task 11 повторное ревью, находка №6 — та же проверка ВНУТРИ таблиц/
+    # графиков (см. докстроку раздела "Текст внутри таблиц и графиков").
+    # "Доминантный" стиль/цвет здесь — ПЕРВАЯ найденная запись с цветом
+    # (`_dominant_aux_color`), не голосование по площади текста, как для
+    # обычных шейпов: у `a:defRPr`-записей нет текста, чтобы взвесить его
+    # длиной (см. докстроку `_dominant_aux_style`) — честное упрощение,
+    # тот же принцип, что уже документирован у `_background_under`
+    # ("один фон на блок").
+    for item in _aux_items(ctx):
+        records = _aux_style_records(item, ctx.scheme, ctx.clr_map)
+        style = _dominant_aux_style(records)
+        text_color = _dominant_aux_color(records)
+        finding = _contrast_finding(ctx, item, style, text_color, config, " внутри таблицы/графика")
+        if finding is not None:
+            findings.append(finding)
     return findings
+
+
+def _contrast_finding(
+    ctx: _SlideContext, item: _Item, style: tuple[str, float, bool] | None,
+    text_color: Color | UnresolvedColor | None, config: AuditConfig, label_suffix: str,
+) -> Finding | None:
+    cfg = config.template
+    if style is None or not isinstance(text_color, Color):
+        return None
+    _family, size_pt, bold = style
+    bg_hex, bg_luminance = _background_under(item, ctx, config)
+    if bg_hex is not None:
+        ratio = contrast_ratio(bg_hex, text_color.hex)
+    else:
+        ratio = _contrast_from_luminance(_relative_luminance(text_color.hex), bg_luminance)
+    is_large = size_pt >= cfg.large_text_pt or (bold and size_pt >= cfg.large_bold_pt)
+    threshold = cfg.min_contrast_large if is_large else cfg.min_contrast_small
+    if ratio >= threshold:
+        return None
+    return _finding(
+        "T06", "critical", ctx, item,
+        f"Контраст текста «{item.name or item.shape_id}»{label_suffix} к фону {ratio:.1f}:1 "
+        f"ниже требуемых {threshold:.1f}:1.",
+        item.box, True, "Заменить цвет текста на контрастный цвет из палитры шаблона.",
+    )
 
 
 def _dominant_run_color(sp_element, scheme: dict, clr_map: dict) -> Color | UnresolvedColor | None:
@@ -1068,7 +1376,7 @@ def _dominant_run_color(sp_element, scheme: dict, clr_map: dict) -> Color | Unre
     return None
 
 
-def _background_under(item: _Item, ctx: _SlideContext) -> tuple[str | None, float]:
+def _background_under(item: _Item, ctx: _SlideContext, config: AuditConfig) -> tuple[str | None, float]:
     """Фон НЕПОСРЕДСТВЕННО под текстовым блоком: своя заливка → объемлющая
     плашка (самая маленькая) → фон слайда → фон макета. `colorpick.
     slide_background_luminance` уже даёт последнее звено (фон макета,
@@ -1080,7 +1388,7 @@ def _background_under(item: _Item, ctx: _SlideContext) -> tuple[str | None, floa
     candidates = [
         other for other in ctx.items
         if other is not item and other.kind == "shape" and isinstance(other.fill_color, Color)
-        and _fully_contains(other.box, item.box)
+        and _fully_contains(other.box, item.box, config.layout.margin_tolerance)
     ]
     if candidates:
         plate = min(candidates, key=lambda o: o.box.width * o.box.height)
@@ -1359,19 +1667,18 @@ def _check_I05(ctx: _SlideContext) -> list[Finding]:
 # I06 — два слайда дублируют друг друга
 # ---------------------------------------------------------------------------
 
-_MIN_TEXT_FOR_DUPLICATE_CHECK = 20
-
 
 def _check_I06(slide_texts: list[str], config: AuditConfig) -> list[Finding]:
     threshold = config.integrity.duplicate_similarity
+    min_len = config.integrity.min_duplicate_check_text_len
     findings = []
     for i in range(len(slide_texts)):
         text_a = slide_texts[i].strip()
-        if len(text_a) < _MIN_TEXT_FOR_DUPLICATE_CHECK:
+        if len(text_a) < min_len:
             continue
         for j in range(i + 1, len(slide_texts)):
             text_b = slide_texts[j].strip()
-            if len(text_b) < _MIN_TEXT_FOR_DUPLICATE_CHECK:
+            if len(text_b) < min_len:
                 continue
             ratio = SequenceMatcher(None, text_a, text_b).ratio()
             if ratio >= threshold:
