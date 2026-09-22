@@ -263,6 +263,65 @@ def test_corrupted_cache_file_triggers_a_fresh_parse_instead_of_crashing(tmp_pat
     assert TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8")) == first
 
 
+def test_stale_cache_with_an_older_schema_version_triggers_a_fresh_parse(tmp_path, monkeypatch):
+    """Task 10 отчёт, находка №5: диск-кеш ключуется ТОЛЬКО отпечатком
+    файла — правка, добавляющая новое поле в модель профиля, не меняет
+    отпечаток .pptx, а старый файл кеша это поле не несёт (pydantic тихо
+    подставил бы дефолт при чтении). Кеш обязан нести версию СХЕМЫ профиля
+    (`PROFILE_SCHEMA_VERSION`) и признавать себя недействительным, когда
+    версия в файле кеша не совпадает с текущей — тогда правка на поле
+    ловится сразу, без ручной чистки `cache/profiles/`."""
+    from deckforge.template import profile as profile_module
+
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    cache_file = cache_dir / f"{first.fingerprint}.json"
+    import json as _json
+    payload = _json.loads(cache_file.read_text(encoding="utf-8"))
+    assert payload.get("schema_version") == profile_module.PROFILE_SCHEMA_VERSION
+    payload["schema_version"] = -1  # версия заведомо старее любой реальной
+    cache_file.write_text(_json.dumps(payload), encoding="utf-8")
+
+    calls = []
+    real_collect_usage = profile_module.collect_usage
+
+    def _tracking_collect_usage(*args, **kwargs):
+        calls.append(1)
+        return real_collect_usage(*args, **kwargs)
+
+    monkeypatch.setattr("deckforge.template.profile.collect_usage", _tracking_collect_usage)
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    assert calls, "кеш со старой версией схемы принят как валидный — разбор не повторился"
+    assert second == first, "пересчитанный профиль обязан совпасть с исходным (тот же файл, тот же код)"
+
+    rewritten = _json.loads(cache_file.read_text(encoding="utf-8"))
+    assert rewritten["schema_version"] == profile_module.PROFILE_SCHEMA_VERSION, (
+        "кеш обязан быть перезаписан текущей версией схемы, а не оставлен со старой"
+    )
+
+
+def test_cache_missing_schema_version_entirely_is_also_treated_as_stale(tmp_path):
+    """Тот же брак, что и выше, но для кеша, записанного ДО того, как в
+    модель вообще добавили поле `schema_version` (реальный сценарий отчёта:
+    "предыдущая правка добавила в модель новые поля, и старый кеш их не
+    несёт") — поля нет в файле вовсе, не просто устаревшее значение."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    cache_file = cache_dir / f"{first.fingerprint}.json"
+    import json as _json
+    payload = _json.loads(cache_file.read_text(encoding="utf-8"))
+    del payload["schema_version"]
+    cache_file.write_text(_json.dumps(payload), encoding="utf-8")
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    assert second == first
+
+
 def test_different_files_get_independent_cache_entries(tmp_path):
     cache_dir = tmp_path / "cache"
     vktech = TemplateProfile.from_file(TEMPLATES_DIR / "VK Tech шаблон.pptx", cache_dir=cache_dir)

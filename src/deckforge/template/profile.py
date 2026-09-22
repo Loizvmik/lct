@@ -21,6 +21,7 @@
 """
 from __future__ import annotations
 import hashlib
+import json
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -42,6 +43,22 @@ from deckforge.template.usage import Usage, collect_usage
 # проекте (см. cli.py: тот же путь, тот же parents[N] от файла до корня
 # репозитория — profile.py на один уровень глубже cli.py, отсюда [3], не [2]).
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
+
+# Версия СХЕМЫ `TemplateProfile` — Task 10 отчёт, находка №5: диск-кеш
+# (`cache/profiles/<fingerprint>.json`) ключуется ТОЛЬКО отпечатком файла
+# шаблона, без учёта версии кода/модели. Правка, добавляющая (или меняющая
+# смысл) поле в `TemplateProfile` или во вложенную модель, не меняет
+# отпечаток .pptx — старый файл кеша при этом молча продолжает
+# подхватываться, а `pydantic` тихо подставляет дефолт для нового поля
+# (или, того хуже, валидирует битую комбинацию как валидную), и профиль
+# отдаётся БЕЗ новых данных, без единого предупреждения — именно это и
+# увидел постановщик после правки, добавившей поля в модель. Бампать это
+# число ОБЯЗАН каждый, кто меняет форму/смысл `TemplateProfile` или любой
+# вложенной pydantic-модели (`LayoutEntryModel`, `PatternModel`,
+# `AssetCatalogModel`, ...) — см. `from_file`, где версия сверяется ДО
+# полной pydantic-валидации кеша, и разбор идёт заново при несовпадении
+# (или отсутствии поля вовсе — кеш, записанный до появления этой версии).
+PROFILE_SCHEMA_VERSION = 1
 
 # Ниже какой уверенности число из разбора попадает в предупреждения, а не
 # только в тело отчёта. 0.5 — не наблюдение за тремя файлами, а сама природа
@@ -431,6 +448,7 @@ class TemplateProfile(BaseModel):
     provenance: list[str]
     warnings: list[str]
     fingerprint: str
+    schema_version: int = PROFILE_SCHEMA_VERSION
 
     @classmethod
     def from_file(
@@ -478,8 +496,19 @@ class TemplateProfile(BaseModel):
             effective_cache_dir / f"{fingerprint}.json" if effective_cache_dir is not None else None
         )
         if cache_file is not None and cache_file.exists():
+            cached: "TemplateProfile | None" = None
             try:
-                cached = cls.model_validate_json(cache_file.read_text(encoding="utf-8"))
+                raw_text = cache_file.read_text(encoding="utf-8")
+                raw_data = json.loads(raw_text)
+                # Версия схемы сверяется НА СЫРОМ словаре, ДО pydantic-
+                # валидации (см. докстроку `PROFILE_SCHEMA_VERSION`) —
+                # если бы поле просто имело дефолт в модели, кеш, в
+                # котором его нет вовсе (записан до появления этой
+                # версии), тихо прошёл бы валидацию С ДЕФОЛТНЫМ (текущим)
+                # значением, как будто он и есть текущая версия — ровно та
+                # деградация, которую эта проверка обязана ловить.
+                if isinstance(raw_data, dict) and raw_data.get("schema_version") == PROFILE_SCHEMA_VERSION:
+                    cached = cls.model_validate(raw_data)
             except Exception:
                 cached = None  # повреждённый кеш — разбираем заново и перезаписываем ниже
             if cached is not None:
@@ -545,6 +574,7 @@ class TemplateProfile(BaseModel):
             assets=_asset_catalog_model(assets),
             patterns=[_pattern_model(p) for p in patterns],
             provenance=provenance, warnings=warnings, fingerprint=fingerprint,
+            schema_version=PROFILE_SCHEMA_VERSION,
         )
 
         if cache_file is not None:
