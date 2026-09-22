@@ -1,0 +1,255 @@
+"""Структура колоды: сколько слайдов, о чём каждый, в каком порядке —
+первый шаг планирования содержания (Task 13). Текст слайдов пишет
+следующий шаг (`writer.write_slides`), конкретную раскладку — шаг за ним
+(`writer.pick_patterns`/`variants.apply_variant`); этот модуль не знает ни
+о том, ни о другом.
+
+Промпт — файл `agents/outline-writer/AGENT.md`, не строка в коде (ТЗ требует
+промпты файлами с версией во фронтматтере — тот же приём, что уже применён
+`template/naming.py` для `agents/palette-namer/AGENT.md`, см. `_load_agent_
+prompt` там). Код здесь читает файл, вызывает модель по схеме и, как и
+`naming.py`, не доверяет ответу слепо: `kind` каждого предложенного слайда
+обязан входить в закрытый список `OUTLINE_KINDS`, невалидный слайд
+отбрасывается, а не портит остальную структуру; без модели (`llm=None`) или
+при любом сбоя сети/парсинга — детерминированный запасной вариант, а не
+падение (тот же принцип, что и у `name_palette_roles_report`)."""
+from __future__ import annotations
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import yaml
+
+from deckforge.provider.base import LLMProvider
+
+AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "outline-writer" / "AGENT.md"
+
+# Закрытый список типов слайда структуры — AGENT.md, дословно.
+OUTLINE_KINDS = (
+    "title", "agenda", "context", "problem", "solution", "how_it_works",
+    "data", "comparison", "case", "roadmap", "team", "risks", "ask", "closing",
+)
+
+# Объём колоды — ТЗ дословно ("10-15 слайдов или заданное пользователем").
+MIN_SLIDES = 10
+MAX_SLIDES = 15
+_DEFAULT_TARGET_SLIDES = 12
+
+# Бюджет токенов начального вызова. Изначально 4096 (тот же порядок, что
+# `naming._PALETTE_NAMING_INITIAL_MAX_TOKENS`) — живой прогон обязательной
+# проверки задачи (девять презентаций, см. отчёт) показал, что qwen3.6
+# рассуждающая тратит на reasoning весь бюджет 4096 систематически, а не
+# как редкое исключение: эскалация до `MAX_TOKENS_BUDGET_CAP`=6144
+# (`provider/yandex.py`) срабатывала на КАЖДОМ вызове без исключения —
+# значит для этой роли 4096 не "типичный случай с редким перекосом", а
+# гарантированно заниженный старт, который только теряет время на лишний
+# HTTP-круг. Начинать сразу с потолка эскалации не имеет смысла экономить —
+# он всё равно будет достигнут.
+OUTLINE_MAX_TOKENS = 6144
+
+
+@dataclass(frozen=True)
+class SourceDoc:
+    """Один исходный документ (бриф, таблица цифр, riskи и т.п.) — план
+    работает с текстом целиком, не разбирает его структуру сам (это делает
+    модель, читая `sources` как есть)."""
+    name: str
+    text: str
+
+
+@dataclass(frozen=True)
+class OutlineSlide:
+    kind: str
+    intent: str
+    needs: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Outline:
+    """Структура будущей колоды. `title`/`language` — не часть JSON-ответа
+    модели (AGENT.md просит только `slides`), а метаданные колоды, которые
+    несёт содержательный пакет (`brief.md`, фронтматтер) и которые нужны
+    `writer.write_slides`, чтобы собрать `DeckSpec` целиком, не имея
+    отдельного параметра под них в своей сигнатуре (брифом Task 13,
+    "Interfaces" — `write_slides(outline, sources, profile, llm)`, без
+    title/language отдельно) — поле сверх литерального перечня JSON-схемы
+    брифа, но без него `DeckSpec.title`/`.language` физически неоткуда
+    взять на выходе `write_slides`."""
+    slides: list[OutlineSlide]
+    title: str = ""
+    language: str = "ru"
+
+
+_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "slides": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": list(OUTLINE_KINDS)},
+                    "intent": {"type": "string"},
+                    "needs": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["kind", "intent"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["slides"],
+    "additionalProperties": False,
+}
+
+
+def _load_agent_prompt(path: Path = AGENT_PATH) -> tuple[dict, str]:
+    text = path.read_text(encoding="utf-8")
+    parts = text.split("---", 2)
+    if len(parts) < 3 or parts[0].strip():
+        raise ValueError(f"{path}: ожидался YAML-фронтматтер, ограниченный `---`")
+    meta = yaml.safe_load(parts[1]) or {}
+    return meta, parts[2].strip()
+
+
+def _clamp_target(target_slides: int | None) -> int:
+    n = target_slides if target_slides else _DEFAULT_TARGET_SLIDES
+    return max(MIN_SLIDES, min(MAX_SLIDES, n))
+
+
+def _fallback_outline(n: int) -> list[OutlineSlide]:
+    """Детерминированный скелет структуры — используется без модели и при
+    любом сбое вызова: не заглушка "пустая колода", а полноценная валидная
+    структура (титул, повестка, контекст/проблема, данные, решение, кейс,
+    риски, дорожная карта, итог), урезанная/растянутая до `n` штатным
+    `_clamp_slide_count`."""
+    skeleton = [
+        OutlineSlide(kind="title", intent="Тема и цель презентации"),
+        OutlineSlide(kind="agenda", intent="О чём пойдёт речь"),
+        OutlineSlide(kind="context", intent="Контекст задачи"),
+        OutlineSlide(kind="problem", intent="В чём проблема"),
+        OutlineSlide(kind="data", intent="Что показывает измерение"),
+        OutlineSlide(kind="solution", intent="Что предлагается сделать"),
+        OutlineSlide(kind="how_it_works", intent="Как это работает"),
+        OutlineSlide(kind="case", intent="Результат пилота/проверки"),
+        OutlineSlide(kind="risks", intent="Риски и как их снимаем"),
+        OutlineSlide(kind="roadmap", intent="Что нужно для раскатки"),
+        OutlineSlide(kind="ask", intent="О чём просим комитет/аудиторию"),
+        OutlineSlide(kind="closing", intent="Итог и следующий шаг"),
+    ]
+    return _clamp_slide_count(skeleton, n)
+
+
+def _clamp_slide_count(slides: list[OutlineSlide], target: int) -> list[OutlineSlide]:
+    """Гарантирует структурные инварианты AGENT.md ("первый слайд —
+    титульный, последний — итоговый") и объём ТЗ (`MIN_SLIDES`..
+    `MAX_SLIDES`) КОДОМ, а не доверием модели — тот же принцип, что и
+    остальной проект: модель предлагает, код проверяет."""
+    slides = list(slides)
+    if not slides:
+        slides = [OutlineSlide(kind="title", intent="Тема презентации")]
+    if slides[0].kind != "title":
+        slides.insert(0, OutlineSlide(kind="title", intent="Тема и цель презентации"))
+    if slides[-1].kind != "closing":
+        slides.append(OutlineSlide(kind="closing", intent="Итог и следующий шаг"))
+
+    if len(slides) > MAX_SLIDES:
+        keep_middle = MAX_SLIDES - 2
+        slides = [slides[0], *slides[1:-1][:keep_middle], slides[-1]]
+
+    filler_kinds = ("context", "data", "case")
+    i = 0
+    while len(slides) < min(target, MAX_SLIDES) or len(slides) < MIN_SLIDES:
+        kind = filler_kinds[i % len(filler_kinds)]
+        slides.insert(-1, OutlineSlide(kind=kind, intent="Дополнительный контекст"))
+        i += 1
+
+    return slides
+
+
+def build_outline(
+    brief: str,
+    sources: list[SourceDoc],
+    profile,
+    llm: LLMProvider | None,
+    target_slides: int | None = None,
+    *,
+    title: str = "",
+    language: str = "ru",
+) -> Outline:
+    """Разбирает бриф+источники в структуру колоды. `profile` в сигнатуре —
+    контракт интерфейса брифа Task 13 дословно; сама структура (сколько
+    слайдов, о чём) от шаблона не зависит (это решает содержание слайда и
+    раскладка под него — следующие шаги), параметр принят и не используется
+    здесь намеренно, той же логикой, что и неиспользуемые типизированные
+    параметры в других местах проекта, где интерфейс шире, чем нужно одному
+    конкретному шагу."""
+    n = _clamp_target(target_slides)
+
+    if llm is None:
+        return Outline(slides=_fallback_outline(n), title=title, language=language)
+
+    _meta, prompt_body = _load_agent_prompt()
+    payload = {
+        "brief": brief,
+        "sources": [{"name": s.name, "text": s.text} for s in sources],
+        "target_slides": n,
+    }
+    messages = [
+        {"role": "system", "content": prompt_body},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+
+    try:
+        raw = llm.complete(messages, schema=_SCHEMA, max_tokens=OUTLINE_MAX_TOKENS)
+        data = json.loads(raw)
+        raw_slides = data["slides"]
+        if not isinstance(raw_slides, list):
+            raise ValueError(f"'slides' должен быть списком, получено {type(raw_slides).__name__}")
+        slides = []
+        for item in raw_slides:
+            kind = item.get("kind") if isinstance(item, dict) else None
+            if kind not in OUTLINE_KINDS:
+                continue  # модель предложила несуществующий тип — код отвергает, не падает
+            intent = item.get("intent") or ""
+            if not intent.strip():
+                continue
+            needs = [str(x) for x in item.get("needs", []) if isinstance(item.get("needs"), list)] \
+                if isinstance(item.get("needs"), list) else []
+            slides.append(OutlineSlide(kind=kind, intent=intent, needs=needs))
+        if not slides:
+            raise ValueError("модель не вернула ни одного валидного слайда структуры")
+    except Exception:
+        slides = _fallback_outline(n)
+    else:
+        slides = _clamp_slide_count(slides, n)
+
+    return Outline(slides=slides, title=title, language=language)
+
+
+# ---------------------------------------------------------------------------
+# Загрузка контент-пакета (`fixtures/content-packs/<pack>/brief.md` +
+# `sources.md`) — не часть интерфейса брифа Task 13 дословно, но без неё
+# нечем скормить `build_outline` реальный бриф/источники за пределами
+# тестов (обязательная проверка задачи — девять презентаций по реальным
+# пакетам, см. отчёт задачи).
+# ---------------------------------------------------------------------------
+
+
+def load_content_pack(pack_dir: Path) -> tuple[str, list[SourceDoc], dict]:
+    """Читает `brief.md` (YAML-фронтматтер + тело брифа) и `sources.md`
+    контент-пакета. Возвращает (текст брифа, список источников, метаданные
+    фронтматтера: `title`/`purpose`/`audience`/`language`/`target_slides`)."""
+    brief_path = pack_dir / "brief.md"
+    sources_path = pack_dir / "sources.md"
+
+    text = brief_path.read_text(encoding="utf-8")
+    parts = text.split("---", 2)
+    if len(parts) >= 3 and not parts[0].strip():
+        meta = yaml.safe_load(parts[1]) or {}
+        body = parts[2].strip()
+    else:
+        meta = {}
+        body = text.strip()
+
+    sources = [SourceDoc(name="sources.md", text=sources_path.read_text(encoding="utf-8"))]
+    return body, sources, meta
