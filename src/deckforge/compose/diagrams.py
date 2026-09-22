@@ -24,14 +24,19 @@ PowerPoint он редактируется КАК SmartArt (перетащить
 
 ## Геометрия схем — из словаря шаблона, не по вкусу
 
-Карточки схем рисуются формой с НАИБОЛЬШИМ числом вхождений среди
-`rect`/`roundRect`/`ellipse` в `profile.shape_vocabulary` (Task 7/10,
-`template/shapes.py`) — у VK Tech это `rect` (1359 против 176 roundRect),
-у Education — `ellipse` (100 против 27 roundRect). Степень скругления
+Карточки схем рисуются формой с НАИБОЛЬШИМ числом вхождений в
+`profile.shape_vocabulary` среди `rect`/`roundRect`/`ellipse` (Task 7/10,
+`template/shapes.py`) — словарь считается по декору КАРТОЧНЫХ ГРУПП
+ПОВТОРА намайненных раскладок шаблона (плашки под реальными карточками
+слайдов-примеров), не по переписи всех автофигур пакета — см. докстроку
+`template/shapes.py` про то, почему (Task 10 код-ревью, находка №1: полная
+перепись пакета, включая макеты/мастера, на всех трёх учебных шаблонах
+неизменно отдавала `rect` победителем из-за массы служебных прямоугольных
+рамок макетов, различения между шаблонами не было). Степень скругления
 `roundRect`, если он выбран, берётся из среднего фактического `adj`
-шаблона (`ShapeVocabEntry.avg_adj`), а не из дефолта PowerPoint (16.67%) —
-рисовать скруглённые карточки со скруглением, которого в шаблоне нет,
-такой же выход из дизайн-системы, как сама форма.
+карточного декора (`ShapeVocabEntry.avg_adj`), а не из дефолта PowerPoint
+(16.67%) — рисовать скруглённые карточки со скруглением, которого в
+шаблоне нет, такой же выход из дизайн-системы, как сама форма.
 """
 from __future__ import annotations
 import io
@@ -47,7 +52,8 @@ from pptx.enum.text import PP_ALIGN
 from pptx.util import Pt
 
 from deckforge.compose.colorpick import (
-    best_contrast_text_color, pop_pair_for_luminance, slide_background_luminance,
+    best_contrast_text_color, best_contrast_text_color_for_luminance, pop_pair_for_luminance,
+    slide_background_luminance,
 )
 from deckforge.compose.textfit import measure
 from deckforge.ooxml.geometry import Box
@@ -77,7 +83,16 @@ _ICON_INSET_SHARE = 0.62
 # крупной к мелкой; полного цикличного ужимания таблиц/укладки здесь нет
 # (карточка схемы короче слота контента по замыслу), достаточно перебора
 # по готовым ступеням шкалы.
-_LABEL_STEPS = ("caption", "micro", "body")
+#
+# Task 10 код-ревью, находка №4: порядок раньше был ("caption", "micro",
+# "body") — средний, мелкий, крупный, вопреки этой самой докстроке. Высота
+# текста растёт с кеглем монотонно (`textfit.measure`), поэтому если
+# "caption" не влезал, "body" (он КРУПНЕЕ caption) тем более не влез бы —
+# ветка "body" была фактически мертва, подпись никогда не получала кегль
+# крупнее caption, даже когда в карточке было полно места. Верный порядок —
+# от самой крупной ступени вниз: "body" > "caption" > "micro" (тот же
+# порядок ступеней, что и `_TIER_ORDER`/`TypeScale.steps` во всём проекте).
+_LABEL_STEPS = ("body", "caption", "micro")
 
 
 @dataclass(frozen=True)
@@ -183,8 +198,22 @@ def add_pictogram_row(slide, box: Box, icons: list[str], profile: TemplateProfil
     # независимо от того, что за фон под ней. Форма подложки — из словаря
     # шаблона, предпочтение `ellipse` (бейдж-иконка в кружке — узнаваемый
     # паттерн), тот же принцип, что и `_marker_geometry` в "timeline".
+    #
+    # Task 10 код-ревью (регрессионный тест находок №5/№6): цвет подложки
+    # ниже подбирается `best_contrast_text_color_for_luminance`, а не
+    # `pop_pair_for_luminance` — ДВУХ кандидатов `surface`/`on_surface`
+    # (пара, откалиброванная друг под друга по контрасту к СЕБЕ самой, не к
+    # произвольной яркости иконки) регулярно не хватало на WCAG-контраст
+    # ≥ 4.5 к средней яркости иконки: живой замер даёт контраст 2.3-3.2
+    # вместо ≥ 4.5 (иконка бледнеет на подложке, не пропадает целиком, но и
+    # не тот уверенный контраст, которого требует находка). Подложка под
+    # иконкой семантически ближе к ТЕКСТУ на фоне (иконка — контент поверх
+    # плашки, как текст поверх заливки), чем к плашке, которая должна
+    # держать СВОЙ полюс против фона слайда, — `best_contrast_text_color_
+    # for_luminance` ищет лучший контраст по ВСЕЙ палитре, не только по
+    # паре surface/on_surface, и даёт контраст 6.6-21 на том же замере.
     plate_prst, plate_type, plate_adj = _marker_geometry(profile)
-    fallback_plate_fill, _text_hex = pop_pair_for_luminance(
+    fallback_plate_fill = best_contrast_text_color_for_luminance(
         slide_background_luminance(slide, profile), profile.palette_roles,
     )
 
@@ -202,7 +231,7 @@ def add_pictogram_row(slide, box: Box, icons: list[str], profile: TemplateProfil
             data = pkg.part(ref.part_name)
             icon_luminance = _icon_average_luminance(data)
             if icon_luminance is not None:
-                plate_fill, _text_hex = pop_pair_for_luminance(icon_luminance, profile.palette_roles)
+                plate_fill = best_contrast_text_color_for_luminance(icon_luminance, profile.palette_roles)
             else:
                 plate_fill = fallback_plate_fill
 
