@@ -4,7 +4,7 @@ import json
 
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec, validate_deck_spec
-from deckforge.plan.writer import pick_patterns, write_slides
+from deckforge.plan.writer import _flag_repeated_headlines, pick_patterns, write_slides
 from deckforge.provider.base import LLMProvider
 
 
@@ -98,6 +98,55 @@ def test_write_slides_falls_back_on_network_error(PROFILE):
     deck = write_slides(outline, [], PROFILE, llm=llm)
     assert validate_deck_spec(deck) == []
     assert all(s.findings for s in deck.slides)
+
+
+# ---------------------------------------------------------------------------
+# _flag_repeated_headlines
+# ---------------------------------------------------------------------------
+
+
+def test_flag_repeated_headlines_catches_the_same_number_stated_differently():
+    """Task 13, дефект отчёта задачи №3 (важное, ручная проверка ЛЦТ2026):
+    в реально собранной колоде слайды 2 и 4 несли один и тот же факт
+    другими словами — "98,5% ожидания устранимы: пилот подтвердил
+    эффективность, готов план раскатки" и "98,5% времени заявка находится
+    в ожидании, а не обрабатывается" — разный падеж ("ожидания"/
+    "ожидании"), разный порядок слов, и буквального пересечения ЗНАЧИМЫХ
+    слов нет вовсе (доля 0.0 — "ожидания" != "ожидании" посимвольно) — старый
+    бэкстоп (только пересечение целых слов) эту пару пропускал. Индексы
+    здесь НЕ соседние (0 и 3, между ними два других слайда) — бэкстоп
+    обязан сравнивать ВСЮ колоду, не только соседей (бриф задачи).
+    Общая цифра "98,5%" — сильный сигнал того же факта (бриф: "числа в
+    заголовке — хороший признак, одна и та же цифра в двух заголовках
+    почти всегда означает повтор")."""
+    slides = [
+        SlideSpec(
+            index=0, kind="bullets",
+            headline="98,5% ожидания устранимы: пилот подтвердил эффективность, готов план раскатки",
+        ),
+        SlideSpec(index=1, kind="bullets", headline="Команда и бюджет"),
+        SlideSpec(index=2, kind="bullets", headline="Обучение сотрудников"),
+        SlideSpec(
+            index=3, kind="bullets",
+            headline="98,5% времени заявка находится в ожидании, а не обрабатывается.",
+        ),
+    ]
+    _flag_repeated_headlines(slides)
+    assert any("слайд 3" in f for f in slides[0].findings), slides[0].findings
+
+
+def test_flag_repeated_headlines_does_not_fire_on_unrelated_headlines_with_incidental_numbers():
+    """Общая цифра — сильный, но не единственный сигнал: две головы,
+    делящие короткое случайное число (например, год "2026" в обеих) без
+    единого общего значимого слова, не обязаны считаться повтором — иначе
+    находка станет бесполезным шумом на любой реальной колоде (обе несут
+    "2026" в контексте сроков/дат)."""
+    slides = [
+        SlideSpec(index=0, kind="bullets", headline="Команда — 2 человека на доработку правил закупок"),
+        SlideSpec(index=1, kind="bullets", headline="Раскатка завершится в 2026 году"),
+    ]
+    _flag_repeated_headlines(slides)
+    assert slides[0].findings == []
 
 
 # ---------------------------------------------------------------------------
