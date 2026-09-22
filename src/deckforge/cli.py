@@ -26,7 +26,7 @@ from deckforge.compose.builder import build_deck
 from deckforge.plan.outline import build_outline, load_content_pack
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
@@ -92,6 +92,16 @@ def _writer_max_workers() -> int:
         return Settings.load(APP_YAML_PATH).llm.slide_writer_max_workers
     except Exception:
         return DEFAULT_WRITER_MAX_WORKERS
+
+
+def _writer_agent_max_steps() -> int:
+    """Task 19 — тот же приём, что и `_writer_max_workers` выше: бюджет
+    сетевых кругов агентного цикла (`config/app.yaml`, `llm.slide_writer_
+    agent_max_steps`), запасной дефолт модуля без читаемого конфига."""
+    try:
+        return Settings.load(APP_YAML_PATH).llm.slide_writer_agent_max_steps
+    except Exception:
+        return AGENT_MAX_STEPS_DEFAULT
 
 
 def _cmd_parse(args: argparse.Namespace) -> int:
@@ -160,7 +170,10 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     # последовательное написание было девяноста процентами времени всей
     # генерации (живой замер, docstring `write_slides`/`task-12-report.md`).
     writer_max_workers = args.writer_max_workers if args.writer_max_workers is not None else _writer_max_workers()
-    deck = write_slides(outline, sources, profile, writer_llm, max_workers=writer_max_workers)
+    deck = write_slides(
+        outline, sources, profile, writer_llm,
+        max_workers=writer_max_workers, agent_max_steps=_writer_agent_max_steps(),
+    )
     written_at = time.monotonic()
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
 

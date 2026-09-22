@@ -25,9 +25,12 @@ def test_generate_passes_writer_max_workers_override_to_write_slides(monkeypatch
     captured = {}
     real_write_slides = cli_module.write_slides
 
-    def _spy(outline, sources, profile, llm, *, max_workers):
+    def _spy(outline, sources, profile, llm, *, max_workers, agent_max_steps=None):
         captured["max_workers"] = max_workers
-        return real_write_slides(outline, sources, profile, llm, max_workers=max_workers)
+        kwargs = {"max_workers": max_workers}
+        if agent_max_steps is not None:
+            kwargs["agent_max_steps"] = agent_max_steps
+        return real_write_slides(outline, sources, profile, llm, **kwargs)
 
     monkeypatch.setattr(cli_module, "write_slides", _spy)
     out_dir = tmp_path / "decks"

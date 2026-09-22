@@ -109,6 +109,99 @@ def test_write_slides_falls_back_on_network_error(PROFILE):
 
 
 # ---------------------------------------------------------------------------
+# Task 19: агентный цикл — модель пишет, при необходимости зовёт инструменты
+# (measure_fit/check_number), видит результат и переписывает, бюджет два
+# сетевых круга на слайд.
+# ---------------------------------------------------------------------------
+
+
+def _one_slide_outline() -> Outline:
+    return Outline(slides=[OutlineSlide(kind="problem", intent="Слайд", needs=[])], title="Т", language="ru")
+
+
+class _ToolThenFinalLLM(LLMProvider):
+    """Первый ответ — вызов `measure_fit` инструмента с заведомо огромным
+    текстом; второй (после результата инструмента) — короткий финальный
+    слайд. Считает вызовы, чтобы тест мог проверить ТОЧНЫЙ бюджет сетевых
+    кругов (бриф Task 19: "Цикл ограничен двумя шагами")."""
+
+    def __init__(self):
+        self.calls = 0
+        self.seen_tool_results: list[dict] = []
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        self.calls += 1
+        if self.calls == 1:
+            return json.dumps({
+                "tool_calls": [
+                    {"tool": "measure_fit", "args": {"role": "headline", "text": "Очень длинный текст. " * 60}},
+                ],
+            }, ensure_ascii=False)
+        # Второй шаг: код обязан был прислать результат инструмента отдельным
+        # user-сообщением (см. `_write_with_agent_loop`) — запоминаем его,
+        # чтобы тест ниже мог проверить, что модель РЕАЛЬНО увидела ответ
+        # инструмента, а не просто была вызвана дважды подряд вслепую.
+        self.seen_tool_results.append(json.loads(messages[-1]["content"]))
+        return _valid_slide_json("Короткий заголовок")
+
+
+def test_write_slides_agent_loop_calls_measure_fit_then_rewrites_shorter(PROFILE):
+    llm = _ToolThenFinalLLM()
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1)
+
+    assert llm.calls == 2, "должно было хватить одного вызова инструмента и одного финального шага"
+    assert deck.slides[0].headline == "Короткий заголовок"
+    assert validate_deck_spec(deck) == []
+    tool_results = llm.seen_tool_results[0]["tool_results"]
+    assert tool_results[0]["tool"] == "measure_fit"
+    assert tool_results[0]["result"]["fits"] is False, "инструмент обязан был честно сказать, что текст не влез"
+
+
+class _StubbornToolCallingLLM(LLMProvider):
+    """Каждый ответ — вызов инструмента, даже на последнем разрешённом
+    шаге: код обязан остановиться на бюджете, а не звать модель без конца
+    или бросить исключение."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        self.calls += 1
+        return json.dumps({"tool_calls": [{"tool": "check_number", "args": {"query": "1"}}]}, ensure_ascii=False)
+
+
+def test_write_slides_agent_loop_stops_at_the_step_budget_and_falls_back(PROFILE):
+    llm = _StubbornToolCallingLLM()
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, agent_max_steps=2)
+
+    assert llm.calls == 2, "бюджет — ровно два сетевых круга, не больше и не меньше"
+    assert deck.slides[0].findings, "не уложилась — обязан остаться запасной вариант с честной пометкой"
+    assert validate_deck_spec(deck) == []
+
+
+def test_write_slides_agent_loop_costs_one_call_when_the_model_is_confident_upfront(PROFILE):
+    """Слайд, написанный уверенно с первого раза (без вызова инструмента),
+    по-прежнему стоит ОДИН сетевой вызов — цикл не должен удорожать уже
+    хороший случай (бриф Task 19, "агент с двумя шагами может удвоить
+    [время]" — но только там, где инструмент реально понадобился)."""
+    llm = _QueueLLM([_valid_slide_json("Заголовок")])
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1)
+    assert deck.slides[0].headline == "Заголовок"
+    assert not llm._responses, "остался неиспользованный заготовленный ответ — было больше одного вызова"
+
+
+def test_write_slides_agent_loop_respects_a_configured_step_budget_of_one(PROFILE):
+    """`agent_max_steps=1` — тот же путь, что и до Task 19 (цикл выключен
+    конфигом): даже если модель отвечает вызовом инструмента, первый шаг уже
+    последний — код обязан потребовать финальный ответ сразу, не звать
+    модель второй раз."""
+    llm = _StubbornToolCallingLLM()
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, agent_max_steps=1)
+    assert llm.calls == 1
+    assert deck.slides[0].findings
+
+
+# ---------------------------------------------------------------------------
 # Параллельность write_slides (это задача: слайды пишутся по очереди — 23с
 # на слайд, слайды друг от друга не зависят, писать нужно параллельно).
 # ---------------------------------------------------------------------------

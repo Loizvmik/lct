@@ -24,6 +24,27 @@
   pattern` использует геометрически точнее — здесь, в `plan/`, доступны
   только числа `Capacity`, не координаты `Box`, тем самым план по-прежнему
   не знает ни одной координаты).
+
+Task 19: `write_slides` — теперь настоящий агентный цикл, не одиночный
+вызов. Модель пишет текст вслепую, не зная, влезет ли он в слот выбранной
+раскладки, — самая частая находка аудита ("текст не помещается в свою
+рамку", 13 из 33 находок на контрольном прогоне брифа). `_write_with_agent_
+loop` даёт модели два инструмента (`_run_tool_call`, диспетчер): `measure_
+fit` — реальный замер текста в слоте раскладки (ОБЯЗАТЕЛЬНО через `compose.
+textfit.measure` внутри `compose.fit_check.measure_fit` — единственный
+замер текста в проекте, см. её докстроку, план по-прежнему не трогает
+`Box`/координаты сам, только пересылает текст+роль и получает обратно
+плоские числа) и `check_number` — водится ли число/факт в исходных
+материалах слайда (`plan.factcheck.check_number_in_sources`, чистые строки,
+без сети). Модель может вызвать инструменты (JSON-конверт `{"tool_calls":
+[...]}`), увидеть результат и переписать текст короче — цикл, где модель
+видит последствия своего действия и поправляется, а не просто "отправили,
+получили ответ, код проверил". Ограничен `AGENT_MAX_STEPS_DEFAULT`
+(`config/app.yaml`, `llm.slide_writer_agent_max_steps`) сетевыми кругами:
+на последнем разрешённом шаге код требует финальный ответ и, если текст
+всё равно не уложился, принимает его как есть — находка остаётся аудиту
+(та же честная деградация "модель предлагает, код не блокирует колоду",
+что и везде в проекте), а не бесконечный цикл дожимания.
 """
 from __future__ import annotations
 import json
@@ -33,6 +54,8 @@ from pathlib import Path
 
 import yaml
 
+from deckforge.compose.fit_check import measure_fit
+from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
     SLIDE_KINDS, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems,
@@ -69,6 +92,20 @@ PICKER_MAX_TOKENS = 2048
 # (`_PER_SLIDE_MAX_TOKENS`/`ThreadPoolExecutor(max_workers=4)`, тот же
 # провайдер, тот же класс нагрузки), не гадание с нуля.
 DEFAULT_WRITER_MAX_WORKERS = 4
+
+# Task 19: сколько сетевых кругов агентного цикла разрешено ОДНОМУ слайду
+# (см. докстроку модуля) — число из `config/app.yaml` (`llm.slide_writer_
+# agent_max_steps`), это здесь только запасной дефолт, тот же приём, что и
+# у `DEFAULT_WRITER_MAX_WORKERS` выше. 2 — буквально то, что просит бриф
+# задачи ("Цикл ограничен двумя шагами. Написала, проверила, при
+# необходимости переписала короче."): шаг 1 — модель пишет и, если хочет,
+# зовёт инструменты (`measure_fit`/`check_number`) в том же шаге; шаг 2 —
+# последний, код требует финальный ответ независимо от того, влез текст или
+# нет ("не уложилась — отдаёт что есть, находка остаётся аудиту"). Слайд,
+# который модель написала уверенно с первого раза (без вызова инструмента),
+# по-прежнему стоит ОДИН сетевой вызов — цикл не удорожает уже хороший
+# случай, только даёт модели путь исправиться в плохом.
+AGENT_MAX_STEPS_DEFAULT = 2
 
 # Запасная вместимость для `kind`, которого нет вовсе ни в одном паттерне
 # профиля (шаблон бедный, или тестовая синтетика) — round-number, того же
@@ -243,6 +280,133 @@ _SLIDE_SCHEMA = {
 }
 
 
+# Task 19 — конверт вызова инструмента, которым модель может ответить
+# ВМЕСТО финального слайда на любом шаге, кроме последнего (см. `_AGENT_
+# TURN_SCHEMA`/`_write_with_agent_loop`). Список, не одиночный вызов —
+# модель может захотеть проверить и заголовок, и цифру в одном шаге, а
+# бюджет сетевых кругов (`AGENT_MAX_STEPS_DEFAULT`) считает именно КРУГИ,
+# не отдельные вызовы инструментов внутри круга (оба инструмента —
+# локальные вычисления, не сеть, батч из нескольких вызовов в одном шаге
+# ничего не стоит по времени сверх самого шага).
+_TOOL_CALL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "tool_calls": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "tool": {"type": "string", "enum": ["measure_fit", "check_number"]},
+                    "args": {"type": "object"},
+                },
+                "required": ["tool", "args"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["tool_calls"],
+    "additionalProperties": False,
+}
+
+# Схема НЕ последнего шага цикла: модель вправе ответить либо вызовом
+# инструмента, либо сразу финальным слайдом (если уверена без проверки) —
+# `oneOf`, не приоритет одного варианта над другим (докстрока `provider.
+# yandex.YandexProvider.complete`: `schema` здесь — только текстовая
+# подсказка модели в system-сообщении, не строгий JSON Schema-режим API,
+# так что `oneOf` читает модель, не валидатор).
+_AGENT_TURN_SCHEMA = {"oneOf": [_TOOL_CALL_SCHEMA, _SLIDE_SCHEMA]}
+
+
+def _run_tool_call(call: dict, profile, desired_kind: str, source_text: str) -> dict:
+    """Диспетчер двух инструментов агентного цикла (см. докстроку модуля).
+    Никогда не бросает исключение наружу — невалидный/неизвестный вызов
+    (модель перепутала имя инструмента или прислала не те аргументы)
+    возвращает объект с `error`, который уходит обратно модели тем же
+    путём, что и настоящий результат: она видит свою ошибку и может
+    попробовать снова на следующем шаге, вместо того чтобы уронить весь
+    цикл написания этого слайда."""
+    if not isinstance(call, dict):
+        return {"error": "вызов инструмента должен быть объектом {tool, args}"}
+    name = call.get("tool")
+    args = call.get("args") if isinstance(call.get("args"), dict) else {}
+    try:
+        if name == "measure_fit":
+            return measure_fit(str(args.get("text", "")), str(args.get("role", "")), profile, desired_kind)
+        if name == "check_number":
+            return check_number_in_sources(str(args.get("query", "")), source_text)
+    except Exception as exc:  # инструмент не должен ронять весь цикл написания слайда
+        return {"error": f"инструмент {name!r} упал: {exc}"}
+    return {"error": f"неизвестный инструмент {name!r}, доступны: measure_fit, check_number"}
+
+
+def _write_with_agent_loop(
+    prompt_body: str, payload: dict, index: int, llm: LLMProvider, profile, desired_kind: str,
+    source_text: str, *, max_steps: int,
+) -> SlideSpec | None:
+    """Task 19: агентный цикл письма ОДНОГО слайда, бюджет `max_steps`
+    сетевых кругов (см. `AGENT_MAX_STEPS_DEFAULT`). Заменяет первый вызов
+    `_ask_slide_writer` в `_write_one_slide` — последующий один шанс
+    исправить СТРУКТУРНО невалидный ответ (`slide_spec_problems`) остаётся
+    снаружи, в `_write_one_slide`, без изменений: это разные заботы (там —
+    "ответ вообще разбирается по схеме", здесь — "текст физически влезает и
+    цифры не выдуманы").
+
+    На каждом шаге, кроме последнего, модель вольна ответить вызовом
+    инструмента (`{"tool_calls": [...]}`) вместо финального слайда — код
+    выполняет все вызовы этого шага, добавляет их результаты отдельным
+    user-сообщением и переходит к следующему шагу. Любой другой валидный
+    JSON-объект (без `tool_calls`) трактуется как попытка финального
+    ответа — цикл завершается ЭТИМ шагом, даже если `max_steps` ещё не
+    исчерпан: слайд, написанный уверенно с первого раза, не должен стоить
+    больше одного сетевого вызова.
+
+    На последнем разрешённом шаге инструменты уже недоступны (`is_final_
+    step`) — код прямо просит модель ответить финальным слайдом, и ЛЮБОЙ
+    ответ на этом шаге, включая случайный `tool_calls`, парсится как
+    попытка слайда (и, скорее всего, провалится валидацией схемы —
+    `slide_spec_from_dict` подберёт это как обычную ошибку разбора, тот же
+    путь, что и раньше у любого невалидного ответа)."""
+    conversation: list[dict] = []
+    for step in range(1, max(1, max_steps) + 1):
+        is_final_step = step >= max_steps
+        turn_payload = dict(payload)
+        if is_final_step and max_steps > 1:
+            turn_payload["_agent_step"] = "final — ответь ТОЛЬКО финальным JSON слайда, вызовы инструментов больше недоступны"
+        messages = [
+            {"role": "system", "content": prompt_body},
+            {"role": "user", "content": json.dumps(turn_payload, ensure_ascii=False)},
+            *conversation,
+        ]
+        schema = _SLIDE_SCHEMA if is_final_step else _AGENT_TURN_SCHEMA
+        try:
+            raw = llm.complete(messages, schema=schema, max_tokens=WRITER_MAX_TOKENS)
+            data = json.loads(raw)
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+
+        tool_calls = data.get("tool_calls")
+        if not is_final_step and isinstance(tool_calls, list) and tool_calls:
+            results = [
+                {"tool": call.get("tool") if isinstance(call, dict) else None,
+                 "args": call.get("args") if isinstance(call, dict) else None,
+                 "result": _run_tool_call(call, profile, desired_kind, source_text)}
+                for call in tool_calls
+            ]
+            conversation.append({"role": "assistant", "content": raw})
+            conversation.append(
+                {"role": "user", "content": json.dumps({"tool_results": results}, ensure_ascii=False)}
+            )
+            continue
+
+        try:
+            return slide_spec_from_dict(data, index)
+        except Exception:
+            return None
+    return None
+
+
 def _ask_slide_writer(prompt_body: str, payload: dict, index: int, llm: LLMProvider, *, repair: list[str] | None = None) -> SlideSpec | None:
     user_payload = dict(payload)
     if repair:
@@ -262,6 +426,7 @@ def _ask_slide_writer(prompt_body: str, payload: dict, index: int, llm: LLMProvi
 
 def _write_one_slide(
     index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
+    *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
 ) -> SlideSpec:
     """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
     чтобы её можно было независимо запускать в пуле потоков (слайды друг от
@@ -290,7 +455,14 @@ def _write_one_slide(
 
     slide: SlideSpec | None = None
     if llm is not None:
-        slide = _ask_slide_writer(prompt_body, payload, index, llm)
+        # Task 19: первый шанс — агентный цикл (пишет, при необходимости
+        # меряет текст/сверяет цифры инструментами, переписывает), не
+        # одиночный вызов. Репарация СТРУКТУРНОЙ невалидности ниже — та же,
+        # что была всегда, отдельная забота (см. докстроку `_write_with_
+        # agent_loop`).
+        slide = _write_with_agent_loop(
+            prompt_body, payload, index, llm, profile, desired_kind, source_text, max_steps=agent_max_steps,
+        )
         if slide is not None:
             problems = slide_spec_problems(slide)
             if problems:
@@ -309,7 +481,7 @@ def _write_one_slide(
 
 def write_slides(
     outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None,
-    *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS,
+    *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
 ) -> DeckSpec:
     """Пишет текст всех слайдов ПАРАЛЛЕЛЬНО (см. `DEFAULT_WRITER_MAX_
     WORKERS` — до `max_workers` одновременных вызовов модели), не по
@@ -335,7 +507,10 @@ def write_slides(
     slides: list[SlideSpec | None] = [None] * total
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures = {
-            pool.submit(_write_one_slide, index, item, profile, prompt_body, source_text, total, llm): index
+            pool.submit(
+                _write_one_slide, index, item, profile, prompt_body, source_text, total, llm,
+                agent_max_steps=agent_max_steps,
+            ): index
             for index, item in enumerate(outline.slides)
         }
         for future in as_completed(futures):

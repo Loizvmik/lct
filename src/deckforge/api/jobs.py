@@ -36,7 +36,7 @@ from deckforge.export.bundle import export_bundle
 from deckforge.plan.outline import SourceDoc, build_outline
 from deckforge.plan.spec import DeckSpec
 from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
@@ -85,6 +85,16 @@ def _writer_max_workers() -> int:
         return Settings.load(APP_YAML_PATH).llm.slide_writer_max_workers
     except Exception:
         return DEFAULT_WRITER_MAX_WORKERS
+
+
+def _writer_agent_max_steps() -> int:
+    """Task 19 — тот же приём, что и `_writer_max_workers` выше: бюджет
+    сетевых кругов агентного цикла (`config/app.yaml`, `llm.slide_writer_
+    agent_max_steps`), запасной дефолт модуля без читаемого конфига."""
+    try:
+        return Settings.load(APP_YAML_PATH).llm.slide_writer_agent_max_steps
+    except Exception:
+        return AGENT_MAX_STEPS_DEFAULT
 
 
 def _artifacts_root() -> Path:
@@ -271,7 +281,8 @@ async def _run_job(
         job.enter_stage("write")
         writer_llm = _build_role_provider("writer")
         deck = await asyncio.to_thread(
-            write_slides, outline, source_docs, profile, writer_llm, max_workers=_writer_max_workers(),
+            write_slides, outline, source_docs, profile, writer_llm,
+            max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
         )
 
         job.enter_stage("compose")
