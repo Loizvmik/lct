@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import pytest
 
-from deckforge.compose.blocks import assign_content, expand_decor, expand_repeat
+from deckforge.compose.blocks import (
+    assign_content, assign_content_with_drops, expand_decor, expand_repeat, filled_repeat_units,
+)
 from deckforge.ooxml.geometry import Box
-from deckforge.plan.spec import Kpi, KpiBlock, SlideSpec
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, Kpi, KpiBlock, SlideSpec, TextBlock
 from deckforge.template.grid import Grid
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
 
@@ -216,3 +218,232 @@ def test_kpi_pairing_is_unaffected_when_labels_are_plentiful():
     assert len([c for c in result if c.role_hint == "kpi_value"]) == 2
     assert len([c for c in result if c.role_hint == "kpi_label"]) == 2
     assert not [c for c in result if c.role_hint == "bullets"]
+
+
+# ---------------------------------------------------------------------------
+# Содержание, которому не нашлось слота, не исчезает молча (Task 23,
+# находка ручной проверки: подзаголовок "Рост доведения до 57%, стоимость
+# выпускника −44%" был в плане, не попал ни в один слот раскладки и нигде
+# не был упомянут — ни находки, ни строки в отчёте).
+# ---------------------------------------------------------------------------
+
+
+def _headline_only_pattern() -> Pattern:
+    """Раскладка с единственным слотом — под заголовок: ни `subhead`, ни
+    `caption`, ни `source` (ровно то, что несёт `two_col`-раскладка
+    контрольного ЛЦТ2026, куда не лёг подзаголовок с цифрами из брифа)."""
+    headline = PatternSlot(
+        role="headline", box=Box(0.05, 0.05, 0.9, 0.1), size_pt=32.0, color_hex=None,
+        align="l", max_chars=120, wraps=True,
+    )
+    return Pattern(
+        pattern_id="headline-only", source_slide_index=[0], layout_id="L", kind="two_col",
+        slots=[headline], repeat=None, decor=[],
+        capacity=Capacity(max_items=0, max_chars_per_item=120, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,
+    )
+
+
+def _three_card_pattern(with_card_title: bool = False) -> Pattern:
+    """Раскладка на три карточки с плашкой под каждой — слепок
+    `slide24` контрольного ЛЦТ2026 (три белых прямоугольника
+    `repeat_group=True` и три слота `card_body` под ними)."""
+    slots = [PatternSlot(
+        role="headline", box=Box(0.05, 0.05, 0.9, 0.1), size_pt=32.0, color_hex=None,
+        align="l", max_chars=120, wraps=True,
+    )]
+    for i in range(3):
+        slots.append(PatternSlot(
+            role="card_body", box=Box(0.05 + i * 0.32, 0.48, 0.27, 0.34), size_pt=14.0, color_hex=None,
+            align="l", max_chars=200, wraps=True,
+        ))
+        if with_card_title:
+            slots.append(PatternSlot(
+                role="card_title", box=Box(0.05 + i * 0.32, 0.44, 0.27, 0.04), size_pt=18.0, color_hex=None,
+                align="l", max_chars=60, wraps=False,
+            ))
+    plaques = [
+        DecorShape(
+            kind="shape", box=Box(0.035 + i * 0.32, 0.44, 0.31, 0.53), rotation=0.0, flip_h=False,
+            flip_v=False, fill_hex="#FFFFFF", has_fill=True, fill_kind="solid",
+            repeat_group=True, repeat_index=i,
+        )
+        for i in range(3)
+    ]
+    return Pattern(
+        pattern_id="three-cards", source_slide_index=[0], layout_id="L", kind="cards",
+        slots=slots, repeat=RepeatSpec(axis="x", count=3, step=0.32, slot_roles=["card_body"]),
+        decor=plaques,
+        capacity=Capacity(max_items=3, max_chars_per_item=200, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,
+    )
+
+
+def test_subhead_without_a_slot_leaves_an_honest_drop():
+    """Главная находка Task 23: подзаголовок есть в плане, слота под него в
+    раскладке нет — текст на слайд не попадает, и это обязано быть
+    названо, а не проглочено."""
+    slide = SlideSpec(
+        index=0, kind="two_col", headline="Итоги 2026: учебная платформа",
+        subhead="Рост доведения до 57%, стоимость выпускника −44%",
+    )
+    result, drops = assign_content_with_drops(slide, _headline_only_pattern(), _grid())
+
+    assert [c.role_hint for c in result] == ["headline"]
+    assert [d.role for d in drops] == ["subhead"]
+    assert "Рост доведения до 57%" in drops[0].text
+
+
+def test_source_note_without_a_slot_leaves_an_honest_drop():
+    slide = SlideSpec(
+        index=0, kind="two_col", headline="Итоги 2026",
+        source_note="Данные за 2026 г., учебная платформа",
+    )
+    _, drops = assign_content_with_drops(slide, _headline_only_pattern(), _grid())
+    assert [d.role for d in drops] == ["source"]
+    assert "Данные за 2026" in drops[0].text
+
+
+def test_nothing_is_reported_when_there_was_nothing_to_place():
+    """Отчёт не заваливается шумом: у раскладки нет слотов под подзаголовок
+    и сноску, но их нет и в содержании — терять нечего, находки быть не
+    должно."""
+    slide = SlideSpec(index=0, kind="two_col", headline="Итоги 2026")
+    _, drops = assign_content_with_drops(slide, _headline_only_pattern(), _grid())
+    assert drops == []
+
+
+def test_empty_blocks_are_not_reported():
+    """Пустой список пунктов — не потеря содержания, а отсутствие
+    содержания: находки быть не должно."""
+    slide = SlideSpec(index=0, kind="bullets", headline="Итоги 2026", blocks=[BulletBlock(items=[])])
+    _, drops = assign_content_with_drops(slide, _headline_only_pattern(), _grid())
+    assert drops == []
+
+
+def test_bullets_without_a_slot_leave_a_drop_naming_the_text():
+    slide = SlideSpec(
+        index=0, kind="bullets", headline="Где уходит время",
+        blocks=[BulletBlock(items=["Ожидание первого согласующего — 18 часов", "Чистая работа — 28 минут"])],
+    )
+    _, drops = assign_content_with_drops(slide, _headline_only_pattern(), _grid())
+    assert [d.role for d in drops] == ["bullets"]
+    assert "Ожидание первого согласующего" in drops[0].text
+
+
+def test_card_titles_without_a_slot_leave_a_drop_while_bodies_are_placed():
+    """У раскладки есть слот под текст карточки, но нет под её заголовок:
+    тексты ложатся как раньше, а заголовки — названы потерянными."""
+    slide = SlideSpec(
+        index=0, kind="cards", headline="Что меняем",
+        blocks=[CardBlock(items=[
+            Card(title="Доведение", body="57% вместо 41%"),
+            Card(title="Стоимость", body="−44% на выпускника"),
+        ])],
+    )
+    result, drops = assign_content_with_drops(slide, _three_card_pattern(), _grid())
+
+    assert len([c for c in result if c.role_hint == "card_body"]) == 2
+    assert [d.role for d in drops] == ["card_title"]
+    assert "Доведение" in drops[0].text and "Стоимость" in drops[0].text
+
+
+def test_cards_on_a_layout_without_a_repeat_leave_a_drop():
+    """Раскладка без повтора вовсе — карточки класть некуда ни одну."""
+    slide = SlideSpec(
+        index=0, kind="cards", headline="Что меняем",
+        blocks=[CardBlock(items=[Card(title="Доведение", body="57% вместо 41%")])],
+    )
+    result, drops = assign_content_with_drops(slide, _headline_only_pattern(), _grid())
+    assert [c.role_hint for c in result] == ["headline"]
+    assert [d.role for d in drops] == ["cards"]
+    assert "Доведение" in drops[0].text
+
+
+def test_kpi_without_any_slot_leaves_a_drop():
+    """Ни kpi-слотов, ни текстового запасного — метрики (цифры, ради
+    которых слайд и делался) теряются целиком, и это обязано быть
+    названо."""
+    slide = SlideSpec(
+        index=0, kind="kpi", headline="Итоги",
+        blocks=[KpiBlock(items=[Kpi(value="-80%", label="сквозное время")])],
+    )
+    _, drops = assign_content_with_drops(slide, _headline_only_pattern(), _grid())
+    assert [d.role for d in drops] == ["kpi"]
+    assert "-80%" in drops[0].text and "сквозное время" in drops[0].text
+
+
+def test_assign_content_keeps_its_old_signature_for_ranking():
+    """`builder.fits` (ранжирование кандидатов) зовёт `assign_content` без
+    находок — укладка обязана быть той же самой, что и у версии с
+    находками."""
+    slide = SlideSpec(index=0, kind="two_col", headline="Итоги 2026", subhead="Подробности")
+    pattern = _headline_only_pattern()
+    plain = assign_content(slide, pattern, _grid())
+    detailed, _ = assign_content_with_drops(slide, pattern, _grid())
+    assert [c.role_hint for c in plain] == [c.role_hint for c in detailed]
+
+
+# ---------------------------------------------------------------------------
+# Плашка группы повтора, под которой пусто, не рисуется (Task 23, находка
+# №2: три белых прямоугольника 4×4 дюйма на слайде с одним заголовком).
+# ---------------------------------------------------------------------------
+
+
+def test_repeat_plaques_are_not_drawn_when_nothing_landed_in_their_slots():
+    """Слайду с одним заголовком досталась раскладка на три карточки:
+    текста в карточках нет ни в одной — ни одна плашка не рисуется."""
+    pattern = _three_card_pattern()
+    slide = SlideSpec(index=0, kind="two_col", headline="Итоги 2026: учебная платформа")
+    contents, _ = assign_content_with_drops(slide, pattern, _grid())
+
+    result = expand_decor(pattern, None, _grid(), filled_repeat_units(pattern, contents))
+    assert result == []
+
+
+def test_a_plaque_under_a_filled_slot_stays():
+    """Слот повтора достался обычному текстовому блоку (слоты повтора не
+    зарезервированы, когда на слайде нет `CardBlock`) — плашка под ним
+    заполнена и обязана остаться; пустые соседки — нет."""
+    pattern = _three_card_pattern()
+    slide = SlideSpec(
+        index=0, kind="two_col", headline="Итоги 2026",
+        blocks=[TextBlock(text="Доведение выросло с 41% до 57%.")],
+    )
+    contents, _ = assign_content_with_drops(slide, pattern, _grid())
+    filled = filled_repeat_units(pattern, contents)
+    assert len(filled) == 1, "текстовый блок обязан занять ровно одну единицу повтора"
+
+    result = expand_decor(pattern, None, _grid(), filled)
+    assert [d.repeat_index for d in result] == sorted(filled)
+
+
+def test_decor_outside_the_repeat_group_survives_when_empty_plaques_go():
+    """Фон слайда/рамка/логотип (`repeat_group=False`) остаются на месте,
+    даже когда все плашки повтора убраны как пустые."""
+    background = DecorShape(
+        kind="shape", box=Box(0.0, 0.0, 1.0, 1.0), rotation=0.0, flip_h=False, flip_v=False,
+        fill_hex="#2B0B4B", has_fill=True, fill_kind="solid", repeat_group=False,
+    )
+    pattern = _three_card_pattern()
+    pattern = Pattern(**{**pattern.__dict__, "decor": [background, *pattern.decor]})
+
+    result = expand_decor(pattern, None, _grid(), set())
+    assert result == [background]
+
+
+def test_plaques_are_kept_as_mined_when_units_cannot_be_matched_one_to_one():
+    """Единиц декора шесть, единиц текстовых слотов одна — номера
+    сопоставить нечем, выдумывать соответствие нельзя: раз содержание
+    куда-то легло, весь декор остаётся как намайнен."""
+    pattern = _six_card_pattern()
+    result = expand_decor(pattern, None, _grid(), {0})
+    assert len(result) == len(pattern.decor)
+
+
+def test_plaques_all_go_when_units_cannot_be_matched_and_nothing_landed():
+    """Тот же случай несопоставимых единиц, но не легло НИЧЕГО — все
+    плашки группы повтора пустые, ни одна не рисуется."""
+    pattern = _six_card_pattern()
+    result = expand_decor(pattern, None, _grid(), set())
+    assert result == []

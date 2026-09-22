@@ -41,36 +41,127 @@ class SlotContent:
     paragraphs: list[Paragraph] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class DroppedContent:
+    """Кусок содержания плана, которому в ЭТОЙ раскладке не нашлось слота
+    подходящей роли, — он не попадёт на слайд вовсе.
+
+    Само по себе это не ошибка сборки (раскладка честно может не нести
+    слот под подзаголовок или сноску, и слайд всё равно собирается), но
+    МОЛЧАНИЕМ это быть не должно: расхождение между тем, что написала
+    модель, и тем, что оказалось в файле, обязана называть наша же
+    проверка качества, а не глаз человека, сверяющего .json с .pptx.
+    Раньше (до этой правки) такой текст исчезал бесследно — ни находки,
+    ни строки в отчёте (живой прогон контрольного шаблона: подзаголовок
+    "Рост доведения до 57%, стоимость выпускника −44%" с цифрами из брифа
+    не попал ни в один слот раскладки `two_col` и нигде не был упомянут).
+
+    `role` — роль содержания в терминах `ROLES`/`role_hint` ("subhead",
+    "source", "card_title", ...), `text` — что именно потерялось (первых
+    слов достаточно, чтобы человек нашёл это место в плане).
+
+    Собирает их `assign_content_with_drops`, превращает в находки
+    `slide_spec.findings` — `builder.place_slide`, ЕДИНСТВЕННОЕ место
+    реальной укладки: `assign_content` зовётся и для РАНЖИРОВАНИЯ
+    кандидатов (`builder.fits`), там находки писать не во что и незачем —
+    раскладка ещё не выбрана."""
+    role: str
+    text: str
+
+
+# Человеческие названия ролей для находки — рядом с самими ролями, а не в
+# `builder.py`: кто заводит роль, тот и отвечает за то, как она называется
+# в отчёте, который читает человек.
+DROPPED_ROLE_TITLES: dict[str, str] = {
+    "headline": "заголовок",
+    "subhead": "подзаголовок",
+    "source": "сноска об источнике",
+    "body": "текстовый блок",
+    "bullets": "список",
+    "quote": "цитата",
+    "quote_author": "автор цитаты",
+    "cards": "карточки",
+    "card_title": "заголовки карточек",
+    "card_body": "тексты карточек",
+    "kpi": "метрики",
+}
+
+# Сколько знаков потерянного текста показывать в находке: достаточно,
+# чтобы человек узнал фразу и нашёл её в плане, и мало, чтобы отчёт
+# остался читаемым (абзац карточки бывает длиннее самой находки).
+_DROPPED_EXCERPT_CHARS = 60
+
+
+def _excerpt(text: str) -> str:
+    flat = " ".join(text.split())
+    if len(flat) <= _DROPPED_EXCERPT_CHARS:
+        return flat
+    return flat[:_DROPPED_EXCERPT_CHARS].rstrip() + "…"
+
+
+def _drop(drops: list[DroppedContent], role: str, *parts: str) -> None:
+    """Запоминает потерю — ТОЛЬКО если терять было что: у блока может
+    честно не быть содержания (пустой список карточек, метрика без
+    подписи), и находка о пустоте — шум, а не находка."""
+    text = "; ".join(p.strip() for p in parts if p and p.strip())
+    if text:
+        drops.append(DroppedContent(role, _excerpt(text)))
+
+
 # ---------------------------------------------------------------------------
 # Распределение содержания по слотам
 # ---------------------------------------------------------------------------
 
 
 def assign_content(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> list[SlotContent]:
-    """Раскладывает `slide_spec` по слотам `pattern` — контент, для которого
-    в этой раскладке не нашлось подходящего по роли слота, просто не
-    попадает в результат (не ошибка сама по себе: находки о том, что
-    контент НЕ ВЛЕЗ по РАЗМЕРУ, а не по отсутствию слота, пишет
-    `builder.py` при замере — здесь только соответствие ролей)."""
+    """Раскладывает `slide_spec` по слотам `pattern` — см.
+    `assign_content_with_drops`, эта обёртка нужна тем, кому интересна
+    только сама укладка (ранжирование кандидатов `builder.fits`), а не
+    список потерянного."""
+    return assign_content_with_drops(slide_spec, pattern, grid)[0]
+
+
+def assign_content_with_drops(
+    slide_spec: SlideSpec, pattern: Pattern, grid: Grid,
+) -> tuple[list[SlotContent], list[DroppedContent]]:
+    """Раскладывает `slide_spec` по слотам `pattern` и ВТОРЫМ значением
+    возвращает то, что в эту раскладку не поместилось ПО РОЛЯМ: контент,
+    для которого здесь нет подходящего слота, на слайд не попадает (не
+    ошибка сборки сама по себе — слайд собирается как собирался), но и не
+    исчезает молча (см. докстроку `DroppedContent`).
+
+    Находки о том, что контент не влез по РАЗМЕРУ, а не по отсутствию
+    слота, по-прежнему пишет `builder.py` при замере — здесь только
+    соответствие ролей."""
     by_role = _slots_by_role(pattern, slide_spec)
     result: list[SlotContent] = []
+    drops: list[DroppedContent] = []
 
     headline_slot = _take_one(by_role, "headline")
-    if headline_slot is not None and slide_spec.headline:
-        result.append(SlotContent(headline_slot, "headline", [Paragraph(slide_spec.headline)]))
+    if slide_spec.headline:
+        if headline_slot is not None:
+            result.append(SlotContent(headline_slot, "headline", [Paragraph(slide_spec.headline)]))
+        else:
+            _drop(drops, "headline", slide_spec.headline)
 
     subhead_slot = _take_one(by_role, "subhead") or _take_one(by_role, "caption")
-    if subhead_slot is not None and slide_spec.subhead:
-        result.append(SlotContent(subhead_slot, "subhead", [Paragraph(slide_spec.subhead)]))
+    if slide_spec.subhead:
+        if subhead_slot is not None:
+            result.append(SlotContent(subhead_slot, "subhead", [Paragraph(slide_spec.subhead)]))
+        else:
+            _drop(drops, "subhead", slide_spec.subhead)
 
     for block in slide_spec.blocks:
-        result.extend(_assign_block(block, by_role, pattern, grid))
+        result.extend(_assign_block(block, by_role, pattern, grid, drops))
 
     source_slot = _take_one(by_role, "source") or _take_one(by_role, "caption")
-    if source_slot is not None and slide_spec.source_note:
-        result.append(SlotContent(source_slot, "source", [Paragraph(slide_spec.source_note)]))
+    if slide_spec.source_note:
+        if source_slot is not None:
+            result.append(SlotContent(source_slot, "source", [Paragraph(slide_spec.source_note)]))
+        else:
+            _drop(drops, "source", slide_spec.source_note)
 
-    return result
+    return result, drops
 
 
 def _slots_by_role(pattern: Pattern, slide_spec: SlideSpec) -> dict[str, list[PatternSlot]]:
@@ -123,6 +214,7 @@ def _take_one(by_role: dict[str, list[PatternSlot]], role: str) -> PatternSlot |
 
 def _assign_block(
     block: Block, by_role: dict[str, list[PatternSlot]], pattern: Pattern, grid: Grid,
+    drops: list[DroppedContent],
 ) -> list[SlotContent]:
     if isinstance(block, TextBlock):
         # "card_body" — запасной вариант: во многих намайненных "bullets"-
@@ -131,54 +223,85 @@ def _assign_block(
         # `mine_patterns`: "плейсхолдеров в шаблонах почти нет"), это тот же
         # по смыслу связный текст, просто найденный структурно иначе.
         slot = _take_one(by_role, "body") or _take_one(by_role, "card_body")
-        return [SlotContent(slot, "body", [Paragraph(block.text)])] if slot is not None else []
+        if slot is None:
+            _drop(drops, "body", block.text)
+            return []
+        return [SlotContent(slot, "body", [Paragraph(block.text)])]
 
     if isinstance(block, BulletBlock):
         slot = _take_one(by_role, "bullet") or _take_one(by_role, "body") or _take_one(by_role, "card_body")
         if slot is None:
+            _drop(drops, "bullets", *block.items)
             return []
         return [SlotContent(slot, "bullets", [Paragraph(item, bullet=True) for item in block.items])]
 
     if isinstance(block, QuoteBlock):
-        return _assign_quote(block, by_role)
+        return _assign_quote(block, by_role, drops)
 
     if isinstance(block, CardBlock):
-        return _assign_cards(block, pattern, grid)
+        return _assign_cards(block, pattern, grid, drops)
 
     if isinstance(block, KpiBlock):
-        return _assign_kpis(block, by_role)
+        return _assign_kpis(block, by_role, drops)
 
     return []
 
 
-def _assign_quote(block: QuoteBlock, by_role: dict[str, list[PatternSlot]]) -> list[SlotContent]:
+def _assign_quote(
+    block: QuoteBlock, by_role: dict[str, list[PatternSlot]], drops: list[DroppedContent],
+) -> list[SlotContent]:
     slot = _take_one(by_role, "quote") or _take_one(by_role, "body") or _take_one(by_role, "card_body")
     if slot is None:
+        _drop(drops, "quote", block.text, block.author or "")
         return []
     result = [SlotContent(slot, "quote", [Paragraph(block.text)])]
     if block.author:
         author_slot = _take_one(by_role, "caption") or _take_one(by_role, "source")
         if author_slot is not None:
             result.append(SlotContent(author_slot, "quote_author", [Paragraph(f"— {block.author}")]))
+        else:
+            _drop(drops, "quote_author", block.author)
     return result
 
 
 _CARD_BODY_ROLES = ("card_body", "bullet", "body")
 
 
-def _assign_cards(block: CardBlock, pattern: Pattern, grid: Grid) -> list[SlotContent]:
-    if pattern.repeat is None or not block.items:
+def _assign_cards(
+    block: CardBlock, pattern: Pattern, grid: Grid, drops: list[DroppedContent],
+) -> list[SlotContent]:
+    if not block.items:
         return []
-    groups = expand_repeat(pattern, len(block.items), grid)
+    groups = expand_repeat(pattern, len(block.items), grid) if pattern.repeat is not None else []
+    if not groups:
+        # У раскладки нет повтора вовсе (или его слоты не нашлись) — класть
+        # карточки некуда ни одну.
+        _drop(drops, "cards", *(f"{c.title}: {c.body}" if c.title else c.body for c in block.items))
+        return []
     result: list[SlotContent] = []
+    lost_titles: list[str] = []
+    lost_bodies: list[str] = []
     for card, group in zip(block.items, groups):
         body_slot = _pick_body_slot(group)
+        title_placed = False
         for slot in group:
             if slot.role == "card_title":
                 if card.title:
                     result.append(SlotContent(slot, "card_title", [Paragraph(card.title)]))
+                title_placed = True
             elif slot is body_slot:
                 result.append(SlotContent(slot, "card_body", [Paragraph(card.body)]))
+        if card.title and not title_placed:
+            lost_titles.append(card.title)
+        if body_slot is None:
+            lost_bodies.append(card.body)
+    # Карточек больше, чем единиц повтора смогла дать `expand_repeat`, —
+    # хвост не лёг никуда (сегодня `expand_repeat` всегда отдаёт ровно `n`
+    # групп, но на его молчаливое обещание опираться не стоит).
+    for card in block.items[len(groups):]:
+        lost_bodies.append(f"{card.title}: {card.body}" if card.title else card.body)
+    _drop(drops, "card_title", *lost_titles)
+    _drop(drops, "card_body", *lost_bodies)
     return result
 
 
@@ -202,7 +325,9 @@ def _pick_body_slot(group: list[PatternSlot]) -> PatternSlot | None:
     return max(candidates, key=lambda s: s.box.width * s.box.height)
 
 
-def _assign_kpis(block: KpiBlock, by_role: dict[str, list[PatternSlot]]) -> list[SlotContent]:
+def _assign_kpis(
+    block: KpiBlock, by_role: dict[str, list[PatternSlot]], drops: list[DroppedContent],
+) -> list[SlotContent]:
     # Task 13, находка обязательной проверки (визуальный ревью на VK
     # Education): раскладки `kind="kpi"` этого шаблона несут ГРИД метрик
     # (2 строки по 4 столбца) — все `kpi_value`/все `kpi_label` слоты
@@ -279,9 +404,14 @@ def _assign_kpis(block: KpiBlock, by_role: dict[str, list[PatternSlot]]) -> list
     # факт молча и не разрывает пару значение/подпись.
     if fallback_items:
         fallback_slot = _take_one(by_role, "bullet") or _take_one(by_role, "body") or _take_one(by_role, "card_body")
+        lines = [f"{item.value} — {item.label}" if item.label else item.value for item in fallback_items]
         if fallback_slot is not None:
-            lines = [f"{item.value} — {item.label}" if item.label else item.value for item in fallback_items]
             result.append(SlotContent(fallback_slot, "bullets", [Paragraph(line, bullet=True) for line in lines]))
+        else:
+            # Ни kpi-слотов, ни текстового слота под запасной вариант —
+            # метрики (цифры, ради которых слайд и делался) не попадут на
+            # слайд вовсе.
+            _drop(drops, "kpi", *lines)
 
     return result
 
@@ -382,7 +512,50 @@ def _expand_positions(axis: str, item_size: float, n: int, grid: Grid, native_st
     return [margin_lo + i * fallback_step for i in range(n)]
 
 
-def expand_decor(pattern: Pattern, n: int | None, grid: Grid) -> list[DecorShape]:
+def _repeat_unit_coords(pattern: Pattern) -> list[float]:
+    """Координаты единиц повтора вдоль его оси (по возрастанию) — по
+    ТЕКСТОВЫМ слотам повтора, тот же порядок, в котором `DecorShape.
+    repeat_index` нумерует декор той же группы."""
+    repeat = pattern.repeat
+    if repeat is None:
+        return []
+    members = [s for s in pattern.slots if s.role in repeat.slot_roles]
+    coord = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
+    return sorted({round(coord(s.box), 3) for s in members})
+
+
+def filled_repeat_units(pattern: Pattern, contents: list[SlotContent]) -> set[int]:
+    """Номера единиц повтора (нумерация `_repeat_unit_coords`, она же
+    `DecorShape.repeat_index`), в слоты которых на ЭТОМ слайде реально лёг
+    непустой текст.
+
+    Нужна `expand_decor` для случая `n is None` — на слайде нет
+    `CardBlock`, разворачивать повтор не под что, но слоты повтора при
+    этом НЕ зарезервированы (см. `_slots_by_role`) и вполне могут достаться
+    обычному текстовому блоку: плашка под таким слотом заполнена и обязана
+    остаться, а плашка под слотом, которому ничего не досталось, — пустой
+    белый прямоугольник на пол-слайда."""
+    repeat = pattern.repeat
+    if repeat is None:
+        return set()
+    coords = _repeat_unit_coords(pattern)
+    index_of = {c: i for i, c in enumerate(coords)}
+    coord = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
+    filled: set[int] = set()
+    for content in contents:
+        if content.slot.role not in repeat.slot_roles:
+            continue
+        if not any(p.text.strip() for p in content.paragraphs):
+            continue
+        index = index_of.get(round(coord(content.slot.box), 3))
+        if index is not None:
+            filled.add(index)
+    return filled
+
+
+def expand_decor(
+    pattern: Pattern, n: int | None, grid: Grid, filled: set[int] | None = None,
+) -> list[DecorShape]:
     """Разворачивает декор ГРУППЫ ПОВТОРА (`DecorShape.repeat_group`, см.
     `template/patterns.py::_decor_repeat_membership`) под фактическое число
     элементов `n` — ВМЕСТЕ с текстовыми слотами (`expand_repeat`) и ТЕМ ЖЕ
@@ -405,12 +578,26 @@ def expand_decor(pattern: Pattern, n: int | None, grid: Grid) -> list[DecorShape
 
     `n=None` — на слайде нет содержания, которое разворачивает
     `pattern.repeat` (сегодня это только `CardBlock` с непустыми `items`,
-    единственный вызывающий `expand_repeat`, см. `_assign_cards`) — декор
-    остаётся как намайнен, менять его не под что."""
+    единственный вызывающий `expand_repeat`, см. `_assign_cards`): двигать
+    и размножать плашки не под что, их РОДНЫЕ позиции остаются как
+    намайнены — но рисуются только те, под чьим слотом реально есть текст
+    (`filled`, см. `filled_repeat_units`). Слоты повтора в этом случае не
+    зарезервированы (см. `_slots_by_role`) и могут достаться обычному
+    текстовому блоку, поэтому "что легло" считается по факту укладки, а не
+    по наличию `CardBlock`. Находка ручной проверки (контрольный шаблон,
+    слайд "Итоги 2026"): раскладка на три карточки досталась слайду с
+    одним заголовком — три белые плашки 4×4 дюйма заняли больше половины
+    слайда и не несли ни буквы.
+
+    `filled=None` — вызывающий не считал, что куда легло: трогать декор
+    не на каком основании, переносится весь, как намайнен (прежнее
+    поведение)."""
     grouped = [d for d in pattern.decor if d.repeat_group]
     ungrouped = [d for d in pattern.decor if not d.repeat_group]
-    if not grouped or pattern.repeat is None or n is None:
+    if not grouped or pattern.repeat is None:
         return list(pattern.decor)
+    if n is None:
+        return _decor_of_filled_units(pattern, grouped, ungrouped, filled)
     if n <= 0:
         return ungrouped
 
@@ -435,6 +622,31 @@ def expand_decor(pattern: Pattern, n: int | None, grid: Grid) -> list[DecorShape
         for d in template_group:
             result.append(replace(d, box=with_axis(d.box, pos), repeat_index=i))
     return result
+
+
+def _decor_of_filled_units(
+    pattern: Pattern, grouped: list[DecorShape], ungrouped: list[DecorShape], filled: set[int] | None,
+) -> list[DecorShape]:
+    """Декор группы повтора на РОДНЫХ позициях, но только тех единиц, в
+    слоты которых что-то легло (`filled`).
+
+    Единицы декора и единицы текстовых слотов сопоставляются ПО НОМЕРУ (и
+    те и другие пронумерованы по возрастанию координаты вдоль оси повтора)
+    — но только когда их одинаковое количество. Когда количества разошлись
+    (декор мог сгруппироваться иначе, чем текстовые слоты), номера ничего
+    не значат и выдумывать соответствие нельзя: решаем по группе целиком —
+    легло хоть во что-то, оставляем весь декор, не легло никуда, не рисуем
+    ни одной плашки.
+
+    Порядок уцелевшего декора — ИСХОДНЫЙ (фильтр по `pattern.decor`, а не
+    склейка "сначала негрупповой, потом групповой"): порядок декора — это
+    порядок отрисовки, то есть кто под кем лежит."""
+    if filled is None:
+        return list(pattern.decor)
+    unit_count = len({d.repeat_index for d in grouped})
+    if unit_count != len(_repeat_unit_coords(pattern)):
+        return list(pattern.decor) if filled else ungrouped
+    return [d for d in pattern.decor if not d.repeat_group or d.repeat_index in filled]
 
 
 # ---------------------------------------------------------------------------

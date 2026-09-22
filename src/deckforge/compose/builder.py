@@ -27,7 +27,10 @@ from pptx.util import Emu, Pt
 
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import audit_slide_layout
-from deckforge.compose.blocks import Paragraph, SlotContent, assign_content, expand_decor, find_bullet_char
+from deckforge.compose.blocks import (
+    DROPPED_ROLE_TITLES, Paragraph, SlotContent, assign_content, assign_content_with_drops,
+    expand_decor, filled_repeat_units, find_bullet_char,
+)
 from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.decor import apply_decor
 from deckforge.compose.tables import TableSpec, add_table
@@ -215,7 +218,28 @@ def place_slide(
     # раскладка на шесть карточек под два элемента содержания оставляла
     # четыре пустые рамки. Декор вне группы повтора (`expand_decor` не
     # трогает `repeat_group=False`) переносится как и раньше.
-    decor = expand_decor(pattern, _repeat_item_count(slide_spec), grid)
+    #
+    # Укладка считается ДО декора (а не в цикле ниже, как было раньше),
+    # потому что теперь она — вход для декора: плашка группы повтора
+    # рисуется, только если в слот её единицы реально лёг текст
+    # (`filled_repeat_units`). Находка ручной проверки: слайду с одним
+    # заголовком досталась раскладка на три карточки, и три пустые белые
+    # плашки 4×4 дюйма заняли больше половины слайда.
+    contents, drops = assign_content_with_drops(slide_spec, pattern, grid)
+    for drop in drops:
+        # Содержание, которому в этой раскладке не нашлось слота, на слайд
+        # не попадает — это не ошибка сборки (слайд собирается), но и не
+        # повод молчать: расхождение между планом и файлом обязана назвать
+        # наша же проверка, а не глаз человека (см. докстроку
+        # `blocks.DroppedContent`).
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: {DROPPED_ROLE_TITLES.get(drop.role, drop.role)} не попал "
+            f"на слайд — в раскладке {pattern.pattern_id!r} нет слота под эту роль: "
+            f"«{drop.text}»."
+        )
+    decor = expand_decor(
+        pattern, _repeat_item_count(slide_spec), grid, filled_repeat_units(pattern, contents),
+    )
     apply_decor(slide, decor, canvas_width_emu, canvas_height_emu)
     # `_local_background_is_dark` ищет охватывающую плашку декора ПОД
     # слотом (см. её докстроку) — обязана видеть УЖЕ развёрнутые позиции
@@ -239,7 +263,7 @@ def place_slide(
     layout_bg_luminance = layout_entry.background.luminance if layout_entry is not None else None
 
     family = _primary_family(profile)
-    for content in assign_content(slide_spec, pattern, grid):
+    for content in contents:
         # Текст-заглушка — та же проверка, что и аудит I02 (`audit.
         # deterministic._check_I02`, тот же `audit_config.integrity.
         # placeholder_patterns`), но здесь она стоит ДО отрисовки, не после

@@ -974,3 +974,119 @@ def test_count_embedded_photos_matches_by_content_not_by_name(tmp_path):
     user_photos = {"team.jpg": embedded_src, "approver.jpg": not_embedded_src}
     assert count_embedded_photos(out_path, user_photos) == 1
     assert count_embedded_photos(out_path, {}) == 0, "без фотографий контент-пакета — честный ноль, не падение"
+
+
+# ---------------------------------------------------------------------------
+# Task 23, находки ручной проверки контрольного ЛЦТ2026: (1) содержание,
+# которому не нашлось слота, исчезало бесследно; (2) плашки карточек
+# рисовались пустыми на слайде, у которого карточек нет вовсе.
+# ---------------------------------------------------------------------------
+
+_PLAQUE_WIDTH = 0.31
+
+
+def _three_plaque_cards_pattern(pattern_id: str) -> Pattern:
+    """Слепок раскладки `slide24` контрольного ЛЦТ2026: заголовок, три
+    слота `card_body` и три белые плашки-подложки под ними
+    (`repeat_group=True`). Слота под подзаголовок раскладка НЕ несёт —
+    ровно поэтому подзаголовок первого слайда и терялся."""
+    headline = PatternSlot(
+        role="headline", box=Box(0.05, 0.06, 0.9, 0.08), size_pt=28.0, color_hex=None,
+        align="l", max_chars=120, wraps=True,
+    )
+    bodies = [
+        PatternSlot(
+            role="card_body", box=Box(0.05 + i * 0.32, 0.48, 0.27, 0.34), size_pt=14.0, color_hex=None,
+            align="l", max_chars=200, wraps=True,
+        )
+        for i in range(3)
+    ]
+    plaques = [
+        DecorShape(
+            kind="shape", box=Box(0.035 + i * 0.32, 0.44, _PLAQUE_WIDTH, 0.5), rotation=0.0,
+            flip_h=False, flip_v=False, fill_hex="#FFFFFF", has_fill=True, fill_kind="solid",
+            repeat_group=True, repeat_index=i,
+        )
+        for i in range(3)
+    ]
+    return Pattern(
+        pattern_id=pattern_id, source_slide_index=[0], layout_id=_real_layout_id(), kind="cards",
+        slots=[headline, *bodies], repeat=RepeatSpec(axis="x", count=3, step=0.32, slot_roles=["card_body"]),
+        decor=plaques,
+        capacity=Capacity(max_items=3, max_chars_per_item=200, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,
+    )
+
+
+def _plaque_widths_on(slide) -> list[int]:
+    expected = round(_PLAQUE_WIDTH * PROFILE.canvas_width_emu)
+    return [sh.width for sh in slide.shapes if abs(sh.width - expected) <= 1]
+
+
+def test_content_without_a_slot_leaves_an_honest_finding():
+    """Главная находка Task 23: подзаголовок с цифрами из брифа был в
+    плане, слота под него в раскладке нет — на слайд он не попал и НИГДЕ
+    не был упомянут (ни находки, ни строки в отчёте). Слайд по-прежнему
+    собирается (это не ошибка сборки), но расхождение обязано быть
+    названо."""
+    pattern = _three_plaque_cards_pattern("plaques-drop")
+    slide_spec = SlideSpec(
+        index=0, kind="two_col", headline="Итоги 2026: учебная платформа",
+        subhead="Рост доведения до 57%, стоимость выпускника −44%",
+    )
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    _, notes = _place_best_candidate(prs, slide_spec, [pattern], PROFILE, canvas, audit_config, bullet_char="•")
+
+    assert len(prs.slides) == 1
+    assert any("подзаголовок" in n and "Рост доведения" in n for n in notes), (
+        f"потерянный подзаголовок обязан остаться находкой: {notes!r}"
+    )
+
+
+def test_empty_repeat_plaques_are_not_drawn():
+    """Находка №2: слайду с одним заголовком досталась раскладка на три
+    карточки — три белые плашки заняли больше половины слайда и не несли
+    ни буквы. Плашка, в чей слот ничего не легло, не рисуется."""
+    pattern = _three_plaque_cards_pattern("plaques-empty")
+    slide_spec = SlideSpec(index=0, kind="two_col", headline="Итоги 2026: учебная платформа")
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    _place_best_candidate(prs, slide_spec, [pattern], PROFILE, canvas, audit_config, bullet_char="•")
+
+    assert _plaque_widths_on(prs.slides[0]) == [], "пустые плашки карточек не должны рисоваться"
+
+
+def test_plaques_of_filled_cards_are_still_drawn():
+    """Обратная сторона той же правки: карточки с текстом свои плашки
+    сохраняют — убирать нужное так же плохо, как рисовать лишнее."""
+    pattern = _three_plaque_cards_pattern("plaques-filled")
+    slide_spec = SlideSpec(
+        index=0, kind="cards", headline="Что изменилось",
+        blocks=[CardBlock(items=[
+            Card(title="", body="Доведение выросло с 41% до 57%."),
+            Card(title="", body="Стоимость выпускника снизилась на 44%."),
+            Card(title="", body="Время проверки работ сократилось вдвое."),
+        ])],
+    )
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    _place_best_candidate(prs, slide_spec, [pattern], PROFILE, canvas, audit_config, bullet_char="•")
+
+    assert len(_plaque_widths_on(prs.slides[0])) == 3
+
+
+def test_a_plaque_under_a_slot_taken_by_plain_text_is_kept():
+    """Слоты повтора не зарезервированы, когда на слайде нет карточек —
+    обычный текстовый блок вправе занять слот карточки, и плашка под ним
+    обязана остаться (пустыми уходят только соседние)."""
+    pattern = _three_plaque_cards_pattern("plaques-text")
+    slide_spec = SlideSpec(
+        index=0, kind="two_col", headline="Что изменилось",
+        blocks=[TextBlock(text="Доведение выросло с 41% до 57%.")],
+    )
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    _place_best_candidate(prs, slide_spec, [pattern], PROFILE, canvas, audit_config, bullet_char="•")
+
+    assert len(_plaque_widths_on(prs.slides[0])) == 1
