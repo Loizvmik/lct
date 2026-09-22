@@ -26,6 +26,7 @@
 from __future__ import annotations
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -722,19 +723,30 @@ class TemplateProfile(BaseModel):
             )
             assets = build_asset_catalog(pkg, canvas, layouts)
             patterns = mine_patterns(pkg, canvas, grid, type_scale, assets)
-            # Task 18: вид раскладки (`Pattern.kind`) уточняется мультимодальной
-            # моделью ПОВЕРХ уже намайненных паттернов — геометрия остаётся
-            # источником истины по умолчанию (`vision=None` — этот вызов вообще
-            # не трогает `patterns`, см. докстроку `classify_patterns_by_vision`),
-            # модель только предлагает замену, которую код уже проверил на
-            # принадлежность закрытому списку `config/pattern-kinds.yaml`.
-            patterns, vision_notes = classify_patterns_by_vision(patterns, path, vision)
             # Task 10 код-ревью, находка №1: словарь карточных форм считается
             # ПО ДЕКОРУ ГРУПП ПОВТОРА уже намайненных раскладок (`patterns`,
             # объект этого же прохода, до pydantic-сериализации — см.
             # докстроку `template/shapes.py`), не по переписи всех автофигур
             # пакета — макеты/мастера служебными рамками перевешивают язык
             # карточек, который реально использует шаблон.
+            #
+            # "Разбор незнакомого шаблона в бюджет", продолжение 3 —
+            # НАРОЧНО посчитан здесь, ДО уточнения вида раскладки моделью
+            # (`classify_patterns_by_vision` ниже, теперь вне блока `with`,
+            # см. его комментарий), не после, как было раньше. Безопасно:
+            # `build_shape_vocabulary`/`_card_decor_vocabulary` читают
+            # только `Pattern.decor` (репит-группы) и `Pattern.slots`
+            # (текстовые слоты) — ни одного обращения к `Pattern.kind` во
+            # всём `template/shapes.py` нет (см. её докстроку), а
+            # `classify_patterns_by_vision` меняет только `kind`
+            # (`dataclasses.replace(p, kind=...)`), никогда `decor`/`slots`.
+            # Результат этого вызова одинаков что до, что после уточнения
+            # вида — переставить его раньше нужно ТОЛЬКО чтобы `pkg` можно
+            # было закрыть до параллельного запуска именования палитры и
+            # уточнения вида раскладки моделью ниже (обоим обращениям к
+            # модели сам pkg не нужен, но `build_shape_vocabulary` — нужен, а
+            # держать zip-пакет открытым во время сетевых вызовов моделей
+            # незачем).
             shape_vocabulary = build_shape_vocabulary(pkg, canvas, patterns)
 
         # Тема для отчёта и именования палитры — уточнённая по фактическому
@@ -745,7 +757,48 @@ class TemplateProfile(BaseModel):
         # уточнённый вывод о деградации fontScheme.
         theme = usage.primary_theme or theme_for_layouts
 
-        palette_report = name_palette_roles_report(usage, theme, namer)
+        # "Разбор незнакомого шаблона в бюджет", продолжение 3 — именование
+        # ролей палитры (`naming.name_palette_roles_report`) и уточнение
+        # вида раскладки мультимодальной моделью
+        # (`vision_kind.classify_patterns_by_vision`) — НЕЗАВИСИМЫЕ
+        # обращения к модели: первое смотрит только на цвета уже
+        # разобранного XML (`usage`/`theme`, посчитаны строками выше, `pkg`
+        # им не нужен), второе — на отрисованные картинки слайдов-примеров
+        # (сам открывает файл шаблона по `path` для рендера, `pkg` тоже не
+        # нужен). Раньше шли по очереди, и живой замер ("Продолжение 2" в
+        # task-18-report.md) отдельно измерил каждый шаг на контрольном
+        # ЛЦТ2026: `namer` один — 60.8с, `vision` один — 121.8с, а вместе
+        # (последовательно, как было) — 102.4-165.1с, то есть СУММА времени
+        # обоих шагов почти без остатка, а не БОЛЬШЕЕ из двух. Запускаем
+        # оба вызова из отдельных потоков одного пула (max_workers=2) —
+        # должно остаться большее из двух шагов, не сумма.
+        #
+        # Почему это безопасно с дедлайном/эскалацией провайдера (проверено
+        # чтением `provider/yandex.py`, не только надеждой): `namer` и
+        # `vision` — РАЗНЫЕ инстансы `YandexProvider` (`cli.py::_build_
+        # namer`/`_build_pattern_kind_vlm`, каждый свой вызов `_build_role_
+        # provider`, свой `YandexProvider(...)`), у каждого свой `httpx.
+        # Client`, свой `deadline_at` (отсчитывается ВНУТРИ `complete()`/
+        # `ask_image()` от начала ИМЕННО ЭТОГО вызова — `self._now() +
+        # self._deadline_seconds`, не общий таймер на оба провайдера) и
+        # свой локальный `tried_budgets`/`attempt_counter` эскалации
+        # (локальные переменные `_post_with_budget_escalation`, не атрибуты
+        # инстанса, которые могли бы перепутаться между потоками). Между
+        # двумя параллельными вызовами не разделяется НИЧЕГО мутируемого,
+        # кроме `httpx.Client` каждого провайдера САМ С СОБОЙ (не друг с
+        # другом) — а `httpx.Client` документирован как безопасный для
+        # конкурентных запросов из нескольких потоков. Честная деградация
+        # тоже не ломается: обе функции ниже уже НИКОГДА не бросают
+        # исключение наружу штатным путём (см. их докстроки — обе сами
+        # ловят сеть/парсинг и возвращают запасной вариант/геометрический
+        # `kind` с заметкой об отказе) — сбой ОДНОГО потока не может
+        # уронить `ThreadPoolExecutor` и не задерживает `.result()` второго.
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            vision_future = pool.submit(classify_patterns_by_vision, patterns, path, vision)
+            palette_future = pool.submit(name_palette_roles_report, usage, theme, namer)
+            patterns, vision_notes = vision_future.result()
+            palette_report = palette_future.result()
+
         chart_series = build_chart_series(usage, dict(palette_report.roles))
 
         provenance = _build_provenance(
