@@ -4,10 +4,14 @@
 шрифты, типографическая шкала, сетка, каталог лейаутов, каталог ассетов,
 майнинг композиционных паттернов) плюс два требования этой задачи:
 
-- именование ролей палитры моделью (`naming.py`, единственный модуль пакета,
-  который реально вызывает модель — см. докстроку пакета; этот модуль
-  импортирует из `deckforge.provider` только тип `LLMProvider` для сигнатуры
-  параметра `namer` у `from_file` ниже, самого вызова здесь нет);
+- именование ролей палитры моделью (`naming.py`) и, начиная с Task 18,
+  уточнение вида раскладки мультимодальной моделью (`vision_kind.py`) — ДВА
+  (не один, см. докстроку пакета — она обновлена этой задачей) модуля
+  пакета, которые реально вызывают модель; `profile.py` сам импортирует из
+  `deckforge.provider` только типы `LLMProvider`/`VisionProvider` для
+  сигнатуры параметров `namer`/`vision` у `from_file` ниже, самого вызова
+  здесь нет — вызов внутри `name_palette_roles_report`/`classify_patterns_
+  by_vision`);
 - человекочитаемый отчёт «откуда что взято» (`.provenance`) и список
   предупреждений о деградировавших источниках (`.warnings`), собранные из
   признаков происхождения и уверенностей, которые уже возвращает каждый
@@ -29,7 +33,7 @@ from pydantic import BaseModel
 from deckforge.ooxml.color import Color, UnresolvedColor
 from deckforge.ooxml.geometry import Canvas
 from deckforge.ooxml.package import PptxPackage
-from deckforge.provider.base import LLMProvider
+from deckforge.provider.base import LLMProvider, VisionProvider
 from deckforge.settings import Settings
 from deckforge.template.assets import AssetCatalog, AssetRef, Placement, build_asset_catalog
 from deckforge.template.chart_palette import build_chart_series
@@ -41,6 +45,7 @@ from deckforge.template.shapes import ShapeVocabEntry, build_shape_vocabulary
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale, build_type_scale
 from deckforge.template.usage import Usage, collect_usage
+from deckforge.template.vision_kind import classify_patterns_by_vision
 
 # config/app.yaml — единственная точка настройки, как и всё остальное в
 # проекте (см. cli.py: тот же путь, тот же parents[N] от файла до корня
@@ -116,7 +121,17 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # направляющие) `source` молча дефолтился бы в "cluster" — направляющая с
 # крошечной поддержкой перестала бы быть безусловно достойной для L05,
 # ровно то поведение, которое эта правка чинит.
-PROFILE_SCHEMA_VERSION = 7
+# 7 -> 8: Task 18 — `PatternModel.kind` может теперь прийти не только из
+# геометрии `patterns.py`, но и из уточнения мультимодальной моделью
+# (`template/vision_kind.py::classify_patterns_by_vision`, вызывается из
+# `from_file` ниже, когда передан `vision`). Форма поля та же (строка), но
+# СМЫСЛ изменился — тот же случай, что уже описан у 3 -> 4/4 -> 5 выше
+# ("смысл поля поменялся, форма нет, бамп всё равно обязателен"): кеш,
+# записанный ДО этой правки, никогда не видел вид `quote`/`photo_text`/
+# `kpi_caption` (`config/pattern-kinds.yaml`) — без бампа старый кеш молча
+# продолжал бы отдавать только семь геометрических видов, даже когда
+# сейчас передан ключ модели и разбор мог бы дать больше разнообразия.
+PROFILE_SCHEMA_VERSION = 8
 
 # Ниже какой уверенности число из разбора попадает в предупреждения, а не
 # только в тело отчёта. 0.5 — не наблюдение за тремя файлами, а сама природа
@@ -535,9 +550,27 @@ class TemplateProfile(BaseModel):
 
     @classmethod
     def from_file(
-        cls, path: Path, *, namer: LLMProvider | None = None, cache_dir: Path | None = None,
+        cls, path: Path, *, namer: LLMProvider | None = None, vision: VisionProvider | None = None,
+        cache_dir: Path | None = None,
     ) -> "TemplateProfile":
         """Разбирает `.pptx`-шаблон целиком, ровно один проход по пакету.
+
+        `vision` (Task 18) — мультимодальный провайдер для уточнения
+        `Pattern.kind` показом картинки слайда-примера (`template.
+        vision_kind.classify_patterns_by_vision`) — необязательный, той же
+        честной деградацией, что и `namer`: без него (или при сбое рендера/
+        сети/ответа модели) `Pattern.kind` остаётся ровно тем, что снял
+        геометрический майнинг `patterns.mine_patterns`, разбор не падает и
+        не замедляется рендером шаблона. В отличие от `namer` (см. ниже про
+        `_reassign_palette_roles`), кеш-хит с `Pattern.kind` без уточнения
+        моделью НЕ переклассифицируется заново, даже если сейчас передан
+        `vision`, — рендер шаблона (`render.soffice.to_pngs`) дороже
+        разбора XML, а профиль и так пересобирается целиком при ЛЮБОЙ правке
+        схемы (`PROFILE_SCHEMA_VERSION`); честная оговорка, не потерянное
+        требование: та же логика "кеш-хит без ключа не отравляет навсегда"
+        достижима перепарсингом (не должна происходить часто — кеш ключуется
+        отпечатком ФАЙЛА, не намерением пользователя иметь/не иметь ключ)
+        или явным `cache_dir=None`.
 
         Порядок и переиспользование посчитанного повторяют
         `tests/template/conftest.py::_build_profile` (прообраз сборки,
@@ -625,6 +658,13 @@ class TemplateProfile(BaseModel):
             )
             assets = build_asset_catalog(pkg, canvas, layouts)
             patterns = mine_patterns(pkg, canvas, grid, type_scale, assets)
+            # Task 18: вид раскладки (`Pattern.kind`) уточняется мультимодальной
+            # моделью ПОВЕРХ уже намайненных паттернов — геометрия остаётся
+            # источником истины по умолчанию (`vision=None` — этот вызов вообще
+            # не трогает `patterns`, см. докстроку `classify_patterns_by_vision`),
+            # модель только предлагает замену, которую код уже проверил на
+            # принадлежность закрытому списку `config/pattern-kinds.yaml`.
+            patterns, vision_notes = classify_patterns_by_vision(patterns, path, vision)
             # Task 10 код-ревью, находка №1: словарь карточных форм считается
             # ПО ДЕКОРУ ГРУПП ПОВТОРА уже намайненных раскладок (`patterns`,
             # объект этого же прохода, до pydantic-сериализации — см.
@@ -647,12 +687,22 @@ class TemplateProfile(BaseModel):
         provenance = _build_provenance(
             master_part=master_part, theme_part=theme_part, theme=theme, usage=usage,
             type_scale=type_scale, grid=grid, assets=assets, layouts=layouts,
-            patterns=patterns, palette_notes=palette_report.notes,
+            patterns=patterns, palette_notes=palette_report.notes, vision_notes=vision_notes,
         )
         warnings = _build_warnings(
             theme=theme, usage=usage, type_scale=type_scale, grid=grid,
             assets=assets, layouts=layouts, palette_notes=palette_report.notes,
         )
+        # Заметки классификации вида раскладки моделью (см. `classify_
+        # patterns_by_vision`) — ПЕРВАЯ строка (сводка "N из M") в provenance
+        # (отчёт "откуда что взято" человеку), отказы отдельных паттернов
+        # («слайд-источник не нашёлся», «модель предложила вид вне списка») —
+        # в warnings, тем же признаком серьёзности, что и у остальных
+        # деградировавших источников этого профиля (текстовое совпадение
+        # достаточно здесь же, без отдельного класса заметок, как у
+        # `PaletteNote.severity` — vision_notes уже сама решает, что писать
+        # только в сводку, а что как отдельную строку отказа, см. её докстроку).
+        warnings.extend(vision_notes[1:])
 
         profile = cls(
             source_name=path.name, source_path=str(path.resolve()),
@@ -790,7 +840,7 @@ class TemplateProfile(BaseModel):
 def _build_provenance(
     *, master_part: str, theme_part: str, theme: ThemeInfo, usage: Usage, type_scale: TypeScale,
     grid: Grid, assets: AssetCatalog, layouts: list[LayoutEntry], patterns: list[Pattern],
-    palette_notes: list[PaletteNote],
+    palette_notes: list[PaletteNote], vision_notes: list[str] = (),
 ) -> list[str]:
     lines: list[str] = []
 
@@ -859,6 +909,18 @@ def _build_provenance(
 
     if palette_notes:
         lines.append("Роли палитры: " + "; ".join(n.text for n in palette_notes) + ".")
+
+    if vision_notes:
+        # Первая строка `vision_notes` — сводка ("N из M"), см.
+        # `classify_patterns_by_vision`; она же единственная, что попадает в
+        # provenance — отказы отдельных паттернов идут в warnings (см. вызов
+        # `from_file` выше), провенанс не обязан перечислять каждый отказ.
+        lines.append(vision_notes[0])
+    else:
+        lines.append(
+            "Вид раскладки (Pattern.kind) не уточнялся моделью — использован только "
+            "геометрический майнинг (без ключа `vision`, семь корзин `patterns._classify_kind`)."
+        )
 
     return lines
 

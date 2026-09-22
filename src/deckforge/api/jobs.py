@@ -198,7 +198,10 @@ class JobStore:
         path = tdir / "template.pptx"
         path.write_bytes(data)
         try:
-            profile = await asyncio.to_thread(TemplateProfile.from_file, path, namer=_build_role_provider("palette_namer"))
+            profile = await asyncio.to_thread(
+                TemplateProfile.from_file, path,
+                namer=_build_role_provider("palette_namer"), vision=_build_role_provider("pattern_kind"),
+            )
         except Exception as exc:  # noqa: BLE001 — любая причина разбора превращается в читаемую 400-ошибку
             shutil.rmtree(tdir, ignore_errors=True)
             raise JobError(f"Не удалось разобрать шаблон {filename!r} как .pptx: {exc}") from exc

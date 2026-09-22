@@ -72,6 +72,15 @@ def _build_vlm() -> LLMProvider | None:
     return _build_role_provider("content_audit")
 
 
+def _build_pattern_kind_vlm() -> LLMProvider | None:
+    """Мультимодальный провайдер для уточнения вида раскладки по картинке
+    слайда-примера (Task 18, роль `pattern_kind`) — та же честная
+    деградация, что и `_build_vlm`: `TemplateProfile.from_file(...,
+    vision=...)` без ключа продолжает работать чистой геометрией
+    (`template.patterns._classify_kind`), см. `template.vision_kind`."""
+    return _build_role_provider("pattern_kind")
+
+
 def _writer_max_workers() -> int:
     """Число слайдов, чей текст пишется одновременно (`plan.writer.write_
     slides`) — из `config/app.yaml` (`llm.slide_writer_max_workers`, см. её
@@ -87,8 +96,9 @@ def _writer_max_workers() -> int:
 
 def _cmd_parse(args: argparse.Namespace) -> int:
     namer = _build_namer()
+    vision = _build_pattern_kind_vlm()
     started = time.monotonic()
-    profile = TemplateProfile.from_file(args.template, namer=namer)
+    profile = TemplateProfile.from_file(args.template, namer=namer, vision=vision)
     elapsed = time.monotonic() - started
 
     args.output.write_text(profile.to_json(), encoding="utf-8")
@@ -127,11 +137,12 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     выполнялся и как его запустить — молчаливая тишина хуже отсутствия
     (то же правило, что и `VisualAuditResult.skipped_reason`)."""
     namer = _build_namer()
+    vision = _build_pattern_kind_vlm()
     outline_llm = _build_role_provider("outline")
     writer_llm = _build_role_provider("writer")
 
     started = time.monotonic()
-    profile = TemplateProfile.from_file(args.template, namer=namer)
+    profile = TemplateProfile.from_file(args.template, namer=namer, vision=vision)
     parsed_at = time.monotonic()
     print(f"{args.template.name}: разобран за {parsed_at - started:.1f}с, паттернов: {len(profile.patterns)}")
 

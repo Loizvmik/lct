@@ -53,6 +53,10 @@ llm:
     pattern_picker: qwen3.6-35b-a3b
     palette_namer: qwen3.6-35b-a3b
     content_audit: qwen3.6-35b-a3b
+    # Task 18: уточнение вида раскладки (Pattern.kind) по картинке слайда-
+    # примера (template/vision_kind.py) — нужна мультимодальная модель, тот
+    # же критерий, что и у content_audit (см. её выбор ниже).
+    pattern_kind: qwen3.6-35b-a3b
 
 paths:
   workspace: workspace

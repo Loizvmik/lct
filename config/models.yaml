@@ -15,7 +15,7 @@ models:
     params_b: 35
     active_params_b: 3
     vision: true
-    roles: [outline, writer, pattern_picker, palette_namer, content_audit]
+    roles: [outline, writer, pattern_picker, palette_namer, content_audit, pattern_kind]
   - id: gpt-oss-20b
     provider: yandex
     hf: openai/gpt-oss-20b

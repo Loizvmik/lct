@@ -42,6 +42,14 @@ class LLMRoles(BaseModel):
     pattern_picker: str
     palette_namer: str
     content_audit: str
+    # Task 18: уточнение вида раскладки (`Pattern.kind`) мультимодальной
+    # моделью по картинке слайда-примера — `template.vision_kind.
+    # classify_patterns_by_vision`. Со значением по умолчанию `None` (не
+    # обязательное поле, как `content_audit` выше уже было для конфигов до
+    # Task 12) — `model_for("pattern_kind")` падает на `self.model`, если
+    # роль явно не расписана в `config/app.yaml`, то же поведение, что и у
+    # любой роли, не перечисленной в `roles:` вовсе (см. `model_for`).
+    pattern_kind: str | None = None
 
 
 class LLMConfig(BaseModel):
