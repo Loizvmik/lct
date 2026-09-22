@@ -18,7 +18,7 @@ from deckforge.audit.config import AuditConfig
 from deckforge.compose.builder import (
     Variant, _avoid_decor_overlap, _best_contrast_color, _clear_sample_slides, _is_cosmetic_truncation,
     _local_background_luminance, _overlap_ratio, _pick_pattern, _place_best_candidate, _relative_luminance,
-    build_deck, fits,
+    _SelectionHistory, build_deck, fits,
 )
 from deckforge.compose.textfit import measure
 from deckforge.ooxml.geometry import Box, Canvas
@@ -366,6 +366,78 @@ def test_pattern_picker_prefers_the_layout_whose_capacity_matches_the_content_vo
     )
     picked = _pick_pattern(slide_spec, [roomy, snug], PROFILE, Variant.dense)
     assert picked.pattern_id == "two-slot"
+
+
+# ---------------------------------------------------------------------------
+# Task 18, находка №3 брифа: штраф за повтор раскладки (`_diversity_
+# penalty`/`_SelectionHistory`) — "ранжирование... по двум признаками:
+# влезает ли текст и не слишком ли пусто... признака «на прошлом слайде уже
+# была такая же» нет, поэтому берётся самая безопасная раз за разом".
+# ---------------------------------------------------------------------------
+
+
+def _twin_cards_slide_spec() -> SlideSpec:
+    return SlideSpec(
+        index=0, kind="cards", headline="",
+        blocks=[CardBlock(items=[Card(body="Коротко"), Card(body="И ещё короче")])],
+    )
+
+
+def test_without_history_the_same_best_candidate_wins_every_time():
+    """Контроль: два кандидата, равные по score/fit/capacity/fill,
+    выбираются детерминированно по порядку без истории — тот самый эффект
+    "самая безопасная раз за разом", который правка ниже обязана сломать
+    ТОЛЬКО когда история передана."""
+    box = Box(0.1, 0.3, 0.3, 0.3)
+    a = _fake_cards_pattern("twin-a", box, capacity_max_items=2)
+    b = _fake_cards_pattern("twin-b", box, capacity_max_items=2)
+    slide_spec = _twin_cards_slide_spec()
+    assert _pick_pattern(slide_spec, [a, b], PROFILE, Variant.dense).pattern_id == "twin-a"
+    assert _pick_pattern(slide_spec, [b, a], PROFILE, Variant.dense).pattern_id == "twin-b"
+
+
+def test_diversity_penalty_avoids_repeating_the_pattern_used_on_the_previous_slide():
+    box = Box(0.1, 0.3, 0.3, 0.3)
+    a = _fake_cards_pattern("twin-a", box, capacity_max_items=2)
+    b = _fake_cards_pattern("twin-b", box, capacity_max_items=2)
+    slide_spec = _twin_cards_slide_spec()
+
+    history = _SelectionHistory(last_pattern_id="twin-a")
+    picked = _pick_pattern(slide_spec, [a, b], PROFILE, Variant.dense, history)
+    assert picked.pattern_id == "twin-b"
+
+
+def test_diversity_penalty_also_reacts_to_overall_frequency_not_only_the_previous_slide():
+    box = Box(0.1, 0.3, 0.3, 0.3)
+    a = _fake_cards_pattern("twin-a", box, capacity_max_items=2)
+    b = _fake_cards_pattern("twin-b", box, capacity_max_items=2)
+    slide_spec = _twin_cards_slide_spec()
+
+    # "twin-a" не была на прошлом слайде (last_pattern_id=None), но уже
+    # использована дважды где-то раньше в этой же колоде — штраф частоты
+    # (не только немедленного повтора) обязан всё равно сместить выбор.
+    history = _SelectionHistory(counts={"twin-a": 2}, last_pattern_id=None)
+    picked = _pick_pattern(slide_spec, [a, b], PROFILE, Variant.dense, history)
+    assert picked.pattern_id == "twin-b"
+
+
+def test_diversity_penalty_never_overrides_a_real_capacity_mismatch():
+    """Task 18 брифом: штраф "не должен перебивать пригодность" —
+    структурно (не весом) гарантировано порядком позиций кортежа
+    `_pattern_rank_key`: `_capacity_badness` идёт РАНЬШЕ штрафа за повтор,
+    поэтому раскладка, чья вместимость реально хуже подходит содержанию,
+    не может победить только за счёт разнообразия, даже если штраф
+    максимален (использована уже несколько раз ПОДРЯД)."""
+    box = Box(0.1, 0.3, 0.3, 0.3)
+    roomy = _fake_cards_pattern("roomy-again", box, capacity_max_items=2)
+    mismatched = _fake_cards_pattern("never-used", box, capacity_max_items=20)
+    slide_spec = _twin_cards_slide_spec()
+
+    history = _SelectionHistory(counts={"roomy-again": 4}, last_pattern_id="roomy-again")
+    picked = _pick_pattern(slide_spec, [roomy, mismatched], PROFILE, Variant.dense, history)
+    assert picked.pattern_id == "roomy-again", (
+        "штраф за повтор пересилил реальное расхождение вместимости — не должен был"
+    )
 
 
 def test_text_block_goes_to_the_biggest_slot_of_its_role_not_the_first_one():

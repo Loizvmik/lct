@@ -12,8 +12,8 @@ from pathlib import Path
 
 from deckforge.audit.config import AuditConfig
 from deckforge.compose.builder import build_deck
-from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock
-from deckforge.plan.variants import MAX_SLIDES, MIN_SLIDES, Variant, apply_variant
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, QuoteBlock, SlideSpec, TextBlock
+from deckforge.plan.variants import MAX_SLIDES, MIN_SLIDES, Variant, apply_variant, _choose_kind_and_pattern
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.template.profile import TemplateProfile
 
@@ -246,3 +246,58 @@ def test_variant_falls_back_when_template_lacks_a_pattern_kind():
     poor = profile_fixture_without_image_patterns()
     spec = apply_variant(DECK, poor, Variant.visual)
     assert all(s.pattern_id for s in spec.slides)
+
+
+# ---------------------------------------------------------------------------
+# Task 18, находка №3 брифа: реальный выбор `pattern_id` делает ИМЕННО
+# `apply_variant` (см. докстроку модуля и `builder._resolve_pattern` —
+# `compose/builder.py` лишь перепроверяет уже проставленный здесь выбор),
+# поэтому штраф за повтор обязан жить здесь, не только в `compose/builder.py`.
+# ---------------------------------------------------------------------------
+
+
+def test_dense_variant_does_not_reuse_the_same_pattern_for_every_bullets_slide():
+    """DECK несёт три `bullets`-слайда (index 1, 7, 9) с коротким, похожим
+    по объёму содержанием — на 11 доступных `bullets`-паттернах VK Tech
+    (см. докстроку модуля) без штрафа за повтор все трое стабильно получали
+    бы ОДНУ и ту же "самую безопасную" раскладку (находка брифа: "берётся
+    самая безопасная раз за разом")."""
+    spec = apply_variant(DECK, PROFILE, Variant.dense)
+    bullets_pattern_ids = {
+        s.pattern_id for s in spec.slides if s.kind == "bullets" and s.pattern_id is not None
+    }
+    assert len(bullets_pattern_ids) > 1, (
+        f"все bullets-слайды получили одну и ту же раскладку: {bullets_pattern_ids}"
+    )
+
+
+def test_quote_block_survives_apply_variant_as_a_quote_kind_when_the_template_has_one():
+    """Task 18, находка №2 брифа: раньше `QuoteBlock` не проверялся в
+    `_compatible_kinds` вовсе — слайд с цитатой, написанной моделью,
+    молча получал `kind="bullets"` здесь (единственном месте, которое
+    РЕАЛЬНО проставляет `kind` на сборку в боевом пайплайне, см. докстроку
+    модуля). VK Tech не несёт `kind="quote"` паттернов геометрически — тест
+    поэтому добавляет синтетический, тем же приёмом, что и остальные
+    `profile_fixture_without_*` фикстуры этого файла."""
+    quote_pattern = PROFILE.patterns[0].model_copy(update={"pattern_id": "synthetic-quote", "kind": "quote"})
+    with_quote = PROFILE.model_copy(update={"patterns": [*PROFILE.patterns, quote_pattern]})
+    quote_slide = SlideSpec(
+        index=0, kind="bullets", headline="Отзыв пилота",
+        blocks=[QuoteBlock(text="Ожидание исчезло — заявки идут день в день")],
+    )
+    # `airy` (не `dense`): `_compatible_kinds` честно считает `quote` не
+    # ЕДИНСТВЕННО совместимым видом ("quote", "section", "bullets" — см. её
+    # докстроку, "quote" может не найтись в шаблоне вовсе, тогда `_assign_
+    # quote` разложит текст в body/card_body одной из этих гибких раскладок),
+    # какой конкретно из трёх победит внутри одного варианта — решает
+    # `kind_rank`, то есть вкус ИМЕННО этого варианта (`_VARIANT_KIND_
+    # PRIORITY`): `dense` ("максимум фактов на слайд") намеренно ставит
+    # героический `quote` последним в списке предпочтения, `airy` ("один
+    # тезис на слайд") — наоборот, сразу после kpi/kpi_caption. Раз ГЛАВНАЯ
+    # находка этого теста — что `quote` вообще ПОПАДАЕТ в кандидаты (не
+    # теряется молча, как до Task 18), а не то, какой из вариантов его в
+    # итоге предпочтёт, `airy` — честный выбор варианта для проверки: у неё
+    # это не пограничный случай стиля, а ожидаемое поведение.
+    kind, pattern_id = _choose_kind_and_pattern(quote_slide, with_quote, Variant.airy)
+    assert kind == "quote"
+    assert pattern_id == "synthetic-quote"

@@ -12,7 +12,7 @@ python-pptx (рисование) одновременно — блоки кон�
 from __future__ import annotations
 import io
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from lxml import etree
@@ -629,7 +629,71 @@ def _missing_signals(slide_spec: SlideSpec, assignments: list[SlotContent]) -> l
     return missing
 
 
-def _pattern_rank_key(slide_spec: SlideSpec, p: Pattern, profile: TemplateProfile, variant: Variant):
+@dataclass(frozen=True)
+class _SelectionHistory:
+    """Раскладки, уже выбранные для ПРЕДЫДУЩИХ слайдов ЭТОЙ же колоды —
+    вход штрафа за повтор (`_diversity_penalty`, Task 18, находка №3 брифа:
+    "ранжирование идёт по двум признаками: влезает ли текст и не слишком ли
+    пусто... признака «на прошлом слайде уже была такая же» нет, поэтому
+    берётся самая безопасная раз за разом"). Пусто по умолчанию — прямые
+    вызовы `_pick_pattern`/`_ranked_candidates` без истории (существующие
+    тесты Task 9-13, `tests/compose/test_builder.py`) ведут себя ровно как
+    раньше, без единого штрафа: диверсификация — свойство ЦИКЛА по слайдам
+    (`build_deck`), не отдельного вызова подбора."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+    last_pattern_id: str | None = None
+
+    def with_choice(self, pattern_id: str) -> "_SelectionHistory":
+        counts = dict(self.counts)
+        counts[pattern_id] = counts.get(pattern_id, 0) + 1
+        return _SelectionHistory(counts=counts, last_pattern_id=pattern_id)
+
+
+_EMPTY_HISTORY = _SelectionHistory()
+
+# Штраф за повтор КОНКРЕТНОЙ раскладки (`Pattern.pattern_id`), не только её
+# `kind` — Task 18 брифа буквально: "признака «на прошлом слайде уже была
+# такая же» нет". Кандидаты `_ranked_candidates` УЖЕ отфильтрованы одним
+# `kind` (`p.kind == slide_spec.kind` в её вызове ниже) — внутри одного
+# вида в богатом шаблоне бывает несколько РАЗНЫХ раскладок (VK Education:
+# 12 "bullets"), и без штрафа `-p.score` (самый частый решающий признак,
+# когда `fit`/`capacity`/`fill` совпадают у нескольких кандидатов — частый
+# случай, см. ниже) стабильно выбирает ОДНУ и ту же "самую безопасную"
+# снова и снова: живой прогон задачи (обязательная проверка, VK Education)
+# — 33 намайненных раскладки, а в готовой колоде использовано фактически
+# два оформления.
+#
+# 1.0 — заведомо больше типичного разброса `-score` (`score` в [0, 1], см.
+# `patterns._score`) и заведомо больше типичного разброса `-visual_bias`
+# (декор считанными штуками) — гарантирует, что среди кандидатов, РАВНЫХ по
+# fit/capacity/fill (позиции 0-3 кортежа ниже, штраф стоит СТРОГО ПОСЛЕ
+# них и потому НИКОГДА не может пересилить настоящее переполнение/пустоту,
+# см. докстроку `_pattern_rank_key`), тот же самый `pattern_id`, что и на
+# прошлом слайде, не победит, если есть хоть один не менее пригодный
+# альтернативный кандидат.
+_REPEAT_PREV_PATTERN_PENALTY = 1.0
+
+# Штраф за КАЖДОЕ предыдущее использование этой же раскладки где-либо в
+# колоде (не только на прошлом слайде) — меньше штрафа за немедленный повтор
+# (0.5 < 1.0): "раскладка уже стояла три слайда назад" — не так плохо, как
+# "стоит второй слайд подряд", но раскладка, использованная уже 2 раза,
+# всё равно должна уступить кандидату, использованному 0-1 раз, при
+# сопоставимой пригодности — растягивает выбор по всем кандидатам вида, а
+# не только избегает соседства.
+_REPEAT_ANYWHERE_PENALTY_STEP = 0.5
+
+
+def _diversity_penalty(pattern: Pattern, history: _SelectionHistory) -> float:
+    penalty = _REPEAT_PREV_PATTERN_PENALTY if pattern.pattern_id == history.last_pattern_id else 0.0
+    penalty += _REPEAT_ANYWHERE_PENALTY_STEP * history.counts.get(pattern.pattern_id, 0)
+    return penalty
+
+
+def _pattern_rank_key(
+    slide_spec: SlideSpec, p: Pattern, profile: TemplateProfile, variant: Variant,
+    history: _SelectionHistory = _EMPTY_HISTORY,
+):
     """Ключ сортировки одного паттерна-кандидата `p` для `slide_spec` —
     вынесен из `_pick_pattern` (Task 13 продолжение) так, чтобы им мог
     пользоваться и он сам (единственный победитель), и `_ranked_candidates`
@@ -653,8 +717,17 @@ def _pattern_rank_key(slide_spec: SlideSpec, p: Pattern, profile: TemplateProfil
        кандидатов раскладка, где содержание не тонет в пустоте и не
        перегружает холст, предпочтительнее формально влезающей, но
        занимающей четверть холста;
-    5. паттерн с более высоким `score` (майнинг увереннее в нём);
-    6. `Variant.visual`/`Variant.dense` — тот же бонус/штраф за декор, что и
+    5. штраф за повтор (`_diversity_penalty`, Task 18, находка №3 брифа) —
+       ПОСЛЕ фит/вместимости/заполненности (позиции 0-3), а не вместо них:
+       "лучше повторить раскладку, чем выдать слайд с вылезающим текстом"
+       (брифом дословно) — раз штраф стоит СТРОГО после них в кортеже
+       сравнения, он структурно не может пересилить настоящую разницу в
+       fit/capacity/fill, независимо от величины своего веса, лексикографи-
+       ческое сравнение кортежей просто не доходит до него, пока эти позиции
+       не равны; ПЕРЕД `score`/декором — раз пригодность у кандидатов
+       сопоставима, разнообразие важнее чистого вкуса майнинга;
+    6. паттерн с более высоким `score` (майнинг увереннее в нём);
+    7. `Variant.visual`/`Variant.dense` — тот же бонус/штраф за декор, что и
        раньше (временная эвристика Task 13, см. докстроку `Variant`)."""
     fit = fits(slide_spec, p, profile)
     # `airy` не смещает выбор по декору вовсе (0) — её плотность решает
@@ -670,12 +743,13 @@ def _pattern_rank_key(slide_spec: SlideSpec, p: Pattern, profile: TemplateProfil
         visual_bias = 0
     return (
         0 if fit.ok else 1, fit.overflow_ratio, _capacity_badness(p, slide_spec),
-        _fill_badness(fit.fill_ratio), -p.score, -visual_bias,
+        _fill_badness(fit.fill_ratio), _diversity_penalty(p, history), -p.score, -visual_bias,
     )
 
 
 def _ranked_candidates(
     slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
+    history: _SelectionHistory = _EMPTY_HISTORY,
 ) -> list[Pattern]:
     """Все кандидаты `pattern.kind == slide_spec.kind`, отсортированные от
     лучшего к худшему тем же ключом, что и `_pick_pattern` (см. докстроку
@@ -685,11 +759,12 @@ def _ranked_candidates(
     лучший на бумаге по `fits()` на деле дал наложение/выход за границы на
     РЕАЛЬНОЙ геометрии уже уложенного слайда."""
     candidates = [p for p in patterns if p.kind == slide_spec.kind]
-    return sorted(candidates, key=lambda p: _pattern_rank_key(slide_spec, p, profile, variant))
+    return sorted(candidates, key=lambda p: _pattern_rank_key(slide_spec, p, profile, variant, history))
 
 
 def _pick_pattern(
     slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
+    history: _SelectionHistory = _EMPTY_HISTORY,
 ) -> Pattern | None:
     """Перебирает кандидатов `pattern.kind == slide_spec.kind` и берёт того,
     в кого содержание влезает (`fits()`, шкала ужимания целиком, не только
@@ -697,13 +772,16 @@ def _pick_pattern(
     полный порядок ранжирования). Публичная обёртка над
     `_ranked_candidates` — сохраняет прежний интерфейс (единственный
     Pattern, не список) буквально ради существующих прямых тестов на неё
-    (`tests/compose/test_builder.py`, Task 9-10)."""
-    ranked = _ranked_candidates(slide_spec, patterns, profile, variant)
+    (`tests/compose/test_builder.py`, Task 9-10) — `history` необязательна
+    (пустая по умолчанию, Task 18), эти тесты вызывают функцию без истории
+    и ведут себя ровно как раньше, без штрафа за повтор."""
+    ranked = _ranked_candidates(slide_spec, patterns, profile, variant, history)
     return ranked[0] if ranked else None
 
 
 def _resolve_pattern(
     slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
+    history: _SelectionHistory = _EMPTY_HISTORY,
 ) -> list[Pattern]:
     """Кандидаты раскладки для `slide_spec`, в порядке предпочтения — Task
     13 продолжение сменило это с единственного выбора на СПИСОК: решение
@@ -719,8 +797,17 @@ def _resolve_pattern(
     больше НЕ принимается слепо по `fits().ok`: окончательную проверку
     делает аудит уже уложенного слайда, а не оценка текстфита ДО укладки
     (тот же принцип, что раньше — "код не доверяет предложению слепо",
-    просто проверка стала точнее)."""
-    ranked = _ranked_candidates(slide_spec, patterns, profile, variant)
+    просто проверка стала точнее).
+
+    `history` (Task 18) — раскладки, уже выбранные для предыдущих слайдов
+    ЭТОЙ колоды (`build_deck` передаёт её и накапливает по ходу цикла, см.
+    `_SelectionHistory`) — двигает штрафуемых повторами кандидатов вниз
+    списка ДО того, как `pattern_id`, проставленный `apply_variant`,
+    переставлен первым: явное предпочтение плана всё ещё побеждает штраф
+    (тот же принцип "план предлагает, сборка не отменяет предложение без
+    причины", что и раньше), штраф работает только когда `pattern_id` не
+    проставлен или его раскладки нет в профиле."""
+    ranked = _ranked_candidates(slide_spec, patterns, profile, variant, history)
     if not slide_spec.pattern_id:
         return ranked
     preferred = next((p for p in ranked if p.pattern_id == slide_spec.pattern_id), None)

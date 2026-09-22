@@ -58,11 +58,11 @@
 "модель/код предлагает, сборка перепроверяет", что и у `pick_patterns`.
 """
 from __future__ import annotations
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from deckforge.plan.spec import (
-    BulletBlock, CardBlock, DeckSpec, KpiBlock, SLIDE_KINDS, SlideSpec, TextBlock,
+    BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SLIDE_KINDS, SlideSpec, TextBlock,
 )
 
 # Объём колоды — то же ограничение, что `outline.MIN_SLIDES`/`MAX_SLIDES`
@@ -88,10 +88,28 @@ class Variant(Enum):
 # уже написанного содержания слайда (`_compatible_kinds`): вариант выбирает
 # ЛУЧШИЙ из того, что физически можно нарисовать без потери контента, а не
 # любой ценой навязывает предпочтение.
+# Task 18: три новых вида вплетены в предпочтение каждого варианта тем же
+# принципом, что и остальные семь — по оси самого варианта (см. таблицу
+# докстроки модуля), не произвольно приписаны в конец:
+# `quote`/`kpi_caption` — героические, малословные формы ("один тезис на
+# слайд"), ближе всего по духу к `kpi`/`section` — у `airy` они СРАЗУ после
+# `kpi`, у `dense`/`visual` — заметно позже (плотность/декор важнее
+# героики). `photo_text` — визуально ведомая форма (фото несёт часть
+# смысла), у `visual` сразу после `image`, у `dense` (текст важнее
+# картинки) — позже, у `airy` — там же, где `image` (просторная форма).
 _VARIANT_KIND_PRIORITY: dict[Variant, tuple[str, ...]] = {
-    Variant.dense: ("cards", "two_col", "table", "bullets", "kpi", "image", "section"),
-    Variant.airy: ("kpi", "section", "bullets", "two_col", "cards", "image", "table"),
-    Variant.visual: ("image", "cards", "kpi", "two_col", "bullets", "table", "section"),
+    Variant.dense: (
+        "cards", "two_col", "table", "bullets", "kpi", "kpi_caption",
+        "image", "photo_text", "section", "quote",
+    ),
+    Variant.airy: (
+        "kpi", "kpi_caption", "quote", "section", "bullets", "two_col",
+        "cards", "image", "photo_text", "table",
+    ),
+    Variant.visual: (
+        "image", "photo_text", "cards", "kpi", "kpi_caption", "quote",
+        "two_col", "bullets", "table", "section",
+    ),
 }
 
 # Полными фразами, не голыми словами-темами ("Данные", "Риски") — находка
@@ -113,6 +131,13 @@ _DIVIDER_LABELS = (
 # ---------------------------------------------------------------------------
 
 
+# Число элементов `KpiBlock`, ниже которого содержание — ОДИН героический
+# фактоид (Task 18, вид `kpi_caption`), а не панель из нескольких метрик
+# (`kind="kpi"`): 1 — буквально "одно число", не наблюдение за файлами, а
+# сама граница смысла между "фактоид" и "панель" (панель начинается с двух).
+_KPI_CAPTION_MAX_ITEMS = 1
+
+
 def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
     """`kind`, на раскладку которых содержание `slide` ляжет БЕЗ ПОТЕРИ
     контента структурно (не по замеру — замер и ужимание делает `compose`
@@ -122,28 +147,63 @@ def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
     `compose.blocks._assign_cards` иначе молча ничего не разложит, см. её
     докстроку про `pattern.repeat is None -> []`), `KpiBlock` требует
     нескольких `kpi_value`/`kpi_label` слотов (гарантированно только у
-    `kind="kpi"`); `TableVisual` — `table`; безблочный слайд (только
-    заголовок) — героический `kind="section"`. Остальное (текст/буллеты/
-    цитата без карточек и KPI) достаточно гибко для нескольких `kind` —
+    `kind="kpi"`, ОДИН элемент — у `kind="kpi_caption"` тоже, см. `_KPI_
+    CAPTION_MAX_ITEMS`); `TableVisual` — `table`; безблочный слайд (только
+    заголовок) — героический `kind="section"`. Остальное (текст/буллеты
+    без карточек и KPI) достаточно гибко для нескольких `kind` —
     `compose.blocks` раскладывает их ПО РОЛИ слота, а не по `kind` пакета
     целиком, так что список этих "гибких" `kind` НАМЕРЕННО не включает
     `"section"` (геройские раскладки почти всегда несут только заголовок —
     вписать туда список пунктов было бы для содержания молча потерянным,
     см. докстроку модуля про то, почему `apply_variant` вообще не рискует
-    содержанием)."""
+    содержанием).
+
+    Task 18, находка №2 брифа ("модель не знает, какие формы умеет шаблон"):
+    раньше `QuoteBlock` не проверялся здесь ВООБЩЕ — даже слайд, который
+    slide-writer честно написал с `kind="quote"` и `QuoteBlock`, "теряло" эту
+    форму на этом шаге (единственном месте, где `kind` окончательно
+    проставляется на сборку, см. докстроку модуля — `write_slides`/
+    `pick_patterns` их не вызывают в реальном пайплайне вовсе, `cli.py`/
+    `api/jobs.py` идут прямо от `write_slides` к `apply_variant`): `has_quote`
+    отсутствовал в проверках выше, слайд с одним `QuoteBlock` (не
+    `TextBlock`/`BulletBlock`) проваливался в `n_text=0, has_bullets=False`
+    и молча получал `kind="bullets"` по умолчанию — весь смысл написанной
+    моделью цитаты для ПОДБОРА раскладки терялся здесь, даже когда в
+    шаблоне есть настоящая раскладка-цитата. `compose.blocks._assign_quote`
+    (уже умеет класть `QuoteBlock` и в `"quote"`-слот, и, если его нет, в
+    `"body"`/`"card_body"`) не единственная причина, почему это раньше
+    "работало" — работало ХУЖЕ, чем могло: содержание не терялось, но
+    ВИЗУАЛЬНО цитата ложилась как обычный абзац."""
     has_card = any(isinstance(b, CardBlock) and b.items for b in slide.blocks)
-    has_kpi = any(isinstance(b, KpiBlock) and b.items for b in slide.blocks)
+    kpi_block = next((b for b in slide.blocks if isinstance(b, KpiBlock) and b.items), None)
     has_table = slide.visual is not None and slide.visual.table is not None
+    has_quote = any(isinstance(b, QuoteBlock) and b.text.strip() for b in slide.blocks)
 
     if has_card:
         return ("cards",)
-    if has_kpi:
+    if kpi_block is not None:
+        if len(kpi_block.items) <= _KPI_CAPTION_MAX_ITEMS:
+            return ("kpi_caption", "kpi")
         return ("kpi",)
     if has_table:
         return ("table",)
+    if has_quote:
+        # `quote` первый по предпочтению, но НЕ единственный совместимый —
+        # шаблон может не нести ни одной раскладки-цитаты вовсе (обычный
+        # случай на бедных шаблонах), тогда `_assign_quote` всё равно
+        # разложит текст цитаты в "body"/"card_body" ближайшего гибкого
+        # `kind` (см. докстроку выше), не теряя содержание.
+        return ("quote", "section", "bullets")
     if not slide.blocks and slide.visual is None:
         return ("section",)
     if slide.visual is not None and slide.visual.kind in ("photo", "icon"):
+        n_text_with_photo = sum(1 for b in slide.blocks if isinstance(b, (TextBlock, BulletBlock)) and _block_has_text(b))
+        if n_text_with_photo >= 1:
+            # Фото/мокап РЯДОМ с содержательным текстом — Task 18,
+            # `photo_text` (не героическая картинка на весь холст без
+            # текста, для неё `image` остаётся первым в списке ниже, когда
+            # текста на слайде фактически нет).
+            return ("photo_text", "image", "bullets", "two_col")
         return ("image", "bullets", "two_col")
 
     n_text = sum(1 for b in slide.blocks if isinstance(b, TextBlock))
@@ -153,6 +213,14 @@ def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
     if has_bullets or n_text >= 1:
         return ("bullets", "two_col")
     return ("bullets",)
+
+
+def _block_has_text(block) -> bool:
+    if isinstance(block, TextBlock):
+        return bool(block.text.strip())
+    if isinstance(block, BulletBlock):
+        return any(item.strip() for item in block.items)
+    return False
 
 
 def _content_char_len(slide: SlideSpec) -> int:
@@ -226,8 +294,52 @@ def _item_count(slide: SlideSpec) -> int | None:
     return None
 
 
+@dataclass(frozen=True)
+class _SelectionHistory:
+    """Раскладки, уже выбранные для ПРЕДЫДУЩИХ слайдов ЭТОЙ же колоды, В
+    ЭТОМ ЖЕ варианте — Task 18, находка №3 брифа: реальный выбор
+    `pattern_id` для собранной колоды делает ЭТОТ модуль (`apply_variant`,
+    не `compose.builder._pick_pattern` — тот выбирает заново только когда
+    `apply_variant` не проставил `pattern_id` вовсе или аудит внутри
+    `compose.builder._place_best_candidate` отклонил его выбор, см. её
+    докстроку), поэтому диверсификация обязана жить здесь, а не (только) в
+    `compose/builder.py` — штраф там же, но ниже по конвейеру, ничего не
+    меняет, если `apply_variant` уже проставил один и тот же `pattern_id`
+    каждому слайду вида `kind` заранее (см. `_resolve_pattern` в
+    `builder.py`: явный `pattern_id` переставлен первым БЕЗУСЛОВНО)."""
+
+    counts: dict[str, int] = field(default_factory=dict)
+    last_pattern_id: str | None = None
+
+    def with_choice(self, pattern_id: str | None) -> "_SelectionHistory":
+        if pattern_id is None:
+            return self
+        counts = dict(self.counts)
+        counts[pattern_id] = counts.get(pattern_id, 0) + 1
+        return _SelectionHistory(counts=counts, last_pattern_id=pattern_id)
+
+
+_EMPTY_HISTORY = _SelectionHistory()
+
+# Те же веса и то же обоснование, что у `compose.builder._REPEAT_PREV_
+# PATTERN_PENALTY`/`_REPEAT_ANYWHERE_PENALTY_STEP` (см. их докстроки) — два
+# места считают штраф за повтор идентично НАМЕРЕННО: одна и та же колода,
+# наблюдаемая тем же человеком на защите, не должна получать РАЗНОЕ понятие
+# "это уже повторяется" в зависимости от того, `apply_variant` выбрал
+# `pattern_id` сразу или `compose.builder` довыбирал его сам.
+_REPEAT_PREV_PATTERN_PENALTY = 1.0
+_REPEAT_ANYWHERE_PENALTY_STEP = 0.5
+
+
+def _diversity_penalty(pattern_id: str, history: _SelectionHistory) -> float:
+    penalty = _REPEAT_PREV_PATTERN_PENALTY if pattern_id == history.last_pattern_id else 0.0
+    penalty += _REPEAT_ANYWHERE_PENALTY_STEP * history.counts.get(pattern_id, 0)
+    return penalty
+
+
 def _pattern_rank_key(
     p, variant: Variant, item_count: int | None, char_len: int, kind_rank: int, avoid: frozenset[str],
+    history: _SelectionHistory = _EMPTY_HISTORY,
 ) -> tuple:
     """Ключ сортировки одного паттерна-кандидата — ОБЩИЙ для всех `kind` из
     предпочтения варианта (см. `_choose_kind_and_pattern`), не только внутри
@@ -296,6 +408,15 @@ def _pattern_rank_key(
     # вкусу", но неотличимая от соседнего варианта.
     avoid_penalty = 1 if p.pattern_id in avoid else 0
 
+    # Штраф за повтор ВНУТРИ уже собираемой последовательности слайдов
+    # этого варианта (Task 18) — СРАЗУ после `avoid_penalty` (кросс-
+    # вариантная различимость) и ДО `kind_rank`/стиля: вместимость и кросс-
+    # вариантная различимость важнее диверсификации внутри варианта, а
+    # диверсификация внутри варианта важнее чистого вкуса `kind_rank`/декора
+    # (тот же порядок приоритетов, что обосновывает позицию `avoid_penalty`
+    # выше в докстроке функции — "различимость... ПЕРЕД вкусом").
+    repeat_penalty = _diversity_penalty(p.pattern_id, history)
+
     # `dense` тянется к раскладкам победнее декором (плотнее текстом, меньше
     # оформления), `visual` — к раскладкам богаче декором (декор часто И
     # ЕСТЬ картинка/пиктограмма), `airy` декор не смещает вовсе (её ось —
@@ -340,26 +461,44 @@ def _pattern_rank_key(
     else:
         roominess_bias = 0
 
-    return (fit_bucket, avoid_penalty, kind_rank, decor_bias, capacity_bias, roominess_bias, -p.score)
+    return (
+        fit_bucket, avoid_penalty, repeat_penalty, kind_rank, decor_bias, capacity_bias, roominess_bias,
+        -p.score,
+    )
 
 
 # `kind`, чей `Pattern.repeat`/визуал требует контента, который приносит
-# ТОЛЬКО соответствующий блок (`CardBlock`/`KpiBlock`/`TableVisual`) — см.
-# `_compatible_kinds`: без такого блока `compose.blocks._assign_cards`/
-# `_assign_kpis`/`builder._place_table_visual` физически нечем заполнить
-# повторяющиеся слоты этого `kind`, они останутся пустыми декоративными
-# рамками (Task 13, дефект отчёта задачи №2, ручная проверка ЛЦТ2026:
-# безблочный слайд деградировал на "cards", т.к. это первый по вкусу `kind`
-# в списке предпочтения `dense`, — четыре пустые карточные плашки на
-# слайде "Содержание_1"). Используется ТОЛЬКО в деградации `_choose_kind_
-# and_pattern` ниже, когда совместимый `kind` не представлен в шаблоне —
-# обычный (не деградирующий) путь и так никогда не выбирает эти `kind` без
-# нужного блока (`_compatible_kinds` их просто не предлагает).
-_HARD_REQUIREMENT_KINDS = frozenset({"cards", "kpi", "table"})
+# ТОЛЬКО соответствующий блок (`CardBlock`/`KpiBlock`/`TableVisual`/фото) —
+# см. `_compatible_kinds`: без такого блока `compose.blocks._assign_cards`/
+# `_assign_kpis`/`builder._place_table_visual`/`_place_visual` физически
+# нечем заполнить повторяющиеся слоты (или единственный слот-картинку) этого
+# `kind`, они останутся пустыми декоративными рамками (Task 13, дефект
+# отчёта задачи №2, ручная проверка ЛЦТ2026: безблочный слайд деградировал
+# на "cards", т.к. это первый по вкусу `kind` в списке предпочтения `dense`,
+# — четыре пустые карточные плашки на слайде "Содержание_1"). Используется
+# ТОЛЬКО в деградации `_choose_kind_and_pattern` ниже, когда совместимый
+# `kind` не представлен в шаблоне — обычный (не деградирующий) путь и так
+# никогда не выбирает эти `kind` без нужного блока (`_compatible_kinds` их
+# просто не предлагает).
+#
+# `"kpi_caption"` (Task 18) — тот же риск, что и `"kpi"`: раскладка ждёт
+# `kpi_value`/`kpi_label`, без `KpiBlock` слот пуст. `"photo_text"` — тот же
+# риск, что у любой раскладки, чей смысл несёт картинка: без `slide.visual`
+# слот-фото пуст (то же самое, чем в этом же списке уже была бы `"image"`,
+# если бы её когда-либо приходилось деградировать — `"image"` сюда НЕ
+# добавлена намеренно: `_compatible_kinds` уже не предлагает её без визуала
+# структурно ни в одной ветке, добавлять её в hard-requirement было бы
+# избыточно, но безопасно; `"quote"` НЕ добавлена — `compose.blocks.
+# _assign_quote` уже умеет положить `QuoteBlock`, а при его отсутствии и
+# любой другой текст, в `"body"`/`"card_body"`-слот раскладки `quote`
+# (см. её докстроку) — деградация на `quote` без QuoteBlock не оставляет
+# слот пустым, тот же класс "гибких" `kind`, что `bullets`/`two_col`.
+_HARD_REQUIREMENT_KINDS = frozenset({"cards", "kpi", "kpi_caption", "table", "photo_text"})
 
 
 def _choose_kind_and_pattern(
-    slide: SlideSpec, profile, variant: Variant, *, avoid: frozenset[str] = frozenset(),
+    slide: SlideSpec, profile, variant: Variant, *,
+    avoid: frozenset[str] = frozenset(), history: _SelectionHistory = _EMPTY_HISTORY,
 ) -> tuple[str, str | None]:
     """`kind`+`pattern_id` для один слайд — брифом: "выбирает раскладку из
     списка, который ей дал разбор шаблона... если предложит несуществующую,
@@ -414,7 +553,7 @@ def _choose_kind_and_pattern(
 
     best = min(
         candidates,
-        key=lambda p: _pattern_rank_key(p, variant, item_count, char_len, kind_rank[p.kind], avoid),
+        key=lambda p: _pattern_rank_key(p, variant, item_count, char_len, kind_rank[p.kind], avoid, history),
     )
     return best.kind, best.pattern_id
 
@@ -462,13 +601,23 @@ def _pattern_choices(
     """`id(slide) -> pattern_id`, выбранный для `variant` по каждому слайду
     `slides` — вынесено отдельной функцией, чтобы `apply_variant` могло
     посчитать выбор ОДНОГО варианта (`dense`) и передать его как контекст
-    `avoid` следующему (см. её докстроку)."""
+    `avoid` следующему (см. её докстроку).
+
+    Своя, ЛОКАЛЬНАЯ история диверсификации (Task 18) — этот проход строит
+    выбор ДЛЯ ОДНОГО варианта целиком (`dense`/`visual`, см. вызовы в
+    `apply_variant`), последовательно по слайдам, тем же принципом "штраф
+    за уже выбранное" (см. `_diversity_penalty`), что и финальный проход в
+    `apply_variant` — предпросмотр выбора `dense` тоже не обязан повторять
+    одну и ту же раскладку на каждом bullets-слайде, раз он сам становится
+    контекстом `avoid` для `visual`/`airy`."""
     avoid_by_slide = avoid_by_slide or {}
     result: dict[int, str | None] = {}
+    history = _EMPTY_HISTORY
     for slide in slides:
         avoid = avoid_by_slide.get(id(slide), frozenset())
-        _kind, pattern_id = _choose_kind_and_pattern(slide, profile, variant, avoid=avoid)
+        _kind, pattern_id = _choose_kind_and_pattern(slide, profile, variant, avoid=avoid, history=history)
         result[id(slide)] = pattern_id
+        history = history.with_choice(pattern_id)
     return result
 
 
@@ -488,7 +637,15 @@ def apply_variant(deck_spec: DeckSpec, profile, variant: Variant) -> DeckSpec:
     `_pattern_rank_key` — избегание НЕ покупается ценой видимого
     переполнения); `airy` избегает ОБОИХ. Порядок (dense -> visual -> airy)
     — не иерархия важности вариантов, а просто порядок вычисления, дающий
-    каждому следующему варианту всё, что уже выбрано раньше."""
+    каждому следующему варианту всё, что уже выбрано раньше.
+
+    Внутри КАЖДОГО отдельного варианта (Task 18) конечный цикл ниже несёт
+    свою `_SelectionHistory`, растущую по ходу перебора слайдов — тот же
+    штраф за повтор, что теперь стоит и в `compose.builder._pattern_rank_
+    key` (см. её докстроку про то, почему одного этого штрафа там
+    недостаточно: `apply_variant` — точка, которая РЕАЛЬНО решает
+    `pattern_id`, `builder.py` лишь перепроверяет и, если проставленный
+    здесь `pattern_id` не прошёл аудит, довыбирает сам)."""
     base_slides = list(deck_spec.slides)
     slides = _with_dividers(base_slides) if variant is Variant.airy else base_slides
 
@@ -509,10 +666,12 @@ def apply_variant(deck_spec: DeckSpec, profile, variant: Variant) -> DeckSpec:
         avoid_by_slide[id(slide)] = frozenset(avoid)
 
     new_slides: list[SlideSpec] = []
+    history = _EMPTY_HISTORY
     for i, slide in enumerate(slides):
         avoid = avoid_by_slide.get(id(slide), frozenset())
-        kind, pattern_id = _choose_kind_and_pattern(slide, profile, variant, avoid=avoid)
+        kind, pattern_id = _choose_kind_and_pattern(slide, profile, variant, avoid=avoid, history=history)
         new_slides.append(replace(slide, index=i, kind=kind, pattern_id=pattern_id))
+        history = history.with_choice(pattern_id)
 
     return DeckSpec(
         title=deck_spec.title, language=deck_spec.language, slides=new_slides, meta=dict(deck_spec.meta),
