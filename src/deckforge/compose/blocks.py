@@ -261,7 +261,7 @@ def expand_repeat(pattern: Pattern, n: int, grid: Grid) -> list[list[PatternSlot
     # завышенным "свободным" пространством и последняя карточка уезжала за
     # правое поле холста.
     item_size = max(size_of(s.box) for s in template_group)
-    positions = _expand_positions(axis, item_size, n, grid)
+    positions = _expand_positions(axis, item_size, n, grid, repeat.step)
 
     result: list[list[PatternSlot]] = []
     for pos in positions:
@@ -269,22 +269,39 @@ def expand_repeat(pattern: Pattern, n: int, grid: Grid) -> list[list[PatternSlot
     return result
 
 
-def _expand_positions(axis: str, item_size: float, n: int, grid: Grid) -> list[float]:
-    """Позиции (координата вдоль `axis`, доли холста) `n` равномерно
-    распределённых единиц размера `item_size` между полями шаблона —
-    геометрическое ядро, общее для `expand_repeat` (текстовые слоты) и
-    `expand_decor` (декор группы повтора, см. ниже): `new_step = (span -
-    item_size) / (n - 1)`, тот же вывод, что в докстроке `expand_repeat`
-    выше (единственный геометрически осмысленный способ распределить
-    произвольное `n` между двумя фиксированными полями), вынесенный в
-    отдельную функцию, чтобы декор пересчитывался ТЕМ ЖЕ шагом, что и
-    текст, а не отдельной, потенциально разъезжающейся копией формулы."""
+def _expand_positions(axis: str, item_size: float, n: int, grid: Grid, native_step: float) -> list[float]:
+    """Позиции (координата вдоль `axis`, доли холста) `n` единиц размера
+    `item_size` между полями шаблона — геометрическое ядро, общее для
+    `expand_repeat` (текстовые слоты) и `expand_decor` (декор группы
+    повтора, см. ниже), чтобы декор пересчитывался ТЕМ ЖЕ шагом, что и
+    текст, а не отдельной, потенциально разъезжающейся копией формулы.
+
+    Task 10 отчёт, находка №3 ("шаг растянулся"): раньше шаг ВСЕГДА
+    пересчитывался так, чтобы `n` единиц заняли весь `span` между полями
+    (`new_step = (span - item_size) / (n - 1)`), независимо от того,
+    сколько элементов было намайнено. При уменьшении числа элементов
+    (раскладка на 3 карточки, контента — 2) это растягивало интервал на
+    всю ширину слайда: два текста расходились к противоположным краям, а
+    визуально ряд карточек переставал читаться как ряд (VK Tech, "Риски
+    раскатки"). Теперь ШАГ ПО УМОЛЧАНИЮ — РОДНОЙ, намайненный
+    (`repeat.step`, `native_step`): `n` единиц ставятся КОМПАКТНО, встык
+    друг к другу тем же шагом, что и в раскладке-источнике, ВЫРОВНЕННЫМИ
+    ПО НАЧАЛУ контентной области (`margin_lo`) — тот же угол, с которого
+    начиналась исходная группа. Растягивающий пересчёт остаётся ЗАПАСНЫМ
+    вариантом ТОЛЬКО когда компактная раскладка физически не помещается
+    между полями при родном шаге (`n` заметно БОЛЬШЕ намайненного
+    `repeat.count`, единственный случай, где растягивать необходимо,
+    чтобы вообще всё поместилось)."""
     margin_lo = grid.margin_left if axis == "x" else grid.margin_top
     margin_hi = grid.margin_right if axis == "x" else grid.margin_bottom
     span = max(1.0 - margin_lo - margin_hi, 0.0)
+    step = native_step if native_step and native_step > 0 else 0.0
+    compact_width = item_size + step * (n - 1) if n > 1 else item_size
+    if n <= 1 or compact_width <= span + 1e-9:
+        return [margin_lo + i * step for i in range(n)]
     usable = max(span - item_size, 0.0)
-    new_step = usable / (n - 1) if n > 1 else 0.0
-    return [margin_lo + i * new_step for i in range(n)]
+    fallback_step = usable / (n - 1) if n > 1 else 0.0
+    return [margin_lo + i * fallback_step for i in range(n)]
 
 
 def expand_decor(pattern: Pattern, n: int | None, grid: Grid) -> list[DecorShape]:
@@ -333,7 +350,7 @@ def expand_decor(pattern: Pattern, n: int | None, grid: Grid) -> list[DecorShape
         by_index.setdefault(d.repeat_index, []).append(d)
     template_group = by_index[min(by_index)]
     item_size = max(size_of(d.box) for d in template_group)
-    positions = _expand_positions(axis, item_size, n, grid)
+    positions = _expand_positions(axis, item_size, n, grid, repeat.step)
 
     result = list(ungrouped)
     for i, pos in enumerate(positions):

@@ -11,7 +11,9 @@ py::_decor_repeat_membership`) — `expand_decor` читает его и раз�
 ТОЛЬКО такой декор, тем же пересчётом шага, что и `expand_repeat`."""
 from __future__ import annotations
 
-from deckforge.compose.blocks import expand_decor
+import pytest
+
+from deckforge.compose.blocks import expand_decor, expand_repeat
 from deckforge.ooxml.geometry import Box
 from deckforge.template.grid import Grid
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
@@ -54,6 +56,30 @@ def test_decor_group_shrinks_to_the_actual_number_of_items():
     result = expand_decor(pattern, 2, _grid())
     assert len(result) == 2
     assert {d.repeat_index for d in result} == {0, 1}
+
+
+def test_decor_group_keeps_the_native_step_instead_of_stretching_to_the_full_span():
+    """Task 10 отчёт, находка №3: при уменьшении числа элементов шаг НЕ
+    растягивается на весь span между полями шаблона (иначе две карточки
+    разъезжаются к противоположным краям слайда) — остаётся РОДНОЙ шаг
+    раскладки (0.15), группа компактна и выровнена по началу контентной
+    области (`grid.margin_left=0.05`), как и первые две намайненные рамки
+    исходной шестёрки."""
+    pattern = _six_card_pattern()
+    result = expand_decor(pattern, 2, _grid())
+    lefts = sorted(d.box.left for d in result)
+    assert lefts == pytest.approx([0.05, 0.20])
+
+
+def test_repeat_group_keeps_the_native_step_instead_of_stretching_to_the_full_span():
+    """Тот же дефект, что и у декора (см. тест выше), но для ТЕКСТОВЫХ
+    слотов `expand_repeat` — обе развёртки обязаны использовать одно и то
+    же геометрическое ядро (`_expand_positions`), так текст и его плашка
+    не расходятся друг с другом."""
+    pattern = _six_card_pattern()
+    groups = expand_repeat(pattern, 2, _grid())
+    lefts = sorted(g[0].box.left for g in groups)
+    assert lefts == pytest.approx([0.05, 0.20])
 
 
 def test_decor_group_grows_and_recomputes_the_step_when_content_has_more_items():
