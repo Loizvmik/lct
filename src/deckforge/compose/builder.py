@@ -521,7 +521,10 @@ def _pattern_from_model(model) -> Pattern:
 
 
 def _grid_from_model(model) -> Grid:
-    columns = [ColumnAxis(center=c.center, count=c.count, confidence=c.confidence) for c in model.columns]
+    columns = [
+        ColumnAxis(center=c.center, count=c.count, confidence=c.confidence, source=c.source)
+        for c in model.columns
+    ]
     return Grid(
         margin_left=model.margin_left, margin_right=model.margin_right,
         margin_top=model.margin_top, margin_bottom=model.margin_bottom,

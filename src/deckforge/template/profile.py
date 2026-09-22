@@ -108,7 +108,15 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # текста внутри, засчитывались наравне с настоящей карточной плашкой; см.
 # докстроку `template/shapes.py`). Без бампа кеш молча продолжал бы
 # отдавать словарь форм, посчитанный БЕЗ отбора по тексту.
-PROFILE_SCHEMA_VERSION = 6
+# 6 -> 7: Task 11 повторное ревью аудита, находка №1 — `ColumnAxis.
+# confidence` у направляющих (`p:guide`) больше не форсируется в 1.0
+# независимо от реальной поддержки, добавлено поле `source` ("guide"/
+# "cluster", см. докстроку `template/grid.py::ColumnAxis`). Без бампа кеш
+# отдавал бы JSON старого формата, где у ВСЕХ осей (включая настоящие
+# направляющие) `source` молча дефолтился бы в "cluster" — направляющая с
+# крошечной поддержкой перестала бы быть безусловно достойной для L05,
+# ровно то поведение, которое эта правка чинит.
+PROFILE_SCHEMA_VERSION = 7
 
 # Ниже какой уверенности число из разбора попадает в предупреждения, а не
 # только в тело отчёта. 0.5 — не наблюдение за тремя файлами, а сама природа
@@ -216,6 +224,7 @@ class ColumnAxisModel(BaseModel):
     center: float
     count: int
     confidence: float
+    source: str = "cluster"
 
 
 class GridModel(BaseModel):
@@ -235,7 +244,10 @@ def _grid_model(grid: Grid) -> GridModel:
     return GridModel(
         margin_left=grid.margin_left, margin_right=grid.margin_right,
         margin_top=grid.margin_top, margin_bottom=grid.margin_bottom,
-        columns=[ColumnAxisModel(center=c.center, count=c.count, confidence=c.confidence) for c in grid.columns],
+        columns=[
+            ColumnAxisModel(center=c.center, count=c.count, confidence=c.confidence, source=c.source)
+            for c in grid.columns
+        ],
         gutter=grid.gutter, anchors=dict(grid.anchors), confidence=dict(grid.confidence),
         skipped_no_box=grid.skipped_no_box, native_guides_used=grid.native_guides_used,
     )

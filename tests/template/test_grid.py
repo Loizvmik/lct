@@ -66,12 +66,45 @@ def test_columns_are_sorted_by_confidence_descending(profile_fixture):
 def test_columns_below_support_threshold_are_not_returned(profile_fixture):
     """Порог отсечения — доля от всех измерений (см. _MIN_COLUMN_AXIS_
     SUPPORT_SHARE), не наблюдение за файлом: проверяем, что он действительно
-    применяется, а не только описан в докстроке."""
+    применяется, а не только описан в докстроке. Направляющие (`source ==
+    "guide"`) освобождены от этого порога по построению (авторитетны как
+    ИСТОЧНИК независимо от статистики, см. докстроку ColumnAxis) — честная
+    (Task 11 повторное ревью, находка №1) `confidence` направляющей может
+    оказаться и ниже порога, это не повод её терять."""
     from deckforge.template.grid import _MIN_COLUMN_AXIS_SUPPORT_SHARE
     for name in ALL_TEMPLATES:
         grid = profile_fixture(name).grid
         for axis in grid.columns:
-            assert axis.confidence >= _MIN_COLUMN_AXIS_SUPPORT_SHARE or axis.confidence == 1.0
+            assert axis.confidence >= _MIN_COLUMN_AXIS_SUPPORT_SHARE or axis.source == "guide"
+
+
+def test_guide_backed_axis_keeps_honest_confidence_not_forced_to_one():
+    """Task 11 повторное ревью, находка №1 — раньше направляющая получала
+    `confidence=1.0` НЕЗАВИСИМО от реальной поддержки, и такая ось обгоняла
+    по 'уверенности' кластерную ось, реально поддержанную на порядки большим
+    числом измерений (ровно так L05 ложно срабатывал на настоящих колонках
+    сетки — см. `tests/audit/test_deterministic.py::
+    test_L05_does_not_flag_a_block_aligned_to_a_well_supported_cluster_axis`).
+    Направляющая без единого подтверждающего её кластера (`guide_columns`
+    не встретила ни одного близкого `left_axes`) — легитимный случай
+    (дизайнер провёл линию, но по ней почти никто не выровнен), и её
+    `confidence` обязана честно отражать это (низкая или нулевая), а не
+    прикидываться единицей."""
+    from deckforge.template.grid import Cluster, _MIN_COLUMN_AXIS_SUPPORT_SHARE, _merge_columns
+
+    well_supported = Cluster(center=0.42, count=470, members=())
+    axes, _ = _merge_columns([well_supported], guide_columns=[0.10], total_left_measurements=10_000)
+
+    guide_axis = next(a for a in axes if a.source == "guide")
+    cluster_axis = next(a for a in axes if a.source == "cluster")
+
+    assert guide_axis.center == 0.10
+    assert guide_axis.confidence == 0.0  # ни один кластер её не поддержал — честный ноль, не 1.0
+    assert cluster_axis.confidence == 470 / 10_000
+    # Сортировка по честной confidence — настоящая массовая ось теперь первая,
+    # а не направляющая просто по факту происхождения.
+    assert axes[0] is cluster_axis
+    assert cluster_axis.confidence > _MIN_COLUMN_AXIS_SUPPORT_SHARE > guide_axis.confidence
 
 
 def test_title_anchor_is_found(profile_fixture):
