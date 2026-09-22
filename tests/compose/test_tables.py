@@ -78,7 +78,18 @@ def test_table_shrinks_font_until_it_fits_but_not_below_floor(new_slide, PROFILE
     )
     sizes = _cell_sizes(frame.table)
     assert sizes
-    assert min(sizes) >= PROFILE.type_scale.steps["caption"] * FONT_FLOOR_RATIO
+    # `type_scale.steps` нормирован к эталонному холсту 13.333″ — пол цикла
+    # ужимания (`tables._fit_font_size`) денормирован к РЕАЛЬНОМУ холсту
+    # `PROFILE` (`TemplateProfile.type_scale_pt`, см. находку аудита T02,
+    # отчёт Task 10a), сырой `type_scale.steps["caption"]` — кегль ДРУГОГО,
+    # эталонного холста, сравнивать построенную таблицу с ним напрямую
+    # неверно на любом шаблоне с холстом, отличным от эталонного.
+    # 0.01pt слабины — квантование `python-pptx` при записи `sz` в XML
+    # (сотые доли пункта), не сама проверка: кегль, ЗАЖАТЫЙ ровно на полу
+    # (`max(size * _SHRINK_FACTOR, floor)`), при обратном чтении из XML
+    # может round-trip'нуться на пару сотых пункта ниже `floor` — тот же
+    # источник шума, что и `config/audit.yaml: template.size_tolerance_pt`.
+    assert min(sizes) >= PROFILE.type_scale_pt("caption") * FONT_FLOOR_RATIO - 0.01
 
 
 def test_row_heights_are_measured_not_split_evenly(new_slide, PROFILE, BOX):

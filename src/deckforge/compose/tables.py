@@ -151,8 +151,15 @@ def _fit_font_size(
     """Кегль и высоты строк, подобранные циклом вниз от `body` до тех пор,
     пока сумма замеренных высот строк не влезет в `box_height_in`, но не
     ниже `FONT_FLOOR_RATIO * caption` (см. докстроку модуля)."""
-    base = profile.type_scale.steps.get("body", 18.0)
-    floor = profile.type_scale.steps.get("caption", 12.0) * FONT_FLOOR_RATIO
+    # `type_scale.steps` нормирован к эталонному холсту 13.333″ —
+    # `type_scale_pt` денормирует ОБА кегля к РЕАЛЬНОМУ холсту профиля ОДНИМ
+    # и тем же коэффициентом (см. `TemplateProfile.denorm_pt`), поэтому
+    # соотношение floor/base — и с ним поведение цикла ужимания ниже —
+    # не меняется, меняется только абсолютный масштаб (Task 10 отчёт,
+    # находка аудита T02: без денормировки тело таблицы на VK Tech выходило
+    # завышенным на треть).
+    base = profile.type_scale_pt("body", 18.0)
+    floor = profile.type_scale_pt("caption", 12.0) * FONT_FLOOR_RATIO
 
     size = base
     heights = _measure_row_heights(rows, family, size, line_spacing, col_width_in)

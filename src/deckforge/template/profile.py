@@ -27,6 +27,7 @@ from pathlib import Path
 from pydantic import BaseModel
 
 from deckforge.ooxml.color import Color, UnresolvedColor
+from deckforge.ooxml.geometry import Canvas
 from deckforge.ooxml.package import PptxPackage
 from deckforge.provider.base import LLMProvider
 from deckforge.settings import Settings
@@ -722,6 +723,52 @@ class TemplateProfile(BaseModel):
 
     def to_json(self) -> str:
         return self.model_dump_json()
+
+    @property
+    def canvas_norm(self) -> float:
+        """Множитель денормировки типографической шкалы к РЕАЛЬНОМУ холсту
+        этого шаблона (`Canvas.norm` — `12192000 / canvas_width_emu`,
+        12192000 EMU = эталонный холст 13.333″, к которому `type_scale.
+        steps` и родные кегли слотов паттернов приведены при сборке
+        профиля). `1.0`, если `canvas_width_emu` не задан (защита от
+        деления на ноль на синтетических профилях тестов, у которых холст
+        не установлен)."""
+        if not self.canvas_width_emu:
+            return 1.0
+        return Canvas(width_emu=self.canvas_width_emu, height_emu=self.canvas_height_emu).norm
+
+    def denorm_pt(self, normalized_pt: float) -> float:
+        """Денормирует кегль, приведённый к эталонному холсту 13.333″
+        (`type_scale.steps`, `PatternSlot.size_pt`), к РЕАЛЬНОМУ кеглю
+        холста этого шаблона — единственная арифметика, которая имеет
+        право это делать (`normalized_pt / self.canvas_norm`).
+
+        ЕДИНСТВЕННЫЙ путь положить кегль, взятый из нормированного
+        источника, на слайд. Найдено аудитом (T02, отчёт задачи 10): на
+        VK Tech (холст 10″, `canvas_norm` = 1.333) `compose/charts.py`,
+        `tables.py` и `diagrams.py` читали `type_scale.steps` напрямую, в
+        обход денормировки, которую `compose/builder.py` уже делал
+        (`_shrink_sequence`) — кегли текста графиков/таблиц/схем выходили
+        завышенными примерно на треть относительно остального слайда.
+        Метод существует, чтобы такой обход было неоткуда взять: любой
+        новый вызывающий код, которому нужен кегль ступени шкалы, идёт
+        через `type_scale_pt`/`denorm_pt`, а не читает `type_scale.steps`
+        напрямую."""
+        return normalized_pt / self.canvas_norm
+
+    def type_scale_pt(self, step: str, default: float | None = 0.0) -> float | None:
+        """Кегль ступени `type_scale.steps` (`"micro"`/`"caption"`/
+        `"body"`/`"h2"`/`"h1"`/`"display"`), денормированный к РЕАЛЬНОМУ
+        холсту этого шаблона (см. `denorm_pt`). `default` — то же, что у
+        `dict.get`, тоже денормируется (сам является кеглем шкалы по
+        смыслу вызова); `default=None` возвращает `None` без деления,
+        когда вызывающему коду важно ОТЛИЧИТЬ "ступени нет вовсе" от
+        "кегль ступени равен нулю" (см. `compose/diagrams.py::_fit_label_
+        size`, перебор ступеней по убыванию)."""
+        raw = self.type_scale.steps.get(step, default)
+        if raw is None:
+            return None
+        return self.denorm_pt(raw)
 
 
 # ---------------------------------------------------------------------------

@@ -139,7 +139,11 @@ def _numeric_categories(categories: list[str]) -> list[float]:
 
 def _style_chart(slide, chart, spec: ChartSpec, profile: TemplateProfile, palette: list[str]) -> None:
     family = profile.type_scale.families[0] if profile.type_scale.families else "Arial"
-    size_pt = profile.type_scale.steps.get("caption", 12.0)
+    # `type_scale.steps` нормирован к эталонному холсту 13.333″ —
+    # `type_scale_pt` денормирует к РЕАЛЬНОМУ холсту профиля (см. докстроку
+    # `TemplateProfile.denorm_pt` — Task 10 отчёт, находка аудита T02: без
+    # этого кегль текста графика на VK Tech выходил завышенным на треть).
+    size_pt = profile.type_scale_pt("caption", 12.0)
     # Текст графика (шрифт/подписи осей) рисуется прямо на фоне СЛАЙДА — у
     # диаграммы нет собственной непрозрачной заливки под текстом, в отличие
     # от ячейки таблицы/карточки схемы. Фиксированная роль "on_surface" не

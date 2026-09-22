@@ -748,11 +748,12 @@ def _shrink_sequence(profile: TemplateProfile, slot_size_pt: float) -> list[floa
     к эталонному холсту 13.333″ (`Canvas.norm` — та же нормировка, что и в
     `typography.py`/`patterns._shape_dominant_size`: `sz_raw/100*canvas.
     norm`), а рисовать нужно РЕАЛЬНЫЙ кегль ЭТОГО холста — денормируем оба
-    источника одним и тем же коэффициентом (`canvas.norm = 12192000 /
-    canvas_width_emu`) один раз здесь, а не порознь у вызывающего."""
-    norm = 12192000 / profile.canvas_width_emu if profile.canvas_width_emu else 1.0
-    size_pt = slot_size_pt / norm
-    raw_steps = {name: profile.type_scale.steps.get(name, 0.0) / norm for name in _SHRINK_STEPS}
+    источника одним и тем же коэффициентом (`TemplateProfile.denorm_pt`/
+    `type_scale_pt`, единственное место в проекте, которое имеет право
+    делить нормированный кегль на `canvas_norm`) один раз здесь, а не
+    порознь у вызывающего."""
+    size_pt = profile.denorm_pt(slot_size_pt)
+    raw_steps = {name: profile.type_scale_pt(name, 0.0) for name in _SHRINK_STEPS}
     caption_pt = raw_steps["caption"]
 
     seq = [size_pt]

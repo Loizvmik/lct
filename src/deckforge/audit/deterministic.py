@@ -856,13 +856,11 @@ def _allowed_font_sizes(profile: TemplateProfile) -> set[float]:
     шкалы шаблона" — "нет нигде в реальном типографическом инвентаре этого
     шаблона" (ни в ступенях, ни в фактических кеглях его собственных
     слайдов), не "не совпадает с одним из шести круглых чисел"."""
-    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
-    norm = canvas.norm if canvas.width_emu else 1.0
-    sizes = {v / norm for v in profile.type_scale.steps.values() if v > 0}
+    sizes = {profile.denorm_pt(v) for v in profile.type_scale.steps.values() if v > 0}
     for pattern in profile.patterns:
         for slot in pattern.slots:
             if slot.size_pt and slot.size_pt > 0:
-                sizes.add(slot.size_pt / norm)
+                sizes.add(profile.denorm_pt(slot.size_pt))
     return sizes
 
 
@@ -1269,9 +1267,7 @@ def _check_I03(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
     style = _dominant_run_style(only.element)
     if style is None:
         return []
-    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
-    norm = canvas.norm if canvas.width_emu else 1.0
-    heading_pt = profile.type_scale.steps.get("h2", 0.0) / norm
+    heading_pt = profile.type_scale_pt("h2", 0.0)
     tol = config.template.size_tolerance_pt
     _family, size_pt, _bold = style
     if heading_pt > 0 and size_pt >= heading_pt - tol:

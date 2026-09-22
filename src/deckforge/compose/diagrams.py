@@ -354,15 +354,25 @@ def _add_connector(slide, x1: int, y1: int, x2: int, y2: int, color_hex: str, *,
 
 
 def _fit_label_size(text: str, family: str, profile: TemplateProfile, width_in: float, height_in: float) -> float:
+    """`type_scale.steps` нормирован к эталонному холсту 13.333″ —
+    `TemplateProfile.type_scale_pt` денормирует каждую ступень к РЕАЛЬНОМУ
+    холсту профиля ПЕРЕД замером (Task 10 отчёт, находка аудита T02: без
+    этого подпись карточки схемы на VK Tech измерялась и рисовалась
+    кеглем, завышенным на треть)."""
     line_spacing = profile.type_scale.body_line_spacing
     for step in _LABEL_STEPS:
-        size_pt = profile.type_scale.steps.get(step)
+        size_pt = profile.type_scale_pt(step, default=None)
         if size_pt is None:
             continue
         metrics = measure(text, family, size_pt, max(width_in, 0.1), line_spacing=line_spacing)
         if metrics.height_in <= height_in:
             return size_pt
-    return profile.type_scale.steps.get("micro", profile.type_scale.steps.get("caption", 10.0))
+    # Дефолт для `type_scale_pt` обязан быть в НОРМИРОВАННОМ пространстве
+    # (сам денормируется внутри `type_scale_pt`) — если бы здесь подставили
+    # уже денормированный `type_scale_pt("caption", ...)`, "micro" отсутствуй
+    # он в шкале, получил бы ВТОРОЕ деление на `canvas_norm` поверх первого.
+    caption_normalized = profile.type_scale.steps.get("caption", 10.0)
+    return profile.type_scale_pt("micro", caption_normalized)
 
 
 def _connector_color(profile: TemplateProfile) -> str:
