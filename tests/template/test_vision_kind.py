@@ -220,8 +220,12 @@ def test_model_proposes_a_kind_outside_the_closed_list_is_rejected(tmp_path, mon
 def test_batch_network_failure_keeps_geometric_kind_for_the_whole_batch(tmp_path, monkeypatch):
     """Пачка — один вызов на несколько паттернов; сбой сети откатывает ВСЮ
     пачку к геометрическим видам, не только один паттерн (докстрока модуля
-    про "блейст-радиус")."""
+    про "блейст-радиус"). `_BATCH_SIZE` поднят monkeypatch'ем до 2 — иначе
+    (продакшен-дефолт 1) два паттерна ушли бы двумя независимыми вызовами,
+    и тест не проверял бы собственно блейст-радиус пачки."""
     import deckforge.template.vision_kind as vk
+
+    monkeypatch.setattr(vk, "_BATCH_SIZE", 2)
 
     png1 = tmp_path / "slide-1.png"
     png1.write_bytes(_tiny_png())
@@ -322,9 +326,19 @@ def test_model_returns_a_non_object_json_is_rejected_for_the_whole_batch(tmp_pat
 
 
 def test_several_uncertain_patterns_are_batched_into_fewer_model_calls(tmp_path, monkeypatch):
+    """`_BATCH_SIZE` в продакшене — 1 (см. её комментарий, "разбор в бюджет:
+    вторая попытка" — пачки ≥2 наступают на потолок эскалации бюджета
+    провайдера ненадёжно). Сам МЕХАНИЗМ группировки (`_ask_batch` уходит
+    ОДНИМ вызовом на несколько паттернов, если `_BATCH_SIZE` больше 1) от
+    этого не удалён и остаётся рабочим и протестированным — тест гонит его
+    с явно повышенным `_BATCH_SIZE` (monkeypatch), не завязываясь на то,
+    какое значение стоит в проде сейчас."""
     import deckforge.template.vision_kind as vk
 
-    n = _BATCH_SIZE + 1  # заведомо больше одной пачки, но меньше двух полных
+    batch_size = 3
+    monkeypatch.setattr(vk, "_BATCH_SIZE", batch_size)
+
+    n = batch_size + 1  # заведомо больше одной пачки, но меньше двух полных
     pngs = []
     for i in range(1, n + 1):
         p = tmp_path / f"slide-{i}.png"
@@ -343,19 +357,24 @@ def test_several_uncertain_patterns_are_batched_into_fewer_model_calls(tmp_path,
     result, notes = classify_patterns_by_vision(patterns, Path("template.pptx"), _FakeVision(_respond), max_workers=1)
 
     assert all(p.kind == "quote" for p in result)
-    # n паттернов пачками до _BATCH_SIZE — минимум два вызова (одна пачка не
-    # вместила бы все n > _BATCH_SIZE), и НИ ОДИН вызов не пачка размера 1
+    # n паттернов пачками до batch_size — минимум два вызова (одна пачка не
+    # вместила бы все n > batch_size), и НИ ОДИН вызов не пачка размера 1
     # на весь список (иначе батчинг не работает вовсе).
     assert len(calls) >= 2
     assert sum(calls) == n
-    assert max(calls) <= _BATCH_SIZE
+    assert max(calls) <= batch_size
 
 
 def test_max_tokens_for_batch_grows_with_batch_size(tmp_path, monkeypatch):
     """Бюджет вызова — на ВСЮ пачку, не фиксированное число вне зависимости
     от того, сколько паттернов в неё легло (докстрока модуля про живой
-    замер: 3072 на паттерн, умноженное на размер пачки)."""
+    замер: 3072 на паттерн, умноженное на размер пачки). `_BATCH_SIZE`
+    поднят monkeypatch'ем — иначе (продакшен-дефолт 1, см. её комментарий)
+    два паттерна ушли бы ДВУМЯ вызовами по одному, а не одной пачкой из
+    двух, и тест проверял бы не то, что заявлен."""
     import deckforge.template.vision_kind as vk
+
+    monkeypatch.setattr(vk, "_BATCH_SIZE", 2)
 
     pngs = []
     for i in (1, 2):

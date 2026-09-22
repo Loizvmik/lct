@@ -33,9 +33,12 @@ def test_pattern_kind_max_workers_is_read_from_app_yaml():
     """Задача "разбор незнакомого шаблона в бюджет", находка №4 — число
     потоков уточнения вида раскладки (`template.vision_kind`) теперь
     настройка, как и `slide_writer_max_workers`, а не хардкод-константа
-    модуля."""
+    модуля. 4 -> 8 (вторая попытка той же задачи, живой замер — см.
+    докстроку `vision_kind.DEFAULT_MAX_WORKERS`): после возврата размера
+    пачки к 1 девять неуверенных паттернов контрольного файла при 4
+    воркерах шли 3 последовательными раундами, при 8 — почти всегда одним."""
     settings = Settings.load(APP_YAML)
-    assert settings.llm.pattern_kind_max_workers == 4
+    assert settings.llm.pattern_kind_max_workers == 8
 
 
 def test_llm_roles_resolve_to_allowed_models():

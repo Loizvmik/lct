@@ -19,6 +19,20 @@ PNG получаются через PDF (`pdftoppm`, если есть в PATH) 
 страницу многостраничного файла), поэтому это не запасной путь, а основной;
 `--convert-to png:calc_png_Export`-подобный обход тоже не решает эту
 проблему, тем же способом идёт `pdftocairo`, если `pdftoppm` не нашёлся.
+
+## Выборочный рендер страниц (задача "разбор незнакомого шаблона в бюджет")
+
+Живой замер на контрольном `ЛЦТ2026 Шаблон презентации.pptx` (37 слайдов,
+изолированный прогон, чистый временный каталог): `to_pdf` (конвертация
+ЦЕЛОГО файла) — 41.6с, `pdftoppm` НА ВСЕ 37 страниц при dpi=110 — ещё 25.4с
+поверх. `soffice` не умеет конвертировать в PDF только часть слайдов (грабля
+уже описана выше) — эта часть стоимости фиксированная и неустранимая этой
+правкой. А вот `pdftoppm` РАЗМЕНИВАЕТ диапазон страниц (`-f`/`-l`) — тот же
+замер, растрирование только 9 РАЗБРОСАННЫХ страниц из тех же 37 (по одному
+вызову `pdftoppm -f N -l N` на страницу, раз страницы не идут подряд) — 4.6с
+вместо 25.4с. `to_pngs(..., pages=[...])` ниже пользуется именно этим: сама
+конвертация в PDF по-прежнему одна на весь файл (иначе нельзя), а
+растрирование — только запрошенных страниц, не всех.
 """
 from __future__ import annotations
 import shutil
@@ -145,13 +159,23 @@ def _pdftoppm_binary() -> str | None:
     return shutil.which("pdftoppm") or shutil.which("pdftocairo")
 
 
-def to_pngs(pptx: Path, out_dir: Path, dpi: int = 110) -> list[Path]:
-    """Растрирует каждый слайд `pptx` в отдельный PNG (`{stem}-N.png`), по
-    порядку слайдов, с разрешением `dpi` точек на дюйм.
+def to_pngs(pptx: Path, out_dir: Path, dpi: int = 110, pages: list[int] | None = None) -> list[Path]:
+    """Растрирует слайды `pptx` в отдельные PNG (`{stem}-N.png`), по
+    возрастанию номера страницы, с разрешением `dpi` точек на дюйм.
 
     Идёт через PDF (`pdftoppm -r {dpi} -png`, см. докстроку модуля), не
     напрямую `soffice --convert-to png` — тот экспортирует только первую
-    страницу многостраничного файла."""
+    страницу многостраничного файла.
+
+    `pages` — `None` (по умолчанию) растрирует ВСЕ страницы файла, одним
+    вызовом `pdftoppm`, как раньше. Список конкретных 1-based номеров
+    страниц растрирует ТОЛЬКО их — по одному вызову `pdftoppm -f N -l N` на
+    страницу (poppler не принимает произвольный несмежный список страниц
+    одним диапазоном `-f`/`-l`, только сплошной интервал; страницы задачи
+    "разбор незнакомого шаблона в бюджет" разбросаны по файлу, не идут
+    подряд — см. докстроку модуля про живой замер, почему это того стоит).
+    Конвертация в PDF (`to_pdf`) в обоих случаях одна на весь файл — этого
+    шага `pages` не касается, `soffice` не умеет конвертировать частично."""
     pptx = Path(pptx)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -166,14 +190,26 @@ def to_pngs(pptx: Path, out_dir: Path, dpi: int = 110) -> list[Path]:
         )
 
     prefix = out_dir / pptx.stem
-    is_cairo = poppler_bin.endswith("pdftocairo")
-    cmd = [poppler_bin, "-r", str(dpi), "-png", str(pdf_path), str(prefix)]
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=_PDFTOPPM_TIMEOUT_SECONDS)
-    except subprocess.TimeoutExpired as exc:
-        raise RenderError(f"{poppler_bin} не уложился в {_PDFTOPPM_TIMEOUT_SECONDS:.0f}с") from exc
-    if result.returncode != 0:
-        raise RenderError(f"{poppler_bin} завершился с кодом {result.returncode}:\n{result.stderr}")
+    if pages is None:
+        cmds = [[poppler_bin, "-r", str(dpi), "-png", str(pdf_path), str(prefix)]]
+    else:
+        # Один вызов на страницу (см. докстроку выше) — каждый пишет ровно
+        # один файл `{stem}-{page}.png` (тот же формат имени, что и полный
+        # рендер, `-f N -l N` не меняет схему именования poppler'ом), так
+        # что дальнейшая сортировка/поиск по `{stem}-*.png` работает
+        # одинаково для обеих веток.
+        cmds = [
+            [poppler_bin, "-r", str(dpi), "-png", "-f", str(page), "-l", str(page), str(pdf_path), str(prefix)]
+            for page in pages
+        ]
+
+    for cmd in cmds:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=_PDFTOPPM_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            raise RenderError(f"{poppler_bin} не уложился в {_PDFTOPPM_TIMEOUT_SECONDS:.0f}с") from exc
+        if result.returncode != 0:
+            raise RenderError(f"{poppler_bin} завершился с кодом {result.returncode}:\n{result.stderr}")
 
     pngs = sorted(out_dir.glob(f"{pptx.stem}-*.png"), key=_page_number)
     if not pngs:
