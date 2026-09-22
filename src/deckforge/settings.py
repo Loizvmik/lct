@@ -50,6 +50,12 @@ class LLMRoles(BaseModel):
     # роль явно не расписана в `config/app.yaml`, то же поведение, что и у
     # любой роли, не перечисленной в `roles:` вовсе (см. `model_for`).
     pattern_kind: str | None = None
+    # Task 20 (встраивание пользовательских фотографий): распределение
+    # фотографий контент-пакета по слайдам, один вызов на колоду
+    # (`plan.photos.assign_photos`) — тот же необязательный приём, что и
+    # `pattern_kind` выше, роль новая и не обязана быть расписана в старых
+    # конфигах (`model_for` падает на `self.model` без явной записи).
+    photo_picker: str | None = None
 
 
 class LLMConfig(BaseModel):

@@ -133,9 +133,24 @@ class Visual:
     например "photo"/"icon"/"logo") или какие данные несёт таблица
     (`table`)/график (`chart`), а не координаты и не то, как картинка
     обрезана под рамку.
-    """
+
+    `photo_name` (Task 20, встраивание пользовательских фотографий) — имя
+    файла фотографии контент-пакета (`plan.photos.ContentPhoto.name`),
+    которую `plan.photos.assign_photos` поставила на этот слайд, или
+    `None` — вёрстка тогда берёт фото из каталога ассетов ШАБЛОНА, как и
+    до этой задачи (`compose.builder._place_picture_visual`). Только имя
+    файла, не путь и не байты — тот же принцип, что и у `asset_role` в
+    докстроке выше: план знает, ЧТО показать по смыслу, не пиксели и не
+    координаты; сами байты фотографии сборка достаёт по этому имени из
+    словаря, который ей передаёт вызывающий код (`cli.py`), а не план.
+    Слайд-райтер (`agents/slide-writer/AGENT.md`) это поле никогда не
+    заполняет — его нет среди `_SLIDE_ALLOWED`/ключей `visual_from_dict`
+    ниже (тот же приём, что и `SlideSpec.pattern_id`, который тоже
+    проставляется ПОСЛЕ содержания отдельным шагом, не моделью, писавшей
+    текст)."""
     kind: str  # "photo" | "icon" | "chart" | "table"
     caption: str | None = None
+    photo_name: str | None = None
     table: TableVisual | None = None
     chart: ChartVisual | None = None
 
@@ -499,7 +514,10 @@ def _visual_to_dict(visual: Visual | None) -> dict | None:
             "unit": c.unit, "highlight_index": c.highlight_index,
             "axis_titles": list(c.axis_titles) if c.axis_titles else None,
         }
-    return {"kind": visual.kind, "caption": visual.caption, "table": table, "chart": chart}
+    return {
+        "kind": visual.kind, "caption": visual.caption, "photo_name": visual.photo_name,
+        "table": table, "chart": chart,
+    }
 
 
 def _visual_from_debug_dict(data: dict | None) -> Visual | None:
@@ -515,7 +533,10 @@ def _visual_from_debug_dict(data: dict | None) -> Visual | None:
             unit=c.get("unit"), highlight_index=c.get("highlight_index"),
             axis_titles=tuple(c["axis_titles"]) if c.get("axis_titles") else None,
         )
-    return Visual(kind=data["kind"], caption=data.get("caption"), table=table, chart=chart)
+    return Visual(
+        kind=data["kind"], caption=data.get("caption"), photo_name=data.get("photo_name"),
+        table=table, chart=chart,
+    )
 
 
 def slide_spec_to_dict(slide: SlideSpec) -> dict:
