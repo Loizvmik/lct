@@ -635,7 +635,21 @@ class TemplateProfile(BaseModel):
         path = Path(path)
         fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
 
+        # Найдено этой задачей: `cache_dir` объявлен типом `Path | None`, но
+        # Python не приводит аргументы к аннотации сама — вызывающий код,
+        # передавший ГОЛУЮ СТРОКУ (`cache_dir="некоторый/путь"`), раньше
+        # долетал до `effective_cache_dir / f"{fingerprint}.json"` ниже и
+        # падал `TypeError: unsupported operand type(s) for /: 'str' and
+        # 'str'` — деталь реализации (что каталог кеша собирается через `/`)
+        # протекала наружу как малопонятная ошибка типа, а не как честная
+        # работа с любым путём. `Path(...)` тут же приводит строку к пути
+        # (и не портит уже-Path, `Path(Path(x)) == Path(x)`), `_CACHE_DIR_
+        # UNSET`/`None` пропускаются мимо приведения как есть — оба не несут
+        # осмысленного пути, приводить их в `Path` незачем и, для `None`,
+        # ломало бы дальнейшую проверку `is not None` ниже.
         effective_cache_dir = cache_dir if cache_dir is not _CACHE_DIR_UNSET else _default_cache_dir()
+        if effective_cache_dir is not None:
+            effective_cache_dir = Path(effective_cache_dir)
         cache_file = (
             effective_cache_dir / f"{fingerprint}.json" if effective_cache_dir is not None else None
         )

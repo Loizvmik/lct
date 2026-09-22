@@ -230,6 +230,21 @@ def test_from_file_writes_a_cache_file_keyed_by_fingerprint(tmp_path):
     assert TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8")) == profile
 
 
+def test_from_file_accepts_cache_dir_as_a_plain_string_not_only_a_path(tmp_path):
+    """Найдено этой задачей: `cache_dir` документирован как `Path | None`,
+    но Python не приводит аргументы к аннотации сама — до фикса
+    `cache_dir="строка"` падал `TypeError: unsupported operand type(s) for
+    /: 'str' and 'str'` на первой же попытке собрать путь к файлу кеша
+    (`effective_cache_dir / f"{fingerprint}.json"`), а не честно работал с
+    любым путём, как обещает сигнатура."""
+    cache_dir_str = str(tmp_path / "cache")
+    profile = TemplateProfile.from_file(TEMPLATES_DIR / "VK Tech шаблон.pptx", cache_dir=cache_dir_str)
+
+    cache_file = Path(cache_dir_str) / f"{profile.fingerprint}.json"
+    assert cache_file.exists()
+    assert TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8")) == profile
+
+
 def test_from_file_second_call_uses_cache_without_reparsing(tmp_path, monkeypatch):
     """Оркестратор генерации будет дёргать from_file на каждую колоду —
     повторный вызов на том же файле не должен снова обходить пакет и снова
