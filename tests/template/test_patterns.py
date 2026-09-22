@@ -506,6 +506,32 @@ def test_decor_repeat_membership_matches_axis_and_step_of_the_content_repeat():
     assert sorted(membership.values()) == [0, 1, 2, 3, 4]
 
 
+def test_decor_repeat_membership_merges_every_matching_size_group_not_just_the_first():
+    """Task 10 отчёт, находка №3 ("плашки пропали"): живой разбор VK Tech
+    показал, что карточная плашка-подложка (крупная) и её иконка (мелкая)
+    — ДВЕ РАЗНЫЕ группы по размеру (`_group_by_size` кластеризует их
+    раздельно), но ОБЕ шагают тем же шагом/осью, что и текстовый повтор.
+    Старый код возвращал членство ПЕРВОЙ подошедшей группы и на этом
+    останавливался (`return` внутри цикла) — иконки опознавались как
+    группа повтора, а плашки-подложки карточек — нет, оставались
+    `repeat_group=False` и рендерились статически (не под фактическое
+    число карточек): визуально "плашки карточек исчезли совсем, остались
+    только синие квадратики-иконки". Обе группы обязаны войти в
+    членство."""
+    boxes = _row([0.05, 0.24, 0.43, 0.62], top=0.3, width=0.15, height=0.1)
+    content = [_ref(b) for b in boxes]
+    tiers = [_tier(step="h2") for _ in boxes]
+    repeat, _ = _find_repeat(content, tiers)
+    assert repeat is not None and repeat.count == 4
+
+    plaques = _row([0.04, 0.23, 0.42, 0.61], top=0.28, width=0.17, height=0.4)  # крупные плашки-подложки
+    icons = _row([0.06, 0.25, 0.44, 0.63], top=0.3, width=0.02, height=0.02)  # мелкие иконки, другой размер
+    decor_refs = [_ref(b) for b in (*plaques, *icons)]
+
+    membership = _decor_repeat_membership(decor_refs, repeat)
+    assert set(membership) == set(range(len(decor_refs))), "обе группы (плашки И иконки) обязаны войти в членство"
+
+
 def test_decor_repeat_membership_ignores_decor_with_a_different_step():
     """Декор, чей шаг/ось не совпадает с повтором текстовых слотов (не тот
     же ряд/сетка — случайный орнамент где-то ещё на слайде), не считается
