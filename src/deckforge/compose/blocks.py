@@ -76,14 +76,23 @@ def assign_content(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> list[
 def _slots_by_role(pattern: Pattern, slide_spec: SlideSpec) -> dict[str, list[PatternSlot]]:
     """Слоты сгруппированы по роли. Роли, входящие в `pattern.repeat`
     (`card_title`/`card_body`/... повтора), исключаются из прямой раздачи
-    ТОЛЬКО когда в `slide_spec` реально есть `CardBlock`/`KpiBlock`,
-    претендующий их развернуть через `expand_repeat` (см. `_assign_cards`/
-    `_assign_kpis`) — иначе повторяющиеся слоты (например, пара `card_body`
-    у "bullets"-раскладки с repeat count=2, не дотянувшим до классификации
-    "cards", см. `patterns._classify_kind`) остались бы недоступны вовсе
-    единственному текстовому блоку слайда, у которого просто нет своего
-    формального слота "bullet"/"body"."""
-    reserved_for_repeat = any(isinstance(b, (CardBlock, KpiBlock)) for b in slide_spec.blocks)
+    ТОЛЬКО когда в `slide_spec` реально есть `CardBlock`, претендующий их
+    развернуть через `expand_repeat` (см. `_assign_cards`) — иначе
+    повторяющиеся слоты (например, пара `card_body` у "bullets"-раскладки с
+    repeat count=2, не дотянувшим до классификации "cards", см.
+    `patterns._classify_kind`) остались бы недоступны вовсе единственному
+    текстовому блоку слайда, у которого просто нет своего формального слота
+    "bullet"/"body".
+
+    `KpiBlock` (Task 13, находка обязательной проверки — живой прогон на
+    queue-latency) НАМЕРЕННО не резервирует эти роли, хотя раньше резервировал
+    наравне с `CardBlock`: `_assign_kpis` не вызывает `expand_repeat` вовсе
+    (она читает `kpi_value`/`kpi_label` напрямую из `by_role`), а её
+    запасной вариант для раскладки БЕЗ единого kpi-слота (VK Tech: 0 из 20
+    раскладок kind="kpi") как раз метит в "bullet"/"body"/"card_body" — были
+    они зарезервированы, KPI-метрики на не-kpi раскладке молча теряли ВСЕ
+    свои факты (слайд с одним заголовком и без единой цифры, живой рендер)."""
+    reserved_for_repeat = any(isinstance(b, CardBlock) for b in slide_spec.blocks)
     repeat_roles = set(pattern.repeat.slot_roles) if (pattern.repeat is not None and reserved_for_repeat) else set()
     by_role: dict[str, list[PatternSlot]] = {}
     for slot in pattern.slots:
@@ -230,6 +239,28 @@ def _assign_kpis(block: KpiBlock, by_role: dict[str, list[PatternSlot]]) -> list
             result.append(SlotContent(label_slots[i], "kpi_label", [Paragraph(item.label)]))
     del value_slots[:n]
     del label_slots[:min(n, len(label_slots))]
+
+    # Task 13, находка обязательной проверки (живой прогон на queue-latency,
+    # VK Tech): раскладку `kind="kpi"` шаблон может не нести вовсе (VK Tech
+    # — 0 раскладок этого kind из 20), а `plan.variants.apply_variant`
+    # обязан всё равно выбрать КАКУЮ-ТО раскладку (`kind_pool` деградирует
+    # на любой доступный `kind` варианта, а не оставляет слайд несобранным)
+    # — не-kpi раскладка не несёт `kpi_value`/`kpi_label` вовсе, и n=0
+    # оставляло KpiBlock ПОЛНОСТЬЮ потерянным (слайд с одним заголовком без
+    # единой цифры — находка: пустые карточки на живом рендере, ни один
+    # факт не попал на слайд). Запасной вариант — тот же приём, что уже
+    # применяют `_assign_block` для BulletBlock ("card_body" как запасная
+    # роль) и `_assign_quote` для QuoteBlock без роли "quote": метрики, не
+    # уместившиеся (или не уместившиеся вовсе) в kpi-слоты, рендерятся
+    # строкой "значение — подпись" в обычном текстовом слоте — хуже
+    # выделенного KPI-блока визуально, но не теряет ни один факт молча.
+    remaining = block.items[n:]
+    if remaining:
+        fallback_slot = _take_one(by_role, "bullet") or _take_one(by_role, "body") or _take_one(by_role, "card_body")
+        if fallback_slot is not None:
+            lines = [f"{item.value} — {item.label}" if item.label else item.value for item in remaining]
+            result.append(SlotContent(fallback_slot, "bullets", [Paragraph(line, bullet=True) for line in lines]))
+
     return result
 
 
