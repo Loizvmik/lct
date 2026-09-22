@@ -22,12 +22,14 @@ from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Pt
 
+from deckforge.audit.config import AuditConfig
+from deckforge.audit.deterministic import audit_slide_layout
 from deckforge.compose.blocks import Paragraph, SlotContent, assign_content, expand_decor, find_bullet_char
 from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.decor import apply_decor
 from deckforge.compose.tables import TableSpec, add_table
 from deckforge.compose.textfit import measure, register_template_fonts
-from deckforge.ooxml.geometry import Box
+from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock
@@ -134,28 +136,21 @@ def build_deck(spec: DeckSpec, profile: TemplateProfile, template_path: Path, va
     prs = Presentation(str(template_path))
     _clear_sample_slides(prs)
 
+    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
+    audit_config = AuditConfig.load()
     patterns = [_pattern_from_model(m) for m in profile.patterns]
     for slide_spec in spec.slides:
-        pattern = _resolve_pattern(slide_spec, patterns, profile, variant)
-        if pattern is None:
+        candidates = _resolve_pattern(slide_spec, patterns, profile, variant)
+        if not candidates:
             slide_spec.findings.append(
                 f"Слайд {slide_spec.index}: для kind={slide_spec.kind!r} не нашлось ни одного "
                 "паттерна этого шаблона — слайд не собран."
             )
             continue
-        fit = fits(slide_spec, pattern, profile)
-        if not fit.ok:
-            # Бриф: "если ни одна раскладка не подходит, выбирай ту, где
-            # переполнение наименьшее, и оставляй явный след о проблеме" —
-            # след пишется здесь, в момент выбора, а не только если потом
-            # дойдёт до усечения в `_draw_slot` (сам выбор уже "наименее
-            # плохой" среди кандидатов этого kind, это надо знать заранее).
-            slide_spec.findings.append(
-                f"Слайд {slide_spec.index}: содержание не помещается ни в одну раскладку вида "
-                f"{slide_spec.kind!r} даже на минимальном кегле — выбрана раскладка с наименьшим "
-                f"переполнением ({fit.overflow_ratio:.0%}, {fit.reason})."
-            )
-        place_slide(prs, slide_spec, pattern, profile, bullet_char=bullet_char)
+        _pattern, notes = _place_best_candidate(
+            prs, slide_spec, candidates, profile, canvas, audit_config, bullet_char=bullet_char,
+        )
+        slide_spec.findings.extend(notes)
 
     out_path = _output_path(spec, template_path, variant)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -625,12 +620,13 @@ def _missing_signals(slide_spec: SlideSpec, assignments: list[SlotContent]) -> l
     return missing
 
 
-def _pick_pattern(
-    slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
-) -> Pattern | None:
-    """Перебирает кандидатов `pattern.kind == slide_spec.kind` и берёт того,
-    в кого содержание влезает (`fits()`, шкала ужимания целиком, не только
-    свой кегль) — не первого попавшегося. Порядок ранжирования:
+def _pattern_rank_key(slide_spec: SlideSpec, p: Pattern, profile: TemplateProfile, variant: Variant):
+    """Ключ сортировки одного паттерна-кандидата `p` для `slide_spec` —
+    вынесен из `_pick_pattern` (Task 13 продолжение) так, чтобы им мог
+    пользоваться и он сам (единственный победитель), и `_ranked_candidates`
+    (весь список по порядку — нужен циклу аудита `_place_best_candidate`,
+    которому мало ОДНОГО выбора: если он не пройдёт проверку, нужен
+    СЛЕДУЮЩИЙ по правильности кандидат, не случайный). Порядок ранжирования:
 
     1. влезает ли вообще (`fit.ok`) — не влезающие кандидаты хуже любого
        влезающего;
@@ -651,53 +647,182 @@ def _pick_pattern(
     5. паттерн с более высоким `score` (майнинг увереннее в нём);
     6. `Variant.visual`/`Variant.dense` — тот же бонус/штраф за декор, что и
        раньше (временная эвристика Task 13, см. докстроку `Variant`)."""
+    fit = fits(slide_spec, p, profile)
+    # `airy` не смещает выбор по декору вовсе (0) — её плотность решает
+    # `kind`, уже проставленный `plan.variants.apply_variant` ДО того,
+    # как сюда дошёл вызов (см. докстроку `Variant` и `_resolve_pattern`
+    # ниже: при заданном `pattern_id` он лишь переставлен первым в списке
+    # кандидатов, ранжир всё равно считается для всех).
+    if variant is Variant.visual:
+        visual_bias = len(p.decor)
+    elif variant is Variant.dense:
+        visual_bias = -len(p.decor)
+    else:
+        visual_bias = 0
+    return (
+        0 if fit.ok else 1, fit.overflow_ratio, _capacity_badness(p, slide_spec),
+        _fill_badness(fit.fill_ratio), -p.score, -visual_bias,
+    )
+
+
+def _ranked_candidates(
+    slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
+) -> list[Pattern]:
+    """Все кандидаты `pattern.kind == slide_spec.kind`, отсортированные от
+    лучшего к худшему тем же ключом, что и `_pick_pattern` (см. докстроку
+    `_pattern_rank_key`) — список, а не единственный выбор, потому что
+    аудит внутри цикла сборки (`_place_best_candidate`, Task 13 продолжение)
+    должен уметь пробовать ВТОРОГО/ТРЕТЬЕГО по качеству кандидата, если
+    лучший на бумаге по `fits()` на деле дал наложение/выход за границы на
+    РЕАЛЬНОЙ геометрии уже уложенного слайда."""
     candidates = [p for p in patterns if p.kind == slide_spec.kind]
-    if not candidates:
-        return None
+    return sorted(candidates, key=lambda p: _pattern_rank_key(slide_spec, p, profile, variant))
 
-    def rank(p: Pattern):
-        fit = fits(slide_spec, p, profile)
-        # `airy` не смещает выбор по декору вовсе (0) — её плотность решает
-        # `kind`, уже проставленный `plan.variants.apply_variant` ДО того,
-        # как сюда дошёл вызов (см. докстроку `Variant` и `_resolve_pattern`
-        # ниже: при заданном `pattern_id` этот ранжир вообще не вызывается,
-        # он остаётся запасным путём для `pattern_id=None`).
-        if variant is Variant.visual:
-            visual_bias = len(p.decor)
-        elif variant is Variant.dense:
-            visual_bias = -len(p.decor)
-        else:
-            visual_bias = 0
-        return (
-            0 if fit.ok else 1, fit.overflow_ratio, _capacity_badness(p, slide_spec),
-            _fill_badness(fit.fill_ratio), -p.score, -visual_bias,
-        )
 
-    return min(candidates, key=rank)
+def _pick_pattern(
+    slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
+) -> Pattern | None:
+    """Перебирает кандидатов `pattern.kind == slide_spec.kind` и берёт того,
+    в кого содержание влезает (`fits()`, шкала ужимания целиком, не только
+    свой кегль) — не первого попавшегося (см. `_pattern_rank_key` про
+    полный порядок ранжирования). Публичная обёртка над
+    `_ranked_candidates` — сохраняет прежний интерфейс (единственный
+    Pattern, не список) буквально ради существующих прямых тестов на неё
+    (`tests/compose/test_builder.py`, Task 9-10)."""
+    ranked = _ranked_candidates(slide_spec, patterns, profile, variant)
+    return ranked[0] if ranked else None
 
 
 def _resolve_pattern(
     slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
-) -> Pattern | None:
-    """Раскладка для `slide_spec` — предпочитает `slide_spec.pattern_id`
-    (Task 13: проставлен `plan.variants.apply_variant`, детерминированно по
-    вместимости, и/или уточнён `plan.writer.pick_patterns` моделью), но
-    НЕ доверяет ему слепо: `pattern_id` обязан существовать в ЭТОМ профиле,
-    нести ТОТ ЖЕ `kind`, что и `slide_spec.kind`, и реально вмещать
-    содержание (`fits().ok`, замер текста, которого нет ни у `apply_variant`,
-    ни у `pick_patterns` — оба живут в `plan/`, не знающем координат/текстфита).
-    Когда что-то из этого не выполняется — код берёт раскладку САМ,
-    `_pick_pattern`, тем же путём, каким собирались `SAMPLE_SPEC`/`CARDS_
-    SPEC` в `tests/compose/test_builder.py` (Task 9-10, до этой задачи;
-    `pattern_id=None` там — обратная совместимость сохранена буквально)."""
-    if slide_spec.pattern_id:
-        candidate = next(
-            (p for p in patterns if p.pattern_id == slide_spec.pattern_id and p.kind == slide_spec.kind),
-            None,
+) -> list[Pattern]:
+    """Кандидаты раскладки для `slide_spec`, в порядке предпочтения — Task
+    13 продолжение сменило это с единственного выбора на СПИСОК: решение
+    "эта раскладка подходит" теперь принимает не эвристика `fits()` заранее,
+    а детерминированный аудит УЖЕ уложенного слайда (`_place_best_
+    candidate`), и ему нужно из чего выбирать, если первый кандидат не
+    пройдёт проверку.
+
+    `slide_spec.pattern_id` (Task 13: проставлен `plan.variants.
+    apply_variant`, детерминированно по вместимости, и/или уточнён `plan.
+    writer.pick_patterns` моделью) — по-прежнему ПЕРВЫЙ кандидат в списке,
+    если он существует в этом профиле и несёт тот же `kind`, но здесь он
+    больше НЕ принимается слепо по `fits().ok`: окончательную проверку
+    делает аудит уже уложенного слайда, а не оценка текстфита ДО укладки
+    (тот же принцип, что раньше — "код не доверяет предложению слепо",
+    просто проверка стала точнее)."""
+    ranked = _ranked_candidates(slide_spec, patterns, profile, variant)
+    if not slide_spec.pattern_id:
+        return ranked
+    preferred = next((p for p in ranked if p.pattern_id == slide_spec.pattern_id), None)
+    if preferred is None:
+        return ranked
+    return [preferred, *(p for p in ranked if p.pattern_id != preferred.pattern_id)]
+
+
+# ---------------------------------------------------------------------------
+# Аудит внутри цикла сборки (Task 13, продолжение брифа: "Аудит — часть
+# пайплайна, а не внешняя проверка"). После укладки КАЖДОГО кандидата
+# раскладки слайд проверяется пятью детерминированными проверками
+# (`audit.deterministic.audit_slide_layout` — L01/L02/L03/L04/D05, буквально
+# то, что бриф называет "проблемами уровня ошибки": наложение, выход за
+# границы, невлезающий текст, заполненность вне допуска). Раскладка,
+# получившая хоть одну такую находку, считается неподходящей — берётся
+# следующий кандидат.
+#
+# Бюджет попыток — обоснование числом (бриф прямо просит обосновать бюджет
+# временем): контрольная проверка задачи меряет полный прогон всех 24
+# проверок аудита на готовую колоду из 12-15 слайдов в ДОЛИ СЕКУНДЫ (см.
+# отчёт задачи Task 13, таблица "Сборка+аудит" — 0.4-1.2с НА ВСЮ колоду);
+# пять проверок ОДНОГО слайда кратно легче этого. Сама пересборка слайда
+# тоже дешёвая — модель НЕ зовётся (содержание уже написано `plan.writer`,
+# меняется только раскладка, тот же принцип, что и у `apply_variant`, не
+# берущего `llm` в сигнатуре). При бюджете времени колоды в 5 минут (ТЗ) и
+# доминирующей стоимости самого разбора/написания текста (~170-180с из
+# 160-196с на шаблон, отчёт задачи) три полных пересборки-с-аудитом на
+# слайд — миллисекунды, не минуты; смысла НЕ ограничивать попытки тоже нет:
+# на некоторых шаблонах (ЛЦТ2026, WorkSpace) у одного `kind` бывает по
+# 10+ паттернов, и исчерпывающий перебор всех кандидатов КАЖДОГО слайда
+# рисковал бы не уложиться в бюджет на самой богатой колоде. 3 — верхняя
+# граница диапазона брифа ("две-три"): даёт циклу шанс пропустить ОДНУ
+# неудачную раскладку и ОДНУ пограничную, не тратя времени на длинный
+# хвост скорее всего таких же плохих кандидатов дальше по ранжиру (после
+# первых 2-3 по вместимости/стилю оставшиеся кандидаты почти всегда хуже
+# по построению `_pattern_rank_key`, не лучше).
+_MAX_LAYOUT_ATTEMPTS = 3
+
+
+def _remove_last_slide(prs) -> None:
+    """Убирает ПОСЛЕДНИЙ добавленный слайд из колоды — используется ТОЛЬКО
+    `_place_best_candidate`, чтобы откатить отклонённого кандидата раскладки
+    ДО того, как пробовать следующего. Тот же рецепт python-pptx, что и
+    `_clear_sample_slides` (`Part.drop_rel` снижает счётчик ссылок на часть
+    слайда; когда он доходит до нуля, сама часть и её relationships уходят
+    вместе с ней)."""
+    xml_slides = prs.slides._sldIdLst  # noqa: SLF001 — тот же приём, что и `_clear_sample_slides` выше в этом файле
+    sld = xml_slides[-1]
+    prs.part.drop_rel(sld.rId)
+    xml_slides.remove(sld)
+
+
+def _place_best_candidate(
+    prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
+    audit_config: AuditConfig, *, bullet_char: str = "•",
+) -> tuple[Pattern, list[str]]:
+    """Собрали слайд — проверили — не понравилось — взяли другую раскладку
+    и пересобрали (бриф, дословно). Пробует кандидатов `candidates` по
+    порядку (уже отранжированы `_resolve_pattern`/`_ranked_candidates` —
+    от предпочтительного к худшему), не больше `_MAX_LAYOUT_ATTEMPTS`:
+    укладывает слайд НА РЕАЛЬНЫЙ `prs`, гонит по нему `audit_slide_layout`
+    (пять проверок уровня "ошибка" — см. докстроку раздела), и
+
+    - если находок нет — оставляет слайд как есть, возвращает эту
+      раскладку;
+    - если находки есть — откатывает слайд (`_remove_last_slide`), логирует
+      причину отказа и пробует следующего кандидата;
+    - если В ПРЕДЕЛАХ БЮДЖЕТА не нашлось кандидата без находок — заново
+      укладывает того, у кого находок оказалось МЕНЬШЕ ВСЕГО (бриф: "потом
+      берётся кандидат с наименьшим числом ошибок") — слайд НИКОГДА не
+      остаётся несобранным (бриф: "пустого слайда быть не должно никогда").
+
+    Возвращает `(выбранная_раскладка, лог_попыток)` — лог уходит в
+    `slide_spec.findings` вызывающим кодом (`build_deck`): "это пойдёт на
+    защиту как доказательство, что аудит встроен, а не приделан" (бриф)."""
+    tried = candidates[:_MAX_LAYOUT_ATTEMPTS]
+    notes: list[str] = []
+    best: tuple[int, Pattern, list[str]] | None = None  # (число находок, паттерн, коды находок)
+
+    for attempt, pattern in enumerate(tried, start=1):
+        trial_spec = replace(slide_spec, findings=[])
+        place_slide(prs, trial_spec, pattern, profile, bullet_char=bullet_char)
+        errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index)
+        if not errors:
+            if attempt > 1:
+                notes.append(
+                    f"Слайд {slide_spec.index}: раскладка {pattern.pattern_id!r} принята с попытки "
+                    f"{attempt}/{len(tried)} (без находок уровня ошибки)."
+                )
+            notes.extend(trial_spec.findings)
+            return pattern, notes
+        ids = sorted({f.check_id for f in errors})
+        notes.append(
+            f"Слайд {slide_spec.index}: раскладка {pattern.pattern_id!r} отклонена (попытка "
+            f"{attempt}/{len(tried)}) — {len(errors)} находок уровня ошибки: {', '.join(ids)}."
         )
-        if candidate is not None and fits(slide_spec, candidate, profile).ok:
-            return candidate
-    return _pick_pattern(slide_spec, patterns, profile, variant)
+        if best is None or len(errors) < best[0]:
+            best = (len(errors), pattern, ids)
+        _remove_last_slide(prs)
+
+    best_errors, best_pattern, best_ids = best
+    trial_spec = replace(slide_spec, findings=[])
+    place_slide(prs, trial_spec, best_pattern, profile, bullet_char=bullet_char)
+    notes.append(
+        f"Слайд {slide_spec.index}: ни один из {len(tried)} проверенных кандидатов не прошёл аудит "
+        f"без находок — выбрана раскладка {best_pattern.pattern_id!r} с наименьшим числом находок "
+        f"({best_errors}: {', '.join(best_ids)})."
+    )
+    notes.extend(trial_spec.findings)
+    return best_pattern, notes
 
 
 # ---------------------------------------------------------------------------

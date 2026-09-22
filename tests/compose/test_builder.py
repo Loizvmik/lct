@@ -7,18 +7,21 @@
 py`) реальным содержанием пакета `fixtures/content-packs/queue-latency`
 (цифры и формулировки — из его `sources.md`)."""
 from __future__ import annotations
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+from deckforge.audit.config import AuditConfig
 from deckforge.compose.builder import (
-    Variant, _avoid_decor_overlap, _best_contrast_color, _is_cosmetic_truncation, _local_background_luminance,
-    _overlap_ratio, _pick_pattern, _relative_luminance, build_deck, fits,
+    Variant, _avoid_decor_overlap, _best_contrast_color, _clear_sample_slides, _is_cosmetic_truncation,
+    _local_background_luminance, _overlap_ratio, _pick_pattern, _place_best_candidate, _relative_luminance,
+    build_deck, fits,
 )
 from deckforge.compose.textfit import measure
-from deckforge.ooxml.geometry import Box
+from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock
 from deckforge.template.grid import Grid
@@ -684,3 +687,134 @@ def test_findings_recorded_when_content_does_not_fit():
     spec = DeckSpec(title="Т", language="ru", slides=[huge])
     build_deck(spec, PROFILE, TEMPLATE, Variant.dense)
     assert huge.findings, "переполнение слота должно оставить находку"
+
+
+# ---------------------------------------------------------------------------
+# Аудит внутри цикла сборки (Task 13, продолжение брифа): "собрали слайд —
+# проверили — не понравилось — взяли другую раскладку и пересобрали".
+# `_place_best_candidate` — единственное место, знающее И про кандидатов
+# паттерна, И про то, что скажет о них аудит (`compose.builder` уже
+# зависит от `audit.deterministic` этим путём, не наоборот).
+# ---------------------------------------------------------------------------
+
+
+def _real_layout_id() -> str:
+    return PROFILE.patterns[0].layout_id
+
+
+def _overlapping_section_pattern(pattern_id: str) -> Pattern:
+    """`headline` и `subhead` — ОДИН и тот же бокс: полное наложение (L02)
+    гарантировано независимо от длины реального текста (`_check_L02.
+    _effective_box` усаживает оба текстовых блока по факту нарисованных
+    чернил, но оба делят один left/top/width — пересечение всегда равно
+    площади МЕНЬШЕГО эффективного бокса, ratio=1.0)."""
+    box = Box(0.05, 0.1, 0.5, 0.1)
+    headline = PatternSlot(role="headline", box=box, size_pt=24.0, color_hex=None, align="l", max_chars=200, wraps=True)
+    subhead = PatternSlot(role="subhead", box=box, size_pt=16.0, color_hex=None, align="l", max_chars=200, wraps=True)
+    return Pattern(
+        pattern_id=pattern_id, source_slide_index=[0], layout_id=_real_layout_id(), kind="section",
+        slots=[headline, subhead], repeat=None, decor=[],
+        capacity=Capacity(max_items=1, max_chars_per_item=999, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,
+    )
+
+
+def _clean_section_pattern(pattern_id: str) -> Pattern:
+    headline = PatternSlot(
+        role="headline", box=Box(0.05, 0.1, 0.5, 0.1), size_pt=24.0, color_hex=None, align="l", max_chars=200, wraps=True,
+    )
+    subhead = PatternSlot(
+        role="subhead", box=Box(0.05, 0.3, 0.5, 0.1), size_pt=16.0, color_hex=None, align="l", max_chars=200, wraps=True,
+    )
+    return Pattern(
+        pattern_id=pattern_id, source_slide_index=[0], layout_id=_real_layout_id(), kind="section",
+        slots=[headline, subhead], repeat=None, decor=[],
+        capacity=Capacity(max_items=1, max_chars_per_item=999, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,
+    )
+
+
+def _new_deck_in_progress():
+    prs = Presentation(str(TEMPLATE))
+    _clear_sample_slides(prs)
+    canvas = Canvas(width_emu=PROFILE.canvas_width_emu, height_emu=PROFILE.canvas_height_emu)
+    audit_config = AuditConfig.load()
+    return prs, canvas, audit_config
+
+
+def test_slide_audit_rejects_an_overlapping_layout_and_retries_the_next_candidate():
+    """Тест брифа: "слайд, который на первой раскладке даёт наложение, а на
+    второй не даёт, собирается на второй". Первый кандидат кладёт заголовок
+    буквально поверх подзаголовка (L02) — цикл обязан отклонить его и
+    уложить слайд на второй, чистый, кандидат."""
+    bad = _overlapping_section_pattern("overlap-bad")
+    good = _clean_section_pattern("overlap-ok")
+    slide_spec = SlideSpec(index=0, kind="section", headline="Ожидание согласующих", subhead="съедает почти всё время")
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    chosen, notes = _place_best_candidate(prs, slide_spec, [bad, good], PROFILE, canvas, audit_config, bullet_char="•")
+
+    assert chosen.pattern_id == "overlap-ok"
+    assert len(prs.slides) == 1, "в колоде обязан остаться РОВНО один (финальный) слайд, не оба кандидата"
+    assert any("overlap-bad" in n and "отклонена" in n for n in notes)
+
+
+def test_slide_audit_retry_budget_is_capped():
+    """Тест брифа: "число попыток ограничь". У ЛЦТ2026/WorkSpace на
+    некоторые `kind` приходится больше десятка паттернов, а колода из
+    12-15 слайдов обязана укладываться в 5 минут (ТЗ) — перебор НЕ может
+    быть исчерпывающим. Четвёртый кандидат идеален (без единой находки
+    уровня ошибки), но раскладка не обязана его достать, если первые три
+    уже исчерпали бюджет попыток."""
+    bad1 = _overlapping_section_pattern("bad-1")
+    bad2 = _overlapping_section_pattern("bad-2")
+    bad3 = _overlapping_section_pattern("bad-3")
+    perfect = _clean_section_pattern("perfect-4th")
+    slide_spec = SlideSpec(index=0, kind="section", headline="Заголовок", subhead="Подзаголовок")
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    chosen, notes = _place_best_candidate(
+        prs, slide_spec, [bad1, bad2, bad3, perfect], PROFILE, canvas, audit_config, bullet_char="•",
+    )
+
+    assert chosen.pattern_id != "perfect-4th", "бюджет обязан остановить перебор до четвёртого кандидата"
+    assert not any("perfect-4th" in n for n in notes), "четвёртый кандидат не должен был даже пробоваться"
+
+
+def test_slide_audit_picks_the_least_bad_candidate_when_none_pass():
+    """Тест брифа: "потом берётся кандидат с наименьшим числом ошибок".
+    `worse` наваливает ТРИ взаимных наложения (headline/subhead/source на
+    одном боксе), `better` — только одно (headline/subhead); ни один не
+    проходит чисто, но `better` обязан победить как менее плохой."""
+    worse = _overlapping_section_pattern("worse")
+    extra = PatternSlot(
+        role="source", box=Box(0.05, 0.1, 0.5, 0.1), size_pt=10.0, color_hex=None, align="l", max_chars=200, wraps=True,
+    )
+    worse = replace(worse, slots=[*worse.slots, extra])
+    better = _overlapping_section_pattern("better")
+    slide_spec = SlideSpec(
+        index=0, kind="section", headline="Заголовок", subhead="Подзаголовок", source_note="Источник данных",
+    )
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    chosen, notes = _place_best_candidate(prs, slide_spec, [worse, better], PROFILE, canvas, audit_config, bullet_char="•")
+
+    assert chosen.pattern_id == "better"
+    assert any("ни один" in n for n in notes)
+
+
+def test_slide_is_never_left_empty_when_no_candidate_passes_the_audit():
+    """Тест брифа: "если ни один кандидат не прошёл, слайд всё равно
+    собирается лучшим из возможных ... пустого слайда быть не должно
+    никогда" — плюс "результат перебора логируй"."""
+    bad = _overlapping_section_pattern("only-bad")
+    slide_spec = SlideSpec(index=0, kind="section", headline="Заголовок", subhead="Подзаголовок")
+    prs, canvas, audit_config = _new_deck_in_progress()
+
+    chosen, notes = _place_best_candidate(prs, slide_spec, [bad], PROFILE, canvas, audit_config, bullet_char="•")
+
+    assert chosen is not None
+    assert len(prs.slides) == 1
+    texts = [s.text_frame.text for s in prs.slides[0].shapes if s.has_text_frame and s.text_frame.text.strip()]
+    assert texts, "слайд не должен оставаться пустым, даже если ни один кандидат не прошёл аудит"
+    assert notes, "результат перебора обязан быть залогирован"

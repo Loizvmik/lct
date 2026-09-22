@@ -111,6 +111,50 @@ def run_deterministic(pptx_path: Path, profile: TemplateProfile, config: AuditCo
 
 
 # ---------------------------------------------------------------------------
+# Аудит ОДНОГО уже уложенного слайда, ДО сохранения файла (Task 13
+# продолжение брифа: "Аудит — часть пайплайна, а не внешняя проверка" —
+# `compose.builder` зовёт это ПОСЛЕ укладки каждого кандидата раскладки,
+# чтобы решить, брать эту раскладку или пробовать следующую).
+#
+# Пять проверок, не все 24 — буквальный список брифа ("наложение, выход за
+# границы, невлезающий текст, заполненность вне допуска"): L01 (за
+# границами), L02 (наложение), L03/L04 (текст не помещается/обрезан
+# краем), D05 (заполненность вне допуска). T01-T06/D01-D04/I02-I05 — либо
+# свойство ШАБЛОНА/СОДЕРЖАНИЯ, а не конкретной геометрии кандидата (шрифт,
+# цвет, число буллетов не меняется от того, какую раскладку из одного и
+# того же `kind` выбрали), либо требуют ВСЕЙ колоды целиком (I06 сравнивает
+# заголовки МЕЖДУ слайдами) — гонять их на каждой из 2-3 попыток каждого
+# слайда было бы работой, которую негде использовать: решение "какую
+# раскладку взять" эти пять не то что не улучшат — не могут отличить один
+# кандидат этого же `kind` от другого. Полный прогон всех 24 остаётся один
+# раз на готовую колоду (`_cmd_generate`/`run_deterministic`), не дублируется.
+_LAYOUT_ERROR_CHECK_IDS = frozenset({"L01", "L02", "L03", "L04", "D05"})
+
+
+def audit_slide_layout(
+    slide, canvas: Canvas, profile: TemplateProfile, config: AuditConfig, *, index: int = 0,
+) -> list[Finding]:
+    """`_LAYOUT_ERROR_CHECK_IDS`-проверки одного УЖЕ УЛОЖЕННОГО python-pptx
+    `slide` — БЕЗ сохранения на диск и повторного открытия: `slide._element`
+    (python-pptx строит свои oxml-элементы поверх `lxml.etree`, тот же
+    `walk_shapes`/`qn()` работает с ним один в один, как с XML, распарсенным
+    из файла заново — проверено чтением исходника `pptx.oxml`) даёт корень
+    дерева шейпов напрямую. Save+reopen через `zipfile`/`PptxPackage` на
+    КАЖДУЮ из 2-3 проверяемых раскладок КАЖДОГО слайда колоды обошёлся бы
+    дороже, чем сама проверка (полный прогон 24 проверок на готовую колоду
+    из 12-15 слайдов — доли секунды, см. отчёт задачи; здесь проверяется
+    один слайд пятью проверками в разы легче)."""
+    ctx = _build_context_inmemory(index, slide, canvas, profile)
+    findings: list[Finding] = []
+    findings.extend(_check_L01(ctx, config))
+    findings.extend(_check_L02(ctx, config))
+    findings.extend(_check_L03(ctx, config))
+    findings.extend(_check_L04(ctx, config))
+    findings.extend(_check_D05(ctx, config))
+    return _stable_sort(findings)
+
+
+# ---------------------------------------------------------------------------
 # Открытие файла — I01
 # ---------------------------------------------------------------------------
 
@@ -175,7 +219,20 @@ class _SlideContext:
 def _build_context(index: int, slide, prs, pkg: PptxPackage, canvas: Canvas, profile: TemplateProfile) -> _SlideContext:
     slide_part = str(slide.part.partname).lstrip("/")
     root = pkg.xml(slide_part)
+    return _context_from_root(index, slide, root, canvas, profile)
 
+
+def _build_context_inmemory(index: int, slide, canvas: Canvas, profile: TemplateProfile) -> _SlideContext:
+    """Тот же `_build_context`, но БЕЗ файла на диске и `PptxPackage` —
+    `root` берётся напрямую из уже открытого python-pptx `slide`
+    (`slide._element`, см. докстроку `audit_slide_layout` про то, почему
+    это тот же самый lxml-элемент, что дал бы файловый путь). Используется
+    ТОЛЬКО `audit_slide_layout` (аудит одного слайда внутри цикла сборки,
+    Task 13 продолжение)."""
+    return _context_from_root(index, slide, slide._element, canvas, profile)  # noqa: SLF001 — тот же приём, что и `compose.builder._clear_sample_slides`/`_remove_last_slide` (см. их докстроки)
+
+
+def _context_from_root(index: int, slide, root, canvas: Canvas, profile: TemplateProfile) -> _SlideContext:
     id_to_pptx = {}
     for shape in _flatten_pptx_shapes(slide.shapes):
         try:
