@@ -18,6 +18,7 @@ from pathlib import Path
 from lxml import etree
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import PP_ALIGN
 from pptx.util import Emu, Pt
 
@@ -223,6 +224,61 @@ def place_slide(
         )
 
     _place_visual(slide, slide_spec, pattern, profile)
+    _remove_empty_placeholders(slide)
+
+
+# ---------------------------------------------------------------------------
+# Плейсхолдеры макета, унаследованные слайдом (Task 13, критичный дефект
+# отчёта задачи, находка №1) — `prs.slides.add_slide(layout)` копирует на
+# слайд ВСЕ плейсхолдеры лейаута (python-pptx, `SlideShapes.clone_layout_
+# placeholders`), а этот модуль ни разу не пишет содержание НЕПОСРЕДСТВЕННО
+# в плейсхолдер: `_draw_slot` всегда добавляет отдельный `add_textbox` по
+# координатам слота (см. её комментарий про `tf.margin_*`), `_place_
+# picture_visual`/`compose.charts.add_chart`/`compose.tables.add_table` —
+# отдельные фигуры поверх. Незаполненный плейсхолдер в LibreOffice рисуется
+# пустотой, в PowerPoint — видимой надписью "Щелкните, чтобы добавить
+# текст"/"чтобы добавить рисунок" — на защите это видно на каждом слайде
+# богатого макета (живой разбор ЛЦТ2026: слайд 4 макета "Содержание_1",
+# девятнадцать пустых плейсхолдеров плюс четыре пустые карточные плашки
+# декора — найдено координатором на живом рендере собранной колоды).
+# ---------------------------------------------------------------------------
+
+# Плейсхолдеры, которые PowerPoint заполняет САМ во время показа (номер
+# слайда, дата, нижний колонтитул, шапка) — пустые в разметке файла, но
+# осмысленные, брифом задачи явно требует их не трогать. python-pptx
+# `clone_layout_placeholders` их и так не клонирует на слайд вовсе (её
+# докстрока: "Latent placeholders (date, slide number, and footer) are not
+# cloned") — проверка по типу здесь защитная, на случай будущей версии
+# библиотеки или лейаута, который несёт такой плейсхолдер не-латентно.
+_AUTO_FILLED_PLACEHOLDER_TYPES = frozenset({
+    PP_PLACEHOLDER.SLIDE_NUMBER, PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.HEADER,
+})
+
+
+def _placeholder_is_empty(shape) -> bool:
+    """Плейсхолдер не несёт ни текста, ни картинки. Этот модуль никогда не
+    пишет НИ ТО, НИ ДРУГОЕ прямо в унаследованный от лейаута плейсхолдер
+    (см. докстроку раздела) — проверка на текст/картинку, а не безусловное
+    удаление, оставлена честно: если однажды появится путь, кладущий
+    контент прямо в плейсхолдер, эта функция не снесёт его."""
+    if shape.has_text_frame and shape.text_frame.text.strip():
+        return False
+    if shape._element.findall(".//" + qn("a:blip")):
+        return False
+    return True
+
+
+def _remove_empty_placeholders(slide) -> None:
+    """Убирает из XML слайда плейсхолдеры лейаута, оставшиеся незаполненными
+    после укладки содержания (см. докстроку раздела выше) — вызывается В
+    КОНЦЕ `place_slide`, когда весь текст/визуал этого слайда уже
+    отрисован, чтобы не удалить плейсхолдер раньше, чем стало известно,
+    что он не понадобился."""
+    for shape in list(slide.placeholders):
+        if shape.placeholder_format.type in _AUTO_FILLED_PLACEHOLDER_TYPES:
+            continue
+        if _placeholder_is_empty(shape):
+            shape._element.getparent().remove(shape._element)
 
 
 # ---------------------------------------------------------------------------

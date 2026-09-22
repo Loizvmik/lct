@@ -121,6 +121,37 @@ def test_slide_is_built_on_a_layout_from_the_template():
         assert slide.slide_layout.name in template_layout_names
 
 
+def test_no_empty_layout_placeholder_survives_into_the_built_slide():
+    """Task 13, дефект отчёта задачи №1 (критично, общий): `prs.slides.
+    add_slide(layout)` копирует на слайд ВСЕ плейсхолдеры макета
+    (python-pptx, `SlideShapes.clone_layout_placeholders`) — а наш код
+    никогда не пишет текст В САМ плейсхолдер: `_draw_slot` всегда рисует
+    отдельный `add_textbox` поверх координат слота, `_place_picture_visual`/
+    `add_chart`/`add_table` — отдельные фигуры (см. докстроки `builder.py`).
+    В LibreOffice пустой плейсхолдер рисуется пустотой, в PowerPoint —
+    видимой надписью "Щелкните, чтобы добавить текст" на каждом слайде
+    богатого макета (живой разбор ЛЦТ2026, слайд 4 макета "Содержание_1":
+    19 пустых плейсхолдеров, координатор). Даже простой Title-плейсхолдер
+    VK Tech (единственный, который несут его лейауты) остаётся пустым тем
+    же путём — заголовок уходит в отдельный textbox, не в него.
+
+    Автозаполняемые PowerPoint'ом плейсхолдеры (номер слайда/дата/
+    колонтитул/шапка) не проверяются — python-pptx их и так не клонирует
+    (`clone_layout_placeholders`: "Latent placeholders... are not cloned"),
+    но даже если бы клонировал, код обязан их не трогать (см. `builder.
+    _AUTO_FILLED_PLACEHOLDER_TYPES`)."""
+    out = build_deck(SAMPLE_SPEC, PROFILE, TEMPLATE, Variant.dense)
+    prs = Presentation(str(out))
+    for i, slide in enumerate(prs.slides):
+        for shape in slide.placeholders:
+            text = shape.text_frame.text if shape.has_text_frame else ""
+            assert text.strip(), (
+                f"слайд {i}: пустой плейсхолдер {shape.name!r} "
+                f"(idx={shape.placeholder_format.idx}, type={shape.placeholder_format.type}) "
+                "остался в готовом слайде"
+            )
+
+
 def test_no_slide_is_a_single_raster_image():
     """ТЗ: слайд, выгруженный единым растровым изображением, не засчитывается."""
     prs = Presentation(str(build_deck(SAMPLE_SPEC, PROFILE, TEMPLATE, Variant.dense)))
