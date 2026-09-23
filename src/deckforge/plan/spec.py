@@ -419,7 +419,15 @@ def visual_from_dict(data: dict | None, where: str) -> Visual | None:
     return Visual(kind=data["kind"], caption=data.get("caption"), table=table, chart=chart)
 
 
-_SLIDE_ALLOWED = {"kind", "headline", "subhead", "blocks", "visual", "source_note", "speaker_notes"}
+# `layout_id` (Task 23) — номер раскладки, которую агент выбрал сам,
+# посмотрев каталог шаблона и собрав слайд начерно (`compose.slide_tools`).
+# Это имя, а не координата: граница «план не знает ни одной координаты»
+# цела — что именно стоит за этим номером (рамки, кегли, цвета), знает
+# только `compose/`. Поле необязательное: слайд без него собирается как
+# раньше — раскладку подбирает код по вместимости.
+_SLIDE_ALLOWED = {
+    "kind", "headline", "subhead", "blocks", "visual", "source_note", "speaker_notes", "layout_id",
+}
 _SLIDE_REQUIRED = {"kind", "headline"}
 
 
@@ -431,6 +439,7 @@ def slide_spec_from_dict(data: dict, index: int) -> SlideSpec:
         index=index, kind=data["kind"], headline=data["headline"], subhead=data.get("subhead"),
         blocks=blocks, visual=visual_from_dict(data.get("visual"), f"{where}.visual"),
         source_note=data.get("source_note"), speaker_notes=data.get("speaker_notes"),
+        pattern_id=data.get("layout_id"),
     )
 
 

@@ -174,6 +174,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     deck = write_slides(
         outline, sources, profile, writer_llm,
         max_workers=writer_max_workers, agent_max_steps=_writer_agent_max_steps(),
+        template_path=args.template,
     )
     written_at = time.monotonic()
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")

@@ -6,6 +6,7 @@ import time
 
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec, validate_deck_spec
+from deckforge.compose.slide_tools import list_layouts
 from deckforge.plan.writer import _flag_repeated_headlines, pick_patterns, write_slides
 from deckforge.provider.base import LLMProvider
 
@@ -473,3 +474,88 @@ def test_fallback_reason_does_not_leak_the_provider_key(PROFILE, monkeypatch):
     finding = " ".join(deck.slides[0].findings)
     assert "AQVN-секрет-не-для-экрана" not in finding
     assert "***" in finding
+
+
+# ---------------------------------------------------------------------------
+# Task 23: агент видит последствия своего решения — каталог раскладок и
+# черновая сборка слайда как инструменты цикла
+# ---------------------------------------------------------------------------
+
+
+def _tool_call(tool: str, args: dict) -> str:
+    return json.dumps({"tool_calls": [{"tool": tool, "args": args}]}, ensure_ascii=False)
+
+
+def test_agent_can_ask_what_layouts_the_template_has(PROFILE, TEMPLATE_PATH):
+    outline = _outline(2)
+    llm = _QueueLLM([
+        _tool_call("list_layouts", {}),
+        _valid_slide_json("После каталога"),
+        _valid_slide_json("Второй"),
+    ])
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
+
+    assert deck.slides[0].headline == "После каталога"
+    assert not deck.slides[0].findings, "слайд написан моделью, запасной вариант не нужен"
+
+
+def test_agent_sees_the_verdict_of_a_draft_slide(PROFILE, TEMPLATE_PATH):
+    """Главное обещание задачи: модель узнаёт, что вышло, ДО того как слайд
+    попал в колоду."""
+    outline = _outline(2)
+    draft = json.loads(_valid_slide_json("Черновик"))
+    layout_id = list_layouts(PROFILE)[0]["layout_id"]
+    llm = _QueueLLM([
+        _tool_call("try_slide", {"layout_id": layout_id, "slide": draft}),
+        _valid_slide_json("Переписано после проверки"),
+        _valid_slide_json("Второй"),
+    ])
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
+
+    assert deck.slides[0].headline == "Переписано после проверки"
+
+
+def test_the_layout_the_agent_chose_reaches_the_slide(PROFILE, TEMPLATE_PATH):
+    """Выбор раскладки агентом бесполезен, если теряется по дороге к
+    сборке."""
+    outline = _outline(2)
+    layout_id = list_layouts(PROFILE)[0]["layout_id"]
+    chosen = json.loads(_valid_slide_json("С выбранной раскладкой"))
+    chosen["layout_id"] = layout_id
+    llm = _QueueLLM([json.dumps(chosen, ensure_ascii=False), _valid_slide_json("Второй")])
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
+
+    assert deck.slides[0].pattern_id == layout_id
+
+
+def test_new_tools_are_unavailable_without_a_template_but_do_not_break_the_loop(PROFILE):
+    """Старые вызовы `write_slides` пути шаблона не передают. Цикл обязан
+    продолжиться на прежних двух инструментах, а не упасть."""
+    outline = _outline(2)
+    llm = _QueueLLM([
+        _tool_call("try_slide", {"layout_id": "что-угодно", "slide": {}}),
+        _valid_slide_json("Всё равно написано"),
+        _valid_slide_json("Второй"),
+    ])
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+
+    assert deck.slides[0].headline == "Всё равно написано"
+
+
+def test_a_malformed_try_slide_call_is_answered_not_raised(PROFILE, TEMPLATE_PATH):
+    """Модель вправе ошибиться в аргументах — ошибка возвращается ей
+    текстом, тем же принципом, что и у остальных инструментов."""
+    outline = _outline(2)
+    llm = _QueueLLM([
+        _tool_call("try_slide", {"slide": {"kind": "bullets"}}),  # забыт layout_id
+        _valid_slide_json("После ошибки"),
+        _valid_slide_json("Второй"),
+    ])
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
+
+    assert deck.slides[0].headline == "После ошибки"

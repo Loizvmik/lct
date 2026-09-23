@@ -25,9 +25,13 @@ def test_generate_passes_writer_max_workers_override_to_write_slides(monkeypatch
     captured = {}
     real_write_slides = cli_module.write_slides
 
-    def _spy(outline, sources, profile, llm, *, max_workers, agent_max_steps=None):
+    def _spy(outline, sources, profile, llm, *, max_workers, agent_max_steps=None, **rest):
+        # `**rest` — чтобы шпион не ломался от НОВЫХ именованных аргументов
+        # `write_slides` (Task 23 добавила `template_path`): тест проверяет
+        # проброс ОДНОГО параметра, а не полную сигнатуру, и падать на
+        # расширении контракта ему незачем.
         captured["max_workers"] = max_workers
-        kwargs = {"max_workers": max_workers}
+        kwargs = {"max_workers": max_workers, **rest}
         if agent_max_steps is not None:
             kwargs["agent_max_steps"] = agent_max_steps
         return real_write_slides(outline, sources, profile, llm, **kwargs)

@@ -283,6 +283,7 @@ async def _run_job(
         deck = await asyncio.to_thread(
             write_slides, outline, source_docs, profile, writer_llm,
             max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
+            template_path=template.path,
         )
 
         job.enter_stage("compose")

@@ -56,6 +56,7 @@ from pathlib import Path
 import yaml
 
 from deckforge.compose.fit_check import measure_fit
+from deckforge.compose.slide_tools import list_layouts, try_slide
 from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
@@ -271,6 +272,7 @@ _SLIDE_SCHEMA = {
     "type": "object",
     "properties": {
         "kind": {"type": "string", "enum": list(SLIDE_KINDS)},
+        "layout_id": {"type": "string"},
         "headline": {"type": "string"},
         "subhead": {"type": "string"},
         "blocks": {"type": "array"},
@@ -299,7 +301,7 @@ _TOOL_CALL_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "tool": {"type": "string", "enum": ["measure_fit", "check_number"]},
+                    "tool": {"type": "string", "enum": ["measure_fit", "check_number", "list_layouts", "try_slide"]},
                     "args": {"type": "object"},
                 },
                 "required": ["tool", "args"],
@@ -320,8 +322,11 @@ _TOOL_CALL_SCHEMA = {
 _AGENT_TURN_SCHEMA = {"oneOf": [_TOOL_CALL_SCHEMA, _SLIDE_SCHEMA]}
 
 
-def _run_tool_call(call: dict, profile, desired_kind: str, source_text: str) -> dict:
-    """Диспетчер двух инструментов агентного цикла (см. докстроку модуля).
+def _run_tool_call(
+    call: dict, profile, desired_kind: str, source_text: str, index: int = 0,
+    template_path: Path | None = None,
+) -> dict:
+    """Диспетчер инструментов агентного цикла (см. докстроку модуля).
     Никогда не бросает исключение наружу — невалидный/неизвестный вызов
     (модель перепутала имя инструмента или прислала не те аргументы)
     возвращает объект с `error`, который уходит обратно модели тем же
@@ -337,9 +342,44 @@ def _run_tool_call(call: dict, profile, desired_kind: str, source_text: str) -> 
             return measure_fit(str(args.get("text", "")), str(args.get("role", "")), profile, desired_kind)
         if name == "check_number":
             return check_number_in_sources(str(args.get("query", "")), source_text)
+        # Оба инструмента ниже (Task 23) требуют файла шаблона: черновик
+        # рисуется от него же, что и настоящая колода. Без пути они просто
+        # недоступны — так работает вызов `write_slides` из тестов и из
+        # старого кода, который путь не передаёт: цикл продолжается на
+        # прежних двух инструментах, а не падает.
+        if name == "list_layouts":
+            if template_path is None:
+                return {"error": "инструмент недоступен в этом прогоне (шаблон не передан)"}
+            kind = args.get("kind")
+            return {"layouts": list_layouts(profile, kind=str(kind) if kind else None)}
+        if name == "try_slide":
+            if template_path is None:
+                return {"error": "инструмент недоступен в этом прогоне (шаблон не передан)"}
+            return _try_slide_tool(args, profile, index, template_path)
     except Exception as exc:  # инструмент не должен ронять весь цикл написания слайда
         return {"error": f"инструмент {name!r} упал: {exc}"}
-    return {"error": f"неизвестный инструмент {name!r}, доступны: measure_fit, check_number"}
+    return {
+        "error": f"неизвестный инструмент {name!r}, доступны: "
+                 "measure_fit, check_number, list_layouts, try_slide"
+    }
+
+
+def _try_slide_tool(args: dict, profile, index: int, template_path: Path) -> dict:
+    """Черновая сборка слайда по ответу модели — обёртка над `compose.
+    slide_tools.try_slide`, разбирающая аргументы так же снисходительно, как
+    и остальные инструменты: модель прислала слайд не по схеме или забыла
+    номер раскладки — это ответ ей текстом, а не исключение."""
+    layout_id = args.get("layout_id")
+    if not layout_id:
+        return {"error": "нужен layout_id — возьми его из list_layouts"}
+    draft = args.get("slide")
+    if not isinstance(draft, dict):
+        return {"error": "нужен объект slide — тот же JSON слайда, что ты собираешься прислать финальным"}
+    try:
+        spec = slide_spec_from_dict(draft, index)
+    except Exception as exc:
+        return {"error": f"слайд не лёг в схему: {exc}"}
+    return try_slide(spec, str(layout_id), profile, template_path)
 
 
 def _why(exc: BaseException) -> str:
@@ -360,7 +400,7 @@ def _why(exc: BaseException) -> str:
 
 def _write_with_agent_loop(
     prompt_body: str, payload: dict, index: int, llm: LLMProvider, profile, desired_kind: str,
-    source_text: str, *, max_steps: int,
+    source_text: str, *, max_steps: int, template_path: Path | None = None,
 ) -> tuple[SlideSpec | None, str | None]:
     """Task 19: агентный цикл письма ОДНОГО слайда, бюджет `max_steps`
     сетевых кругов (см. `AGENT_MAX_STEPS_DEFAULT`). Заменяет первый вызов
@@ -421,7 +461,8 @@ def _write_with_agent_loop(
             results = [
                 {"tool": call.get("tool") if isinstance(call, dict) else None,
                  "args": call.get("args") if isinstance(call, dict) else None,
-                 "result": _run_tool_call(call, profile, desired_kind, source_text)}
+                 "result": _run_tool_call(
+                     call, profile, desired_kind, source_text, index, template_path)}
                 for call in tool_calls
             ]
             conversation.append({"role": "assistant", "content": raw})
@@ -463,7 +504,7 @@ def _ask_slide_writer(
 
 def _write_one_slide(
     index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
-    *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
+    *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, template_path: Path | None = None,
 ) -> SlideSpec:
     """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
     чтобы её можно было независимо запускать в пуле потоков (слайды друг от
@@ -499,7 +540,8 @@ def _write_one_slide(
         # что была всегда, отдельная забота (см. докстроку `_write_with_
         # agent_loop`).
         slide, reason = _write_with_agent_loop(
-            prompt_body, payload, index, llm, profile, desired_kind, source_text, max_steps=agent_max_steps,
+            prompt_body, payload, index, llm, profile, desired_kind, source_text,
+            max_steps=agent_max_steps, template_path=template_path,
         )
         if slide is not None:
             problems = slide_spec_problems(slide)
@@ -533,6 +575,7 @@ def _write_one_slide(
 def write_slides(
     outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None,
     *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
+    template_path: Path | None = None,
 ) -> DeckSpec:
     """Пишет текст всех слайдов ПАРАЛЛЕЛЬНО (см. `DEFAULT_WRITER_MAX_
     WORKERS` — до `max_workers` одновременных вызовов модели), не по
@@ -560,7 +603,7 @@ def write_slides(
         futures = {
             pool.submit(
                 _write_one_slide, index, item, profile, prompt_body, source_text, total, llm,
-                agent_max_steps=agent_max_steps,
+                agent_max_steps=agent_max_steps, template_path=template_path,
             ): index
             for index, item in enumerate(outline.slides)
         }
