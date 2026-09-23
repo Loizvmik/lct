@@ -35,9 +35,8 @@ from pptx import Presentation
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import audit_slide_layout, slide_fill_ratio
 from deckforge.compose.builder import (
-    _clear_sample_slides, _pattern_from_model, _ranked_candidates, _remove_last_slide, place_slide,
+    _clear_sample_slides, _pattern_from_model, _remove_last_slide, place_slide,
 )
-from deckforge.plan.variants import Variant
 from deckforge.ooxml.geometry import Canvas
 from deckforge.plan.spec import SlideSpec
 from deckforge.template.profile import TemplateProfile
@@ -154,20 +153,6 @@ def try_slide(
         "findings": [f"{f.check_id}: {f.message}" for f in errors],
         "notes": list(trial.findings),
     }
-
-
-def best_layout_for(slide_spec: SlideSpec, profile: TemplateProfile) -> str | None:
-    """Номер раскладки, которую ВЫБРАЛА БЫ сборка для этого слайда.
-
-    Нужен, чтобы черновая проверка показывала вердикт той раскладки, на
-    которой слайд реально окажется, а не какой-нибудь другой того же вида:
-    иначе цикл письма правил бы текст по чужому вердикту.
-
-    `None`, если раскладок этого вида в шаблоне нет вовсе — тогда проверять
-    нечего, сборка сама напишет находку об отсутствии раскладки."""
-    patterns = [_pattern_from_model(m) for m in profile.patterns]
-    ranked = _ranked_candidates(slide_spec, patterns, profile, Variant.dense)
-    return ranked[0].pattern_id if ranked else None
 
 
 def _find_pattern(profile: TemplateProfile, layout_id: str):

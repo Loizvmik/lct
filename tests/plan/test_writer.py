@@ -7,7 +7,6 @@ import time
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec, validate_deck_spec
 from deckforge.compose.slide_tools import list_layouts
-from deckforge.plan import writer as writer_module
 from deckforge.plan.writer import _flag_repeated_headlines, pick_patterns, write_slides
 from deckforge.provider.base import LLMProvider
 
@@ -525,15 +524,7 @@ def test_the_layout_the_agent_chose_reaches_the_slide(PROFILE, TEMPLATE_PATH):
     layout_id = list_layouts(PROFILE)[0]["layout_id"]
     chosen = json.loads(_valid_slide_json("С выбранной раскладкой"))
     chosen["layout_id"] = layout_id
-    # Тот же ответ дважды: код показывает модели вердикт черновика и просит
-    # финальный ответ (см. `_draft_verdict`), так что на слайд уходит ВТОРОЙ
-    # ответ модели. Здесь он совпадает с первым — проверяется, что выбор
-    # раскладки переживает этот круг, а не что модель что-то переписала.
-    llm = _QueueLLM([
-        json.dumps(chosen, ensure_ascii=False),
-        json.dumps(chosen, ensure_ascii=False),
-        _valid_slide_json("Второй"),
-    ])
+    llm = _QueueLLM([json.dumps(chosen, ensure_ascii=False), _valid_slide_json("Второй")])
 
     deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
 
@@ -570,50 +561,3 @@ def test_a_malformed_try_slide_call_is_answered_not_raised(PROFILE, TEMPLATE_PAT
     assert deck.slides[0].headline == "После ошибки"
 
 
-def test_a_bad_draft_is_sent_back_to_the_model_without_being_asked(PROFILE, TEMPLATE_PATH):
-    """Код сам показывает модели вердикт черновика, не дожидаясь, пока она
-    сходит за ним инструментом.
-
-    Два живых прогона 23 сентября 2026 подряд: `try_slide` дан, в задании
-    расписан, использован на ОДНОМ слайде из двенадцати. Обратная связь не
-    может зависеть от того, вспомнит ли модель о ней."""
-    outline = _outline(2)
-    # Слайд из одной короткой строки заведомо не наберёт четверти холста.
-    thin = json.dumps({
-        "kind": "bullets", "headline": "Коротко",
-        "blocks": [{"type": "bullets", "items": ["Одна строка"]}],
-    }, ensure_ascii=False)
-    llm = _QueueLLM([thin, _valid_slide_json("Переписано после вердикта"), _valid_slide_json("Второй")])
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
-
-    assert deck.slides[0].headline == "Переписано после вердикта"
-
-
-def test_a_clean_draft_is_not_sent_back(PROFILE, TEMPLATE_PATH, monkeypatch):
-    """Цена проверки — ноль лишних обращений к модели, когда слайд и так
-    хорош: иначе она съела бы бюджет генерации на ровном месте.
-
-    Вердикт подменяется, а не подбирается текстом: «чистый слайд» зависит
-    от конкретного шаблона, и тест, который на одном шаблоне зелёный, а на
-    другом красный, проверял бы шаблон, а не правило."""
-    monkeypatch.setattr(
-        writer_module, "try_slide",
-        lambda *a, **kw: {"ok": True, "fill_percent": 50, "findings": [], "notes": []},
-    )
-    slide = SlideSpec(index=0, kind="bullets", headline="Хороший слайд")
-
-    assert writer_module._draft_verdict(slide, PROFILE, TEMPLATE_PATH) is None
-
-
-def test_a_dirty_draft_is_handed_back_with_its_verdict(PROFILE, TEMPLATE_PATH, monkeypatch):
-    """Обратная сторона того же правила."""
-    monkeypatch.setattr(
-        writer_module, "try_slide",
-        lambda *a, **kw: {"ok": False, "fill_percent": 7, "findings": ["D05: пусто"], "notes": []},
-    )
-    slide = SlideSpec(index=0, kind="bullets", headline="Пустой слайд")
-
-    verdict = writer_module._draft_verdict(slide, PROFILE, TEMPLATE_PATH)
-
-    assert verdict is not None and verdict["fill_percent"] == 7

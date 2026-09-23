@@ -57,7 +57,7 @@ from pathlib import Path
 import yaml
 
 from deckforge.compose.fit_check import measure_fit
-from deckforge.compose.slide_tools import best_layout_for, list_layouts, try_slide
+from deckforge.compose.slide_tools import list_layouts, try_slide
 from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
@@ -401,7 +401,7 @@ def _why(exc: BaseException) -> str:
 
 def _write_with_agent_loop(
     prompt_body: str, payload: dict, index: int, llm: LLMProvider, profile, desired_kind: str,
-    source_text: str, *, max_steps: int, template_path: Path | None = None, draft_verdict: bool = True,
+    source_text: str, *, max_steps: int, template_path: Path | None = None,
 ) -> tuple[SlideSpec | None, str | None]:
     """Task 19: агентный цикл письма ОДНОГО слайда, бюджет `max_steps`
     сетевых кругов (см. `AGENT_MAX_STEPS_DEFAULT`). Заменяет первый вызов
@@ -435,7 +435,6 @@ def _write_with_agent_loop(
     слайда из двенадцати ушли в запасной вариант, и понять почему было
     нечем."""
     conversation: list[dict] = []
-    checked: dict | bool = False  # вердикт черновика показывают ОДИН раз за слайд; dict — он был показан
     for step in range(1, max(1, max_steps) + 1):
         is_final_step = step >= max_steps
         turn_payload = dict(payload)
@@ -478,88 +477,8 @@ def _write_with_agent_loop(
         except Exception as exc:
             return None, f"шаг {step}/{max_steps}: ответ не лёг в схему слайда — {_why(exc)}"
 
-        # Вердикт черновика — КОДОМ, а не по просьбе.
-        #
-        # Живые прогоны 23 сентября 2026: инструмент `try_slide` модели дан,
-        # в задании расписан по шагам, и всё равно использован на ОДНОМ
-        # слайде из двенадцати — дважды подряд. Уговаривать промптом дальше
-        # бессмысленно: код сам собирает присланный слайд начерно и, если
-        # вышло плохо, возвращает вердикт тем же путём, что и ответ
-        # инструмента. Модель получает ровно ту обратную связь, за которой
-        # должна была сходить сама.
-        #
-        # Стоит это ноль лишних вызовов, когда слайд хорош (вердикт чистый —
-        # возвращаем как есть), и один, когда плох.
-        if draft_verdict and not is_final_step and template_path is not None and not checked:
-            verdict = _draft_verdict(slide, profile, template_path)
-            if verdict is not None:
-                checked = verdict
-                conversation.append({"role": "assistant", "content": raw})
-                conversation.append({"role": "user", "content": json.dumps(
-                    {"draft_verdict": verdict,
-                     "что_делать": "перепиши слайд с учётом вердикта и пришли финальный ответ"},
-                    ensure_ascii=False)})
-                continue
-        # Замер: стало ли лучше от того, что слайд отправили на второй круг.
-        # Без этих чисел спор «вердикт помогает или только жрёт время»
-        # решается на глаз, а находки колоды между прогонами пляшут и от
-        # того, что модель каждый раз пишет другой текст (живые прогоны
-        # 23 сентября 2026: 22 находки против 28 на одних и тех же
-        # материалах, и понять, чья это заслуга, было нечем).
-        if isinstance(checked, dict):
-            slide.findings.append(_verdict_delta_note(slide, checked, profile, template_path))
         return slide, None
     return None, f"бюджет шагов исчерпан ({max_steps}), финального слайда модель так и не прислала"
-
-
-_VERDICT_NOTE_PREFIX = "Замер вердикта черновика"
-
-
-def _verdict_delta_note(slide: SlideSpec, before: dict, profile, template_path: Path) -> str:
-    """Одна строка про то, что дал второй круг: заполнение до и после,
-    число находок до и после, и совпала ли раскладка, по которой считался
-    вердикт, с той, что выберется теперь.
-
-    Последнее — не придирка: если модель переписала текст под одну
-    раскладку, а сборка возьмёт другую, правка ушла не туда, и это ровно то
-    объяснение «почему вердикт не помог», которое иначе не отличить от
-    «модель не умеет им пользоваться»."""
-    after = _draft_verdict(slide, profile, template_path)
-    layout_now = slide.pattern_id or best_layout_for(slide, profile)
-    same_layout = "да" if layout_now == before.get("layout_id") else f"нет ({before.get('layout_id')} -> {layout_now})"
-    if after is None:
-        return (
-            f"{_VERDICT_NOTE_PREFIX}: заполнение {before.get('fill_percent')}% -> норма, "
-            f"находок {len(before.get('findings', []))} -> 0, раскладка та же: {same_layout}."
-        )
-    return (
-        f"{_VERDICT_NOTE_PREFIX}: заполнение {before.get('fill_percent')}% -> {after.get('fill_percent')}%, "
-        f"находок {len(before.get('findings', []))} -> {len(after.get('findings', []))}, "
-        f"раскладка та же: {same_layout}."
-    )
-
-
-def _draft_verdict(slide: SlideSpec, profile, template_path: Path) -> dict | None:
-    """Вердикт черновой сборки слайда, если его стоит показать модели.
-    `None` означает «слайд собрался чисто, переписывать нечего».
-
-    Проверяется раскладка, выбранная моделью (`layout_id`), а если она не
-    выбирала — та, которую возьмёт сборка (`best_layout_for`): иначе модель
-    правила бы текст по вердикту чужой раскладки.
-
-    Любая поломка внутри проверки означает, что слайд уходит как есть: вердикт —
-    помощь, а не обязательный этап, и ронять из-за него написанный текст
-    нельзя."""
-    layout_id = slide.pattern_id or best_layout_for(slide, profile)
-    if not layout_id:
-        return None
-    try:
-        verdict = try_slide(slide, str(layout_id), profile, template_path)
-    except Exception:
-        return None
-    if verdict.get("ok") and 25 <= verdict.get("fill_percent", 0) <= 75:
-        return None
-    return {"layout_id": layout_id, **verdict}
 
 
 def _ask_slide_writer(
@@ -589,7 +508,6 @@ def _ask_slide_writer(
 def _write_one_slide(
     index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
     *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, template_path: Path | None = None,
-    draft_verdict: bool = True,
 ) -> SlideSpec:
     """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
     чтобы её можно было независимо запускать в пуле потоков (слайды друг от
@@ -626,7 +544,7 @@ def _write_one_slide(
         # agent_loop`).
         slide, reason = _write_with_agent_loop(
             prompt_body, payload, index, llm, profile, desired_kind, source_text,
-            max_steps=agent_max_steps, template_path=template_path, draft_verdict=draft_verdict,
+            max_steps=agent_max_steps, template_path=template_path,
         )
         if slide is not None:
             problems = slide_spec_problems(slide)
@@ -683,7 +601,7 @@ def _validate_chosen_layout(slide: SlideSpec, profile) -> SlideSpec:
 def write_slides(
     outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None,
     *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
-    template_path: Path | None = None, draft_verdict: bool = True,
+    template_path: Path | None = None,
 ) -> DeckSpec:
     """Пишет текст всех слайдов ПАРАЛЛЕЛЬНО (см. `DEFAULT_WRITER_MAX_
     WORKERS` — до `max_workers` одновременных вызовов модели), не по
@@ -712,7 +630,6 @@ def write_slides(
             pool.submit(
                 _write_one_slide, index, item, profile, prompt_body, source_text, total, llm,
                 agent_max_steps=agent_max_steps, template_path=template_path,
-                draft_verdict=draft_verdict,
             ): index
             for index, item in enumerate(outline.slides)
         }
