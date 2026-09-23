@@ -885,10 +885,17 @@ def _slide_section(index: int, blocks_html: str, bg_css: str, is_dark: bool, spe
     kind = spec_slide.kind if spec_slide is not None else ""
     title = spec_slide.headline if spec_slide is not None else f"Слайд {index + 1}"
     theme = "dark" if is_dark else "light"
+    # Текст докладчика едет рядом со слайдом, а не только на странице заметок
+    # .pptx (уточнение заказчика 23 сентября 2026: на выходе ждут «готовые
+    # слайды и текст к каждому слайду»). Лежит в разметке всегда, показывается
+    # по кнопке — печатать его поверх слайда нельзя, это текст для
+    # рассказывающего, а не для зала.
+    notes = getattr(spec_slide, "speaker_notes", None) if spec_slide is not None else None
+    notes_html = f'<aside class="slide-notes">{_esc(notes.strip())}</aside>' if notes and notes.strip() else ""
     return (
         f'<section class="slide" data-index="{index}" data-kind="{_esc(kind)}" '
         f'data-theme="{theme}" aria-label="{_esc(title)}" style="background:{bg_css};">'
-        f'<div class="slide-inner">{blocks_html}</div>'
+        f'<div class="slide-inner">{blocks_html}</div>{notes_html}'
         f"</section>"
     )
 
@@ -951,6 +958,18 @@ html, body {{
 }}
 .slide.is-current {{ display: block; }}
 .slide-inner {{ position: absolute; inset: 0; }}
+/* Текст докладчика: в разметке всегда, на экране — по клавише N. Поверх
+   слайда он не печатается никогда: это текст для рассказывающего, не для
+   зала. В режиме обзора (`body.overview`) тоже скрыт — там миниатюры. */
+.slide-notes {{ display: none; }}
+body.notes .slide.is-current .slide-notes {{
+  display: block; position: absolute; left: 0; right: 0; bottom: 0;
+  max-height: 38%; overflow: auto; z-index: 5;
+  padding: 14px 18px; box-sizing: border-box;
+  background: rgba(17,17,17,.88); color: #fff;
+  font: 400 15px/1.45 var(--font-fallback); white-space: pre-wrap;
+}}
+body.overview .slide-notes {{ display: none !important; }}
 .block {{ position: absolute; }}
 .text-frame {{ position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-start; }}
 .text-frame p, .text-frame li {{ margin: 0 0 .25em 0; padding: 0; }}
@@ -1024,7 +1043,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 {slides_joined}
 </div>
 <div id="hud">1 / {n_slides}</div>
-<div id="help">← → навигация · g обзор · Ctrl/⌘+P — печать в PDF</div>
+<div id="help">← → навигация · g обзор · n текст докладчика · Ctrl/⌘+P — печать в PDF</div>
 <script>
 (function() {{
   var slides = Array.prototype.slice.call(document.querySelectorAll('#stage .slide'));
@@ -1095,7 +1114,8 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
       document.body.classList.toggle('overview');
       if (document.body.classList.contains('overview')) {{ buildGrid(); fitGrid(); }}
     }}
-    else if (ev.key === 'Escape') {{ document.body.classList.remove('overview'); }}
+    else if (ev.key === 'n' || ev.key === 'N') {{ document.body.classList.toggle('notes'); }}
+    else if (ev.key === 'Escape') {{ document.body.classList.remove('overview'); document.body.classList.remove('notes'); }}
   }});
 
   fit();

@@ -41,7 +41,10 @@ def _deck_spec() -> DeckSpec:
         title="Экспорт: проверка форматов",
         language="ru",
         slides=[
-            SlideSpec(index=0, kind="section", headline="Экспорт в HTML, PDF и PPTX"),
+            SlideSpec(
+                index=0, kind="section", headline="Экспорт в HTML, PDF и PPTX",
+                speaker_notes="Тут сказать, что слайд — не картинка, а текст.",
+            ),
             SlideSpec(
                 index=1, kind="bullets", headline="Где уходит время",
                 blocks=[BulletBlock(items=[

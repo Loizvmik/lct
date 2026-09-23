@@ -1090,3 +1090,47 @@ def test_a_plaque_under_a_slot_taken_by_plain_text_is_kept():
     _place_best_candidate(prs, slide_spec, [pattern], PROFILE, canvas, audit_config, bullet_char="•")
 
     assert len(_plaque_widths_on(prs.slides[0])) == 1
+
+
+# ---------------------------------------------------------------------------
+# Заметки докладчика: уточнение заказчика от 23 сентября 2026 — на выходе
+# ждут «готовые слайды и текст к каждому слайду», потому что на защите по
+# слайдам ещё и рассказывают
+# ---------------------------------------------------------------------------
+
+
+def test_speaker_notes_reach_the_pptx_notes_page():
+    """`SlideSpec.speaker_notes` обязан доехать до страницы заметок готового
+    файла.
+
+    До этой правки поле заполнялось моделью (`agents/slide-writer/AGENT.md`,
+    схема ответа), ехало через `plan.spec` и молча терялось на сборке: ни
+    `build_deck`, ни выгрузка его не читали. Модель писала текст, который
+    никто никогда не видел."""
+    spec = replace(
+        SAMPLE_SPEC,
+        slides=[
+            replace(SAMPLE_SPEC.slides[0], speaker_notes="Начать с цифры 31,5 часа — она держит весь рассказ."),
+            replace(SAMPLE_SPEC.slides[1], speaker_notes=None),
+        ],
+    )
+
+    out = build_deck(spec, PROFILE, TEMPLATE, Variant.dense)
+    prs = Presentation(str(out))
+
+    assert "31,5 часа" in prs.slides[0].notes_slide.notes_text_frame.text
+
+
+def test_a_slide_without_speaker_notes_gets_no_notes_page():
+    """Пустое поле не должно порождать пустую страницу заметок — иначе у
+    каждого слайда колоды появляется пустой лист заметок, которого в
+    исходном шаблоне не было."""
+    spec = replace(
+        SAMPLE_SPEC,
+        slides=[replace(SAMPLE_SPEC.slides[0], speaker_notes=None)],
+    )
+
+    out = build_deck(spec, PROFILE, TEMPLATE, Variant.dense)
+    prs = Presentation(str(out))
+
+    assert not prs.slides[0].has_notes_slide

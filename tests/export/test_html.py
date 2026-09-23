@@ -60,3 +60,12 @@ def test_html_slide_count_matches_pptx(DECK, PROFILE, PPTX, tmp_path):
     text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html").read_text(encoding="utf-8")
     n_slides = len(Presentation(str(PPTX)).slides)
     assert text.count('<section class="slide"') == n_slides * 2  # экран + печать (см. докстроку html.py)
+
+
+def test_html_carries_speaker_notes(DECK, PROFILE, PPTX, tmp_path):
+    """Заказчик ждёт на выходе «готовые слайды и текст к каждому слайду»
+    (уточнение от 23 сентября 2026): по слайдам на защите рассказывают, и
+    текст докладчика должен читаться рядом со слайдом, а не только на
+    странице заметок .pptx, которую в браузере не открыть."""
+    text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html").read_text(encoding="utf-8")
+    assert DECK.slides[0].speaker_notes in text

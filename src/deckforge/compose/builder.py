@@ -188,6 +188,7 @@ def build_deck(
             bullet_char=bullet_char, user_photos=user_photos,
         )
         slide_spec.findings.extend(notes)
+        _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
         history = history.with_choice(pattern.pattern_id)
 
     out_path = _output_path(spec, template_path, variant)
@@ -195,6 +196,24 @@ def build_deck(
     prs.save(str(out_path))
     write_custom_property(out_path, WORKFLOW_PROPERTY_NAME, workflow_manifest().as_property_value())
     return out_path
+
+
+def _write_speaker_notes(slide, text: str | None) -> None:
+    """Кладёт текст докладчика на страницу заметок слайда.
+
+    Заказчик 23 сентября 2026 назвал ожидаемым результатом «готовые слайды
+    и текст к каждому слайду»: на защите по слайдам ещё и рассказывают.
+    Поле `SlideSpec.speaker_notes` модель заполняла и раньше (схема ответа
+    `agents/slide-writer/AGENT.md`), но дальше `plan.spec` оно не шло —
+    терялось на сборке молча.
+
+    Пустое поле не трогает слайд вовсе: обращение к `slide.notes_slide`
+    СОЗДАЁТ страницу заметок (а при её отсутствии в шаблоне — ещё и мастер
+    заметок), поэтому безусловный вызов приделал бы пустой лист заметок
+    каждому слайду колоды, которого в исходном шаблоне не было."""
+    if not text or not text.strip():
+        return
+    slide.notes_slide.notes_text_frame.text = text.strip()
 
 
 def place_slide(
