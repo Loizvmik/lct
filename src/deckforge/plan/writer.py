@@ -47,6 +47,7 @@ textfit.measure` внутри `compose.fit_check.measure_fit` — единств
 что и везде в проекте), а не бесконечный цикл дожимания.
 """
 from __future__ import annotations
+import os
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -242,7 +243,7 @@ def _all_kind_capacities(profile) -> list[dict]:
     ]
 
 
-def _fallback_slide(kind: str, index: int, intent: str, needs: list[str]) -> SlideSpec:
+def _fallback_slide(kind: str, index: int, intent: str, needs: list[str], *, reason: str | None = None) -> SlideSpec:
     """Детерминированный запасной слайд — используется без модели и когда
     модель дважды не смогла вернуть валидный слайд. Заведомо проходит
     `slide_spec_problems` — колода собирается целиком, с честной пометкой в
@@ -257,6 +258,8 @@ def _fallback_slide(kind: str, index: int, intent: str, needs: list[str]) -> Sli
     этом словами, а не выдумывает ссылку на данные."""
     headline = intent.strip() or "Слайд требует содержания"
     finding = "Слайд собран запасным вариантом — модель недоступна или не вернула валидный ответ."
+    if reason:
+        finding += f" Причина: {reason}."
     if needs:
         finding += f" Нужны данные: {', '.join(needs)}."
     source_note = "Источник не подтверждён — текст запасного варианта, требует проверки перед показом." \
@@ -339,10 +342,26 @@ def _run_tool_call(call: dict, profile, desired_kind: str, source_text: str) -> 
     return {"error": f"неизвестный инструмент {name!r}, доступны: measure_fit, check_number"}
 
 
+def _why(exc: BaseException) -> str:
+    """Короткая причина отказа для отчёта — класс исключения плюс начало
+    сообщения.
+
+    Ключ провайдера вырезается: он уходит в заголовок запроса, а не в текст
+    исключения, но причина попадает в `SlideSpec.findings`, оттуда в отчёт
+    прогона и в веб-интерфейс, и цена ошибки тут несимметрична — лучше
+    вырезать лишнее, чем однажды показать секрет на экране."""
+    text = f"{type(exc).__name__}: {str(exc)[:200]}"
+    for name in ("YANDEX_API_KEY", "YANDEX_FOLDER_ID"):
+        secret = os.environ.get(name)
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
 def _write_with_agent_loop(
     prompt_body: str, payload: dict, index: int, llm: LLMProvider, profile, desired_kind: str,
     source_text: str, *, max_steps: int,
-) -> SlideSpec | None:
+) -> tuple[SlideSpec | None, str | None]:
     """Task 19: агентный цикл письма ОДНОГО слайда, бюджет `max_steps`
     сетевых кругов (см. `AGENT_MAX_STEPS_DEFAULT`). Заменяет первый вызов
     `_ask_slide_writer` в `_write_one_slide` — последующий один шанс
@@ -365,7 +384,15 @@ def _write_with_agent_loop(
     ответ на этом шаге, включая случайный `tool_calls`, парсится как
     попытка слайда (и, скорее всего, провалится валидацией схемы —
     `slide_spec_from_dict` подберёт это как обычную ошибку разбора, тот же
-    путь, что и раньше у любого невалидного ответа)."""
+    путь, что и раньше у любого невалидного ответа).
+
+    Возвращает `(слайд, причина_отказа)`. Раньше возвращала только слайд, а
+    причину глотала (`except Exception: return None`) — и запасной слайд
+    получал одну и ту же строку «модель недоступна или не вернула валидный
+    ответ» независимо от того, отвалилась сеть, кончился бюджет токенов или
+    ответ не разобрался по схеме. На живом прогоне 23 сентября 2026 четыре
+    слайда из двенадцати ушли в запасной вариант, и понять почему было
+    нечем."""
     conversation: list[dict] = []
     for step in range(1, max(1, max_steps) + 1):
         is_final_step = step >= max_steps
@@ -380,11 +407,14 @@ def _write_with_agent_loop(
         schema = _SLIDE_SCHEMA if is_final_step else _AGENT_TURN_SCHEMA
         try:
             raw = llm.complete(messages, schema=schema, max_tokens=WRITER_MAX_TOKENS)
+        except Exception as exc:
+            return None, f"шаг {step}/{max_steps}: модель не ответила — {_why(exc)}"
+        try:
             data = json.loads(raw)
-        except Exception:
-            return None
+        except Exception as exc:
+            return None, f"шаг {step}/{max_steps}: ответ не разобрался как JSON — {_why(exc)}"
         if not isinstance(data, dict):
-            return None
+            return None, f"шаг {step}/{max_steps}: модель вернула {type(data).__name__}, а не объект JSON"
 
         tool_calls = data.get("tool_calls")
         if not is_final_step and isinstance(tool_calls, list) and tool_calls:
@@ -401,13 +431,18 @@ def _write_with_agent_loop(
             continue
 
         try:
-            return slide_spec_from_dict(data, index)
-        except Exception:
-            return None
-    return None
+            return slide_spec_from_dict(data, index), None
+        except Exception as exc:
+            return None, f"шаг {step}/{max_steps}: ответ не лёг в схему слайда — {_why(exc)}"
+    return None, f"бюджет шагов исчерпан ({max_steps}), финального слайда модель так и не прислала"
 
 
-def _ask_slide_writer(prompt_body: str, payload: dict, index: int, llm: LLMProvider, *, repair: list[str] | None = None) -> SlideSpec | None:
+def _ask_slide_writer(
+    prompt_body: str, payload: dict, index: int, llm: LLMProvider, *, repair: list[str] | None = None,
+) -> tuple[SlideSpec | None, str | None]:
+    """Один вызов модели за слайдом. Возвращает `(слайд, причина_отказа)` —
+    тем же контрактом, что и `_write_with_agent_loop` выше и по той же
+    причине."""
     user_payload = dict(payload)
     if repair:
         user_payload["previous_answer_problems"] = repair
@@ -417,11 +452,13 @@ def _ask_slide_writer(prompt_body: str, payload: dict, index: int, llm: LLMProvi
     ]
     try:
         raw = llm.complete(messages, schema=_SLIDE_SCHEMA, max_tokens=WRITER_MAX_TOKENS)
-        data = json.loads(raw)
-        slide = slide_spec_from_dict(data, index)
-    except Exception:
-        return None
-    return slide
+    except Exception as exc:
+        return None, f"модель не ответила — {_why(exc)}"
+    try:
+        slide = slide_spec_from_dict(json.loads(raw), index)
+    except Exception as exc:
+        return None, f"ответ не лёг в схему слайда — {_why(exc)}"
+    return slide, None
 
 
 def _write_one_slide(
@@ -454,13 +491,14 @@ def _write_one_slide(
     }
 
     slide: SlideSpec | None = None
+    reason: str | None = None
     if llm is not None:
         # Task 19: первый шанс — агентный цикл (пишет, при необходимости
         # меряет текст/сверяет цифры инструментами, переписывает), не
         # одиночный вызов. Репарация СТРУКТУРНОЙ невалидности ниже — та же,
         # что была всегда, отдельная забота (см. докстроку `_write_with_
         # agent_loop`).
-        slide = _write_with_agent_loop(
+        slide, reason = _write_with_agent_loop(
             prompt_body, payload, index, llm, profile, desired_kind, source_text, max_steps=agent_max_steps,
         )
         if slide is not None:
@@ -470,11 +508,24 @@ def _write_one_slide(
                 # собственные ошибки (брифом: "валидатор ловит то, что
                 # иначе всплывёт при сборке" — здесь оно ловится ДО
                 # сборки и ДО того, как испортит остальную колоду).
-                repaired = _ask_slide_writer(prompt_body, payload, index, llm, repair=problems)
-                slide = repaired if repaired is not None and not slide_spec_problems(repaired) else None
+                repaired, repair_reason = _ask_slide_writer(prompt_body, payload, index, llm, repair=problems)
+                still_broken = slide_spec_problems(repaired) if repaired is not None else []
+                if repaired is not None and not still_broken:
+                    slide = repaired
+                else:
+                    slide = None
+                    reason = (
+                        f"ответ не прошёл проверку ({'; '.join(problems)}), "
+                        + (
+                            f"попытка исправить тоже: {'; '.join(still_broken)}"
+                            if still_broken else f"попытка исправить: {repair_reason}"
+                        )
+                    )
+    elif llm is None:
+        reason = "модель не подключена (нет ключа) — текст слайдов не писался вовсе"
 
     if slide is None:
-        slide = _fallback_slide(desired_kind, index, item.intent, item.needs)
+        slide = _fallback_slide(desired_kind, index, item.intent, item.needs, reason=reason)
 
     return slide
 

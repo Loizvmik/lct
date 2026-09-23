@@ -424,3 +424,52 @@ def test_pick_patterns_keeps_slide_untouched_when_kind_has_no_candidates(PROFILE
 
     result = pick_patterns(deck, _EmptyPatterns(), llm=None)
     assert result.slides[0].pattern_id is None
+
+
+# ---------------------------------------------------------------------------
+# Причина отказа модели: живой прогон 23 сентября 2026 — 4 слайда из 12 ушли
+# в запасной вариант, и понять почему было нечем
+# ---------------------------------------------------------------------------
+
+
+def test_fallback_finding_names_the_network_failure(PROFILE):
+    """Запасной слайд обязан сказать, ЧТО именно случилось, а не только «не
+    вернула валидный ответ»: сеть отвалилась, кончился бюджет токенов и
+    ответ не лёг в схему — три разные болезни с разным лечением."""
+    outline = _outline(2)
+    llm = _QueueLLM([RuntimeError("The read operation timed out")] * 4)
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+
+    finding = " ".join(deck.slides[0].findings)
+    assert "The read operation timed out" in finding
+    assert "RuntimeError" in finding
+
+
+def test_fallback_finding_names_the_schema_failure(PROFILE):
+    """Ответ пришёл, но не лёг в схему — причина обязана отличаться от
+    сетевой, иначе по отчёту не понять, чинить сеть или промпт."""
+    outline = _outline(2)
+    bad = json.dumps({"kind": "bullets", "headline": "X", "unknown_field": 1}, ensure_ascii=False)
+    llm = _QueueLLM([bad] * 4)
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+
+    finding = " ".join(deck.slides[0].findings)
+    assert "unknown_field" in finding or "схем" in finding
+    assert "The read operation timed out" not in finding
+
+
+def test_fallback_reason_does_not_leak_the_provider_key(PROFILE, monkeypatch):
+    """Причина едет в отчёт прогона и в веб-интерфейс. Ключ уходит в
+    заголовок запроса, а не в текст исключения, но цена ошибки
+    несимметрична — вырезаем."""
+    monkeypatch.setenv("YANDEX_API_KEY", "AQVN-секрет-не-для-экрана")
+    outline = _outline(2)
+    llm = _QueueLLM([RuntimeError("401 Unauthorized: Api-Key AQVN-секрет-не-для-экрана")] * 4)
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+
+    finding = " ".join(deck.slides[0].findings)
+    assert "AQVN-секрет-не-для-экрана" not in finding
+    assert "***" in finding
