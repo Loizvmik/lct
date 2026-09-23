@@ -21,6 +21,12 @@ export default function BriefPage() {
   // бриф и перегенерировать»), форма не должна быть пустой — подставляем
   // последний черновик для этого шаблона. Шаблон при этом не перезагружаем:
   // `template_id` в URL тот же, профиль уже лежит в кеше API.
+  // Черновика нет (первый заход на этот шаблон) — форма открывается уже
+  // заполненной примером, а не пустой. На тестовых прогонах бриф каждый раз
+  // придумывать заново незачем, а пустая форма ещё и провоцирует запуск
+  // без исходных материалов: тогда модели неоткуда брать цифры и слайды
+  // выходят из общих слов. Кнопка «заполнить примером» остаётся — ею
+  // возвращают пример поверх своих правок.
   useEffect(() => {
     const draft = loadBriefDraft(params.templateId);
     if (draft) {
@@ -29,7 +35,9 @@ export default function BriefPage() {
       setSources(draft.sources);
       setTargetSlides(draft.targetSlides);
       setAutofix(draft.autofix);
+      return;
     }
+    fillExample();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.templateId]);
 
@@ -38,6 +46,13 @@ export default function BriefPage() {
     setBrief(EXAMPLE_BRIEF);
     setSources(EXAMPLE_SOURCES);
     setTargetSlides(EXAMPLE_TARGET_SLIDES);
+  }
+
+  function clearForm() {
+    setTitle("");
+    setBrief("");
+    setSources("");
+    setTargetSlides("");
   }
 
   async function submit() {
@@ -77,7 +92,10 @@ export default function BriefPage() {
 
       <div className="row-actions example-fill">
         <button type="button" className="secondary" onClick={fillExample} disabled={busy}>
-          Заполнить примером (маршрутизация заявок)
+          Вернуть пример (маршрутизация заявок)
+        </button>
+        <button type="button" className="secondary" onClick={clearForm} disabled={busy}>
+          Очистить
         </button>
       </div>
 
