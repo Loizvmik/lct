@@ -57,7 +57,7 @@ from pathlib import Path
 import yaml
 
 from deckforge.compose.fit_check import measure_fit
-from deckforge.compose.slide_tools import list_layouts, try_slide
+from deckforge.compose.slide_tools import best_layout_for, list_layouts, try_slide
 from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
@@ -435,6 +435,7 @@ def _write_with_agent_loop(
     слайда из двенадцати ушли в запасной вариант, и понять почему было
     нечем."""
     conversation: list[dict] = []
+    checked = False  # вердикт черновика показывают ОДИН раз за слайд
     for step in range(1, max(1, max_steps) + 1):
         is_final_step = step >= max_steps
         turn_payload = dict(payload)
@@ -473,10 +474,57 @@ def _write_with_agent_loop(
             continue
 
         try:
-            return slide_spec_from_dict(data, index), None
+            slide = slide_spec_from_dict(data, index)
         except Exception as exc:
             return None, f"шаг {step}/{max_steps}: ответ не лёг в схему слайда — {_why(exc)}"
+
+        # Вердикт черновика — КОДОМ, а не по просьбе.
+        #
+        # Живые прогоны 23 сентября 2026: инструмент `try_slide` модели дан,
+        # в задании расписан по шагам, и всё равно использован на ОДНОМ
+        # слайде из двенадцати — дважды подряд. Уговаривать промптом дальше
+        # бессмысленно: код сам собирает присланный слайд начерно и, если
+        # вышло плохо, возвращает вердикт тем же путём, что и ответ
+        # инструмента. Модель получает ровно ту обратную связь, за которой
+        # должна была сходить сама.
+        #
+        # Стоит это ноль лишних вызовов, когда слайд хорош (вердикт чистый —
+        # возвращаем как есть), и один, когда плох.
+        if not is_final_step and template_path is not None and not checked:
+            verdict = _draft_verdict(slide, profile, template_path)
+            if verdict is not None:
+                checked = True
+                conversation.append({"role": "assistant", "content": raw})
+                conversation.append({"role": "user", "content": json.dumps(
+                    {"draft_verdict": verdict,
+                     "что_делать": "перепиши слайд с учётом вердикта и пришли финальный ответ"},
+                    ensure_ascii=False)})
+                continue
+        return slide, None
     return None, f"бюджет шагов исчерпан ({max_steps}), финального слайда модель так и не прислала"
+
+
+def _draft_verdict(slide: SlideSpec, profile, template_path: Path) -> dict | None:
+    """Вердикт черновой сборки слайда, если его стоит показать модели.
+    `None` означает «слайд собрался чисто, переписывать нечего».
+
+    Проверяется раскладка, выбранная моделью (`layout_id`), а если она не
+    выбирала — та, которую возьмёт сборка (`best_layout_for`): иначе модель
+    правила бы текст по вердикту чужой раскладки.
+
+    Любая поломка внутри проверки означает, что слайд уходит как есть: вердикт —
+    помощь, а не обязательный этап, и ронять из-за него написанный текст
+    нельзя."""
+    layout_id = slide.pattern_id or best_layout_for(slide, profile)
+    if not layout_id:
+        return None
+    try:
+        verdict = try_slide(slide, str(layout_id), profile, template_path)
+    except Exception:
+        return None
+    if verdict.get("ok") and 25 <= verdict.get("fill_percent", 0) <= 75:
+        return None
+    return {"layout_id": layout_id, **verdict}
 
 
 def _ask_slide_writer(
