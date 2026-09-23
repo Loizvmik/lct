@@ -36,7 +36,7 @@ live = pytest.mark.skipif(not os.getenv("YANDEX_API_KEY"), reason="нет YANDEX
 needs_render = pytest.mark.skipif(not soffice_available(), reason="LibreOffice не установлен")
 
 TEMPLATE = Path("dataset/templates/VK Tech шаблон.pptx")
-PROFILE = TemplateProfile.from_file(TEMPLATE)
+PROFILE = TemplateProfile.from_file(TEMPLATE, cache_dir=None)
 
 
 # ---------------------------------------------------------------------------

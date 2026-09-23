@@ -29,7 +29,7 @@ from deckforge.template.profile import TemplateProfile
 
 TEMPLATES_DIR = Path("dataset/templates")
 TEMPLATE = TEMPLATES_DIR / "VK Tech шаблон.pptx"
-PROFILE = TemplateProfile.from_file(TEMPLATE)
+PROFILE = TemplateProfile.from_file(TEMPLATE, cache_dir=None)
 CONFIG = AuditConfig.load()
 
 # Макет шаблона без единого плейсхолдера (разведано: `slideLayout18.xml`,

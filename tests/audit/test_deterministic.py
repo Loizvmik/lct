@@ -43,7 +43,7 @@ from deckforge.template.profile import TemplateProfile
 # объявляет свои PROFILE/TEMPLATE, а не тянет их из соседнего conftest.py
 # через точечный импорт).
 TEMPLATE = Path("dataset/templates/VK Tech шаблон.pptx")
-PROFILE = TemplateProfile.from_file(TEMPLATE)
+PROFILE = TemplateProfile.from_file(TEMPLATE, cache_dir=None)
 CONFIG = AuditConfig.load()
 
 

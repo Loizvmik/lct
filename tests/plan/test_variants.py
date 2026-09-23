@@ -18,7 +18,7 @@ from deckforge.audit.deterministic import run_deterministic
 from deckforge.template.profile import TemplateProfile
 
 TEMPLATE = Path("dataset/templates/VK Tech шаблон.pptx")
-PROFILE = TemplateProfile.from_file(TEMPLATE)
+PROFILE = TemplateProfile.from_file(TEMPLATE, cache_dir=None)
 CONFIG = AuditConfig.load()
 
 DECK = DeckSpec(

@@ -30,7 +30,7 @@ from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSl
 from deckforge.template.profile import TemplateProfile
 
 TEMPLATE = Path("dataset/templates/VK Tech шаблон.pptx")
-PROFILE = TemplateProfile.from_file(TEMPLATE)
+PROFILE = TemplateProfile.from_file(TEMPLATE, cache_dir=None)
 
 SAMPLE_SPEC = DeckSpec(
     title="Сокращение времени согласования заявок",
