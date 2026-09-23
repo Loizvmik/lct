@@ -458,7 +458,7 @@ def _mine_slide(
     slide_number = _slide_number(slide_part)
     layout_id = Path(layout_part).stem if layout_part else ""
     is_dark = _slide_is_dark(pkg, theme, slide_part, layout_part, decor, bg_image_cache)
-    capacity = _capacity(content, slots, repeat, grid)
+    capacity = _capacity(content, slots, repeat, grid, canvas)
     score = _score(slots, repeat, roles_present)
     if score < _MIN_SCORE:
         return None
@@ -1519,14 +1519,57 @@ def _score(slots: list[PatternSlot], repeat: RepeatSpec | None, roles_present: s
 # --- вместимость на уровне всей раскладки ------------------------------
 
 
+# Потолок числа пунктов, который раскладка вправе пообещать модели. ТЗ
+# (Приложение 1, «Плотность») считает браком слайд, где больше шести
+# буллетов, и `config/audit.yaml::density.max_bullets` держит ровно это
+# число. Блок высотой в пол-слайда физически вмещает два десятка строк, но
+# обещать их модели значит заказать слайд, который сами же и забракуем.
+_MAX_BULLETS_PROMISED = 6
+
+
+def _lines_that_fit(slot: PatternSlot, canvas: Canvas) -> int:
+    """Сколько строк собственного кегля слота помещается в его высоту.
+
+    `PatternSlot.size_pt` нормирован к эталонному холсту 13.333″ (см.
+    `_shape_dominant_size`), а высота слота — доля РЕАЛЬНОГО холста, поэтому
+    кегль денормируется: иначе на узком холсте (VK Tech, 10″) строк
+    насчитывалось бы на треть меньше, чем влезает."""
+    real_pt = slot.size_pt / canvas.norm if canvas.norm else slot.size_pt
+    if real_pt <= 0:
+        return 1
+    line_height_in = (real_pt / 72) * _LINE_HEIGHT_EM
+    height_in = slot.box.height * canvas.height_in
+    return max(1, int(height_in / line_height_in))
+
+
 def _capacity(
     content: list[ShapeRef], slots: list[PatternSlot], repeat: RepeatSpec | None, grid: Grid,
+    canvas: Canvas,
 ) -> Capacity:
-    body_like = [s.max_chars for s in slots if s.role in ("body", "card_body", "bullet")]
+    body_like_slots = [s for s in slots if s.role in ("body", "card_body", "bullet")]
+    body_like = [s.max_chars for s in body_like_slots]
     max_chars_per_item = max(body_like, default=0)
 
+    # Сколько пунктов раскладка держит. Слоты с ролью "bullet" считаются
+    # штучно — там каждый пункт лежит в своей рамке. Когда таких слотов нет,
+    # пункты живут строками ВНУТРИ одного блока, и их число задаёт высота
+    # блока, а не количество блоков.
+    #
+    # Раньше здесь стояла единица: «нет bullet-слотов — значит один пункт».
+    # На живом прогоне 23 сентября 2026 (ЛЦТ2026, веб-интерфейс) это
+    # обещало модели `max_bullets: 1` у раскладки, чей текстовый блок
+    # занимает половину холста. Модель честно писала одну строку, код
+    # рисовал её в блоке 5×6 дюймов — и аудит отмечал слайд как заполненный
+    # на 2-14% холста. Пустота приходила не от модели и не от раскладки, а
+    # отсюда: мы считали контейнеры вместо того, чтобы мерить место.
     bullet_count = sum(1 for s in slots if s.role == "bullet")
-    max_bullets = bullet_count if bullet_count else (1 if body_like else 0)
+    if bullet_count:
+        max_bullets = bullet_count
+    elif body_like_slots:
+        fits = max(_lines_that_fit(s, canvas) for s in body_like_slots)
+        max_bullets = min(fits, _MAX_BULLETS_PROMISED)
+    else:
+        max_bullets = 0
 
     if repeat is not None and repeat.step > 0:
         span = (

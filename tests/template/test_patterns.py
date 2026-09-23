@@ -573,7 +573,7 @@ def test_capacity_accounts_for_last_item_own_footprint_not_only_step():
     )
     content: list[ShapeRef] = []
 
-    capacity = _capacity(content, [slot], repeat, grid)
+    capacity = _capacity(content, [slot], repeat, grid, _CANVAS)
 
     # span = 1 - 0.05 - 0.05 = 0.9; item_size = 0.15 (ширина слота повтора)
     # старая формула (без учёта item_size): int(0.9/0.2) + 1 = 5 (переоценка)
@@ -718,3 +718,65 @@ def test_columns_still_recognizes_the_simple_one_block_per_column_case():
     columns = _columns(slots)
 
     assert len(columns) == 2
+
+
+# ---------------------------------------------------------------------------
+# Вместимость по пунктам: живой прогон 23 сентября 2026 — слайды заполнены
+# на 2-14% холста, потому что раскладке приписывался ОДИН пункт
+# ---------------------------------------------------------------------------
+
+
+def _body_slot(height: float, size_pt: float = 16.0) -> PatternSlot:
+    return PatternSlot(
+        role="body", box=Box(left=0.1, top=0.1, width=0.4, height=height),
+        size_pt=size_pt, color_hex=None, align="l", max_chars=400, wraps=True, sample_text=None,
+    )
+
+
+def _empty_grid() -> Grid:
+    return Grid(
+        margin_left=0.05, margin_right=0.05, margin_top=0.05, margin_bottom=0.05,
+        columns=[], gutter=0.0, anchors={},
+    )
+
+
+def test_a_tall_text_block_promises_more_than_one_bullet():
+    """Блок высотой в 80% холста держит десятки строк 16-м кеглем — раньше
+    вместимость всё равно объявляла один пункт, модель писала одну строку,
+    и слайд выходил пустым на 90%."""
+    capacity = _capacity([], [_body_slot(0.8)], None, _empty_grid(), _CANVAS)
+
+    assert capacity.max_bullets > 1
+
+
+def test_promised_bullets_never_exceed_the_density_limit():
+    """ТЗ (Приложение 1, «Плотность») считает браком больше шести буллетов
+    на слайде. Обещать модели двадцать строк значит заказать слайд, который
+    сами же и забракуем."""
+    capacity = _capacity([], [_body_slot(0.95, size_pt=10.0)], None, _empty_grid(), _CANVAS)
+
+    assert capacity.max_bullets <= 6
+
+
+def test_a_short_text_block_still_promises_one_bullet():
+    """Обратный край: в полоску высотой в одну строку больше одного пункта
+    не влезает, и обещать их нельзя."""
+    capacity = _capacity([], [_body_slot(0.04)], None, _empty_grid(), _CANVAS)
+
+    assert capacity.max_bullets == 1
+
+
+def test_explicit_bullet_slots_are_still_counted_one_by_one():
+    """Где каждый пункт лежит в своей рамке, считаются рамки — высота тут
+    ни при чём, и старое поведение обязано сохраниться."""
+    slots = [
+        PatternSlot(
+            role="bullet", box=Box(left=0.1, top=0.1 + i * 0.1, width=0.4, height=0.06),
+            size_pt=16.0, color_hex=None, align="l", max_chars=80, wraps=False, sample_text=None,
+        )
+        for i in range(3)
+    ]
+
+    capacity = _capacity([], slots, None, _empty_grid(), _CANVAS)
+
+    assert capacity.max_bullets == 3
