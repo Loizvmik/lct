@@ -1559,10 +1559,24 @@ def _check_D04(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 
-def _check_D05(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
+def slide_fill_ratio(slide, canvas: Canvas, profile: TemplateProfile, *, index: int = 0) -> float:
+    """Доля холста, занятая видимым содержанием уже уложенного слайда —
+    ровно то число, по которому D05 судит «пусто/перегружено».
+
+    Вынесено из `_check_D05` отдельной функцией, потому что то же число
+    нужно инструменту `compose.slide_tools.try_slide`: агент спрашивает
+    «насколько полным вышел слайд» и обязан получить тот же ответ, который
+    потом даст аудит. Два расчёта заполненности разошлись бы — инструмент
+    говорил бы 7%, аудит 14%, и агент правил бы не то (ровно это и вышло
+    на первом живом прогоне инструмента 23 сентября 2026)."""
+    ctx = _build_context_inmemory(index, slide, canvas, profile)
+    return _fill_ratio(ctx)
+
+
+def _fill_ratio(ctx: _SlideContext) -> float:
     canvas_area = ctx.canvas.width_in * ctx.canvas.height_in
     if canvas_area <= 0:
-        return []
+        return 0.0
     covered = 0.0
     for item in ctx.items:
         if item.kind == "connector":
@@ -1575,7 +1589,13 @@ def _check_D05(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
             covered += eff.area * canvas_area
         elif item.kind in ("picture", "graphic_frame"):
             covered += item.box.area * canvas_area
-    ratio = covered / canvas_area
+    return covered / canvas_area
+
+
+def _check_D05(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
+    if ctx.canvas.width_in * ctx.canvas.height_in <= 0:
+        return []
+    ratio = _fill_ratio(ctx)
     cfg = config.density
     if cfg.fill_ratio_min <= ratio <= cfg.fill_ratio_max:
         return []
