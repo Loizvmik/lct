@@ -41,8 +41,13 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# `--reload` — чтобы правка в src/ применялась без ручного перезапуска, как
+# это давно делает веб-часть (`pnpm dev`). 23 сентября 2026 несимметрия
+# стоила полудня: фиксы в Python лежали закоммиченными, сервер крутился со
+# старым кодом, прогоны через интерфейс их не видели, и выглядело это как
+# «починили, а ничего не изменилось».
 echo "==> API: http://127.0.0.1:${API_PORT} (config/app.yaml)"
-uv run uvicorn deckforge.api.app:app --host 127.0.0.1 --port "$API_PORT" &
+uv run uvicorn deckforge.api.app:app --host 127.0.0.1 --port "$API_PORT" --reload --reload-dir src &
 API_PID=$!
 
 echo "==> Веб-интерфейс: http://127.0.0.1:${WEB_PORT}"
