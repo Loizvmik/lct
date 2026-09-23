@@ -24,7 +24,6 @@
 именно сериализуемая, а не питоновская объектная форма.
 """
 from __future__ import annotations
-import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -43,6 +42,7 @@ from deckforge.template.layouts import Background, LayoutEntry, PlaceholderSlot,
 from deckforge.template.naming import PaletteNote, name_palette_roles_report
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec, mine_patterns
 from deckforge.template.shapes import ShapeVocabEntry, build_shape_vocabulary
+from deckforge.template.store import profile_key
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale, build_type_scale
 from deckforge.template.usage import Usage, collect_usage
@@ -718,7 +718,13 @@ class TemplateProfile(BaseModel):
         отдаётся как есть: уже полученное от модели не деградирует до
         запасного варианта/голой геометрии, и ничего не перечитывается."""
         path = Path(path)
-        fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
+        # Ключ несёт ВЕРСИЮ разбора вместе с отпечатком файла (`store.
+        # profile_key`). Сверка версии внутри записи ниже остаётся — она
+        # ловит записи, сделанные до появления версионного ключа, — но
+        # основную защиту даёт именно ключ: код новой версии просто не
+        # видит чужих записей, в том числе в общем хранилище, которое
+        # переживает выкатку (см. докстроку `template/store.py`).
+        fingerprint = profile_key(path.read_bytes(), PROFILE_SCHEMA_VERSION)
 
         # Найдено этой задачей: `cache_dir` объявлен типом `Path | None`, но
         # Python не приводит аргументы к аннотации сама — вызывающий код,

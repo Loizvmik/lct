@@ -51,6 +51,7 @@ import os
 import json
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import replace
 from pathlib import Path
 
 import yaml
@@ -569,7 +570,30 @@ def _write_one_slide(
     if slide is None:
         slide = _fallback_slide(desired_kind, index, item.intent, item.needs, reason=reason)
 
-    return slide
+    return _validate_chosen_layout(slide, profile)
+
+
+def _validate_chosen_layout(slide: SlideSpec, profile) -> SlideSpec:
+    """Номер раскладки, выбранный агентом, обязан существовать в ЭТОМ
+    шаблоне — тот же принцип «модель предлагает, код проверяет», что и у
+    именования палитры и выбора вида раскладки.
+
+    Живой прогон 23 сентября 2026: модель прислала `layout_id: "bullets_1"`,
+    хотя раскладки этого шаблона называются `slide16`/`slide18` — то есть
+    выдумала номер, не посмотрев каталог. `compose.builder._resolve_pattern`
+    такой номер и так не примет (он ищет паттерн по id и не находит), но
+    молча: со стороны это неотличимо от «агент не выбирал». Выдуманный
+    номер стирается здесь и остаётся честной находкой."""
+    if not slide.pattern_id:
+        return slide
+    known = {p.pattern_id for p in profile.patterns}
+    if slide.pattern_id in known:
+        return slide
+    slide.findings.append(
+        f"Слайд {slide.index}: раскладки {slide.pattern_id!r} в шаблоне нет — "
+        "выбор модели отброшен, раскладку подобрал код. Номер надо брать из list_layouts."
+    )
+    return replace(slide, pattern_id=None)
 
 
 def write_slides(
