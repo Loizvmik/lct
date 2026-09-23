@@ -144,7 +144,31 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # моделью, перестала бы спрашиваться вовсе). Бамп версии заставляет такой
 # кеш пересобраться заново, с настоящей уверенностью по ветвям `_classify_
 # kind`, а не с фиктивной единицей.
-PROFILE_SCHEMA_VERSION = 9
+# 9 -> 10: у `TemplateProfile` появилось поле `pattern_kinds_source` —
+# признак «уточнялся ли вид раскладки моделью при сборке ЭТОГО профиля»
+# (см. его комментарий у поля). Старый кеш этого поля не несёт вовсе, и
+# pydantic подставил бы дефолт `"geometry"` — формально верно (все
+# профили в `cache/profiles/` на момент правки собраны без `vision`), но
+# ровно тот молчаливый случай, про который написана докстрока выше:
+# смысл модели изменился, значит версия бампается, а не угадывается по
+# дефолту. Заодно бамп чистит кеши, собранные ДО этой правки БЕЗ
+# уточнения вида моделью, — их не придётся дочитывать на лету.
+PROFILE_SCHEMA_VERSION = 10
+
+# Строка отчёта «откуда что взято» про вид раскладки: её пишет
+# `_build_provenance` при полном разборе и она же ищется/заменяется при
+# дозапросе видов моделью поверх кеш-хита (`_reclassify_pattern_kinds`) —
+# одна константа на оба места, чтобы формулировка не разъехалась и строка
+# не задвоилась в провенансе.
+_NO_VISION_PROVENANCE_LINE = (
+    "Вид раскладки (Pattern.kind) не уточнялся моделью — использован только "
+    "геометрический майнинг (без ключа `vision`, семь корзин `patterns._classify_kind`)."
+)
+
+# Начала строк провенанса, которые говорят про вид раскладки: и сводка
+# самой `classify_patterns_by_vision` ("Вид раскладки: N паттернов...",
+# "Виды раскладки моделью не уточнялись: ..."), и строка выше.
+_VISION_PROVENANCE_PREFIXES = ("Вид раскладки", "Виды раскладки")
 
 # Ниже какой уверенности число из разбора попадает в предупреждения, а не
 # только в тело отчёта. 0.5 — не наблюдение за тремя файлами, а сама природа
@@ -580,6 +604,28 @@ class TemplateProfile(BaseModel):
     layouts: list[LayoutEntryModel]
     assets: AssetCatalogModel
     patterns: list[PatternModel]
+    # Уточнялся ли вид раскладки (`PatternModel.kind`) моделью при сборке
+    # ЭТОГО профиля: "model" — `vision` был передан и `classify_patterns_by_
+    # vision` отработала, "geometry" — модель не звалась вовсе, виды сняты
+    # только геометрией (`patterns._classify_kind`). Зеркало `palette_roles_
+    # source` и нужен ровно за тем же: ключ диск-кеша — отпечаток ФАЙЛА
+    # шаблона, он ничего не знает про то, был ли ключ модели у прогона,
+    # который этот профиль записал. Без этого признака профиль, собранный
+    # без ключа, навсегда отдавался бы и тем вызовам, у которых ключ есть
+    # (найдено на живом прогоне: 8 из 15 раскладок ЛЦТ2026 остались
+    # `bullets` с `kind_confidence=0.3` — корзина по умолчанию, обязанная
+    # уйти на уточнение моделью). См. `from_file`/`_reclassify_pattern_kinds`.
+    #
+    # Честная оговорка про смысл "model": это «модель спрашивали», а не
+    # «модель ответила». Если рендер или сеть подвели, виды остаются
+    # геометрическими (отказ виден в `.warnings`), но перезапрашиваться на
+    # каждом чтении кеша не будут — рендер шаблона стоит десятки секунд, и
+    # платить их на каждой генерации ради повторной попытки дороже, чем
+    # один раз почистить `cache/profiles/`. У `palette_roles_source`
+    # выбран противоположный компромисс ("fallback" после неудачи модели →
+    # попытка повторяется), потому что именование палитры не требует
+    # рендера и стоит одного текстового вызова.
+    pattern_kinds_source: str = "geometry"
     # Task 10: словарь автофигур шаблона (`ShapeVocabEntry`, по убыванию
     # частоты) — `compose/diagrams.py` рисует карточки схем ТОЛЬКО формами
     # из этого списка (см. докстроку `template/shapes.py`), никогда не
@@ -608,16 +654,15 @@ class TemplateProfile(BaseModel):
         честной деградацией, что и `namer`: без него (или при сбое рендера/
         сети/ответа модели) `Pattern.kind` остаётся ровно тем, что снял
         геометрический майнинг `patterns.mine_patterns`, разбор не падает и
-        не замедляется рендером шаблона. В отличие от `namer` (см. ниже про
-        `_reassign_palette_roles`), кеш-хит с `Pattern.kind` без уточнения
-        моделью НЕ переклассифицируется заново, даже если сейчас передан
-        `vision`, — рендер шаблона (`render.soffice.to_pngs`) дороже
-        разбора XML, а профиль и так пересобирается целиком при ЛЮБОЙ правке
-        схемы (`PROFILE_SCHEMA_VERSION`); честная оговорка, не потерянное
-        требование: та же логика "кеш-хит без ключа не отравляет навсегда"
-        достижима перепарсингом (не должна происходить часто — кеш ключуется
-        отпечатком ФАЙЛА, не намерением пользователя иметь/не иметь ключ)
-        или явным `cache_dir=None`.
+        не замедляется рендером шаблона. Кеш-хит с видами, снятыми ТОЛЬКО
+        геометрией (`pattern_kinds_source != "model"`), при переданном
+        `vision` дозапрашивается — см. `_reclassify_pattern_kinds` ниже и
+        абзац про ключ кеша. До этой правки такой кеш-хит отдавался как есть
+        навсегда, и разбор, сделанный один раз без ключа модели, навсегда
+        отравлял шаблон: на ЛЦТ2026 восемь из пятнадцати раскладок остались
+        `bullets` с `kind_confidence=0.3` (корзина по умолчанию, обязанная
+        по порогу `vision_kind._ASK_CONFIDENCE_THRESHOLD` уйти на уточнение
+        моделью), хотя ключ у прогона был.
 
         Порядок и переиспользование посчитанного повторяют
         `tests/template/conftest.py::_build_profile` (прообраз сборки,
@@ -643,18 +688,26 @@ class TemplateProfile(BaseModel):
         обязательное условие сборки профиля). Повреждённый файл кеша не
         роняет вызов — профиль пересчитывается заново и перезаписывает его.
 
-        Ключ кеша — только отпечаток ФАЙЛА, без учёта `namer` (Task 8
-        код-ревью, находка 2). Раньше это значило: первый вызов на файле без
-        ключа модели (namer=None, роли — запасным вариантом) навсегда
-        отравлял кеш — следующий вызов с настоящим `namer` получал те же
-        запасные роли, модель не вызывалась никогда. Починено: на кеш-хите,
-        если сохранённый профиль несёт `palette_roles_source != "model"`
-        (роли — запасной вариант, а не ответ модели) и сейчас передан
-        `namer`, роли переназначаются моделью через
-        `_reassign_palette_roles`, и кеш обновляется — остальной разбор
-        (детерминированный, не изменился) не переделывается. Обратное
-        (роли уже от модели, а вызов идёт без ключа) кеш отдаёт как есть —
-        уже полученное от модели не деградирует до запасного варианта."""
+        Ключ кеша — только отпечаток ФАЙЛА, без учёта `namer`/`vision`
+        (Task 8 код-ревью, находка 2). Сам по себе он не различает разбор,
+        сделанный с моделью, и разбор, сделанный без неё, — поэтому профиль
+        несёт ДВА признака происхождения своих «модельных» частей
+        (`palette_roles_source`, `pattern_kinds_source`), и кеш-хит
+        проверяется по ним, а не по одному лишь отпечатку:
+
+        - сейчас передан `namer`, а роли в кеше — запасной вариант
+          (`palette_roles_source != "model"`): роли переназначаются моделью
+          (`_reassign_palette_roles`);
+        - сейчас передан `vision`, а виды раскладок в кеше сняты только
+          геометрией (`pattern_kinds_source != "model"`): паттерны
+          перемайниваются (детерминированно, без сети) и уходят на уточнение
+          модели (`_reclassify_pattern_kinds`);
+        - обновлённый профиль перезаписывает файл кеша, чтобы следующий
+          вызов с той же конфигурацией ничего не дозапрашивал.
+
+        Обратный случай — в кеше уже ответ модели, а вызов идёт без ключа —
+        отдаётся как есть: уже полученное от модели не деградирует до
+        запасного варианта/голой геометрии, и ничего не перечитывается."""
         path = Path(path)
         fingerprint = hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -693,6 +746,7 @@ class TemplateProfile(BaseModel):
             except Exception:
                 cached = None  # повреждённый кеш — разбираем заново и перезаписываем ниже
             if cached is not None:
+                refreshed = False
                 if namer is not None and cached.palette_roles_source != "model":
                     # Честная оговорка из докстроки выше: ключ кеша — только
                     # отпечаток файла, без учёта namer. Профиль мог лечь в
@@ -702,12 +756,25 @@ class TemplateProfile(BaseModel):
                     # трогая остальной (детерминированный, не изменившийся)
                     # разбор — см. `_reassign_palette_roles`.
                     cached = cls._reassign_palette_roles(cached, path, namer)
-                    if cache_file is not None:
-                        try:
-                            cache_file.parent.mkdir(parents=True, exist_ok=True)
-                            cache_file.write_text(cached.to_json(), encoding="utf-8")
-                        except OSError:
-                            pass  # кеш — оптимизация, не обязана быть надёжной
+                    refreshed = True
+                if vision is not None and cached.pattern_kinds_source != "model":
+                    # То же самое, но про вид раскладки: профиль мог лечь в
+                    # кеш в прогоне без ключа `vision` (виды — только
+                    # геометрия), а сейчас модель доступна. Такой профиль не
+                    # годится для запроса, у которого модель есть, — иначе
+                    # половина шаблона остаётся в корзине по умолчанию
+                    # навсегда (см. докстроку `pattern_kinds_source`).
+                    cached = cls._reclassify_pattern_kinds(cached, path, vision)
+                    refreshed = True
+                if refreshed and cache_file is not None:
+                    # Запись одна на оба дозапроса — иначе профиль, которому
+                    # нужны и роли, и виды, лёг бы в кеш дважды, причём
+                    # первый раз в промежуточном состоянии.
+                    try:
+                        cache_file.parent.mkdir(parents=True, exist_ok=True)
+                        cache_file.write_text(cached.to_json(), encoding="utf-8")
+                    except OSError:
+                        pass  # кеш — оптимизация, не обязана быть надёжной
                 return cached
 
         with PptxPackage.open(path) as pkg:
@@ -831,6 +898,10 @@ class TemplateProfile(BaseModel):
             layouts=[_layout_entry_model(entry) for entry in layouts],
             assets=_asset_catalog_model(assets),
             patterns=[_pattern_model(p) for p in patterns],
+            # "model" значит «модель спрашивали», а не «модель ответила» —
+            # см. комментарий у самого поля. Ответила она или отказала, видно
+            # по `provenance`/`warnings` (заметки `classify_patterns_by_vision`).
+            pattern_kinds_source="model" if vision is not None else "geometry",
             shape_vocabulary=[_shape_vocab_entry_model(e) for e in shape_vocabulary],
             chart_series=chart_series,
             provenance=provenance, warnings=warnings, fingerprint=fingerprint,
@@ -898,6 +969,69 @@ class TemplateProfile(BaseModel):
             "chart_series": chart_series,
             "provenance": provenance,
             "warnings": warnings,
+        })
+
+    @classmethod
+    def _reclassify_pattern_kinds(
+        cls, cached: "TemplateProfile", path: Path, vision: VisionProvider,
+    ) -> "TemplateProfile":
+        """Дозапрашивает вид раскладки у модели поверх кеш-хита, собранного
+        без `vision` (виды — только геометрия `patterns._classify_kind`) —
+        зеркало `_reassign_palette_roles` для второй «модельной» части
+        профиля.
+
+        Почему паттерны перемайниваются, а не берутся из кеша: `classify_
+        patterns_by_vision` работает с дата-классами `patterns.Pattern`, а в
+        профиле лежат их JSON-зеркала (`PatternModel`), причём зеркала
+        неполные — `DecorShapeModel` не несёт `prst`/`adj`. Восстанавливать
+        `Pattern` из зеркала значило бы собирать заведомо обеднённый объект
+        и молча тащить это обеднение дальше при любой будущей правке
+        `vision_kind.py`. Майнинг детерминированный и не ходит в сеть (живой
+        замер разбора без моделей — меньше секунды против десятков секунд
+        рендера и обращений к модели, ради которых всё и затевается), так
+        что честнее посчитать паттерны заново.
+
+        Остальной профиль (палитра, типографика, сетка, лейауты, ассеты,
+        словарь форм, палитра рядов) из кеша не трогается: `classify_
+        patterns_by_vision` меняет только `Pattern.kind`, а `shape_
+        vocabulary` считается по `decor`/`slots` и от `kind` не зависит (см.
+        докстроку `template/shapes.py`).
+
+        Строка провенанса про вид раскладки заменяется целиком (старая —
+        «не уточнялся моделью», новая — сводка модели), отказы отдельных
+        паттернов добавляются в `.warnings`. Старых «модельных» заметок про
+        вид в кеше быть не может: профиль сюда попадает только с
+        `pattern_kinds_source != "model"`, то есть собранный вообще без
+        `vision`."""
+        with PptxPackage.open(path) as pkg:
+            canvas = pkg.canvas()
+            usage = collect_usage(pkg, canvas)
+            type_scale = build_type_scale(pkg, canvas, usage)
+            grid = build_grid(pkg, canvas)
+            master_part = pick_primary_master(pkg)
+            theme_for_layouts = read_theme(pkg, master_part)
+            layouts = build_layout_catalog(
+                pkg, canvas, theme_for_layouts, grid, usage=usage, type_scale=type_scale,
+            )
+            assets = build_asset_catalog(pkg, canvas, layouts)
+            patterns = mine_patterns(pkg, canvas, grid, type_scale, assets)
+
+        patterns, vision_notes = classify_patterns_by_vision(patterns, path, vision)
+
+        provenance = [
+            line for line in cached.provenance
+            if not line.startswith(_VISION_PROVENANCE_PREFIXES)
+        ]
+        # `vision_notes` пуст только когда паттернов нет вовсе (см.
+        # `classify_patterns_by_vision`) — тогда честнее оставить прежнюю
+        # формулировку «моделью не уточнялся», чем выдумывать сводку.
+        provenance.append(vision_notes[0] if vision_notes else _NO_VISION_PROVENANCE_LINE)
+
+        return cached.model_copy(update={
+            "patterns": [_pattern_model(p) for p in patterns],
+            "pattern_kinds_source": "model",
+            "provenance": provenance,
+            "warnings": list(cached.warnings) + list(vision_notes[1:]),
         })
 
     def to_json(self) -> str:
@@ -1034,10 +1168,7 @@ def _build_provenance(
         # `from_file` выше), провенанс не обязан перечислять каждый отказ.
         lines.append(vision_notes[0])
     else:
-        lines.append(
-            "Вид раскладки (Pattern.kind) не уточнялся моделью — использован только "
-            "геометрический майнинг (без ключа `vision`, семь корзин `patterns._classify_kind`)."
-        )
+        lines.append(_NO_VISION_PROVENANCE_LINE)
 
     return lines
 

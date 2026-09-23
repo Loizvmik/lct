@@ -33,12 +33,13 @@ import io
 import os
 import time
 import tokenize
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 import deckforge.template as pkg
-from deckforge.provider.base import LLMProvider
+from deckforge.provider.base import LLMProvider, VisionProvider
 from deckforge.template.profile import TemplateProfile
 
 TEMPLATES_DIR = Path("dataset/templates")
@@ -484,3 +485,158 @@ def test_cache_hit_with_model_roles_and_same_key_does_not_touch_network(tmp_path
     second = TemplateProfile.from_file(path, cache_dir=cache_dir, namer=namer)
     assert second == first
     assert calls == [True]  # ровно один реальный вызов именования, не два
+
+
+# --- Кеш не путает геометрическое предположение о виде раскладки с ответом
+# модели. Та же болезнь, что вылечена выше для ролей палитры, и тот же
+# способ лечения — признак происхождения внутри профиля
+# (`pattern_kinds_source`), а не в ключе кеша. Найдено на живом прогоне:
+# профиль ЛЦТ2026, записанный в общий `cache/profiles/` прогоном БЕЗ ключа,
+# потом отдавался запросам с ключом — восемь из пятнадцати раскладок
+# оставались `bullets` с `kind_confidence=0.3` (корзина по умолчанию
+# `patterns._classify_kind`, обязанная по порогу `vision_kind._ASK_
+# CONFIDENCE_THRESHOLD = 0.5` уйти на уточнение моделью). ---
+
+
+class _FakeVision(VisionProvider):
+    """Никогда не вызывается по-настоящему: `classify_patterns_by_vision`
+    подменяется заглушкой, которая решает по `llm is None`. Нужен только как
+    typed-корректный сигнал «ключ vision доступен» для from_file (тот же
+    приём, что и `_FakeNamer` выше)."""
+
+    def ask_image(self, png, prompt, *, max_tokens=1024) -> str:
+        raise AssertionError("FakeVision.ask_image не должен вызываться в этих тестах")
+
+
+_VISION_SUMMARY = "Вид раскладки: вид уточнён моделью (тест)."
+_VISION_SKIP_NOTE = "p-тест: слайд-источник не нашёлся — вид оставлен геометрическим (тест)."
+
+
+def _patch_vision_kind(monkeypatch, *, model_kind="quote"):
+    """Подменяет `deckforge.template.profile.classify_patterns_by_vision`:
+    без llm — паттерны как есть и ни одной заметки (ровно как настоящая
+    функция), с llm — всем паттернам проставлен `model_kind` плюс сводка и
+    заметка об отказе. Возвращает список вызовов, чтобы проверять, что на
+    кеш-хите без нужды дозапроса модель не трогается вовсе."""
+    calls: list[bool] = []
+
+    def fake(patterns, template_path, llm, **kwargs):
+        calls.append(llm is not None)
+        if llm is None:
+            return list(patterns), []
+        return (
+            [replace(p, kind=model_kind) for p in patterns],
+            [_VISION_SUMMARY, _VISION_SKIP_NOTE],
+        )
+
+    monkeypatch.setattr("deckforge.template.profile.classify_patterns_by_vision", fake)
+    return calls
+
+
+def _vision_provenance_lines(profile):
+    return [
+        line for line in profile.provenance
+        if line.startswith(("Вид раскладки", "Виды раскладки"))
+    ]
+
+
+def test_cache_hit_with_geometric_kinds_and_available_vision_reclassifies(tmp_path, monkeypatch):
+    """Главный случай находки: профиль, собранный БЕЗ ключа модели, не
+    удовлетворяет запрос, у которого ключ есть."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    calls = _patch_vision_kind(monkeypatch)
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)  # vision=None -> только геометрия
+    assert first.pattern_kinds_source == "geometry"
+    assert {p.kind for p in first.patterns} != {"quote"}
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=_FakeVision())
+    assert calls == [False, True]  # первый разбор без модели, второй — с ней
+    assert second.pattern_kinds_source == "model"
+    assert [p.kind for p in second.patterns] == ["quote"] * len(first.patterns)
+
+    # Детерминированная часть разбора не потеряна и не переписана: те же
+    # лейауты, та же палитра, те же паттерны с точностью до вида.
+    assert second.layouts == first.layouts
+    assert second.palette_roles == first.palette_roles
+    assert second.palette_roles_source == first.palette_roles_source
+    assert [p.pattern_id for p in second.patterns] == [p.pattern_id for p in first.patterns]
+    assert [p.slots for p in second.patterns] == [p.slots for p in first.patterns]
+
+    # Отчёт «откуда что взято» не задваивается: строка про вид раскладки
+    # ровно одна и теперь это сводка модели, а не «моделью не уточнялся».
+    assert _vision_provenance_lines(second) == [_VISION_SUMMARY]
+    assert _VISION_SKIP_NOTE in second.warnings
+
+    # Кеш на диске обновлён — следующий вызов с той же конфигурацией ничего
+    # не дозапрашивает.
+    cache_file = cache_dir / f"{first.fingerprint}.json"
+    reread = TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8"))
+    assert reread == second
+
+
+def test_cache_hit_with_model_kinds_and_no_vision_returns_as_is(tmp_path, monkeypatch):
+    """Обратный случай: профиль, собранный С моделью, переиспользуется
+    всегда — вызов без ключа отдаёт сохранённые виды, а не откатывает их к
+    геометрии. Деградация честная: перечитывать нечего."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    calls = _patch_vision_kind(monkeypatch)
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=_FakeVision())
+    assert first.pattern_kinds_source == "model"
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("шаблон перемайнен без нужды дозапрашивать виды")
+
+    monkeypatch.setattr("deckforge.template.profile.mine_patterns", _must_not_be_called)
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=None)
+    assert second == first
+    assert calls == [True]  # второй вызов вообще не дошёл до классификации
+
+
+def test_cache_hit_with_model_kinds_and_same_vision_does_not_ask_again(tmp_path, monkeypatch):
+    """Повторный вызов с тем же ключом не гоняет рендер и модель заново —
+    виды уже уточнены, дозапрашивать нечего."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    calls = _patch_vision_kind(monkeypatch)
+    vision = _FakeVision()
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=vision)
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("шаблон перемайнен на уже модельном кеш-хите")
+
+    monkeypatch.setattr("deckforge.template.profile.mine_patterns", _must_not_be_called)
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=vision)
+    assert second == first
+    assert calls == [True]  # ровно одно обращение к классификации, не два
+
+
+def test_cache_hit_needing_both_roles_and_kinds_refreshes_both_once(tmp_path, monkeypatch):
+    """Профиль без ключа вовсе: при появлении обоих ключей дозапрашиваются и
+    роли палитры, и виды раскладок, а в кеш ложится итог, а не промежуточное
+    состояние."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    _patch_palette_naming(monkeypatch)
+    _patch_vision_kind(monkeypatch)
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    assert (first.palette_roles_source, first.pattern_kinds_source) == ("fallback", "geometry")
+
+    second = TemplateProfile.from_file(
+        path, cache_dir=cache_dir, namer=_FakeNamer(), vision=_FakeVision(),
+    )
+    assert second.palette_roles == {"brand": "#222222"}
+    assert second.palette_roles_source == "model"
+    assert second.pattern_kinds_source == "model"
+
+    cache_file = cache_dir / f"{first.fingerprint}.json"
+    reread = TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8"))
+    assert reread == second
+
