@@ -174,7 +174,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     deck = write_slides(
         outline, sources, profile, writer_llm,
         max_workers=writer_max_workers, agent_max_steps=_writer_agent_max_steps(),
-        template_path=args.template,
+        template_path=args.template, draft_verdict=not args.no_draft_verdict,
     )
     written_at = time.monotonic()
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
@@ -372,6 +372,13 @@ def build_parser() -> argparse.ArgumentParser:
             "Число слайдов, чей текст пишется одновременно (по умолчанию — "
             "config/app.yaml, llm.slide_writer_max_workers); значение 1 — для "
             "замера 'до' против параллельной записи"
+        ),
+    )
+    generate_cmd.add_argument(
+        "--no-draft-verdict", action="store_true",
+        help=(
+            "Не показывать модели вердикт черновой сборки слайда — для честного сравнения "
+            "'с вердиктом против без' на одних и тех же материалах"
         ),
     )
     generate_cmd.set_defaults(func=_cmd_generate)
