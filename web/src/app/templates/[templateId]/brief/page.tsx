@@ -3,6 +3,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { createDeck } from "@/lib/api";
+import { getAppSettings } from "@/lib/appSettings";
 import { clearBriefDraft, loadBriefDraft, saveBriefDraft } from "@/lib/briefDraft";
 
 const MIN_SLIDES = 10;
@@ -29,6 +30,10 @@ export default function BriefPage() {
         setSources(draft.sources);
         setTargetSlides(draft.targetSlides);
         setAutofix(draft.autofix);
+      } else {
+        const settings = getAppSettings();
+        setTargetSlides(settings.defaultSlideCount === "auto" ? "" : settings.defaultSlideCount);
+        setAutofix(settings.defaultAutofix);
       }
       setReady(true);
     }, 0);
@@ -52,7 +57,10 @@ export default function BriefPage() {
   }
 
   function clearForm() {
-    setTitle(""); setBrief(""); setSources(""); setTargetSlides(""); setAutofix(true); setError(null);
+    const settings = getAppSettings();
+    setTitle(""); setBrief(""); setSources("");
+    setTargetSlides(settings.defaultSlideCount === "auto" ? "" : settings.defaultSlideCount);
+    setAutofix(settings.defaultAutofix); setError(null);
     clearBriefDraft(params.templateId);
   }
 

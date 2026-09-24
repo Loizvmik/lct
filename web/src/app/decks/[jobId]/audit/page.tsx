@@ -5,6 +5,7 @@ import { useParams, useRouter, useSearchParams } from "next/navigation";
 import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { PreviewImage } from "@/components/PreviewImage";
 import { applyFix, assetUrl, exportUrl, Finding, getJob, getVariants, SEVERITY_LABELS, VariantName, VariantSummary, VARIANT_LABELS } from "@/lib/api";
+import { EXPORT_FORMATS, ExportFormat, getAppSettings, subscribeToAppSettings } from "@/lib/appSettings";
 
 function AuditScreen() {
   const params = useParams<{ jobId: string }>();
@@ -19,6 +20,7 @@ function AuditScreen() {
   const [applying, setApplying] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
+  const [preferredFormat, setPreferredFormat] = useState<ExportFormat>("pptx");
 
   const load = useCallback(() => {
     getVariants(params.jobId)
@@ -32,9 +34,17 @@ function AuditScreen() {
 
   useEffect(() => { load(); }, [load]);
   useEffect(() => { getJob(params.jobId).then((job) => setTemplateId(job.template_id)).catch(() => undefined); }, [params.jobId]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => setPreferredFormat(getAppSettings().preferredExportFormat), 0);
+    const unsubscribe = subscribeToAppSettings((settings) => setPreferredFormat(settings.preferredExportFormat));
+    return () => { window.clearTimeout(timer); unsubscribe(); };
+  }, []);
   const variant = all?.find((item) => item.variant === variantName) ?? null;
   const slideFindings = useMemo(() => variant?.findings.filter((item) => item.slide_index === slideIndex) ?? [], [variant, slideIndex]);
   const commonFindings = useMemo(() => variant?.findings.filter((item) => item.slide_index === null) ?? [], [variant]);
+  const downloadFormats = [...EXPORT_FORMATS].sort((a, b) =>
+    Number(b.value === preferredFormat) - Number(a.value === preferredFormat)
+  );
 
   if (error) return <div className="error-banner" role="alert">{error}</div>;
   if (!variant) return <p className="muted"><span className="spinner" /> Загружаем проверку…</p>;
@@ -138,9 +148,11 @@ function AuditScreen() {
       </div>
 
       <div className="row-actions">
-        <a className="button" href={exportUrl(params.jobId, variantName, "pptx")}>Скачать PowerPoint</a>
-        <a className="button secondary" href={exportUrl(params.jobId, variantName, "pdf")}>Скачать PDF</a>
-        <a className="button secondary" href={exportUrl(params.jobId, variantName, "html")}>Открыть веб-версию</a>
+        {downloadFormats.map((format) => (
+          <a className={`button${format.value === preferredFormat ? "" : " secondary"}`} href={exportUrl(params.jobId, variantName, format.value)} key={format.value}>
+            {format.value === "html" ? "Открыть веб-версию" : `Скачать ${format.label}`}
+          </a>
+        ))}
         <Link className="button ghost" href={`/decks/${params.jobId}/variants`}>Вернуться к вариантам</Link>
         {templateId && <Link className="button ghost" href={`/templates/${templateId}/brief`}>Изменить задание</Link>}
       </div>

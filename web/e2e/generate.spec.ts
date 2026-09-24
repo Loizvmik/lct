@@ -51,11 +51,27 @@ test("настройки и управление с клавиатуры", async
   await page.goto("/");
   await page.getByRole("button", { name: /настройки/i }).click();
   await expect(page.getByRole("dialog", { name: "Настройки" })).toBeVisible();
-  await expect(page.getByText("Русский", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Создание презентации" })).toBeVisible();
+  await page.getByLabel("Количество слайдов по умолчанию").selectOption("12");
+  await page.getByLabel("Предпочтительный формат").selectOption("pdf");
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog", { name: "Настройки" })).toBeHidden();
+  await page.goto("/templates/settings-test/brief");
+  await expect(page.getByRole("textbox", { name: "Количество слайдов", exact: true })).toHaveValue("12");
   await page.keyboard.press("Tab");
   await expect(page.locator(":focus-visible")).toBeVisible();
+});
+
+test("новая презентация требует подтверждения", async ({ page }) => {
+  await page.goto("/templates/ui-test-template/brief");
+  await page.getByRole("button", { name: "Новая презентация" }).click();
+  const dialog = page.getByRole("dialog", { name: "Начать новую презентацию?" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Остаться" }).click();
+  await expect(page).toHaveURL(/\/templates\/ui-test-template\/brief$/);
+  await page.getByRole("button", { name: "Новая презентация" }).click();
+  await dialog.getByRole("button", { name: "Начать новую" }).click();
+  await expect(page).toHaveURL(/\/$/);
 });
 
 test("пустая форма, черновик и проверка числа слайдов", async ({ page }) => {

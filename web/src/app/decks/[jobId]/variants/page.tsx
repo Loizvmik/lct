@@ -5,6 +5,7 @@ import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { PreviewImage } from "@/components/PreviewImage";
 import { assetUrl, exportUrl, getJob, getVariants, SEVERITY_LABELS, VariantSummary, VARIANT_LABELS } from "@/lib/api";
+import { EXPORT_FORMATS, ExportFormat, getAppSettings, subscribeToAppSettings } from "@/lib/appSettings";
 
 const DESCRIPTIONS = {
   dense: "Больше фактов и деталей на каждом слайде.",
@@ -18,14 +19,24 @@ export default function VariantsPage() {
   const [error, setError] = useState<string | null>(null);
   const [activeSlide, setActiveSlide] = useState<Record<string, number>>({});
   const [templateId, setTemplateId] = useState<string | null>(null);
+  const [preferredFormat, setPreferredFormat] = useState<ExportFormat>("pptx");
 
   useEffect(() => {
     getVariants(params.jobId).then(setVariants).catch((err: Error) => setError(err.message));
     getJob(params.jobId).then((job) => setTemplateId(job.template_id)).catch(() => undefined);
   }, [params.jobId]);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => setPreferredFormat(getAppSettings().preferredExportFormat), 0);
+    const unsubscribe = subscribeToAppSettings((settings) => setPreferredFormat(settings.preferredExportFormat));
+    return () => { window.clearTimeout(timer); unsubscribe(); };
+  }, []);
+
   if (error) return <div className="error-banner" role="alert">{error}</div>;
   if (!variants) return <p className="muted"><span className="spinner" /> Загружаем варианты…</p>;
+  const downloadFormats = [...EXPORT_FORMATS].sort((a, b) =>
+    Number(b.value === preferredFormat) - Number(a.value === preferredFormat)
+  );
 
   return (
     <div>
@@ -44,7 +55,10 @@ export default function VariantsPage() {
             <article className="variant-card" key={variant.variant}>
               <header>
                 <div><h2>{VARIANT_LABELS[variant.variant]}</h2><p className="muted small">{DESCRIPTIONS[variant.variant]}</p></div>
-                <span className="pill">{variant.slide_count} слайдов</span>
+                <span className="slide-count" aria-label={`Количество слайдов: ${variant.slide_count}`}>
+                  <strong>{variant.slide_count}</strong>
+                  <span>слайдов</span>
+                </span>
               </header>
               <div>
                 <div className="preview">
@@ -80,9 +94,9 @@ export default function VariantsPage() {
                   <Link className="button" href={`/decks/${params.jobId}/audit?variant=${variant.variant}`}>Проверить вариант</Link>
                 </div>
                 <div className="row-actions" aria-label="Скачать вариант">
-                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "pptx")}>PowerPoint</a>
-                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "pdf")}>PDF</a>
-                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "html")}>Веб-версия</a>
+                  {downloadFormats.map((format) => (
+                    <a className={`button secondary${format.value === preferredFormat ? " preferred-download" : ""}`} href={exportUrl(params.jobId, variant.variant, format.value)} key={format.value}>{format.label}</a>
+                  ))}
                 </div>
               </div>
             </article>

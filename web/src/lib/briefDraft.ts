@@ -1,3 +1,5 @@
+import { getAppSettings } from "@/lib/appSettings";
+
 export interface BriefDraft {
   title: string;
   brief: string;
@@ -16,6 +18,7 @@ function looksLikeBundledExample(draft: BriefDraft): boolean {
 
 export function loadBriefDraft(templateId: string): BriefDraft | null {
   if (typeof window === "undefined") return null;
+  if (!getAppSettings().rememberDrafts) return null;
   const current = localStorage.getItem(key(templateId));
   if (current) {
     try { return JSON.parse(current) as BriefDraft; } catch { localStorage.removeItem(key(templateId)); }
@@ -35,7 +38,12 @@ export function loadBriefDraft(templateId: string): BriefDraft | null {
 }
 
 export function saveBriefDraft(templateId: string, draft: BriefDraft): void {
-  if (typeof window !== "undefined") localStorage.setItem(key(templateId), JSON.stringify(draft));
+  if (typeof window === "undefined") return;
+  if (!getAppSettings().rememberDrafts) {
+    clearBriefDraft(templateId);
+    return;
+  }
+  localStorage.setItem(key(templateId), JSON.stringify(draft));
 }
 
 export function clearBriefDraft(templateId: string): void {
