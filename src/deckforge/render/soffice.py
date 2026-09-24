@@ -119,7 +119,7 @@ def _run_soffice(args: list[str], *, cwd: Path | None = None) -> None:
 
     cmd = [
         soffice, "--headless", "--norestore", "--nolockcheck", "--nodefault",
-        f"-env:UserInstallation=file://{profile_dir}",
+        f"-env:UserInstallation={profile_dir.resolve().as_uri()}",
         *args,
     ]
     try:
