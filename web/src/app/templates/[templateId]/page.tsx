@@ -5,8 +5,18 @@ import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
 import { getProfile, TemplateProfile } from "@/lib/api";
 
-const ROLE_ORDER = ["brand", "accent", "surface", "on_surface", "muted", "border", "danger", "warning"];
-const STEP_ORDER = ["display", "h1", "h2", "body", "caption", "micro"];
+const COLOR_NAMES: Record<string, string> = {
+  brand: "Основной", accent: "Акцентный", surface: "Фон", on_surface: "Текст",
+  muted: "Второстепенный", border: "Границы", danger: "Ошибка", warning: "Предупреждение",
+};
+
+function friendlyWarning(text: string): string {
+  const lower = text.toLowerCase();
+  if (lower.includes("logo") || lower.includes("логотип")) return "Логотип в шаблоне не найден. Его можно будет добавить в готовый файл вручную.";
+  if (lower.includes("media") || lower.includes("медиа")) return "Некоторые изображения не удалось распознать. Они останутся частью исходного шаблона.";
+  if (lower.includes("confidence") || lower.includes("уверен")) return "Некоторые параметры оформления определены приблизительно. Проверьте готовые слайды перед отправкой.";
+  return "Часть оформления определена приблизительно. Проверьте готовые слайды перед отправкой.";
+}
 
 export default function TemplateProfilePage() {
   const params = useParams<{ templateId: string }>();
@@ -16,108 +26,61 @@ export default function TemplateProfilePage() {
   useEffect(() => {
     let cancelled = false;
     getProfile(params.templateId)
-      .then((res) => {
-        if (!cancelled) setProfile(res.profile);
-      })
-      .catch((err) => !cancelled && setError(err.message));
-    return () => {
-      cancelled = true;
-    };
+      .then((res) => { if (!cancelled) setProfile(res.profile); })
+      .catch((err: Error) => { if (!cancelled) setError(err.message); });
+    return () => { cancelled = true; };
   }, [params.templateId]);
 
-  if (error) return <div className="error-banner">{error}</div>;
-  if (!profile) return <p className="muted">Загружаем дизайн-систему…</p>;
+  if (error) return <div className="error-banner" role="alert">{error}</div>;
+  if (!profile) return <p className="muted" aria-live="polite"><span className="spinner" /> Изучаем шаблон…</p>;
 
-  const roles = Object.entries(profile.palette_roles).sort(
-    (a, b) => ROLE_ORDER.indexOf(a[0]) - ROLE_ORDER.indexOf(b[0]),
-  );
-  const steps = Object.entries(profile.type_scale.steps).sort(
-    (a, b) => STEP_ORDER.indexOf(a[0]) - STEP_ORDER.indexOf(b[0]),
-  );
-  const patternsByKind: Record<string, number> = {};
-  for (const pattern of profile.patterns) {
-    patternsByKind[pattern.kind] = (patternsByKind[pattern.kind] ?? 0) + 1;
-  }
-
+  const warnings = Array.from(new Set(profile.warnings.map(friendlyWarning)));
   return (
     <div>
-      <h1>Дизайн-система шаблона «{profile.source_name}»</h1>
+      <header className="page-header">
+        <p className="eyebrow">Шаблон готов</p>
+        <h1>{profile.source_name}</h1>
+        <p className="lead">Мы нашли основные правила оформления. Теперь можно описать будущую презентацию.</p>
+      </header>
+
+      <div className="summary-grid" aria-label="Сводка по шаблону">
+        <div className="summary-tile"><span className="muted small">Макеты</span><span className="summary-value">{profile.layouts.length}</span></div>
+        <div className="summary-tile"><span className="muted small">Цвета</span><span className="summary-value">{Object.keys(profile.palette_roles).length}</span></div>
+        <div className="summary-tile"><span className="muted small">Шрифты</span><span className="summary-value">{profile.type_scale.families.length || "—"}</span></div>
+      </div>
 
       <div className="grid-2">
-        <div className="card">
-          <h2>Палитра ролей {profile.palette_roles_source === "model" ? "(названо моделью)" : "(запасной вариант)"}</h2>
-          <div className="swatch-row">
-            {roles.map(([role, hex]) => (
-              <div className="swatch" key={role}>
-                <span className="dot" style={{ background: hex }} />
-                {role} · {hex}
+        <section className="card">
+          <h2>Основные цвета</h2>
+          <div className="color-list">
+            {Object.entries(profile.palette_roles).slice(0, 8).map(([role, hex]) => (
+              <div className="color-chip" key={role}>
+                <span className="color-dot" style={{ background: hex }} aria-hidden="true" />
+                <span><strong>{COLOR_NAMES[role] ?? "Цвет"}</strong><br /><span className="muted small">{hex}</span></span>
               </div>
             ))}
           </div>
-        </div>
-
-        <div className="card">
-          <h2>Типографическая шкала</h2>
-          {steps.map(([step, pt]) => (
-            <div className="type-scale-row" key={step}>
-              <span className="step-name">{step}</span>
-              <span style={{ fontSize: Math.min(28, Math.max(11, pt)) }}>{pt.toFixed(1)}pt — Aa</span>
-            </div>
-          ))}
-          <p className="muted" style={{ marginTop: 10 }}>
-            Гарнитуры: {profile.type_scale.families.join(", ") || "не определены"}
-          </p>
-        </div>
-
-        <div className="card">
-          <h2>Сетка</h2>
-          <p style={{ fontFamily: "var(--mono)", fontSize: 13 }}>
-            поля: слева {profile.grid.margin_left.toFixed(3)}, справа{" "}
-            {profile.grid.margin_right.toFixed(3)}, сверху {profile.grid.margin_top.toFixed(3)}, снизу{" "}
-            {profile.grid.margin_bottom.toFixed(3)} (доли холста)
-          </p>
-          <p className="muted">{profile.grid.columns.length} направляющих колонок восстановлено кластеризацией</p>
-        </div>
-
-        <div className="card">
-          <h2>Каталог паттернов вёрстки ({profile.patterns.length})</h2>
-          <div className="swatch-row">
-            {Object.entries(patternsByKind).map(([kind, count]) => (
-              <span className="pill kind" key={kind}>
-                {kind} × {count}
-              </span>
-            ))}
-          </div>
-          <p className="muted" style={{ marginTop: 10 }}>
-            {profile.layouts.length} макетов в шаблоне
-          </p>
-        </div>
+        </section>
+        <section className="card">
+          <h2>Шрифты</h2>
+          {profile.type_scale.families.length ? (
+            <p className="lead">{profile.type_scale.families.join(", ")}</p>
+          ) : (
+            <p className="muted">Не удалось определить. Будут использованы шрифты из макетов.</p>
+          )}
+          <p className="field-hint">Размеры и начертания будут подобраны по образцам в шаблоне.</p>
+        </section>
       </div>
 
-      <div className="card">
-        <h2>Откуда что взято</h2>
-        <ul className="provenance-list">
-          {profile.provenance.map((line, i) => (
-            <li key={i}>{line}</li>
-          ))}
-        </ul>
-      </div>
-
-      {profile.warnings.length > 0 && (
-        <div className="card">
-          <h2>Предупреждения разбора</h2>
-          <ul className="warning-list">
-            {profile.warnings.map((line, i) => (
-              <li key={i}>{line}</li>
-            ))}
-          </ul>
-        </div>
+      {warnings.length > 0 && (
+        <section className="notice">
+          <h2>Что стоит проверить</h2>
+          <ul className="warning-list">{warnings.map((line) => <li key={line}>{line}</li>)}</ul>
+        </section>
       )}
 
       <div className="row-actions">
-        <Link className="button" href={`/templates/${params.templateId}/brief`}>
-          Дальше: бриф и материалы →
-        </Link>
+        <Link className="button" href={`/templates/${params.templateId}/brief`}>Перейти к заданию</Link>
       </div>
     </div>
   );

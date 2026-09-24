@@ -1,27 +1,18 @@
 import type { Metadata } from "next";
-import Link from "next/link";
-import StepNav from "@/components/StepNav";
+import AppHeader from "@/components/AppHeader";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "DeckForge",
-  description: "Генерация презентаций по .pptx-шаблону",
+  title: "Слайды — презентации по вашему шаблону",
+  description: "Создание и проверка презентаций по загруженному шаблону",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="ru">
+    <html lang="ru" data-scroll-behavior="smooth">
       <body>
-        <div className="topbar">
-          <div className="brand">
-            Deck<span>Forge</span>
-          </div>
-          <StepNav />
-          <Link className="button restart-button" href="/" title="Начать с чистого листа: новая загрузка шаблона и новый бриф">
-            + Новая презентация
-          </Link>
-        </div>
-        <div className="shell">{children}</div>
+        <AppHeader />
+        <main className="shell" id="main-content">{children}</main>
       </body>
     </html>
   );

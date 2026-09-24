@@ -3,15 +3,14 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import {
-  assetUrl,
-  exportUrl,
-  getJob,
-  getVariants,
-  SEVERITY_LABELS,
-  VariantSummary,
-  VARIANT_LABELS,
-} from "@/lib/api";
+import { PreviewImage } from "@/components/PreviewImage";
+import { assetUrl, exportUrl, getJob, getVariants, SEVERITY_LABELS, VariantSummary, VARIANT_LABELS } from "@/lib/api";
+
+const DESCRIPTIONS = {
+  dense: "Больше фактов и деталей на каждом слайде.",
+  airy: "Крупнее текст, больше свободного пространства.",
+  visual: "Больше визуальных акцентов и короче формулировки.",
+} as const;
 
 export default function VariantsPage() {
   const params = useParams<{ jobId: string }>();
@@ -21,90 +20,72 @@ export default function VariantsPage() {
   const [templateId, setTemplateId] = useState<string | null>(null);
 
   useEffect(() => {
-    getVariants(params.jobId).then(setVariants).catch((err) => setError(err.message));
+    getVariants(params.jobId).then(setVariants).catch((err: Error) => setError(err.message));
     getJob(params.jobId).then((job) => setTemplateId(job.template_id)).catch(() => undefined);
   }, [params.jobId]);
 
-  if (error) return <div className="error-banner">{error}</div>;
-  if (!variants) return <p className="muted">Загружаем варианты…</p>;
+  if (error) return <div className="error-banner" role="alert">{error}</div>;
+  if (!variants) return <p className="muted"><span className="spinner" /> Загружаем варианты…</p>;
 
   return (
     <div>
-      <h1>Шаг 3 — три варианта вёрстки, один и тот же контент</h1>
-      <p className="muted">
-        Плотный (максимум фактов на слайд), воздушный (акцент на читаемость и паузы),
-        визуальный (упор на изображения/иконографику) — сравните и выберите, с каким
-        работать дальше на экране аудита.
-      </p>
+      <header className="page-header">
+        <p className="eyebrow">Шаг 3 из 4</p>
+        <h1>Выберите подачу</h1>
+        <p className="lead">Содержание одинаковое, меняются плотность и визуальный ритм. Откройте любой вариант для подробной проверки.</p>
+      </header>
 
-      <div className="row-actions" style={{ marginBottom: 16 }}>
-        {templateId && (
-          <Link className="button secondary" href={`/templates/${templateId}/brief`}>
-            ← Изменить бриф и сгенерировать заново
-          </Link>
-        )}
-      </div>
+      {templateId && <p><Link href={`/templates/${templateId}/brief`}>← Изменить задание и создать заново</Link></p>}
 
       <div className="grid-3">
         {variants.map((variant) => {
-          const slideIdx = activeSlide[variant.variant] ?? 0;
-          const totalFindings = variant.findings.length;
+          const slideIndex = Math.min(activeSlide[variant.variant] ?? 0, Math.max(variant.preview_pngs.length - 1, 0));
           return (
-            <div className="variant-card" key={variant.variant}>
+            <article className="variant-card" key={variant.variant}>
               <header>
-                <strong>{VARIANT_LABELS[variant.variant]}</strong>
+                <div><h2>{VARIANT_LABELS[variant.variant]}</h2><p className="muted small">{DESCRIPTIONS[variant.variant]}</p></div>
                 <span className="pill">{variant.slide_count} слайдов</span>
               </header>
-              <div className="preview">
-                {variant.preview_pngs[slideIdx] && (
-                  // eslint-disable-next-line @next/next/no-img-element
-                  <img src={assetUrl(variant.preview_pngs[slideIdx])} alt={`${variant.variant} слайд ${slideIdx + 1}`} />
-                )}
-              </div>
-              <div className="thumb-strip" style={{ padding: "8px 12px" }}>
-                {variant.preview_pngs.map((png, idx) => (
-                  <div
-                    className={`thumb${idx === slideIdx ? " active" : ""}`}
-                    key={png}
-                    onClick={() => setActiveSlide((prev) => ({ ...prev, [variant.variant]: idx }))}
-                  >
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img src={assetUrl(png)} alt={`слайд ${idx + 1}`} />
-                  </div>
-                ))}
+              <div>
+                <div className="preview">
+                  {variant.preview_pngs[slideIndex]
+                    ? <PreviewImage src={assetUrl(variant.preview_pngs[slideIndex])} alt={`${VARIANT_LABELS[variant.variant]}, слайд ${slideIndex + 1}`} />
+                    : <div className="preview-fallback">Предпросмотр пока недоступен</div>}
+                </div>
+                <div className="thumb-strip" aria-label={`Слайды варианта «${VARIANT_LABELS[variant.variant]}»`}>
+                  {variant.preview_pngs.map((png, index) => (
+                    <button
+                      type="button"
+                      className={`thumb${index === slideIndex ? " active" : ""}`}
+                      key={png}
+                      onClick={() => setActiveSlide((prev) => ({ ...prev, [variant.variant]: index }))}
+                      aria-label={`Показать слайд ${index + 1}`}
+                      aria-pressed={index === slideIndex}
+                    >
+                      <PreviewImage src={assetUrl(png)} alt="" />
+                      <span className="slide-number">{index + 1}</span>
+                    </button>
+                  ))}
+                </div>
               </div>
               <div className="body">
-                <div className="severity-counts">
-                  {Object.entries(variant.by_severity).map(([sev, count]) => (
-                    <span className={`count ${sev}`} key={sev}>
-                      {SEVERITY_LABELS[sev] ?? sev}: {count}
-                    </span>
+                <div className="severity-counts" aria-label="Результаты проверки">
+                  {Object.entries(variant.by_severity).filter(([, count]) => count > 0).map(([level, count]) => (
+                    <span className={`count ${level}`} key={level}>{SEVERITY_LABELS[level] ?? "Замечания"}: {count}</span>
                   ))}
-                  {totalFindings === 0 && <span className="count minor">Находок нет</span>}
+                  {variant.findings.length === 0 && <span className="count minor">Замечаний нет</span>}
                 </div>
-                {variant.autofixed_count > 0 && (
-                  <p className="muted" style={{ fontSize: 12 }}>
-                    Автопочинка уже применила {variant.autofixed_count} исправлений.
-                  </p>
-                )}
-                <div className="row-actions" style={{ marginTop: "auto" }}>
-                  <Link className="button" href={`/decks/${params.jobId}/audit?variant=${variant.variant}`}>
-                    Аудит и починка ({totalFindings})
-                  </Link>
-                </div>
+                {variant.autofixed_count > 0 && <p className="field-hint">Уже исправлено автоматически: {variant.autofixed_count}.</p>}
                 <div className="row-actions">
-                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "pptx")}>
-                    .pptx
-                  </a>
-                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "pdf")}>
-                    .pdf
-                  </a>
-                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "html")}>
-                    .html
-                  </a>
+                  <Link className="button" href={`/decks/${params.jobId}/audit?variant=${variant.variant}`}>Проверить вариант</Link>
+                </div>
+                <div className="row-actions" aria-label="Скачать вариант">
+                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "pptx")}>PowerPoint</a>
+                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "pdf")}>PDF</a>
+                  <a className="button secondary" href={exportUrl(params.jobId, variant.variant, "html")}>Веб-версия</a>
                 </div>
               </div>
-            </div>
+            </article>
           );
         })}
       </div>

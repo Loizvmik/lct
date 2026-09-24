@@ -6,12 +6,8 @@ import { defineConfig, devices } from "@playwright/test";
 // минуты, не секунды (ТЗ: "время генерации одной колоды — не более пяти
 // минут"), отсюда увеличенный `timeout` теста и `webServer.timeout`.
 //
-// `channel: "chrome"` — тестовый профиль использует УЖЕ УСТАНОВЛЕННЫЙ в
-// системе Google Chrome, а не отдельно загружаемый Playwright Chromium:
-// «актуальная версия Chrome» — один из четырёх браузеров, которые ТЗ прямо
-// требует поддерживать («Chrome, Firefox, Safari, Яндекс Браузер, MacOS &
-// Windows, актуальная и предыдущая версии»), и в среде без доступа в сеть к
-// cdn.playwright.dev это единственный способ прогнать e2e вовсе.
+// Используем установленный в Windows Microsoft Edge, чтобы локальная
+// проверка не зависела от скачивания отдельного Chromium.
 export default defineConfig({
   testDir: "./e2e",
   timeout: 6 * 60 * 1000,
@@ -22,10 +18,10 @@ export default defineConfig({
   use: {
     baseURL: "http://127.0.0.1:3000",
     trace: "retain-on-failure",
-    channel: "chrome",
+    channel: "msedge",
   },
   projects: [
-    { name: "chrome", use: { ...devices["Desktop Chrome"], channel: "chrome" } },
+    { name: "edge", use: { ...devices["Desktop Chrome"], channel: "msedge" } },
   ],
   webServer: [
     {

@@ -1,4 +1,4 @@
-// Клиент DeckForge API (Task 16) — тонкая обёртка над `fetch`, без
+// Клиент API — тонкая обёртка над `fetch`, без
 // дополнительных библиотек: эндпоинтов немного, и типы здесь — прямое
 // зеркало `deckforge.api.schemas` (см. комментарии у каждого типа).
 export const API_BASE =
@@ -111,6 +111,11 @@ export async function uploadTemplate(file: File): Promise<TemplateUploadResponse
   return asJson(response);
 }
 
+export async function healthcheck(): Promise<{ status: string; stages: Stage[] }> {
+  const response = await fetch(`${API_BASE}/api/health`);
+  return asJson(response);
+}
+
 export async function getProfile(templateId: string): Promise<TemplateUploadResponse> {
   const response = await fetch(`${API_BASE}/api/templates/${templateId}/profile`);
   return asJson(response);
@@ -188,12 +193,12 @@ export function exportUrl(deckId: string, variant: VariantName, format: "pptx" |
 }
 
 export const STAGE_LABELS: Record<Stage, string> = {
-  parse: "Разбор шаблона",
-  outline: "Структура презентации",
-  write: "Текст слайдов",
-  compose: "Вёрстка трёх вариантов",
-  audit: "Детерминированный аудит",
-  export: "Выгрузка (PDF/HTML/превью)",
+  parse: "Читаем шаблон",
+  outline: "Составляем план",
+  write: "Готовим тексты",
+  compose: "Оформляем слайды",
+  audit: "Проверяем результат",
+  export: "Подготавливаем файлы",
 };
 
 export const STAGE_ORDER: Stage[] = ["parse", "outline", "write", "compose", "audit", "export"];

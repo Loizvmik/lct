@@ -215,6 +215,9 @@ class JobStore:
         except Exception as exc:  # noqa: BLE001 — любая причина разбора превращается в читаемую 400-ошибку
             shutil.rmtree(tdir, ignore_errors=True)
             raise JobError(f"Не удалось разобрать шаблон {filename!r} как .pptx: {exc}") from exc
+        # The parser sees the internal storage name. The interface must show
+        # the file name selected by the user instead.
+        profile.source_name = Path(filename).name
         (tdir / "profile.json").write_text(profile.to_json(), encoding="utf-8")
         record = TemplateRecord(template_id=template_id, path=path, profile=profile)
         self.templates[template_id] = record

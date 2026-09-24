@@ -15,9 +15,9 @@ type StepKey = "template" | "brief" | "variants" | "audit";
 
 const STEPS: { key: StepKey; label: string }[] = [
   { key: "template", label: "1. Шаблон" },
-  { key: "brief", label: "2. Бриф" },
+  { key: "brief", label: "2. Задание" },
   { key: "variants", label: "3. Варианты" },
-  { key: "audit", label: "4. Аудит" },
+  { key: "audit", label: "4. Проверка" },
 ];
 
 export default function StepNav() {
@@ -31,11 +31,7 @@ export default function StepNav() {
   const [deckReady, setDeckReady] = useState(false);
 
   useEffect(() => {
-    if (!jobId) {
-      setJobTemplateId(null);
-      setDeckReady(false);
-      return;
-    }
+    if (!jobId) return;
     let cancelled = false;
     getJob(jobId)
       .then((job) => {
@@ -49,7 +45,8 @@ export default function StepNav() {
     };
   }, [jobId]);
 
-  const templateId = templateIdFromUrl ?? jobTemplateId;
+  const templateId = templateIdFromUrl ?? (jobId ? jobTemplateId : null);
+  const currentDeckReady = jobId ? deckReady : false;
 
   let current: StepKey = "template";
   if (templateMatch && pathname.endsWith("/brief")) current = "brief";
@@ -71,14 +68,14 @@ export default function StepNav() {
       case "brief":
         return templateId ? `/templates/${templateId}/brief` : null;
       case "variants":
-        return jobId && deckReady ? `/decks/${jobId}/variants` : null;
+        return jobId && currentDeckReady ? `/decks/${jobId}/variants` : null;
       case "audit":
-        return jobId && deckReady ? `/decks/${jobId}/audit?variant=dense` : null;
+        return jobId && currentDeckReady ? `/decks/${jobId}/audit?variant=dense` : null;
     }
   }
 
   return (
-    <div className="steps">
+    <nav className="steps" aria-label="Этапы создания презентации">
       {STEPS.map((step) => {
         const isActive = step.key === current;
         const href = hrefFor(step.key);
@@ -96,6 +93,6 @@ export default function StepNav() {
           </span>
         );
       })}
-    </div>
+    </nav>
   );
 }

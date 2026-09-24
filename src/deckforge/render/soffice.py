@@ -35,6 +35,7 @@ PNG получаются через PDF (`pdftoppm`, если есть в PATH) 
 растрирование — только запрошенных страниц, не всех.
 """
 from __future__ import annotations
+import os
 import shutil
 import subprocess
 import tempfile
@@ -110,8 +111,6 @@ def _run_soffice(args: list[str], *, cwd: Path | None = None) -> None:
     profile_dir = Path(tempfile.gettempdir()) / f"deckforge-soffice-{uuid.uuid4().hex}"
     profile_dir.mkdir(parents=True, exist_ok=True)
 
-    import os
-
     env = dict(os.environ)
     fontconfig = _fontconfig_path()
     if fontconfig:
@@ -156,7 +155,23 @@ def to_pdf(pptx: Path, out_dir: Path) -> Path:
 
 
 def _pdftoppm_binary() -> str | None:
-    return shutil.which("pdftoppm") or shutil.which("pdftocairo")
+    found = shutil.which("pdftoppm") or shutil.which("pdftocairo")
+    if found:
+        return found
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            packages = Path(local_app_data) / "Microsoft" / "WinGet" / "Packages"
+            for name in ("pdftoppm.exe", "pdftocairo.exe"):
+                matches = sorted(packages.glob(f"oschwartz10612.Poppler*/poppler-*/Library/bin/{name}"), reverse=True)
+                if matches:
+                    return str(matches[0])
+        for root in (Path(r"C:\Program Files\poppler"), Path(r"C:\Program Files (x86)\poppler")):
+            for name in ("pdftoppm.exe", "pdftocairo.exe"):
+                matches = sorted(root.glob(f"**/{name}"), reverse=True)
+                if matches:
+                    return str(matches[0])
+    return None
 
 
 def to_pngs(pptx: Path, out_dir: Path, dpi: int = 110, pages: list[int] | None = None) -> list[Path]:

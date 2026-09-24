@@ -23,6 +23,7 @@ def test_upload_template_returns_profile(client: TestClient) -> None:
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["template_id"]
+    assert body["profile"]["source_name"] == template_path.name
     assert body["profile"]["patterns"]
     assert body["profile"]["palette_roles"]["brand"].startswith("#")
     assert body["profile"]["layouts"]

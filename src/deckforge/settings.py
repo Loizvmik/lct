@@ -12,9 +12,11 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel
 
-# Порядок важен: сначала более специфичные для macOS/Homebrew пути,
-# shutil.which подстрахует остальные платформы.
+# Порядок важен: сначала системный PATH, затем типичные места установки
+# LibreOffice на Windows, macOS и Linux.
 _SOFFICE_CANDIDATES = (
+    r"C:\Program Files\LibreOffice\program\soffice.exe",
+    r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
     "/opt/homebrew/bin/soffice",
     "/Applications/LibreOffice.app/Contents/MacOS/soffice",
     "/usr/local/bin/soffice",
