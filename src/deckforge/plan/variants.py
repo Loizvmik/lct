@@ -138,7 +138,24 @@ _DIVIDER_LABELS = (
 _KPI_CAPTION_MAX_ITEMS = 1
 
 
-def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
+def _kinds_that_hold_cards(profile) -> tuple[str, ...]:
+    """Виды раскладок этого шаблона, среди которых есть хоть одна с
+    повтором по ролям карточек. `cards` идёт первым, если он есть: при
+    прочих равных родной вид всё-таки предпочтительнее."""
+    if profile is None:
+        return ()
+    kinds = {
+        p.kind for p in profile.patterns
+        if p.repeat is not None and set(p.repeat.slot_roles) & {"card_title", "card_body"}
+    }
+    if not kinds:
+        return ()
+    ordered = ["cards"] if "cards" in kinds else []
+    ordered += sorted(k for k in kinds if k != "cards")
+    return tuple(ordered)
+
+
+def _compatible_kinds(slide: SlideSpec, profile=None) -> tuple[str, ...]:
     """`kind`, на раскладку которых содержание `slide` ляжет БЕЗ ПОТЕРИ
     контента структурно (не по замеру — замер и ужимание делает `compose`
     при сборке, здесь только "физически есть куда положить эту РОЛЬ
@@ -182,7 +199,17 @@ def _compatible_kinds(slide: SlideSpec) -> tuple[str, ...]:
     has_bullets = any(isinstance(b, BulletBlock) and b.items for b in slide.blocks)
 
     if has_card:
-        return ("cards",)
+        # Вид раскладки — ярлык, снятый ГЕОМЕТРИЕЙ, а держать карточки
+        # умеет не только он: любая раскладка с повтором по ролям карточек
+        # разложит их не хуже (`compose.blocks._assign_cards` смотрит на
+        # `Pattern.repeat`, а не на `Pattern.kind`).
+        #
+        # Живой прогон 25 сентября 2026 на VK Education: все шесть
+        # раскладок вида `cards` идут БЕЗ единого украшения, а из шести
+        # двухколоночных украшены пять — и одна из них, `slide26`, несёт
+        # ровно такой повтор. Жёсткая привязка к `cards` запирала слайд в
+        # голых раскладках, хотя рядом была подходящая и оформленная.
+        return _kinds_that_hold_cards(profile) or ("cards",)
     if kpi_block is not None:
         if len(kpi_block.items) <= _KPI_CAPTION_MAX_ITEMS:
             return ("kpi_caption", "kpi")
@@ -458,14 +485,22 @@ def _pattern_rank_key(
     # `visual` тянется к раскладкам богаче декором (декор часто И ЕСТЬ
     # картинка/пиктограмма). `dense` и `airy` декор не смещает вовсе.
     #
-    # Пробовал 25 сентября 2026 тянуть к декору ВСЕ варианты — чтобы уйти
-    # от белых листов. Стало хуже: выбор садился на раскладки с богатой
-    # повторяющейся сеткой, содержания на все её единицы не хватало, и на
-    # слайде оставались осиротевшие иконки без подписей вразброс. Пустой
-    # слайд честнее замусоренного; настоящее лечение белых листов — не
-    # предпочтение декора, а раскладка содержания ПО единицам повтора.
+    # Больше оформления — лучше, для ВСЕХ вариантов; `visual` тянется вдвое
+    # сильнее, это его ось.
+    #
+    # Первая попытка (25 сентября 2026) сделала хуже: выбор садился на
+    # раскладки с богатой повторяющейся сеткой, содержания на все её
+    # единицы не хватало, и на слайде оставались осиротевшие иконки без
+    # подписей. Тогда предпочтение убрали.
+    #
+    # Вернули после того, как список научился раскладываться ПО ЕДИНИЦАМ
+    # ПОВТОРА (`compose.blocks._spread_bullets_over_repeat`): три пункта
+    # теперь занимают три ячейки, и сетка заполняется вместо того, чтобы
+    # осиротеть. Без той правки это предпочтение вредно, с ней — нужно:
+    # из 34 раскладок VK Education 20 идут вообще без декора, и при
+    # безразличии выбор садился именно на них.
     decor = len(p.decor)
-    decor_bias = -decor if variant is Variant.visual else 0
+    decor_bias = -decor * (2 if variant is Variant.visual else 1)
 
     # Второй тай-брейк стиля — вместимость самой раскладки (`Capacity.
     # max_items`), не только её декор: `dense` тянется к раскладкам с
@@ -510,8 +545,8 @@ def _pattern_rank_key(
     # находку «нет слота под фото/иконку».
     image_penalty = 0 if (not needs_image or _has_image_slot(p)) else 1
     return (
-        fit_bucket, image_penalty, avoid_penalty, repeat_penalty, kind_rank,
-        decor_bias, capacity_bias, roominess_bias, -p.score,
+        fit_bucket, image_penalty, avoid_penalty, repeat_penalty, decor_bias, kind_rank,
+        capacity_bias, roominess_bias, -p.score,
     )
 
 
@@ -600,7 +635,7 @@ def _choose_kind_and_pattern(
         if authored is not None:
             return authored.kind, authored.pattern_id
 
-    compatible = _compatible_kinds(slide)
+    compatible = _compatible_kinds(slide, profile)
     priority = _VARIANT_KIND_PRIORITY[variant]
     available = {p.kind for p in profile.patterns}
     item_count = _item_count(slide)

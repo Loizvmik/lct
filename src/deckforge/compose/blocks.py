@@ -669,7 +669,16 @@ def expand_decor(
     result = list(ungrouped)
     for i, pos in enumerate(positions):
         for d in template_group:
-            result.append(replace(d, box=with_axis(d.box, pos), repeat_index=i))
+            copy = replace(d, box=with_axis(d.box, pos), repeat_index=i)
+            # Значок-НОМЕР перенумеровывается по позиции в сетке: эталон
+            # взят с первой единицы повтора, и без этого все четыре кружка
+            # шаблона выходили с цифрой «1» (живой рендер 25 сентября 2026,
+            # VK Education). Значок-буква или единица измерения не трогается
+            # — она одинакова во всех единицах по замыслу.
+            if copy.badge_text and copy.badge_text.strip().rstrip(".").isdigit():
+                suffix = "." if copy.badge_text.strip().endswith(".") else ""
+                copy = replace(copy, badge_text=f"{i + 1}{suffix}")
+            result.append(copy)
     return result
 
 

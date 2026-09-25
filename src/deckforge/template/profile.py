@@ -175,7 +175,10 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # pydantic подставил бы `"t"` (верх) — формально то же, что было, но тогда
 # шаблон, где 40 слотов из 169 выровнены по центру (VK Education), так и
 # остался бы с текстом, липнущим к верху высоких карточек.
-PROFILE_SCHEMA_VERSION = 13
+# 13 -> 14: у `DecorShape` появились поля значка (`badge_text` и соседние).
+# Старый кеш их не несёт, и нумерованные кружки шаблона снова стали бы
+# пустыми местами под содержание.
+PROFILE_SCHEMA_VERSION = 15
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -521,6 +524,14 @@ class DecorShapeModel(BaseModel):
     # image_part`). Значение по умолчанию — обратная совместимость со
     # старым диск-кешем, тем же приёмом, что и поля повтора выше.
     image_part: str | None = None
+    # Текст значка — короткая подпись внутри залитой фигуры (номер шага,
+    # буква). См. `patterns.DecorShape.badge_text`.
+    badge_text: str | None = None
+    badge_size_pt: float = 0.0
+    badge_color_hex: str | None = None
+    # Пресет-форма автофигуры (`a:prstGeom`, например `ellipse`): без неё
+    # круглый значок шаблона рисуется квадратом.
+    prst: str | None = None
 
 
 def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
@@ -529,7 +540,9 @@ def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
         flip_h=decor.flip_h, flip_v=decor.flip_v, fill_hex=decor.fill_hex,
         has_fill=decor.has_fill, fill_kind=decor.fill_kind,
         repeat_group=decor.repeat_group, repeat_index=decor.repeat_index,
-        image_part=decor.image_part,
+        image_part=decor.image_part, badge_text=decor.badge_text,
+        badge_size_pt=decor.badge_size_pt, badge_color_hex=decor.badge_color_hex,
+        prst=decor.prst,
     )
 
 

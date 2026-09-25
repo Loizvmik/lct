@@ -1229,7 +1229,8 @@ def _pattern_from_model(model) -> Pattern:
             kind=d.kind, box=_box_from_model(d.box), rotation=d.rotation, flip_h=d.flip_h, flip_v=d.flip_v,
             fill_hex=d.fill_hex, has_fill=d.has_fill, fill_kind=d.fill_kind,
             repeat_group=d.repeat_group, repeat_index=d.repeat_index,
-            image_part=d.image_part,
+            image_part=d.image_part, badge_text=d.badge_text,
+            badge_size_pt=d.badge_size_pt, badge_color_hex=d.badge_color_hex, prst=d.prst,
         )
         for d in model.decor
     ]

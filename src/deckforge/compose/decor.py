@@ -52,7 +52,8 @@ from typing import Callable
 
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
-from pptx.util import Emu
+from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
+from pptx.util import Emu, Pt
 
 from deckforge.ooxml.geometry import Box
 from deckforge.ooxml.ns import qn
@@ -64,6 +65,20 @@ from deckforge.template.patterns import DecorShape
 # под три учебных файла), заметно тоньше типичной плашки, но шире
 # погрешности округления EMU.
 _LINE_THICKNESS_SHARE = 0.01
+
+# Пресет-формы, которые действительно встречаются в декоре учебных шаблонов
+# (`a:prstGeom/@prst`). Остальные рисуются прямоугольником, как и раньше:
+# приблизить форму лучше, чем не приблизить, но выдумывать соответствие для
+# сотни пресетов OOXML незачем — круглый значок с номером был единственным,
+# который живой разбор показал квадратом (VK Education, слайд 21).
+_PRST_TO_SHAPE = {
+    "ellipse": MSO_SHAPE.OVAL,
+    "roundRect": MSO_SHAPE.ROUNDED_RECTANGLE,
+    "round1Rect": MSO_SHAPE.ROUND_1_RECTANGLE,
+    "round2SameRect": MSO_SHAPE.ROUND_2_SAME_RECTANGLE,
+    "triangle": MSO_SHAPE.ISOSCELES_TRIANGLE,
+    "rightArrow": MSO_SHAPE.RIGHT_ARROW,
+}
 
 
 def apply_decor(
@@ -139,10 +154,38 @@ def _emu_box(box: Box, canvas_width_emu: int, canvas_height_emu: int) -> tuple[i
 
 def _add_plaque(slide, shape: DecorShape, canvas_width_emu: int, canvas_height_emu: int) -> None:
     left, top, width, height = _emu_box(shape.box, canvas_width_emu, canvas_height_emu)
-    auto_shape = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Emu(left), Emu(top), Emu(width), Emu(height))
+    auto_shape = slide.shapes.add_shape(
+        _PRST_TO_SHAPE.get(shape.prst or "", MSO_SHAPE.RECTANGLE),
+        Emu(left), Emu(top), Emu(width), Emu(height),
+    )
     auto_shape.line.fill.background()
     _apply_fill(auto_shape, shape)
     _apply_rotation_and_flip(auto_shape, shape)
+    _apply_badge_text(auto_shape, shape)
+
+
+def _apply_badge_text(auto_shape, shape: DecorShape) -> None:
+    """Подпись значка — номер шага, буква, единица — пишется в саму фигуру
+    тем же кеглем и цветом, что в шаблоне.
+
+    Значок переносится целиком (форма, заливка, текст), потому что это
+    часть рисунка, а не место под содержание: живой разбор 25 сентября 2026
+    на VK Education — четыре синих кружка с номерами 1-4 разбирались как
+    слоты под цифры, наше содержание их не заполняло, и вместе с текстом
+    пропадал сам кружок."""
+    if not shape.badge_text:
+        return
+    tf = auto_shape.text_frame
+    tf.word_wrap = False
+    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+    para = tf.paragraphs[0]
+    para.alignment = PP_ALIGN.CENTER
+    run = para.add_run()
+    run.text = shape.badge_text
+    if shape.badge_size_pt:
+        run.font.size = Pt(shape.badge_size_pt)
+    if shape.badge_color_hex:
+        run.font.color.rgb = RGBColor.from_string(shape.badge_color_hex.lstrip("#"))
 
 
 def _add_connector(slide, shape: DecorShape, canvas_width_emu: int, canvas_height_emu: int) -> None:

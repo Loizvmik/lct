@@ -220,6 +220,13 @@ class DecorShape:
     repeat_index: int = 0
     prst: str | None = None
     adj: float | None = None
+    # Текст ЗНАЧКА — короткая подпись внутри залитой фигуры: номер шага,
+    # буква, единица измерения. Такие фигуры несут текст, но это не место
+    # под содержание, а часть рисунка (см. `_is_badge`). `None` у обычного
+    # декора без текста.
+    badge_text: str | None = None
+    badge_size_pt: float = 0.0
+    badge_color_hex: str | None = None
     # Часть пакета с самой картинкой (`ppt/media/imageN.png`) — только для
     # `kind == "picture"`. Без неё декоративную картинку нечем нарисовать:
     # `DecorShape` намеренно не держит lxml-элемент, а геометрии для
@@ -478,7 +485,7 @@ def _mine_slide(
 
     decor_membership = _decor_repeat_membership(decor, repeat)
     decor_shapes = [
-        _to_decor(pkg, rels, ref, theme, decor_image_cache, decor_membership.get(i))
+        _to_decor(pkg, rels, ref, theme, decor_image_cache, decor_membership.get(i), canvas, scale)
         for i, ref in enumerate(decor)
     ]
 
@@ -649,7 +656,10 @@ def _split_content_decor(
                 # опционально ровно для этого случая).
                 content.append(ref)
             elif _shape_text(ref.element).strip():
-                content.append(ref)
+                if _is_badge(ref, _shape_text(ref.element)):
+                    decor.append(ref)
+                else:
+                    content.append(ref)
             else:
                 # НЕ-плейсхолдер без текста — вот это уже декор как он есть
                 # (фигура без заливки и без текста, линия, фоновая плашка,
@@ -708,6 +718,34 @@ def _has_bullets(element) -> bool:
     # строки короче типографской практики "абзац" и характернее для списка).
     non_empty = sum(1 for p in paragraphs if "".join(t.text or "" for t in p.iter(qn("a:t"))).strip())
     return non_empty >= 3
+
+
+# Столько знаков может нести ЗНАЧОК — номер шага, буква, единица. Больше
+# — уже подпись, то есть содержание. Три знака берут "1"/"12"/"1." и
+# отсекают даже короткое слово.
+_BADGE_MAX_CHARS = 3
+
+
+def _is_badge(ref: ShapeRef, text: str) -> bool:
+    """Залитая фигура с очень коротким текстом — значок, а не место под
+    содержание.
+
+    Живой разбор 25 сентября 2026 (VK Education, слайд 21): четыре синих
+    кружка с номерами 1-4 разбирались как слоты под цифры. Наше содержание
+    их не заполняло, и вместе с текстом пропадал САМ КРУЖОК — фигуру мы не
+    перерисовываем, если её слот пуст. Слайд выходил белым листом там, где
+    в шаблоне нумерованная схема.
+
+    Значок переносится целиком: форма, заливка и его собственный текст."""
+    stripped = text.strip()
+    if not stripped or len(stripped) > _BADGE_MAX_CHARS:
+        return False
+    if ref.is_placeholder:
+        return False  # плейсхолдер — структурный сигнал «здесь контент»
+    sp_pr = ref.element.find(qn("p:spPr"))
+    fill_el = _pick_fill_element(sp_pr) if sp_pr is not None else None
+    kind = _FILL_TAG_TO_KIND.get(local_name(fill_el), "unspecified") if fill_el is not None else "unspecified"
+    return kind not in ("none", "unspecified")
 
 
 def _vertical_anchor(element) -> str:
@@ -1910,6 +1948,7 @@ def _picture_fill_average_color(
 def _to_decor(
     pkg: PptxPackage, rels: dict[str, str], ref: ShapeRef, theme: ThemeInfo,
     decor_image_cache: dict[str, str | None], repeat_index: int | None = None,
+    canvas: Canvas | None = None, scale: TypeScale | None = None,
 ) -> DecorShape:
     """`repeat_index` — позиция этого декора в группе повтора
     (`_decor_repeat_membership`), если он в неё вошёл; `None` (по
@@ -1934,11 +1973,22 @@ def _to_decor(
     prst, adj = _decor_prst_geom(ref.element) if ref.kind == "shape" else (None, None)
     image_part = _picture_target(ref.element, rels) if ref.kind == "picture" else None
 
+    badge_text = badge_color = None
+    badge_size = 0.0
+    if ref.kind == "shape":
+        raw = _shape_text(ref.element).strip()
+        if raw and _is_badge(ref, raw):
+            tier = _tier_info(ref, canvas, scale, theme) if canvas is not None and scale is not None else None
+            badge_text = raw
+            badge_size = tier.size_pt if tier is not None else 0.0
+            badge_color = tier.color_hex if tier is not None else None
+
     return DecorShape(
         kind=ref.kind, box=ref.box, rotation=ref.rotation, flip_h=ref.flip_h, flip_v=ref.flip_v,
         fill_hex=fill_hex, has_fill=has_fill, fill_kind=fill_kind,
         repeat_group=repeat_index is not None, repeat_index=repeat_index or 0,
         prst=prst, adj=adj, image_part=image_part,
+        badge_text=badge_text, badge_size_pt=badge_size, badge_color_hex=badge_color,
     )
 
 
