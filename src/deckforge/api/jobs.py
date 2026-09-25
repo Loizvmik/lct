@@ -311,6 +311,18 @@ async def _run_job(
             for variant in Variant:
                 tg.create_task(_audit_variant(job, variant.value, profile, config, autofix))
 
+        # Ярлык на последний прогон рядом с каталогами заданий: их имена —
+        # случайные номера, и найти «тот самый, который только что собрали»
+        # иначе можно только по времени изменения. Ярлык переставляется на
+        # каждом прогоне, старые каталоги не трогаются.
+        try:
+            latest = self.root / "decks" / "latest"
+            if latest.is_symlink() or latest.exists():
+                latest.unlink()
+            latest.symlink_to(job.dir.name)
+        except Exception:  # noqa: BLE001 — удобство, не вправе ронять генерацию
+            pass
+
         job.enter_stage("export")
         async with asyncio.TaskGroup() as tg:
             for variant in Variant:
