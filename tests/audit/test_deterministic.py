@@ -796,3 +796,27 @@ def test_same_file_gives_the_same_result_twice(clean_deck_path, deck_with):
     first = run_deterministic(path, PROFILE, CONFIG)
     second = run_deterministic(path, PROFILE, CONFIG)
     assert first == second
+
+
+def test_T03_accepts_the_templates_own_decor_colours(blank_deck):
+    """Палитра ролей и тема собраны по ТЕКСТУ, а фирменные плашки часто
+    залиты цветом, которого ни в одной роли нет: у ЛЦТ2026 это #FD0C50 и
+    #E4EAE9. С переносом декора шаблона на слайд проверка начала ругаться
+    на замысел самого шаблона — семь находок на двенадцать слайдов, все про
+    его собственные цвета."""
+    decor_colour = next(
+        (d.fill_hex for p in PROFILE.patterns for d in p.decor if d.fill_hex),
+        None,
+    )
+    if decor_colour is None:
+        return  # у этого шаблона нет декора с разрешённым цветом — проверять нечего
+
+    slide = blank_deck.add_slide()
+    plaque = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(0.5), Inches(1.0), Inches(3.0), Inches(2.0))
+    plaque.fill.solid()
+    plaque.fill.fore_color.rgb = RGBColor.from_string(decor_colour.lstrip("#"))
+    plaque.line.fill.background()
+
+    ids = _ids(run_deterministic(blank_deck.save_as("decor-colour.pptx"), PROFILE, CONFIG))
+
+    assert "T03" not in ids, "цвет декора самого шаблона не должен считаться чужим"

@@ -1240,9 +1240,20 @@ def _all_run_sizes(sp_element) -> set[float]:
 
 def _check_T03(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
     text_allowed = {c.upper() for c in profile.palette_roles.values() if c}
-    fill_allowed = text_allowed | {c.upper() for c in profile.theme.scheme.values() if c} | {
-        c.upper() for c in profile.chart_series if c
+    # Заливки ДЕКОРА самого шаблона — тоже его цвета, по определению.
+    #
+    # Палитра ролей и тема собраны по ТЕКСТУ и теме, а фирменные плашки
+    # часто залиты цветом, которого ни в одной роли нет: у ЛЦТ2026 это
+    # #FD0C50 и #E4EAE9. С 25 сентября 2026 сборка переносит декор шаблона
+    # на слайд как есть (`compose.decor`), и без этой добавки проверка
+    # ругалась на замысел самого шаблона — семь находок на двенадцать
+    # слайдов, все про его собственные цвета.
+    decor_allowed = {
+        d.fill_hex.upper() for pattern in profile.patterns for d in pattern.decor if d.fill_hex
     }
+    fill_allowed = text_allowed | decor_allowed | {
+        c.upper() for c in profile.theme.scheme.values() if c
+    } | {c.upper() for c in profile.chart_series if c}
     findings = []
     for item in ctx.items:
         if item.kind == "shape":
