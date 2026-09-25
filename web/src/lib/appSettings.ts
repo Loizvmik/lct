@@ -1,4 +1,4 @@
-export type DefaultSlideCount = "auto" | 10 | 12 | 15;
+export type DefaultSlideCount = "auto" | 6 | 8 | 10 | 12 | 15;
 export type ExportFormat = "pptx" | "pdf" | "html";
 
 export interface AppSettings {
@@ -26,7 +26,7 @@ const CHANGE_EVENT = "slides:settings-change";
 const DRAFT_PREFIXES = ["slides:task-draft:v2:", "deckforge:brief-draft:"];
 
 function isDefaultSlideCount(value: unknown): value is DefaultSlideCount {
-  return value === "auto" || value === 10 || value === 12 || value === 15;
+  return value === "auto" || value === 6 || value === 8 || value === 10 || value === 12 || value === 15;
 }
 
 function isExportFormat(value: unknown): value is ExportFormat {

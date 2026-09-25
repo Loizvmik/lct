@@ -369,6 +369,45 @@ def test_request_timeout_capped_to_remaining_deadline():
     assert calls[0].extensions["timeout"]["read"] == pytest.approx(6.0)
 
 
+def test_read_timeout_is_retried(monkeypatch):
+    """Кратковременный сетевой тайм-аут не должен обрывать генерацию с первого раза."""
+    calls = []
+    monkeypatch.setattr(yandex_module.time, "sleep", lambda _seconds: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("temporary timeout", request=request)
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ОК"}, "finish_reason": "stop"}]},
+        )
+
+    provider = _offline_provider()
+    provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    assert provider.complete([{"role": "user", "content": "Скажи ОК"}], max_tokens=300) == "ОК"
+    assert len(calls) == 2
+
+
+def test_remote_disconnect_is_retried(monkeypatch):
+    calls = []
+    monkeypatch.setattr(yandex_module.time, "sleep", lambda _seconds: None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        if len(calls) == 1:
+            raise httpx.RemoteProtocolError("server disconnected")
+        return httpx.Response(
+            200, json={"choices": [{"message": {"content": "ОК"}, "finish_reason": "stop"}]},
+        )
+
+    provider = _offline_provider()
+    provider._client = httpx.Client(transport=httpx.MockTransport(handler))
+
+    assert provider.complete([{"role": "user", "content": "Скажи ОК"}], max_tokens=300) == "ОК"
+    assert len(calls) == 2
+
+
 def test_backoff_sleep_capped_to_remaining_deadline(monkeypatch):
     """Пауза экспоненциального бэкоффа не должна спать дольше остатка до
     дедлайна, даже если сам бэкофф просит больше."""

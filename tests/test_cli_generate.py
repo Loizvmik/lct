@@ -16,12 +16,18 @@ TEMPLATE = Path("dataset/templates/VK Tech шаблон.pptx")
 CONTENT_PACK = Path("fixtures/content-packs/queue-latency")
 
 
+def _disable_model_providers(monkeypatch) -> None:
+    """Keep CLI fallback tests offline even when the repository has a .env."""
+    monkeypatch.setattr(cli_module, "_build_role_provider", lambda _role: None)
+
+
 def test_generate_passes_writer_max_workers_override_to_write_slides(monkeypatch, tmp_path):
     """`--writer-max-workers` — нужен для честного замера "до/после"
     (задача: сравнить параллельную запись текста слайдов с последовательной
     на ОДНОМ и том же коде, не угадывать по старому коммиту)."""
     monkeypatch.delenv("YANDEX_API_KEY", raising=False)
     monkeypatch.delenv("YANDEX_FOLDER_ID", raising=False)
+    _disable_model_providers(monkeypatch)
     captured = {}
     real_write_slides = cli_module.write_slides
 
@@ -49,6 +55,7 @@ def test_generate_passes_writer_max_workers_override_to_write_slides(monkeypatch
 def test_generate_does_not_run_visual_audit_and_says_how_to_run_it(monkeypatch, capsys, tmp_path):
     monkeypatch.delenv("YANDEX_API_KEY", raising=False)
     monkeypatch.delenv("YANDEX_FOLDER_ID", raising=False)
+    _disable_model_providers(monkeypatch)
     out_dir = tmp_path / "decks"
 
     exit_code = main([
@@ -67,6 +74,7 @@ def test_audit_visual_runs_on_a_finished_pptx_without_regenerating_it(monkeypatc
     не вызывая модель для написания текста заново."""
     monkeypatch.delenv("YANDEX_API_KEY", raising=False)
     monkeypatch.delenv("YANDEX_FOLDER_ID", raising=False)
+    _disable_model_providers(monkeypatch)
     out_dir = tmp_path / "decks"
     main(["generate", str(TEMPLATE), str(CONTENT_PACK), "-o", str(out_dir), "--variant", "dense"])
     capsys.readouterr()  # очистить вывод generate — интересен только вывод audit-visual

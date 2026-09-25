@@ -58,6 +58,45 @@ def test_secrets_come_from_env(monkeypatch):
     assert settings.yandex_folder_id == "test-folder"
 
 
+def test_secrets_are_loaded_from_env_file_outside_current_directory(tmp_path, monkeypatch):
+    repo = tmp_path / "project"
+    config_dir = repo / "config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "app.yaml"
+    config_path.write_text(APP_YAML.read_text(encoding="utf-8"), encoding="utf-8")
+    (repo / ".env").write_text(
+        "YANDEX_API_KEY=file-key\nYANDEX_FOLDER_ID=file-folder\n", encoding="utf-8",
+    )
+    monkeypatch.delenv("YANDEX_API_KEY", raising=False)
+    monkeypatch.delenv("YANDEX_FOLDER_ID", raising=False)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+
+    settings = Settings.load(config_path)
+
+    assert settings.yandex_api_key == "file-key"
+    assert settings.yandex_folder_id == "file-folder"
+
+
+def test_process_environment_overrides_env_file(tmp_path, monkeypatch):
+    repo = tmp_path / "project"
+    config_dir = repo / "config"
+    config_dir.mkdir(parents=True)
+    config_path = config_dir / "app.yaml"
+    config_path.write_text(APP_YAML.read_text(encoding="utf-8"), encoding="utf-8")
+    (repo / ".env").write_text(
+        "YANDEX_API_KEY=file-key\nYANDEX_FOLDER_ID=file-folder\n", encoding="utf-8",
+    )
+    monkeypatch.setenv("YANDEX_API_KEY", "process-key")
+    monkeypatch.setenv("YANDEX_FOLDER_ID", "process-folder")
+
+    settings = Settings.load(config_path)
+
+    assert settings.yandex_api_key == "process-key"
+    assert settings.yandex_folder_id == "process-folder"
+
+
 def test_missing_config_file_raises():
     with pytest.raises(FileNotFoundError):
         Settings.load(ROOT / "config" / "does-not-exist.yaml")
@@ -146,4 +185,4 @@ render:
     # обязан найти soffice без явного пути в конфиге.
     found = settings.render.resolve_soffice()
     assert found
-    assert Path(found).name == "soffice"
+    assert Path(found).stem == "soffice"

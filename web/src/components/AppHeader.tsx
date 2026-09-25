@@ -99,10 +99,12 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
             id="default-slides"
             value={preferences.defaultSlideCount}
             onChange={(event) => updatePreferences({
-              defaultSlideCount: event.target.value === "auto" ? "auto" : Number(event.target.value) as 10 | 12 | 15,
+              defaultSlideCount: event.target.value === "auto" ? "auto" : Number(event.target.value) as 6 | 8 | 10 | 12 | 15,
             })}
           >
             <option value="auto">Выбирать автоматически</option>
+            <option value="6">6 слайдов</option>
+            <option value="8">8 слайдов</option>
             <option value="10">10 слайдов</option>
             <option value="12">12 слайдов</option>
             <option value="15">15 слайдов</option>

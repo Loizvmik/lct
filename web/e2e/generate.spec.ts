@@ -93,7 +93,7 @@ test("пустая форма, черновик и проверка числа �
   await task.fill("Показать команде итоги и согласовать следующий этап.");
   await sources.fill("Обработано 410 заявок.");
   await slides.fill("99");
-  await expect(page.getByText("Введите число от 10 до 15.")).toBeVisible();
+  await expect(page.getByText("Введите число от 4 до 15.")).toBeVisible();
   await expect(submit).toBeDisabled();
   await slides.fill("12");
   await expect(submit).toBeEnabled();

@@ -10,6 +10,7 @@ import shutil
 from pathlib import Path
 
 import yaml
+from dotenv import dotenv_values
 from pydantic import BaseModel
 
 # Порядок важен: сначала системный PATH, затем типичные места установки
@@ -73,15 +74,14 @@ class LLMConfig(BaseModel):
     # Дефолт дублирует `plan.writer.DEFAULT_WRITER_MAX_WORKERS` — см.
     # комментарий про происхождение числа в app.yaml. Со значением по
     # умолчанию по той же причине, что и `deadline_seconds` выше.
-    slide_writer_max_workers: int = 4
-    # Task 19 ("настоящий агент вместо одиночного вызова"): сколько сетевых
-    # кругов агентного цикла `plan.writer._write_with_agent_loop` разрешено
-    # одному слайду — бриф задачи буквально: "Цикл ограничен двумя шагами".
+    slide_writer_max_workers: int = 2
+    # Один обязательный структурированный ответ на слайд; повтор при временном
+    # сетевом или невалидном ответе выполняется отдельно и ограничен кодом провайдера.
     # Дефолт дублирует `plan.writer.AGENT_MAX_STEPS_DEFAULT` — см. её
     # комментарий про происхождение числа. Со значением по умолчанию по той
     # же причине, что и `slide_writer_max_workers` выше (конфиги без явного
     # поля, собранные вручную в тестах, не должны переставать парситься).
-    slide_writer_agent_max_steps: int = 2
+    slide_writer_agent_max_steps: int = 1
     # Задача "разбор незнакомого шаблона в бюджет", находка №4 ("Гонять
     # оставшиеся обращения параллельно... число потоков лежит в
     # config/app.yaml. Сделай так же") — то же самое для уточнения вида
@@ -170,16 +170,28 @@ class Settings(BaseModel):
 
     @classmethod
     def load(cls, path: Path) -> Settings:
-        """Прочитать app.yaml и подмешать секреты из окружения (.env)."""
-        data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        """Прочитать app.yaml и секреты из ближайшего к нему `.env`.
+
+        Поиск начинается рядом с конфигом и идёт вверх, поэтому запуск из
+        другой рабочей папки, uvicorn и Windows ведут себя одинаково.
+        Настоящее окружение процесса имеет приоритет над `.env`; значения
+        не добавляются в ``os.environ`` и нигде не журналируются.
+        """
+        config_path = Path(path).resolve()
+        data = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         leaked = [key for key in ("yandex_api_key", "yandex_folder_id") if key in data]
         if leaked:
             raise ValueError(
-                f"{path}: секретам ({', '.join(leaked)}) не место в yaml-конфиге — "
+                f"{config_path}: секретам ({', '.join(leaked)}) не место в yaml-конфиге — "
                 "их место в .env (см. .env.example)."
             )
+        env_path = next(
+            (directory / ".env" for directory in (config_path.parent, *config_path.parents) if (directory / ".env").is_file()),
+            None,
+        )
+        file_env = dotenv_values(env_path) if env_path is not None else {}
         return cls(
             **data,
-            yandex_api_key=os.environ.get("YANDEX_API_KEY"),
-            yandex_folder_id=os.environ.get("YANDEX_FOLDER_ID"),
+            yandex_api_key=os.environ.get("YANDEX_API_KEY") or file_env.get("YANDEX_API_KEY"),
+            yandex_folder_id=os.environ.get("YANDEX_FOLDER_ID") or file_env.get("YANDEX_FOLDER_ID"),
         )

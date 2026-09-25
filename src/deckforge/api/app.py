@@ -30,7 +30,9 @@ from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from deckforge.api import schemas
-from deckforge.api.jobs import JobError, JobRecord, JobStore, STAGES, VariantState, finding_id, fix_deck
+from deckforge.api.jobs import (
+    JobError, JobRecord, JobStore, ProviderUnavailableError, STAGES, VariantState, finding_id, fix_deck,
+)
 from deckforge.audit.findings import Finding
 
 _FORMAT_ATTR = {"pptx": "pptx_path", "pdf": "pdf_path", "html": "html_path"}
@@ -130,6 +132,8 @@ def create_app(store: JobStore | None = None) -> FastAPI:
                 title=request.title, language=request.language, target_slides=request.target_slides,
                 autofix=request.autofix,
             )
+        except ProviderUnavailableError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
         except JobError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return schemas.DeckCreateResponse(job_id=job.job_id)

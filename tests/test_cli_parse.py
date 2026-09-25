@@ -8,9 +8,16 @@ from pathlib import Path
 
 import pytest
 
+import deckforge.cli as cli_module
 from deckforge.cli import _build_namer, main
 
 TEMPLATES_DIR = Path("dataset/templates")
+
+
+@pytest.fixture(autouse=True)
+def _disable_model_providers(monkeypatch):
+    """Keep parser tests offline even when Settings discovers the repository .env."""
+    monkeypatch.setattr(cli_module, "_build_role_provider", lambda _role: None)
 
 
 def test_parse_writes_profile_json(tmp_path):

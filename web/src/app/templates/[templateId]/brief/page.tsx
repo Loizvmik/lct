@@ -6,7 +6,7 @@ import { createDeck } from "@/lib/api";
 import { getAppSettings } from "@/lib/appSettings";
 import { clearBriefDraft, loadBriefDraft, saveBriefDraft } from "@/lib/briefDraft";
 
-const MIN_SLIDES = 10;
+const MIN_SLIDES = 4;
 const MAX_SLIDES = 15;
 
 export default function BriefPage() {
@@ -146,8 +146,8 @@ export default function BriefPage() {
               />
               <button type="button" className="secondary" onClick={() => changeSlides(targetSlides === "" ? MIN_SLIDES : targetSlides + 1)} disabled={targetSlides === MAX_SLIDES} aria-label="Увеличить количество слайдов">+</button>
             </div>
-            <p className="field-hint" id="slides-hint">Оставьте пустым для автоматического выбора. Допустимо от 10 до 15.</p>
-            {slideError && <p className="field-error" id="slides-error">Введите число от 10 до 15.</p>}
+            <p className="field-hint" id="slides-hint">Оставьте пустым — количество подберётся по объёму материалов. Допустимо от 4 до 15.</p>
+            {slideError && <p className="field-error" id="slides-error">Введите число от 4 до 15.</p>}
           </div>
           <div className="field">
             <span className="field-label">Проверка оформления</span>

@@ -15,6 +15,7 @@ prompt` там). Код здесь читает файл, вызывает мо�
 падение (тот же принцип, что и у `name_palette_roles_report`)."""
 from __future__ import annotations
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -31,9 +32,9 @@ OUTLINE_KINDS = (
 )
 
 # Объём колоды — ТЗ дословно ("10-15 слайдов или заданное пользователем").
-MIN_SLIDES = 10
+MIN_SLIDES = 4
 MAX_SLIDES = 15
-_DEFAULT_TARGET_SLIDES = 12
+_DEFAULT_TARGET_SLIDES = 6
 
 # Бюджет токенов начального вызова. Изначально 4096 (тот же порядок, что
 # `naming._PALETTE_NAMING_INITIAL_MAX_TOKENS`) — живой прогон обязательной
@@ -80,6 +81,10 @@ class Outline:
     language: str = "ru"
 
 
+class OutlineGenerationError(RuntimeError):
+    """Модель не смогла подготовить структуру для обычного API-прогона."""
+
+
 _SCHEMA = {
     "type": "object",
     "properties": {
@@ -111,8 +116,13 @@ def _load_agent_prompt(path: Path = AGENT_PATH) -> tuple[dict, str]:
     return meta, parts[2].strip()
 
 
-def _clamp_target(target_slides: int | None) -> int:
-    n = target_slides if target_slides else _DEFAULT_TARGET_SLIDES
+def _clamp_target(target_slides: int | None, brief: str = "", sources: list[SourceDoc] | None = None) -> int:
+    if target_slides:
+        n = target_slides
+    else:
+        material = "\n".join([brief, *(source.text for source in (sources or []))])
+        units = len([part for part in re.split(r"[\n.!?]+", material) if len(part.strip()) >= 20])
+        n = min(8, max(MIN_SLIDES, 3 + (units + 1) // 2)) if material.strip() else _DEFAULT_TARGET_SLIDES
     return max(MIN_SLIDES, min(MAX_SLIDES, n))
 
 
@@ -206,6 +216,7 @@ def build_outline(
     *,
     title: str = "",
     language: str = "ru",
+    allow_fallback: bool = True,
 ) -> Outline:
     """Разбирает бриф+источники в структуру колоды. `profile` — контракт
     интерфейса брифа Task 13 дословно; сама структура (сколько слайдов, о
@@ -219,9 +230,11 @@ def build_outline(
     `agents/outline-writer/AGENT.md`. `profile=None` (синтетика тестов,
     вызов без разобранного шаблона) по-прежнему работает — сводка тогда
     пустая, поведение не отличается от того, что было до Task 18."""
-    n = _clamp_target(target_slides)
+    n = _clamp_target(target_slides, brief, sources)
 
     if llm is None:
+        if not allow_fallback:
+            raise OutlineGenerationError("модель структуры не подключена")
         return Outline(slides=_fallback_outline(n), title=title, language=language)
 
     _meta, prompt_body = _load_agent_prompt()
@@ -255,7 +268,9 @@ def build_outline(
             slides.append(OutlineSlide(kind=kind, intent=intent, needs=needs))
         if not slides:
             raise ValueError("модель не вернула ни одного валидного слайда структуры")
-    except Exception:
+    except Exception as exc:
+        if not allow_fallback:
+            raise OutlineGenerationError(f"не удалось получить структуру презентации: {exc}") from exc
         slides = _fallback_outline(n)
     else:
         slides = _clamp_slide_count(slides, n)

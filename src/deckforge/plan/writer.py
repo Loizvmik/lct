@@ -55,6 +55,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import yaml
+import httpx
 
 from deckforge.compose.fit_check import measure_fit
 from deckforge.compose.slide_tools import list_layouts, try_slide
@@ -69,13 +70,38 @@ AGENT_PATH_WRITER = Path(__file__).resolve().parents[3] / "agents" / "slide-writ
 AGENT_PATH_PICKER = Path(__file__).resolve().parents[3] / "agents" / "pattern-picker" / "AGENT.md"
 
 # Живой прогон обязательной проверки задачи (девять презентаций, отчёт
-# задачи): на старте 3072 эскалация до потолка `MAX_TOKENS_BUDGET_CAP`=6144
+# задачи): на старте 3072 эскалация до потолка `MAX_TOKENS_BUDGET_CAP`; живой
 # (`provider/yandex.py`) срабатывала практически на каждом вызове
 # slide-writer — та же находка и то же решение, что и у `outline.
 # OUTLINE_MAX_TOKENS` (см. её комментарий): начинать ниже гарантированно
 # нужного бюджета только теряет время на лишний HTTP-круг.
-WRITER_MAX_TOKENS = 6144
+WRITER_MAX_TOKENS = 7168
 PICKER_MAX_TOKENS = 2048
+TRANSIENT_MODEL_ATTEMPTS = 2
+
+
+def _is_retryable_provider_error(exc: BaseException) -> bool:
+    current: BaseException | None = exc
+    while current is not None:
+        if isinstance(current, httpx.TransportError):
+            return True
+        if isinstance(current, RuntimeError) and any(
+            marker in str(current) for marker in ("невалидный JSON", "не вернула ответ")
+        ):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+def _complete_with_transient_retry(llm: LLMProvider, messages: list[dict], **kwargs) -> str:
+    """Один раз повторяет временный сетевой или невалидный структурированный ответ."""
+    for attempt in range(TRANSIENT_MODEL_ATTEMPTS):
+        try:
+            return llm.complete(messages, **kwargs)
+        except Exception as exc:
+            if not _is_retryable_provider_error(exc) or attempt >= TRANSIENT_MODEL_ATTEMPTS - 1:
+                raise
+    raise RuntimeError("недостижимо")
 
 # Слайды пишутся моделью ПАРАЛЛЕЛЬНО, не по очереди — живой замер задачи
 # (task-12-report.md): 23с на слайд, 12 слайдов подряд дали 273.7с из
@@ -94,7 +120,7 @@ PICKER_MAX_TOKENS = 2048
 # 4 — тот же порядок, что уже проверен живьём в визуальном аудите
 # (`_PER_SLIDE_MAX_TOKENS`/`ThreadPoolExecutor(max_workers=4)`, тот же
 # провайдер, тот же класс нагрузки), не гадание с нуля.
-DEFAULT_WRITER_MAX_WORKERS = 4
+DEFAULT_WRITER_MAX_WORKERS = 2
 
 # Task 19: сколько сетевых кругов агентного цикла разрешено ОДНОМУ слайду
 # (см. докстроку модуля) — число из `config/app.yaml` (`llm.slide_writer_
@@ -108,7 +134,11 @@ DEFAULT_WRITER_MAX_WORKERS = 4
 # который модель написала уверенно с первого раза (без вызова инструмента),
 # по-прежнему стоит ОДИН сетевой вызов — цикл не удорожает уже хороший
 # случай, только даёт модели путь исправиться в плохом.
-AGENT_MAX_STEPS_DEFAULT = 2
+AGENT_MAX_STEPS_DEFAULT = 1
+
+
+class SlideGenerationError(RuntimeError):
+    """Содержательный слайд не удалось получить без запасной заглушки."""
 
 # Запасная вместимость для `kind`, которого нет вовсе ни в одном паттерне
 # профиля (шаблон бедный, или тестовая синтетика) — round-number, того же
@@ -266,7 +296,10 @@ def _fallback_slide(kind: str, index: int, intent: str, needs: list[str], *, rea
         finding += f" Нужны данные: {', '.join(needs)}."
     source_note = "Источник не подтверждён — текст запасного варианта, требует проверки перед показом." \
         if _DIGIT_RE.search(headline) else None
-    return SlideSpec(index=index, kind=kind, headline=headline, source_note=source_note, findings=[finding])
+    return SlideSpec(
+        index=index, kind=kind, headline=headline, source_note=source_note,
+        findings=[finding], generation_origin="fallback", generation_error=reason,
+    )
 
 
 _SLIDE_SCHEMA = {
@@ -438,16 +471,24 @@ def _write_with_agent_loop(
     for step in range(1, max(1, max_steps) + 1):
         is_final_step = step >= max_steps
         turn_payload = dict(payload)
-        if is_final_step and max_steps > 1:
+        if is_final_step:
             turn_payload["_agent_step"] = "final — ответь ТОЛЬКО финальным JSON слайда, вызовы инструментов больше недоступны"
+        step_prompt = prompt_body
+        if is_final_step:
+            step_prompt += (
+                "\n\nНа этом шаге инструменты недоступны. Не возвращай tool_calls. "
+                "Верни только объект слайда по запрошенной JSON-схеме."
+            )
         messages = [
-            {"role": "system", "content": prompt_body},
+            {"role": "system", "content": step_prompt},
             {"role": "user", "content": json.dumps(turn_payload, ensure_ascii=False)},
             *conversation,
         ]
         schema = _SLIDE_SCHEMA if is_final_step else _AGENT_TURN_SCHEMA
         try:
-            raw = llm.complete(messages, schema=schema, max_tokens=WRITER_MAX_TOKENS)
+            raw = _complete_with_transient_retry(
+                llm, messages, schema=schema, max_tokens=WRITER_MAX_TOKENS,
+            )
         except Exception as exc:
             return None, f"шаг {step}/{max_steps}: модель не ответила — {_why(exc)}"
         try:
@@ -495,7 +536,9 @@ def _ask_slide_writer(
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
     try:
-        raw = llm.complete(messages, schema=_SLIDE_SCHEMA, max_tokens=WRITER_MAX_TOKENS)
+        raw = _complete_with_transient_retry(
+            llm, messages, schema=_SLIDE_SCHEMA, max_tokens=WRITER_MAX_TOKENS,
+        )
     except Exception as exc:
         return None, f"модель не ответила — {_why(exc)}"
     try:
@@ -508,6 +551,7 @@ def _ask_slide_writer(
 def _write_one_slide(
     index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
     *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, template_path: Path | None = None,
+    allow_fallback: bool = True,
 ) -> SlideSpec:
     """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
     чтобы её можно было независимо запускать в пуле потоков (слайды друг от
@@ -570,6 +614,10 @@ def _write_one_slide(
         reason = "модель не подключена (нет ключа) — текст слайдов не писался вовсе"
 
     if slide is None:
+        if not allow_fallback:
+            raise SlideGenerationError(
+                f"слайд {index + 1} не создан моделью: {reason or 'неизвестная ошибка'}"
+            )
         slide = _fallback_slide(desired_kind, index, item.intent, item.needs, reason=reason)
 
     return _validate_chosen_layout(slide, profile)
@@ -601,7 +649,7 @@ def _validate_chosen_layout(slide: SlideSpec, profile) -> SlideSpec:
 def write_slides(
     outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None,
     *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
-    template_path: Path | None = None,
+    template_path: Path | None = None, allow_fallback: bool = True,
 ) -> DeckSpec:
     """Пишет текст всех слайдов ПАРАЛЛЕЛЬНО (см. `DEFAULT_WRITER_MAX_
     WORKERS` — до `max_workers` одновременных вызовов модели), не по
@@ -630,6 +678,7 @@ def write_slides(
             pool.submit(
                 _write_one_slide, index, item, profile, prompt_body, source_text, total, llm,
                 agent_max_steps=agent_max_steps, template_path=template_path,
+                allow_fallback=allow_fallback,
             ): index
             for index, item in enumerate(outline.slides)
         }

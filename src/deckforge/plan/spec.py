@@ -179,6 +179,8 @@ class SlideSpec:
     source_note: str | None = None
     speaker_notes: str | None = None
     findings: list[str] = field(default_factory=list)
+    generation_origin: str = "model"
+    generation_error: str | None = None
     # Task 13: raскладка КОНКРЕТНОГО паттерна (`Pattern.pattern_id`), а не
     # только желаемого `kind` — проставляется `plan.variants.apply_variant`
     # (детерминированно, по вместимости) и/или `plan.writer.pick_patterns`
@@ -555,6 +557,7 @@ def slide_spec_to_dict(slide: SlideSpec) -> dict:
         "visual": _visual_to_dict(slide.visual),
         "source_note": slide.source_note, "speaker_notes": slide.speaker_notes,
         "findings": list(slide.findings), "pattern_id": slide.pattern_id,
+        "generation_origin": slide.generation_origin, "generation_error": slide.generation_error,
     }
 
 
@@ -565,6 +568,8 @@ def slide_spec_from_debug_dict(data: dict) -> SlideSpec:
         visual=_visual_from_debug_dict(data.get("visual")),
         source_note=data.get("source_note"), speaker_notes=data.get("speaker_notes"),
         findings=list(data.get("findings") or []), pattern_id=data.get("pattern_id"),
+        generation_origin=data.get("generation_origin", "model"),
+        generation_error=data.get("generation_error"),
     )
 
 

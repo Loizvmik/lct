@@ -31,7 +31,7 @@ class DeckCreateRequest(BaseModel):
     sources: list[str] = Field(default_factory=list)
     title: str | None = None
     language: str = "ru"
-    target_slides: int | None = None
+    target_slides: int | None = Field(default=None, ge=4, le=15)
     # Step 2a брифа: демонстрация идёт без диалога — по умолчанию чинится
     # всё, что чинится автоматически (`audit.autofix.SUPPORTED_CHECKS`);
     # экран выбора в интерфейсе остаётся для случая, когда человек хочет
@@ -51,6 +51,7 @@ class JobResponse(BaseModel):
     stages: list[Stage]
     deck_id: str | None
     error: str | None = None
+    generation_summary: dict | None = None
 
 
 class FindingModel(BaseModel):

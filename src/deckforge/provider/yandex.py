@@ -229,7 +229,23 @@ class YandexProvider(LLMProvider, VisionProvider):
                 )
             request_timeout = min(self._timeout, remaining)
             attempt_counter[0] += 1
-            response = self._client.post(ENDPOINT, json=body, timeout=request_timeout)
+            try:
+                response = self._client.post(ENDPOINT, json=body, timeout=request_timeout)
+            except httpx.TransportError as exc:
+                if attempt >= attempts - 1:
+                    raise RuntimeError(
+                        f"временная сетевая ошибка после {attempt_counter[0]} попыток: "
+                        f"{type(exc).__name__}"
+                    ) from exc
+                remaining = deadline_at - self._now()
+                if remaining <= 0:
+                    raise self._deadline_error(
+                        remaining, attempt_counter[0], tried_budgets,
+                        f"сетевая ошибка {type(exc).__name__}, времени на повтор не осталось",
+                    ) from exc
+                time.sleep(min(delay, remaining))
+                delay *= 2
+                continue
             if response.status_code in _RETRY_STATUS and attempt < attempts - 1:
                 remaining = deadline_at - self._now()
                 if remaining <= 0:

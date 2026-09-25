@@ -3,11 +3,14 @@ from __future__ import annotations
 import json
 import threading
 import time
+import httpx
 
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec, validate_deck_spec
 from deckforge.compose.slide_tools import list_layouts
-from deckforge.plan.writer import _flag_repeated_headlines, pick_patterns, write_slides
+from deckforge.plan.writer import (
+    _complete_with_transient_retry, _flag_repeated_headlines, pick_patterns, write_slides,
+)
 from deckforge.provider.base import LLMProvider
 
 
@@ -26,6 +29,44 @@ class _QueueLLM(LLMProvider):
         if isinstance(response, Exception):
             raise response
         return response
+
+
+class _CapturingLLM(_QueueLLM):
+    def __init__(self, responses: list[str | Exception]):
+        super().__init__(responses)
+        self.messages: list[list[dict]] = []
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        self.messages.append(messages)
+        return super().complete(
+            messages, schema=schema, max_tokens=max_tokens, temperature=temperature,
+        )
+
+
+def test_transient_provider_error_is_retried_through_wrapped_cause():
+    timeout = httpx.ReadTimeout(
+        "temporary timeout", request=httpx.Request("POST", "https://example.test"),
+    )
+    wrapped = RuntimeError("provider deadline expired")
+    wrapped.__cause__ = timeout
+    llm = _QueueLLM([wrapped, "готово"])
+
+    assert _complete_with_transient_retry(llm, [{"role": "user", "content": "test"}]) == "готово"
+
+
+def test_invalid_structured_response_is_retried_once():
+    llm = _QueueLLM([RuntimeError("модель вернула невалидный JSON"), "готово"])
+
+    assert _complete_with_transient_retry(llm, [{"role": "user", "content": "test"}]) == "готово"
+
+
+def test_single_agent_step_explicitly_forbids_tool_calls(PROFILE):
+    llm = _CapturingLLM([_valid_slide_json("Первый"), _valid_slide_json("Второй")])
+
+    write_slides(_outline(2), [], PROFILE, llm=llm, max_workers=1, agent_max_steps=1)
+
+    first_payload = json.loads(llm.messages[0][1]["content"])
+    assert first_payload["_agent_step"].startswith("final")
 
 
 def _valid_slide_json(headline: str, *, with_number: bool = False) -> str:
@@ -148,7 +189,9 @@ class _ToolThenFinalLLM(LLMProvider):
 
 def test_write_slides_agent_loop_calls_measure_fit_then_rewrites_shorter(PROFILE):
     llm = _ToolThenFinalLLM()
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1)
+    deck = write_slides(
+        _one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, agent_max_steps=2,
+    )
 
     assert llm.calls == 2, "должно было хватить одного вызова инструмента и одного финального шага"
     assert deck.slides[0].headline == "Короткий заголовок"
@@ -494,7 +537,10 @@ def test_agent_can_ask_what_layouts_the_template_has(PROFILE, TEMPLATE_PATH):
         _valid_slide_json("Второй"),
     ])
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
+    deck = write_slides(
+        outline, [], PROFILE, llm=llm, max_workers=1, agent_max_steps=2,
+        template_path=TEMPLATE_PATH,
+    )
 
     assert deck.slides[0].headline == "После каталога"
     assert not deck.slides[0].findings, "слайд написан моделью, запасной вариант не нужен"
@@ -512,7 +558,10 @@ def test_agent_sees_the_verdict_of_a_draft_slide(PROFILE, TEMPLATE_PATH):
         _valid_slide_json("Второй"),
     ])
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
+    deck = write_slides(
+        outline, [], PROFILE, llm=llm, max_workers=1, agent_max_steps=2,
+        template_path=TEMPLATE_PATH,
+    )
 
     assert deck.slides[0].headline == "Переписано после проверки"
 
@@ -541,7 +590,7 @@ def test_new_tools_are_unavailable_without_a_template_but_do_not_break_the_loop(
         _valid_slide_json("Второй"),
     ])
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, agent_max_steps=2)
 
     assert deck.slides[0].headline == "Всё равно написано"
 
@@ -556,7 +605,10 @@ def test_a_malformed_try_slide_call_is_answered_not_raised(PROFILE, TEMPLATE_PAT
         _valid_slide_json("Второй"),
     ])
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
+    deck = write_slides(
+        outline, [], PROFILE, llm=llm, max_workers=1, agent_max_steps=2,
+        template_path=TEMPLATE_PATH,
+    )
 
     assert deck.slides[0].headline == "После ошибки"
 

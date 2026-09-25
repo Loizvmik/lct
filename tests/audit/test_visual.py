@@ -239,10 +239,9 @@ def test_build_collage_returns_valid_png_taller_than_one_slide():
     try:
         png_bytes = _build_collage(paths)
         import io
-        im = Image.open(io.BytesIO(png_bytes))
-        assert im.format == "PNG"
-        single = Image.open(paths[0])
-        assert im.height > single.height  # три слайда подряд, не один
+        with Image.open(io.BytesIO(png_bytes)) as im, Image.open(paths[0]) as single:
+            assert im.format == "PNG"
+            assert im.height > single.height  # три слайда подряд, не один
     finally:
         for p in paths:
             p.unlink(missing_ok=True)

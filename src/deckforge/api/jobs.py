@@ -19,12 +19,15 @@ subprocess `soffice`, CPU); каждый вызов уходит в `asyncio.to_
 собранные файлы."""
 from __future__ import annotations
 import asyncio
+import copy
 import hashlib
+import json
 import shutil
 import zipfile
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
+from typing import Callable
 from uuid import uuid4
 
 from deckforge.audit.autofix import SUPPORTED_CHECKS, apply_fixes
@@ -33,8 +36,9 @@ from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.findings import Finding
 from deckforge.compose.builder import build_deck
 from deckforge.export.bundle import export_bundle
+from deckforge.plan.coverage import ContentValidationError, validate_deck_content, validate_pptx_content
 from deckforge.plan.outline import SourceDoc, build_outline
-from deckforge.plan.spec import DeckSpec
+from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
@@ -51,6 +55,40 @@ STAGES: tuple[str, ...] = ("parse", "outline", "write", "compose", "audit", "exp
 class JobError(ValueError):
     """Ошибка, чей текст безопасно показать пользователю API как есть
     (400/404) — не голое исключение из глубины пайплайна."""
+
+
+class ProviderUnavailableError(JobError):
+    """Генерацию нельзя начинать без обязательных AI-ролей."""
+
+
+ProviderFactory = Callable[[str], LLMProvider | None]
+
+
+def _safe_error(exc: BaseException) -> str:
+    text = str(exc)[:1200] or type(exc).__name__
+    try:
+        settings = Settings.load(APP_YAML_PATH)
+        for secret in (settings.yandex_api_key, settings.yandex_folder_id):
+            if secret:
+                text = text.replace(secret, "***")
+    except Exception:
+        pass
+    return text
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _outline_dict(outline) -> dict:
+    return {
+        "title": outline.title,
+        "language": outline.language,
+        "slides": [
+            {"index": index, "kind": slide.kind, "intent": slide.intent, "needs": list(slide.needs)}
+            for index, slide in enumerate(outline.slides)
+        ],
+    }
 
 
 def finding_id(finding: Finding) -> str:
@@ -126,6 +164,7 @@ class VariantState:
     pdf_path: Path | None = None
     html_path: Path | None = None
     autofixed_count: int = 0
+    content_verification: dict = field(default_factory=dict)
 
     def set_findings(self, findings: list[Finding]) -> None:
         self.findings = findings
@@ -143,6 +182,7 @@ class JobRecord:
     error: str | None = None
     profile: TemplateProfile | None = None
     variants: dict[str, VariantState] = field(default_factory=dict)
+    generation_summary: dict | None = None
     _subscribers: list[asyncio.Queue] = field(default_factory=list)
 
     def snapshot(self) -> dict:
@@ -156,7 +196,7 @@ class JobRecord:
         return {
             "job_id": self.job_id, "template_id": self.template_id, "status": self.status,
             "stage": self.stage, "stages": list(self.stages), "deck_id": self.job_id,
-            "error": self.error,
+            "error": self.error, "generation_summary": self.generation_summary,
         }
 
     def subscribe(self) -> asyncio.Queue:
@@ -189,8 +229,15 @@ class JobStore:
     """Реестр задач и шаблонов процесса (в памяти — см. докстроку модуля
     про то, что переживает и что не переживает перезапуск)."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self, root: Path | None = None, *, provider_factory: ProviderFactory | None = None,
+        template_provider_factory: ProviderFactory | None = None,
+        allow_offline_fallback: bool = False,
+    ) -> None:
         self.root = root if root is not None else _artifacts_root()
+        self.provider_factory = provider_factory or _build_role_provider
+        self.template_provider_factory = template_provider_factory or _build_role_provider
+        self.allow_offline_fallback = allow_offline_fallback
         self.templates: dict[str, TemplateRecord] = {}
         self.jobs: dict[str, JobRecord] = {}
 
@@ -210,7 +257,8 @@ class JobStore:
         try:
             profile = await asyncio.to_thread(
                 TemplateProfile.from_file, path,
-                namer=_build_role_provider("palette_namer"), vision=_build_role_provider("pattern_kind"),
+                namer=self.template_provider_factory("palette_namer"),
+                vision=self.template_provider_factory("pattern_kind"),
             )
         except Exception as exc:  # noqa: BLE001 — любая причина разбора превращается в читаемую 400-ошибку
             shutil.rmtree(tdir, ignore_errors=True)
@@ -236,6 +284,18 @@ class JobStore:
         language: str, target_slides: int | None, autofix: bool,
     ) -> JobRecord:
         template = self.get_template(template_id)
+        try:
+            outline_llm = self.provider_factory("outline")
+            writer_llm = self.provider_factory("writer")
+        except Exception as exc:
+            raise ProviderUnavailableError(
+                "Не удалось подключить AI для создания презентации. Проверьте настройки Yandex Cloud."
+            ) from exc
+        if not self.allow_offline_fallback and (outline_llm is None or writer_llm is None):
+            raise ProviderUnavailableError(
+                "AI для создания презентации недоступен. Проверьте YANDEX_API_KEY и "
+                "YANDEX_FOLDER_ID в файле .env и перезапустите сервер."
+            )
         job_id = uuid4().hex
         job_dir = self.root / "decks" / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
@@ -244,6 +304,8 @@ class JobStore:
         asyncio.create_task(_run_job(
             job=job, template=template, brief=brief, sources=sources, title=title,
             language=language, target_slides=target_slides, autofix=autofix,
+            outline_llm=outline_llm, writer_llm=writer_llm,
+            allow_fallback=self.allow_offline_fallback,
         ))
         return job
 
@@ -267,32 +329,55 @@ class JobStore:
 async def _run_job(
     *, job: JobRecord, template: TemplateRecord, brief: str, sources: list[str], title: str | None,
     language: str, target_slides: int | None, autofix: bool,
+    outline_llm: LLMProvider | None, writer_llm: LLMProvider | None, allow_fallback: bool,
 ) -> None:
+    report: dict = {"status": "running", "source_count": len(sources), "variants": {}}
     try:
         job.enter_stage("parse")
         profile = template.profile  # уже разобран при загрузке шаблона (POST /api/templates)
         job.profile = profile
 
         job.enter_stage("outline")
-        outline_llm = _build_role_provider("outline")
         source_docs = [SourceDoc(name=f"source-{i + 1}.md", text=text) for i, text in enumerate(sources)]
         outline = await asyncio.to_thread(
             build_outline, brief, source_docs, profile, outline_llm, target_slides,
-            title=title or "Презентация", language=language,
+            title=title or "Презентация", language=language, allow_fallback=allow_fallback,
         )
+        _write_json(job.dir / "outline.json", _outline_dict(outline))
 
         job.enter_stage("write")
-        writer_llm = _build_role_provider("writer")
         deck = await asyncio.to_thread(
             write_slides, outline, source_docs, profile, writer_llm,
             max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
-            template_path=template.path,
+            template_path=template.path, allow_fallback=allow_fallback,
         )
+        coverage = await asyncio.to_thread(validate_deck_content, deck, sources)
+        _write_json(job.dir / "deck-spec.json", deck_spec_to_dict(deck))
+        report.update({
+            "slide_count": len(deck.slides),
+            "slide_origins": [
+                {"index": slide.index, "origin": slide.generation_origin, "error": slide.generation_error}
+                for slide in deck.slides
+            ],
+            "source_coverage": coverage,
+        })
+        job.generation_summary = {
+            "slide_count": len(deck.slides),
+            "source_fact_count": coverage["source_fact_count"],
+            "used_fact_count": coverage["used_fact_count"],
+            "coverage_ratio": coverage["coverage_ratio"],
+            "fallback_slide_count": sum(1 for slide in deck.slides if slide.generation_origin == "fallback"),
+        }
+        _write_json(job.dir / "generation-report.json", report)
 
         job.enter_stage("compose")
         async with asyncio.TaskGroup() as tg:
             for variant in Variant:
-                tg.create_task(_compose_variant(job, variant, deck, profile, template.path))
+                tg.create_task(_compose_variant(job, variant, deck, profile, template.path, coverage))
+        report["variants"] = {
+            name: state.content_verification for name, state in sorted(job.variants.items())
+        }
+        _write_json(job.dir / "generation-report.json", report)
 
         job.enter_stage("audit")
         config = AuditConfig.load()
@@ -305,20 +390,72 @@ async def _run_job(
             for variant in Variant:
                 tg.create_task(_export_variant(job, variant.value, profile))
 
+        report["status"] = "done"
+        _write_json(job.dir / "generation-report.json", report)
         job.finish()
     except* Exception as eg:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
         # не остаться молчаливым "running" навсегда
-        job.finish(error="; ".join(str(e) for e in eg.exceptions))
+        error = "; ".join(_safe_error(e) for e in eg.exceptions)
+        report.update({"status": "error", "error": error})
+        _write_json(job.dir / "generation-report.json", report)
+        job.finish(error=error)
 
 
-async def _compose_variant(job: JobRecord, variant: Variant, deck: DeckSpec, profile: TemplateProfile, template_path: Path) -> None:
-    variant_deck = await asyncio.to_thread(apply_variant, deck, profile, variant)
-    built_path = await asyncio.to_thread(build_deck, variant_deck, profile, template_path, variant)
+async def _compose_variant(
+    job: JobRecord, variant: Variant, deck: DeckSpec, profile: TemplateProfile,
+    template_path: Path, coverage: dict,
+) -> None:
     dest_dir = job.dir / variant.value
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "deck.pptx"
+    strategies: list[tuple[str, Variant | None]] = [(variant.value, variant)]
+    strategies.extend(
+        (name, candidate) for name, candidate in (
+            ("visual-compatible", Variant.visual),
+            ("dense-compatible", Variant.dense),
+            ("original-compatible", None),
+        )
+        if candidate is None or candidate is not variant
+    )
+    attempted: list[str] = []
+    seen: set[tuple] = set()
+    selected: tuple[DeckSpec, Path, dict, str] | None = None
+    for strategy_name, strategy_variant in strategies:
+        base = copy.deepcopy(deck)
+        variant_deck = (
+            await asyncio.to_thread(apply_variant, base, profile, strategy_variant)
+            if strategy_variant is not None else base
+        )
+        signature = tuple((slide.kind, slide.pattern_id, len(slide.blocks)) for slide in variant_deck.slides)
+        if signature in seen:
+            continue
+        seen.add(signature)
+        built_path = await asyncio.to_thread(
+            build_deck, variant_deck, profile, template_path, variant,
+        )
+        try:
+            verification = await asyncio.to_thread(
+                validate_pptx_content, built_path, variant_deck, coverage,
+            )
+        except ContentValidationError as exc:
+            attempted.append(f"{strategy_name}: {_safe_error(exc)}")
+            continue
+        selected = (variant_deck, built_path, verification, strategy_name)
+        break
+    if selected is None:
+        raise ContentValidationError(
+            f"для варианта {variant.value} не найдена раскладка без потери содержания: "
+            + "; ".join(attempted)
+        )
+    variant_deck, built_path, verification, strategy_name = selected
     await asyncio.to_thread(shutil.copy2, built_path, dest)
-    job.variants[variant.value] = VariantState(variant=variant, deck_spec=variant_deck, pptx_path=dest)
+    verification["layout_strategy"] = strategy_name
+    verification["layout_attempts"] = len(attempted) + 1
+    verification["dropped_content_count"] = 0
+    job.variants[variant.value] = VariantState(
+        variant=variant, deck_spec=variant_deck, pptx_path=dest,
+        content_verification=verification,
+    )
 
 
 async def _audit_variant(job: JobRecord, variant_name: str, profile: TemplateProfile, config: AuditConfig, autofix: bool) -> None:
