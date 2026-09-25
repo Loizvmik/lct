@@ -25,6 +25,8 @@
 """
 from __future__ import annotations
 import json
+import shutil
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -34,6 +36,7 @@ from deckforge.ooxml.color import Color, UnresolvedColor
 from deckforge.ooxml.geometry import Canvas
 from deckforge.ooxml.package import PptxPackage
 from deckforge.provider.base import LLMProvider, VisionProvider
+from deckforge.render.soffice import RenderError, to_pngs
 from deckforge.settings import Settings
 from deckforge.template.assets import AssetCatalog, AssetRef, Placement, build_asset_catalog
 from deckforge.template.chart_palette import build_chart_series
@@ -178,7 +181,18 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # 13 -> 14: у `DecorShape` появились поля значка (`badge_text` и соседние).
 # Старый кеш их не несёт, и нумерованные кружки шаблона снова стали бы
 # пустыми местами под содержание.
-PROFILE_SCHEMA_VERSION = 15
+# 15 -> 16: задача "превью PNG на каждый паттерн шаблона в кэше профиля" —
+# `PatternModel` несёт новое поле `preview_path` (относительный путь к PNG
+# первого исходного слайда паттерна рядом с JSON профиля, см. `_save_
+# pattern_previews`). Формально поле НОВОЕ (не меняет смысл существующих),
+# и pydantic тихо подставил бы дефолт `None` старому кешу без единой
+# ошибки — но именно этот дефолт совпадает с "превью не сохранялось",
+# поэтому кеш, записанный до этой правки, навсегда остался бы без превью,
+# даже когда прогон, способный их сохранить (с ключом модели `vision`),
+# случится позже и просто не будет знать, что кеш-хит нуждается в
+# пересборке ради нового поля. Бамп версии заставляет такой кеш
+# пересобраться заново, а не молча выдавать "превью нет" опытному прогону.
+PROFILE_SCHEMA_VERSION = 16
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -566,9 +580,19 @@ class PatternModel(BaseModel):
     # принцип, что и у `RepeatSpecModel.group_size`/`DecorShapeModel.
     # repeat_group` выше в этом файле).
     kind_confidence: float = 1.0
+    # Задача C ("превью PNG на каждый паттерн шаблона в кэше профиля") —
+    # путь к PNG первого исходного слайда паттерна (`source_slide_index[0]`),
+    # ОТНОСИТЕЛЬНЫЙ от каталога профиля в кеше (`<cache_dir>/<fingerprint>/`,
+    # см. `_save_pattern_previews` и `TemplateProfile.pattern_preview_path`)
+    # — не абсолютный, чтобы кеш, скопированный/перенесённый на другую
+    # машину, не нёс путей чужого диска. `None`, если превью не сохранялось
+    # (нет soffice/poppler на машине разбора, разбор без ключа `vision`
+    # вовсе — см. докстроку `_save_pattern_previews`, честная деградация,
+    # тот же принцип, что и у остальных опциональных источников профиля).
+    preview_path: str | None = None
 
 
-def _pattern_model(pattern: Pattern) -> PatternModel:
+def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> PatternModel:
     return PatternModel(
         pattern_id=pattern.pattern_id, source_slide_index=list(pattern.source_slide_index),
         layout_id=pattern.layout_id, kind=pattern.kind,
@@ -576,7 +600,7 @@ def _pattern_model(pattern: Pattern) -> PatternModel:
         repeat=_repeat_spec_model(pattern.repeat),
         decor=[_decor_shape_model(d) for d in pattern.decor],
         capacity=_capacity_model(pattern.capacity), score=pattern.score, is_dark=pattern.is_dark,
-        kind_confidence=pattern.kind_confidence,
+        kind_confidence=pattern.kind_confidence, preview_path=preview_path,
     )
 
 
@@ -619,6 +643,94 @@ def _default_cache_dir() -> Path | None:
     except Exception:
         return None
     return settings.paths.profile_cache
+
+
+def _default_preview_dpi() -> int:
+    """dpi рендера превью паттернов — та же настройка, что уже откалибрована
+    для уточнения вида раскладки моделью (`config/app.yaml`, `render.
+    pattern_kind_dpi`, см. её докстроку в `settings.py` про живой замер).
+    Отдельная, более высокая настройка только ради превью не заводится
+    (Задача C, брифом прямо: "не выше: разбор и так ~190 с") — превью нужно
+    человеку для доверия к разбору, не для печати."""
+    try:
+        return Settings.load(APP_YAML_PATH).render.pattern_kind_dpi
+    except Exception:
+        return 72  # тот же запасной dpi, что и у vision_kind.DEFAULT_RENDER_DPI
+
+
+def _save_pattern_previews(
+    patterns: list[Pattern], template_path: Path, preview_dir: Path | None,
+) -> dict[str, str]:
+    """Рендерит PNG первого исходного слайда (`Pattern.source_slide_index[0]`)
+    КАЖДОГО паттерна и сохраняет их рядом с JSON профиля в кеше
+    (`<cache_dir>/<fingerprint>/previews/<pattern_id>.png`, см. `from_file`
+    и `TemplateProfile.pattern_preview_path`) — задача C ("превью PNG на
+    каждый паттерн шаблона в кэше профиля"): без них жюри и разработчику
+    нечем увидеть, что реально снято с шаблона, кроме чтения JSON профиля
+    целиком.
+
+    Возвращает `pattern_id -> относительный путь` (`"previews/<id>.png"`,
+    от каталога профиля в кеше, не от `preview_dir` буквально — см.
+    докстроку `PatternModel.preview_path`) только для паттернов, чьё превью
+    реально сохранилось; остальные (страница не нашлась, запись на диск не
+    удалась) в словарь не попадают — вызывающий код читает отсутствие ключа
+    как `preview_path=None`.
+
+    `preview_dir` — `None`, если сохранять превью решительно некуда (кеш
+    профиля выключен вызывающим кодом, `cache_dir=None` явно, или ключ
+    `vision` не передан вовсе — см. докстроку `from_file`, "честная
+    деградация": рендер шаблона не бесплатен, а без модели профиль обязан
+    собираться быстро, как и раньше). НИКОГДА не бросает исключение наружу:
+    нет soffice/poppler на машине, рендер завис/упал — тот же принцип
+    честной деградации, что у `vision_kind.classify_patterns_by_vision`
+    (пустой словарь, разбор профиля продолжается как есть)."""
+    if preview_dir is None or not patterns:
+        return {}
+    needed_pages = sorted({p.source_slide_index[0] for p in patterns if p.source_slide_index})
+    if not needed_pages:
+        return {}
+    dpi = _default_preview_dpi()
+    try:
+        with tempfile.TemporaryDirectory(prefix="deckforge-pattern-previews-") as tmp_dir:
+            try:
+                pngs = to_pngs(template_path, Path(tmp_dir), dpi=dpi, pages=needed_pages)
+            except RenderError:
+                return {}
+            # `to_pngs(..., pages=needed_pages)` возвращает по одному PNG на
+            # страницу из `needed_pages`, по возрастанию номера страницы (её
+            # докстрока) — `needed_pages` уже отсортирован и не содержит
+            # дублей, значит позиционное сопоставление верно без
+            # реимплементации разбора номера страницы из имени файла (тот
+            # же независимый-копии принцип модульной границы избегается
+            # здесь просто за ненадобностью третьей копии `_page_number`,
+            # см. её уже две копии в `render/soffice.py` и `vision_kind.py`).
+            if len(pngs) != len(needed_pages):
+                return {}
+            png_by_page = dict(zip(needed_pages, pngs))
+
+            try:
+                preview_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return {}
+
+            mapping: dict[str, str] = {}
+            for pattern in patterns:
+                if not pattern.source_slide_index:
+                    continue
+                src = png_by_page.get(pattern.source_slide_index[0])
+                if src is None:
+                    continue
+                dest = preview_dir / f"{pattern.pattern_id}.png"
+                try:
+                    shutil.copy2(src, dest)
+                except OSError:
+                    continue
+                mapping[pattern.pattern_id] = f"previews/{pattern.pattern_id}.png"
+            return mapping
+    except OSError:
+        # Временный каталог не создался (диск полон/нет прав) — превью не
+        # критичны для профиля, тот же принцип, что и у `LocalProfileStore`.
+        return {}
 
 
 class TemplateProfile(BaseModel):
@@ -817,7 +929,7 @@ class TemplateProfile(BaseModel):
                     # годится для запроса, у которого модель есть, — иначе
                     # половина шаблона остаётся в корзине по умолчанию
                     # навсегда (см. докстроку `pattern_kinds_source`).
-                    cached = cls._reclassify_pattern_kinds(cached, path, vision)
+                    cached = cls._reclassify_pattern_kinds(cached, path, vision, effective_cache_dir)
                     refreshed = True
                 if refreshed and cache_file is not None:
                     # Запись одна на оба дозапроса — иначе профиль, которому
@@ -913,11 +1025,40 @@ class TemplateProfile(BaseModel):
         # ловят сеть/парсинг и возвращают запасной вариант/геометрический
         # `kind` с заметкой об отказе) — сбой ОДНОГО потока не может
         # уронить `ThreadPoolExecutor` и не задерживает `.result()` второго.
-        with ThreadPoolExecutor(max_workers=2) as pool:
+        #
+        # Задача C ("превью PNG на каждый паттерн шаблона в кэше профиля") —
+        # третий поток того же пула, а не отдельный шаг ПОСЛЕ него: рендер
+        # превью (`_save_pattern_previews`) — свой собственный `soffice`/
+        # `pdftoppm` (докстрока `render/soffice.py`: ~40с на конвертацию в
+        # PDF плюс растрирование нужных страниц), и, добавленный ПОСЛЕ
+        # `namer`/`vision`, он бы прибавился к их и без того большому
+        # времени (see vision_kind.py, "разбор незнакомого шаблона в
+        # бюджет": уже 130-165с на контрольном шаблоне). Параллельно с ними
+        # он почти бесплатен — прячется под большим из двух остальных шагов,
+        # тот же приём, что уже применён здесь для `namer`/`vision`.
+        # Единственный явный компромисс (см. докстроку `_save_pattern_
+        # previews`): превью рендерятся, только если передан `vision`, —
+        # без ключа модели `from_file` обязан собираться быстро, как и
+        # раньше (`test_parsing_is_fast_enough`), а без `vision` (offline,
+        # тесты) рендер шаблона и так не нужен ничему другому в этой
+        # функции — заводить его ТОЛЬКО ради превью значило бы платить
+        # десятки секунд там, где сейчас не платится ничего. `patterns` для
+        # рендера — список ДО уточнения вида моделью (тот же объект, что
+        # уйдёт в `vision_future`): `source_slide_index`/`pattern_id`
+        # уточнение вида не трогает (`vision_kind.classify_patterns_by_
+        # vision` меняет только `kind`, `dataclasses.replace`), поэтому
+        # словарь превью остаётся верным для итогового списка.
+        preview_dir = (
+            effective_cache_dir / fingerprint / "previews"
+            if effective_cache_dir is not None and vision is not None else None
+        )
+        with ThreadPoolExecutor(max_workers=3) as pool:
             vision_future = pool.submit(classify_patterns_by_vision, patterns, path, vision)
             palette_future = pool.submit(name_palette_roles_report, usage, theme, namer)
+            preview_future = pool.submit(_save_pattern_previews, patterns, path, preview_dir)
             patterns, vision_notes = vision_future.result()
             palette_report = palette_future.result()
+            preview_paths = preview_future.result()
 
         chart_series = build_chart_series(usage, dict(palette_report.roles))
 
@@ -950,7 +1091,7 @@ class TemplateProfile(BaseModel):
             type_scale=_type_scale_model(type_scale), grid=_grid_model(grid),
             layouts=[_layout_entry_model(entry) for entry in layouts],
             assets=_asset_catalog_model(assets),
-            patterns=[_pattern_model(p) for p in patterns],
+            patterns=[_pattern_model(p, preview_paths.get(p.pattern_id)) for p in patterns],
             # "model" значит «модель спрашивали», а не «модель ответила» —
             # см. комментарий у самого поля. Ответила она или отказала, видно
             # по `provenance`/`warnings` (заметки `classify_patterns_by_vision`).
@@ -1027,11 +1168,20 @@ class TemplateProfile(BaseModel):
     @classmethod
     def _reclassify_pattern_kinds(
         cls, cached: "TemplateProfile", path: Path, vision: VisionProvider,
+        cache_dir: Path | None = None,
     ) -> "TemplateProfile":
         """Дозапрашивает вид раскладки у модели поверх кеш-хита, собранного
         без `vision` (виды — только геометрия `patterns._classify_kind`) —
         зеркало `_reassign_palette_roles` для второй «модельной» части
         профиля.
+
+        `cache_dir` (задача C, "превью PNG на каждый паттерн шаблона в кэше
+        профиля") — тот же `effective_cache_dir`, что уже посчитан в
+        `from_file` до вызова этого метода: раз `vision` только что
+        появился, у профиля впервые есть чем сделать превью (см. `_save_
+        pattern_previews`), и честнее сделать это сразу, тем же рендером,
+        что уже неизбежен для уточнения видов, а не оставлять `preview_
+        path=None` до следующего полного разбора с нуля.
 
         Почему паттерны перемайниваются, а не берутся из кеша: `classify_
         patterns_by_vision` работает с дата-классами `patterns.Pattern`, а в
@@ -1071,6 +1221,18 @@ class TemplateProfile(BaseModel):
 
         patterns, vision_notes = classify_patterns_by_vision(patterns, path, vision)
 
+        # Превью — тот же рендер, что и уточнение видов выше (не
+        # параллельно: этот метод — один дозапрос на кеш-хите, не полный
+        # разбор `from_file`, лишний `ThreadPoolExecutor` ради одного
+        # шага не по чем). Если что-то из старого кеша уже несло превью
+        # (например, паттерн с уверенной геометрией, чей вид не менялся
+        # этим дозапросом), а свежий рендер этого конкретного паттерна не
+        # удался — старое превью не теряется, честный приоритет "свежее
+        # лучше старого, старое лучше отсутствия".
+        preview_dir = cache_dir / cached.fingerprint / "previews" if cache_dir is not None else None
+        fresh_previews = _save_pattern_previews(patterns, path, preview_dir)
+        old_previews = {p.pattern_id: p.preview_path for p in cached.patterns}
+
         provenance = [
             line for line in cached.provenance
             if not line.startswith(_VISION_PROVENANCE_PREFIXES)
@@ -1081,7 +1243,10 @@ class TemplateProfile(BaseModel):
         provenance.append(vision_notes[0] if vision_notes else _NO_VISION_PROVENANCE_LINE)
 
         return cached.model_copy(update={
-            "patterns": [_pattern_model(p) for p in patterns],
+            "patterns": [
+                _pattern_model(p, fresh_previews.get(p.pattern_id) or old_previews.get(p.pattern_id))
+                for p in patterns
+            ],
             "pattern_kinds_source": "model",
             "provenance": provenance,
             "warnings": list(cached.warnings) + list(vision_notes[1:]),
@@ -1135,6 +1300,26 @@ class TemplateProfile(BaseModel):
         if raw is None:
             return None
         return self.denorm_pt(raw)
+
+    def pattern_preview_path(
+        self, pattern: PatternModel, *, cache_dir: Path | None = _CACHE_DIR_UNSET,  # type: ignore[assignment]
+    ) -> Path | None:
+        """Абсолютный путь к PNG-превью паттерна на диске, либо `None`, если
+        превью не сохранялось (`pattern.preview_path is None`) или каталог
+        кеша недоступен. `PatternModel.preview_path` сам по себе —
+        ОТНОСИТЕЛЬНЫЙ путь (от `<cache_dir>/<fingerprint>/`, см. `_save_
+        pattern_previews`), поэтому открыть файл, зная только его, нельзя
+        без того же `cache_dir`, каким собирался профиль — этот метод
+        разрешает разницу тем же приёмом, что `from_file` разрешает
+        `cache_dir` не переданный (`_CACHE_DIR_UNSET` -> `_default_cache_
+        dir()`) от переданного явно, включая `None` (кеш выключен -> превью
+        негде искать)."""
+        if pattern.preview_path is None:
+            return None
+        effective_cache_dir = cache_dir if cache_dir is not _CACHE_DIR_UNSET else _default_cache_dir()
+        if effective_cache_dir is None:
+            return None
+        return Path(effective_cache_dir) / self.fingerprint / pattern.preview_path
 
 
 # ---------------------------------------------------------------------------
