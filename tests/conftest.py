@@ -29,29 +29,11 @@ cwd — без изоляции тесты, вызывающие `TemplateProfil
 from __future__ import annotations
 import pytest
 
+from _profile_cache_isolation import write_isolated_app_yaml
+
 
 @pytest.fixture(autouse=True)
 def _isolate_default_profile_cache(tmp_path, monkeypatch):
-    cache_dir = tmp_path / "profile_cache"
-    fake_config = tmp_path / "app.yaml"
-    fake_config.write_text(
-        f"""
-llm:
-  provider: yandex
-  model: qwen3.6-35b-a3b
-  roles:
-    outline: qwen3.6-35b-a3b
-    writer: qwen3.6-35b-a3b
-    pattern_picker: qwen3.6-35b-a3b
-    palette_namer: qwen3.6-35b-a3b
-    content_audit: qwen3.6-35b-a3b
-paths:
-  workspace: workspace
-  artifacts: artifacts
-  profile_cache: {cache_dir}
-render:
-  soffice_path: null
-""",
-        encoding="utf-8",
+    monkeypatch.setattr(
+        "deckforge.template.profile.APP_YAML_PATH", write_isolated_app_yaml(tmp_path),
     )
-    monkeypatch.setattr("deckforge.template.profile.APP_YAML_PATH", fake_config)

@@ -23,6 +23,8 @@ from deckforge.api.app import create_app
 from deckforge.api.jobs import JobStore
 from deckforge.plan.outline import load_content_pack
 
+from _profile_cache_isolation import write_isolated_app_yaml
+
 # ЛЦТ2026 (не VK Tech) — разведано вручную: без ключа модели (запасной
 # текст) сборка на этом шаблоне реально оставляет автопочинимые находки
 # (L03/T03) на нескольких вариантах, VK Tech в этом же сценарии выходит
@@ -30,6 +32,18 @@ from deckforge.plan.outline import load_content_pack
 # было бы чинить.
 TEMPLATE_PATH = Path("dataset/templates/ЛЦТ2026 Шаблон презентации.pptx")
 CONTENT_PACK = Path("fixtures/content-packs/queue-latency")
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _isolate_profile_cache_for_module(tmp_path_factory: pytest.TempPathFactory):
+    """Генерация ниже идёт в фикстурах уровня модуля, то есть РАНЬШЕ
+    функциональной изоляции кеша из `tests/conftest.py` — без этой
+    фикстуры разбор шаблона без ключа модели ложился в общий
+    `cache/profiles/` (см. докстроку `tests/_profile_cache_isolation.py`)."""
+    root = tmp_path_factory.mktemp("deckforge-api-cache")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("deckforge.template.profile.APP_YAML_PATH", write_isolated_app_yaml(root))
+        yield
 
 
 @pytest.fixture(scope="module")
