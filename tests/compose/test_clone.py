@@ -19,7 +19,7 @@ from pptx import Presentation
 from deckforge.audit.config import AuditConfig
 from deckforge.compose import builder
 from deckforge.compose.blocks import Paragraph
-from deckforge.compose.clone import bind_text, clone_example_slide, sample_slides_by_number, shape_text
+from deckforge.compose.clone import bind_text, clone_example_slide, match_slots, sample_slides_by_number, shape_text, slide_refs
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.walk import walk_shapes
@@ -255,4 +255,30 @@ def test_bind_text_into_an_empty_placeholder_leaves_the_size_to_the_layout(deck)
 
     run_pr = element.find(".//" + qn("a:r")).find(qn("a:rPr"))
     assert run_pr is None or run_pr.get("sz") is None
+
+
+def test_cloned_headline_frame_is_narrowed_to_the_graphics_on_its_right(profile, deck):
+    """Обложка VK Education (пример №1): плейсхолдер заголовка во всю
+    ширину, справа половина слайда под графикой. Длинный заголовок заезжал
+    на неё (прогон 26 сентября 2026); рамка сужается до графики."""
+    prs, sources = deck
+    pattern = _pattern(profile, "slide1")
+    canvas = _canvas(profile)
+    slide = clone_example_slide(prs, sources[1], builder._find_layout(prs, pattern.layout_id))
+    matched = match_slots(slide, pattern.slots, canvas)
+    headline_index = next(i for i, s in enumerate(pattern.slots) if s.role == "headline")
+    ref = matched[headline_index]
+    assert ref is not None
+    graphics = [
+        r for r in builder._frame_obstacles(slide, ref, [ref.element], canvas)
+        if r.box.intersect(ref.box) is not None and not builder._contains(r.box, ref.box)
+    ]
+    graphics_left = min(r.box.left for r in graphics if r.box.left > ref.box.left + 0.3 * ref.box.width)
+    assert ref.box.right > graphics_left, "у примера рамка заголовка заходит под графику: тест не о чем"
+
+    shrunk = builder._shrink_frame_away_from_decor(slide, ref, [ref.element], canvas)
+
+    assert shrunk.box.right <= graphics_left
+    xfrm = shrunk.element.find(qn("p:spPr")).find(qn("a:xfrm"))
+    assert int(xfrm.find(qn("a:ext")).get("cx")) == int(round(shrunk.box.width * canvas.width_emu))
 

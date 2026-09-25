@@ -532,6 +532,29 @@ def set_text_size(shape_element, size_pt: float) -> None:
 # ---------------------------------------------------------------------------
 
 
+def set_shape_box(element, box: Box, canvas: Canvas) -> None:
+    """Пишет фигуре её собственный `a:xfrm` по коробке в долях холста.
+    Плейсхолдер без `a:xfrm` (наследовал коробку от лейаута) получает
+    явный: иначе сузить его нельзя."""
+    sp_pr = element.find(qn("p:spPr"))
+    if sp_pr is None:
+        sp_pr = etree.SubElement(element, qn("p:spPr"))
+    xfrm = sp_pr.find(qn("a:xfrm"))
+    if xfrm is None:
+        xfrm = etree.Element(qn("a:xfrm"))
+        sp_pr.insert(0, xfrm)
+    off = xfrm.find(qn("a:off"))
+    if off is None:
+        off = etree.SubElement(xfrm, qn("a:off"))
+    ext = xfrm.find(qn("a:ext"))
+    if ext is None:
+        ext = etree.SubElement(xfrm, qn("a:ext"))
+    off.set("x", str(int(round(box.left * canvas.width_emu))))
+    off.set("y", str(int(round(box.top * canvas.height_emu))))
+    ext.set("cx", str(int(round(box.width * canvas.width_emu))))
+    ext.set("cy", str(int(round(box.height * canvas.height_emu))))
+
+
 def remove_shape(element) -> None:
     """Удаляет фигуру; опустевшая группа уходит вслед за ней, иначе в файле
     остаётся невидимая пустая рамка группы, которую ловит аудит."""

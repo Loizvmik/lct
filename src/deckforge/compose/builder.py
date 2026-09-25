@@ -38,13 +38,14 @@ from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
     allow_wrap, bind_text, clone_example_slide, fix_duplicate_partnames, inherited_text_size, mark_slide, match_slots,
     prune_unfilled, remove_in_box, remove_sample_frames, remove_stray_text, replace_picture,
-    sample_slides_by_number, set_text_size, slide_refs, text_style,
+    sample_slides_by_number, set_shape_box, set_text_size, shape_text, slide_refs, text_style,
 )
 from deckforge.compose.decor import apply_decor
 from deckforge.compose.tables import TableSpec, add_table
 from deckforge.compose.textfit import measure, register_template_fonts
 from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.customprops import write_custom_property
+from deckforge.ooxml.walk import walk_shapes
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
@@ -1365,7 +1366,9 @@ def place_slide_by_clone(
         bound.append((content, ref))
 
     family = _primary_family(profile)
+    bound_elements = [ref.element for _, ref in bound]
     for content, ref in bound:
+        ref = _shrink_frame_away_from_decor(slide, ref, bound_elements, canvas)
         bind_text(ref.element, content.paragraphs, bullet_char=bullet_char)
         _fit_cloned_text(slide, slide_spec, content, ref, profile, family, canvas)
         _fix_cloned_contrast(slide, ref, profile, canvas, audit_config)
@@ -1463,6 +1466,61 @@ def _ordinal_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
         if s.sample_text and _ORDINAL_RE.fullmatch(s.sample_text.strip())
         and round(along(s.box), 3) in units and units.index(round(along(s.box), 3)) in filled
     ]
+
+
+# Зазор между суженной рамкой текста и графикой справа, доли холста.
+_FRAME_GAP = 0.02
+# Суженная рамка не уже стольких долей холста и половины исходной: иначе
+# текст в столбик хуже наложения, и слайд честно уйдёт на сборку с нуля.
+_FRAME_MIN_WIDTH = 0.3
+
+
+def _frame_obstacles(slide, ref, bound_elements: list, canvas: Canvas) -> list:
+    """Графика, с которой рамке текста нельзя пересекаться: картинки и
+    фигуры без текста самого слайда и его лейаута. Лейаут обязателен:
+    графика обложки VK Education лежит именно там, на слайде только два
+    плейсхолдера."""
+    own = [
+        r for r in slide_refs(slide, canvas)
+        if r.box is not None and r.element is not ref.element and r.element not in bound_elements
+    ]
+    layout = [
+        r for r in walk_shapes(slide.slide_layout._element, canvas)  # noqa: SLF001
+        if r.box is not None and not r.is_placeholder
+    ]
+    return [
+        r for r in own + layout
+        if r.kind == "picture" or (r.kind == "shape" and not shape_text(r.element).strip())
+    ]
+
+
+def _shrink_frame_away_from_decor(slide, ref, bound_elements: list, canvas: Canvas):
+    """ADAPT: рамка примера часто шире своего текста. Обложка VK Education:
+    плейсхолдер заголовка во всю ширину, справа половину слайда занимает
+    графика, и заголовок длиннее образца заезжал на неё (прогон 26 сентября
+    2026). Если справа от текста стоит графика (картинка или фигура без
+    текста), которая частично перекрывает рамку, рамка сужается до неё, а
+    кегль дальше подберёт `_fit_cloned_text` тем же замером. Фигура,
+    целиком содержащая рамку (плашка-фон), помехой не считается."""
+    box = ref.box
+    if box is None:
+        return ref
+    new_right = box.right
+    for other in _frame_obstacles(slide, ref, bound_elements, canvas):
+        if _contains(other.box, box) or _contains(box, other.box):
+            continue
+        if _overlap_ratio(box, other.box) <= _OVERLAP_MIN_AREA_SHARE:
+            continue
+        if other.box.left > box.left + box.width * 0.3:
+            new_right = min(new_right, other.box.left - _FRAME_GAP)
+    if new_right >= box.right - 0.001:
+        return ref
+    width = new_right - box.left
+    if width < max(_FRAME_MIN_WIDTH, box.width * 0.5):
+        return ref
+    shrunk = replace(box, width=width)
+    set_shape_box(ref.element, shrunk, canvas)
+    return replace(ref, box=shrunk)
 
 
 def _fit_cloned_text(
