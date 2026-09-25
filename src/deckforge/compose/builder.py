@@ -1957,9 +1957,17 @@ def _joined_text(paragraphs: list[Paragraph]) -> str:
 
 def _split_back(text: str, original: list[Paragraph]) -> list[Paragraph]:
     bullet_flags = [p.bullet for p in original]
+    bold_flags = [p.bold for p in original]
     last_flag = bullet_flags[-1] if bullet_flags else False
     lines = text.split("\n")
-    return [Paragraph(line, bullet=(bullet_flags[i] if i < len(bullet_flags) else last_flag)) for i, line in enumerate(lines)]
+    return [
+        Paragraph(
+            line,
+            bullet=(bullet_flags[i] if i < len(bullet_flags) else last_flag),
+            bold=(bold_flags[i] if i < len(bold_flags) else False),
+        )
+        for i, line in enumerate(lines)
+    ]
 
 
 # Порог "усечение ещё косметическое, а не разрушительное" — доля исходной
@@ -2162,7 +2170,7 @@ def _draw_slot(
         run.text = para.text
         run.font.size = Pt(chosen_size)
         run.font.name = family
-        run.font.bold = bold
+        run.font.bold = bold or para.bold
         run.font.color.rgb = RGBColor.from_string(color_hex.lstrip("#"))
         if para.bullet:
             _apply_bullet(p, bullet_char, family)

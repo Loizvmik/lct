@@ -218,3 +218,21 @@ def _color(r_pr) -> str:
 
 def _xml(el) -> bytes:
     return etree.tostring(el) if el is not None else b""
+
+
+def test_bind_text_marks_a_bold_paragraph_and_keeps_the_rest_regular(deck):
+    """Заголовок карточки, склеенный с телом (`blocks._assign_cards`),
+    приходит абзацем с `bold=True`: у его run появляется `b="1"`, у
+    остальных начертание примера не меняется."""
+    _prs, sources = deck
+    element = next(
+        sp for slide in sources.values() for sp in slide._element.iter(qn("p:sp"))
+        if sp.find(".//" + qn("a:r")) is not None
+    )
+    bind_text(element, [Paragraph("Бюджет", bold=True), Paragraph("2,4 млн ₽")])
+
+    runs = element.findall(".//" + qn("a:r"))
+    assert [r.find(qn("a:t")).text for r in runs] == ["Бюджет", "2,4 млн ₽"]
+    assert runs[0].find(qn("a:rPr")).get("b") == "1"
+    assert runs[1].find(qn("a:rPr")) is None or runs[1].find(qn("a:rPr")).get("b") != "1"
+

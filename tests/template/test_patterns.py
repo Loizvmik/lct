@@ -789,3 +789,16 @@ def test_explicit_bullet_slots_are_still_counted_one_by_one():
     capacity = _capacity([], slots, None, _empty_grid(), _CANVAS)
 
     assert capacity.max_bullets == 3
+
+
+def test_an_asset_sheet_slide_is_not_mined_as_a_pattern(profile_fixture):
+    """Слайд «Иконки» VK Education несёт 208 значков и одну подпись: как
+    раскладка `bullets` он проходил все проверки, и клон приносил на слайд
+    все 208 значков (прогон 26 сентября 2026, слайд 3). Лист ассетов не
+    раскладка: ни один паттерн не держит больше `_MAX_DECOR_SHAPES` декора."""
+    from deckforge.template.patterns import _MAX_DECOR_SHAPES
+
+    for name in ALL_TEMPLATES:
+        for pattern in profile_fixture(name).patterns:
+            assert len(pattern.decor) <= _MAX_DECOR_SHAPES, (name, pattern.pattern_id, len(pattern.decor))
+

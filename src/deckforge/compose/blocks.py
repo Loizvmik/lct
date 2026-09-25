@@ -29,6 +29,9 @@ _DEFAULT_BULLET_CHAR = "•"
 class Paragraph:
     text: str
     bullet: bool = False
+    # Жирный абзац: заголовок карточки, склеенный с её телом, когда у
+    # единицы повтора нет своего слота под заголовок (см. `_assign_cards`).
+    bold: bool = False
 
 
 @dataclass
@@ -332,15 +335,24 @@ def _assign_cards(
     lost_bodies: list[str] = []
     for card, group in zip(block.items, groups):
         body_slot = _pick_body_slot(group)
-        title_placed = False
+        has_title_slot = any(slot.role == "card_title" for slot in group)
         for slot in group:
             if slot.role == "card_title":
                 if card.title:
                     result.append(SlotContent(slot, "card_title", [Paragraph(card.title)]))
-                title_placed = True
             elif slot is body_slot:
-                result.append(SlotContent(slot, "card_body", [Paragraph(card.body)]))
-        if card.title and not title_placed:
+                paragraphs = [Paragraph(card.body)]
+                if card.title and not has_title_slot:
+                    # У единицы повтора нет слота под заголовок (VK Education
+                    # `slide21`: кружок с номером + описание). Раньше заголовок
+                    # молча выбрасывался, и на слайде оставались безымянные
+                    # абзацы (прогон 26 сентября 2026: «Бюджет», «Сроки»,
+                    # «Риски» пропали с пяти слайдов из двенадцати). Заголовок
+                    # становится первым, жирным абзацем тела: смысл на месте,
+                    # а влезет ли — решает тот же замер, что и для тела.
+                    paragraphs = [Paragraph(card.title, bold=True), Paragraph(card.body)]
+                result.append(SlotContent(slot, "card_body", paragraphs))
+        if card.title and not has_title_slot and body_slot is None:
             lost_titles.append(card.title)
         if body_slot is None:
             lost_bodies.append(card.body)

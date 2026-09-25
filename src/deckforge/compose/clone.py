@@ -327,6 +327,14 @@ def bind_text(shape_element, paragraphs, *, bullet_char: str | None = None) -> N
                     br.append(copy.deepcopy(r_pr))
                 _insert_before(p, br, end)
             run = copy.deepcopy(proto_r)
+            if getattr(para, "bold", False):
+                # Заголовок карточки, склеенный с телом (`blocks._assign_cards`):
+                # начертание примера остаётся, добавляется только жирность.
+                run_pr = run.find(qn("a:rPr"))
+                if run_pr is None:
+                    run_pr = etree.Element(qn("a:rPr"))
+                    run.insert(0, run_pr)
+                run_pr.set("b", "1")
             t = run.find(qn("a:t"))
             if t is None:
                 t = etree.SubElement(run, qn("a:t"))

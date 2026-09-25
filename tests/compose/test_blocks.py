@@ -331,9 +331,12 @@ def test_bullets_without_a_slot_leave_a_drop_naming_the_text():
     assert "Ожидание первого согласующего" in drops[0].text
 
 
-def test_card_titles_without_a_slot_leave_a_drop_while_bodies_are_placed():
-    """У раскладки есть слот под текст карточки, но нет под её заголовок:
-    тексты ложатся как раньше, а заголовки — названы потерянными."""
+def test_card_titles_without_a_slot_become_a_bold_first_paragraph_of_the_body():
+    """У раскладки есть слот под текст карточки, но нет под её заголовок
+    (VK Education `slide21`: кружок с номером + описание). Раньше заголовок
+    молча выбрасывался (прогон 26 сентября 2026: «Бюджет», «Сроки», «Риски»
+    пропали с пяти слайдов из двенадцати). Теперь он становится первым,
+    жирным абзацем тела, и потерь нет."""
     slide = SlideSpec(
         index=0, kind="cards", headline="Что меняем",
         blocks=[CardBlock(items=[
@@ -343,9 +346,11 @@ def test_card_titles_without_a_slot_leave_a_drop_while_bodies_are_placed():
     )
     result, drops = assign_content_with_drops(slide, _three_card_pattern(), _grid())
 
-    assert len([c for c in result if c.role_hint == "card_body"]) == 2
-    assert [d.role for d in drops] == ["card_title"]
-    assert "Доведение" in drops[0].text and "Стоимость" in drops[0].text
+    bodies = [c for c in result if c.role_hint == "card_body"]
+    assert len(bodies) == 2
+    assert [p.text for p in bodies[0].paragraphs] == ["Доведение", "57% вместо 41%"]
+    assert [p.bold for p in bodies[0].paragraphs] == [True, False]
+    assert drops == []
 
 
 def test_cards_on_a_layout_without_a_repeat_leave_a_drop():
