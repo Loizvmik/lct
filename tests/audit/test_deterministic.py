@@ -755,7 +755,13 @@ def test_I06_flags_duplicate_slides():
     dup.index = 1
     spec = DeckSpec(title="Дубликат", language="ru", slides=[slide, dup])
     path = build_deck(spec, PROFILE, TEMPLATE, Variant.dense)
-    assert "I06" in _ids(run_deterministic(path, PROFILE, CONFIG))
+    findings = run_deterministic(path, PROFILE, CONFIG)
+    assert "I06" in _ids(findings)
+    # Автопочинки для I06 нет (удаление слайда по совпадению текста
+    # опасно — ложное срабатывание убьёт настоящий слайд), находка должна
+    # честно говорить об этом, не обещать fixable=True без фиксера.
+    i06 = next(f for f in findings if f.check_id == "I06")
+    assert i06.fixable is False
 
 
 def test_I06_is_silent_on_two_genuinely_different_slides():
