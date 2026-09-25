@@ -229,6 +229,9 @@ def _assign_block(
         return [SlotContent(slot, "body", [Paragraph(block.text)])]
 
     if isinstance(block, BulletBlock):
+        spread = _spread_bullets_over_repeat(block, by_role, pattern, grid)
+        if spread is not None:
+            return spread
         slot = _take_one(by_role, "bullet") or _take_one(by_role, "body") or _take_one(by_role, "card_body")
         if slot is None:
             _drop(drops, "bullets", *block.items)
@@ -265,6 +268,52 @@ def _assign_quote(
 
 
 _CARD_BODY_ROLES = ("card_body", "bullet", "body")
+
+
+def _spread_bullets_over_repeat(
+    block: BulletBlock, by_role: dict[str, list[PatternSlot]], pattern: Pattern, grid: Grid,
+) -> list[SlotContent] | None:
+    """Раскладывает пункты списка ПО ЕДИНИЦАМ ПОВТОРА раскладки — по пункту
+    в каждую, — если раскладка построена на повторе. `None` означает «эта
+    раскладка не про повтор», и список кладётся в один блок, как раньше.
+
+    Зачем. Декор шаблона прибит к структуре: три иконки существуют потому,
+    что под ними три подписи. Пока список падал в ОДИН текстовый блок,
+    украшенная раскладка либо оставалась пустой (единицы повтора не
+    заполнены — декор не рисуется), либо давала осиротевшие иконки без
+    подписей. Живой рендер 25 сентября 2026 на VK Education: одиннадцать
+    слайдов из двенадцати вышли белыми листами, при том что фирменная
+    графика в шаблоне есть.
+
+    Условия намеренно узкие:
+
+    - пунктов не меньше двух (один пункт по сетке раскладывать нечего);
+    - у раскладки есть повтор и он развернулся ровно под столько единиц,
+      сколько пунктов — частичная раскладка оставила бы часть сетки пустой,
+      а это ровно тот мусор, от которого уходим;
+    - в каждой единице нашлось место под текст.
+
+    Слоты, ушедшие под пункты, удаляются из `by_role`: иначе тот же слот
+    достался бы ещё и другому блоку слайда."""
+    items = [i for i in block.items if i.strip()]
+    if len(items) < 2 or pattern.repeat is None:
+        return None
+    groups = expand_repeat(pattern, len(items), grid)
+    if len(groups) != len(items):
+        return None
+
+    result: list[SlotContent] = []
+    used: set[int] = set()
+    for item, group in zip(items, groups):
+        body_slot = _pick_body_slot(group)
+        if body_slot is None:
+            return None  # единица повтора без места под текст — приём не годится
+        result.append(SlotContent(body_slot, "card_body", [Paragraph(item)]))
+        used.add(id(body_slot))
+
+    for slots in by_role.values():
+        slots[:] = [s for s in slots if id(s) not in used]
+    return result
 
 
 def _assign_cards(
@@ -645,25 +694,15 @@ def _decor_of_filled_units(
         return list(pattern.decor)
     unit_count = len({d.repeat_index for d in grouped})
     if unit_count != len(_repeat_unit_coords(pattern)):
-        return list(pattern.decor) if filled else [d for d in pattern.decor if not _is_empty_plaque(d)]
-    return [
-        d for d in pattern.decor
-        if not d.repeat_group or d.repeat_index in filled or not _is_empty_plaque(d)
-    ]
-
-
-def _is_empty_plaque(decor: DecorShape) -> bool:
-    """Читается ли этот декор как «здесь должна была быть карточка».
-
-    Убирать незаполненные единицы повтора нужно только ради ЗАЛИТЫХ
-    ПЛАШЕК — пустой белый прямоугольник в пол-слайда выглядит браком (см.
-    комментарий в `_decor_of_filled_units`). Картинка и линия — рисунок сам
-    по себе: иконка без подписи по-прежнему выглядит частью оформления, а
-    её удаление стоит дорого. Живой разбор 25 сентября 2026 на VK
-    Education: правило про плашки убирало вместе с ними четыре фирменные
-    иконки раскладки `slide26`, и собранный слайд выходил белым листом там,
-    где в шаблоне цветная композиция."""
-    return decor.kind == "shape" and decor.has_fill
+        return list(pattern.decor) if filled else ungrouped
+    # Пробовал 25 сентября 2026 оставлять КАРТИНКИ незаполненных единиц
+    # повтора — рассуждая, что иконка без подписи всё равно выглядит
+    # оформлением. Живой рендер показал обратное: семь синих квадратов
+    # вразброс, текст под двумя из них. Осиротевшая иконка читается не как
+    # украшение, а как потерянная карточка, ровно так же, как пустая
+    # плашка. Правило прежнее: единица повтора рисуется целиком или не
+    # рисуется вовсе.
+    return [d for d in pattern.decor if not d.repeat_group or d.repeat_index in filled]
 
 
 # ---------------------------------------------------------------------------
