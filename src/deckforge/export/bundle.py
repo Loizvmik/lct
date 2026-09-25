@@ -54,8 +54,12 @@ def export_bundle(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # PDF рендерится ровно один раз: soffice конвертирует pptx->pdf для
+    # итогового `.pdf` бандла, а `to_pngs` получает готовый файл через
+    # `pdf_path=`, а не гоняет ту же конвертацию заново (замер: 302.8с на
+    # двойной рендер против лимита ТЗ в 300с на всю генерацию колоды).
     pdf_path = to_pdf(pptx_path, out_dir)
-    pngs = to_pngs(pptx_path, out_dir / "preview", dpi=preview_dpi)
+    pngs = to_pngs(pptx_path, out_dir / "preview", dpi=preview_dpi, pdf_path=pdf_path)
 
     spec = deck_spec if deck_spec is not None else DeckSpec(title=pptx_path.stem, language="ru", slides=[])
     html_result = to_html_report(spec, profile, pptx_path, out_dir / f"{pptx_path.stem}.html")

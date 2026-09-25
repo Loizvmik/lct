@@ -52,3 +52,23 @@ def test_parallel_conversions_do_not_fight_over_the_profile(PPTX, tmp_path):
     with ThreadPoolExecutor(4) as pool:
         results = list(pool.map(lambda i: to_pdf(PPTX, tmp_path / str(i)), range(4)))
     assert all(p.exists() for p in results)
+
+
+def test_to_pngs_with_given_pdf_path_does_not_render_pdf_again(PPTX, tmp_path, monkeypatch):
+    """Заранее отрендеренный PDF (`pdf_path=`) не должен гонять soffice
+    ещё раз — именно этот дубликат и убирает эта правка (export_bundle
+    иначе конвертирует один pptx дважды, см. докстроку `to_pngs`)."""
+    import deckforge.render.soffice as soffice_mod
+
+    pdf_path = to_pdf(PPTX, tmp_path)
+    calls = []
+    orig_run_soffice = soffice_mod._run_soffice
+    monkeypatch.setattr(
+        soffice_mod, "_run_soffice",
+        lambda *a, **kw: calls.append(a) or orig_run_soffice(*a, **kw),
+    )
+
+    pngs = to_pngs(PPTX, tmp_path / "preview", pdf_path=pdf_path)
+
+    assert len(pngs) == len(_actual_slide_count(PPTX))
+    assert calls == []
