@@ -12,8 +12,10 @@ from pathlib import Path
 
 from deckforge.audit.config import AuditConfig
 from deckforge.compose.builder import build_deck
-from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, QuoteBlock, SlideSpec, TextBlock
-from deckforge.plan.variants import MAX_SLIDES, MIN_SLIDES, Variant, apply_variant, _choose_kind_and_pattern
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, QuoteBlock, SlideSpec, TextBlock, Visual
+from deckforge.plan.variants import (
+    MAX_SLIDES, MIN_SLIDES, Variant, apply_variant, _choose_kind_and_pattern, _has_image_slot,
+)
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.template.profile import TemplateProfile
 
@@ -335,3 +337,131 @@ def test_section_slide_with_one_short_text_block_keeps_its_authored_kind():
         kind, pattern_id = _choose_kind_and_pattern(section_slide, with_both, variant)
         assert kind in ("section", "bullets"), f"{variant}: получили {kind!r}"
         assert pattern_id != "synthetic-two-col-empty-second-column", f"{variant}: выбрал two_col с пустой колонкой"
+
+
+# ---------------------------------------------------------------------------
+# Замер 24 прогонов 23 сентября 2026: ноль вставленных фотографий из двух на
+# КАЖДОМ прогоне обоих шаблонов — выбор раскладки не знал, что слайду нужна
+# картинка
+# ---------------------------------------------------------------------------
+
+
+def _photo_slide(text: str = "Очередь") -> SlideSpec:
+    """Текст короткий намеренно: раскладки с местом под картинку на учебных
+    шаблонах тесные (у единственной `bullets`-раскладки VK Tech с картинкой
+    — 14 знаков на элемент). Длинный текст в них не влезает, и выбор
+    справедливо уходит на раскладку без картинки: «текст обрезан» хуже, чем
+    «фото не встало». Здесь проверяется именно предпочтение при прочих
+    равных, а не готовность жертвовать текстом."""
+    return SlideSpec(
+        index=0, kind="image", headline="Стенд",
+        blocks=[TextBlock(text=text)],
+        visual=Visual(kind="photo", caption="Разбор очереди"),
+    )
+
+
+def _slots_of(profile, pattern_id: str):
+    pattern = next(p for p in profile.patterns if p.pattern_id == pattern_id)
+    return {slot.role for slot in pattern.slots}
+
+
+def test_a_slide_with_a_photo_gets_a_layout_that_has_room_for_it():
+    """Раскладка без слота под картинку принимает такой слайд молча, а
+    сборка потом честно пишет «нет слота под фото» — и фотография не
+    вставляется вовсе."""
+    if not any(_has_image_slot(p) for p in PROFILE.patterns):
+        return  # шаблон без раскладок с картинкой — проверять нечего
+
+    _kind, pattern_id = _choose_kind_and_pattern(_photo_slide(), PROFILE, Variant.dense)
+
+    assert pattern_id is not None
+    assert _slots_of(PROFILE, pattern_id) & {"image", "icon"}, (
+        f"для слайда с фотографией выбрана раскладка {pattern_id!r} без места под картинку"
+    )
+
+
+def test_a_long_text_still_beats_an_image_slot():
+    """Обратный край того же правила: если текст в раскладку с картинкой не
+    влезает, выбирается та, где он влезает. Обрезанный текст хуже, чем
+    невставленное фото, и это решение принято сознательно."""
+    long_photo_slide = _photo_slide("Разбор очереди согласований на стенде, подробности в отчёте за май.")
+
+    _kind, pattern_id = _choose_kind_and_pattern(long_photo_slide, PROFILE, Variant.dense)
+
+    assert pattern_id is not None
+
+
+def test_a_slide_without_a_photo_is_not_pushed_into_an_image_layout():
+    """Обратная сторона: признак не должен тянуть в раскладки с картинкой
+    всё подряд."""
+    text_only = SlideSpec(
+        index=0, kind="bullets", headline="Где уходит время",
+        blocks=[BulletBlock(items=["Ожидание первого согласующего — 18 часов", "Второго — 11 часов"])],
+    )
+
+    kind, _pattern_id = _choose_kind_and_pattern(text_only, PROFILE, Variant.dense)
+
+    assert kind != "image"
+
+
+def test_a_template_without_image_layouts_still_places_the_slide():
+    """Честная деградация: шаблон без единой раскладки с картинкой обязан
+    собраться, а не остаться без слайда."""
+    profile = PROFILE.model_copy(
+        update={"patterns": [p for p in PROFILE.patterns if not _has_image_slot(p)]}
+    )
+
+    _kind, pattern_id = _choose_kind_and_pattern(_photo_slide(), profile, Variant.dense)
+
+    assert pattern_id is not None
+
+
+# ---------------------------------------------------------------------------
+# Раскладка, под которую писала модель, доезжает до собранной презентации
+# ---------------------------------------------------------------------------
+
+
+def test_dense_variant_keeps_the_layout_the_writer_chose():
+    """Замер того же дня: раскладка вердикта совпала с раскладкой колоды у
+    8 слайдов из 46 — текст правился под одну раскладку, слайд уезжал в
+    другую."""
+    chosen = PROFILE.patterns[0].pattern_id
+    slide = SlideSpec(
+        index=0, kind="bullets", headline="Где уходит время",
+        blocks=[BulletBlock(items=["Ожидание — 18 часов"])], pattern_id=chosen,
+    )
+
+    _kind, pattern_id = _choose_kind_and_pattern(slide, PROFILE, Variant.dense)
+
+    assert pattern_id == chosen
+
+
+def test_an_invented_layout_from_the_writer_is_ignored():
+    """Номер, которого в ЭТОМ шаблоне нет, выбором не считается — раскладку
+    подбирает код."""
+    slide = SlideSpec(
+        index=0, kind="bullets", headline="Где уходит время",
+        blocks=[BulletBlock(items=["Ожидание — 18 часов"])], pattern_id="такой-раскладки-нет",
+    )
+
+    _kind, pattern_id = _choose_kind_and_pattern(slide, PROFILE, Variant.dense)
+
+    assert pattern_id != "такой-раскладки-нет"
+    assert pattern_id is not None
+
+
+def test_the_other_two_variants_do_not_inherit_the_writers_choice():
+    """Три варианта обязаны быть различимы — выбор у писателя один, поэтому
+    наследует его ровно один вариант."""
+    chosen = PROFILE.patterns[0].pattern_id
+    slide = SlideSpec(
+        index=0, kind="bullets", headline="Где уходит время",
+        blocks=[BulletBlock(items=["Ожидание — 18 часов"])], pattern_id=chosen,
+    )
+
+    picked = {
+        variant: _choose_kind_and_pattern(slide, PROFILE, variant, avoid=frozenset({chosen}))[1]
+        for variant in (Variant.airy, Variant.visual)
+    }
+
+    assert all(pid != chosen for pid in picked.values()), picked

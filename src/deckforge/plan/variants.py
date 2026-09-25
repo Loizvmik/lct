@@ -358,9 +358,13 @@ def _diversity_penalty(pattern_id: str, history: _SelectionHistory) -> float:
     return penalty
 
 
+def _has_image_slot(p) -> bool:
+    return any(slot.role in ("image", "icon") for slot in p.slots)
+
+
 def _pattern_rank_key(
     p, variant: Variant, item_count: int | None, char_len: int, kind_rank: int, avoid: frozenset[str],
-    history: _SelectionHistory = _EMPTY_HISTORY,
+    history: _SelectionHistory = _EMPTY_HISTORY, needs_image: bool = False,
 ) -> tuple:
     """Ключ сортировки одного паттерна-кандидата — ОБЩИЙ для всех `kind` из
     предпочтения варианта (см. `_choose_kind_and_pattern`), не только внутри
@@ -482,9 +486,19 @@ def _pattern_rank_key(
     else:
         roominess_bias = 0
 
+    # Слайду с фотографией — раскладка, где для неё есть место. Стоит
+    # СРАЗУ после «влезает ли текст» и выше всего остального: замер 24
+    # прогонов 23 сентября 2026 показал ноль вставленных фотографий из двух
+    # на КАЖДОМ прогоне обоих шаблонов. `_compatible_kinds` возвращает для
+    # фото список видов, но держит в нём `bullets`/`two_col` запасными (на
+    # шаблонах, где раскладок с картинкой нет вовсе), и выбор спокойно
+    # садился на них. Признак не жёсткий фильтр, а штраф: шаблон без единой
+    # раскладки с картинкой по-прежнему собирается, а сборка честно пишет
+    # находку «нет слота под фото/иконку».
+    image_penalty = 0 if (not needs_image or _has_image_slot(p)) else 1
     return (
-        fit_bucket, avoid_penalty, repeat_penalty, kind_rank, decor_bias, capacity_bias, roominess_bias,
-        -p.score,
+        fit_bucket, image_penalty, avoid_penalty, repeat_penalty, kind_rank,
+        decor_bias, capacity_bias, roominess_bias, -p.score,
     )
 
 
@@ -551,6 +565,28 @@ def _choose_kind_and_pattern(
     шаблоне есть. `pattern_id=None` — только если у профиля вообще нет ни
     одного паттерна ни одного `kind` (пустой шаблон, честный крайний
     случай)."""
+    # Плотный вариант наследует раскладку, выбранную писателем текста.
+    #
+    # `plan.writer` даёт модели каталог раскладок и черновую сборку
+    # (`compose.slide_tools`), и она вправе вернуть `layout_id` — номер
+    # раскладки, под которую писала текст. Раньше этот выбор выбрасывался
+    # ЗДЕСЬ, для всех трёх вариантов: замер 23 сентября 2026 показал, что
+    # раскладка, по которой модель правила текст, совпала с раскладкой
+    # собранной презентации у 8 слайдов из 46. Текст правился под одну
+    # раскладку, слайд уезжал в другую.
+    #
+    # Наследует ОДИН вариант, а не все три: три варианта обязаны быть
+    # различимы (ТЗ), а выбор у писателя один. `dense` — потому что он же
+    # идёт первым в предвычислении `avoid` и остальные два его избегают.
+    #
+    # Номер проверяется по каталогу профиля: выдуманный не годится (та же
+    # сверка, что `writer._validate_chosen_layout`, но здесь она защищает
+    # от профиля ДРУГОГО шаблона, а не от фантазии модели).
+    if variant is Variant.dense and slide.pattern_id:
+        authored = next((p for p in profile.patterns if p.pattern_id == slide.pattern_id), None)
+        if authored is not None:
+            return authored.kind, authored.pattern_id
+
     compatible = _compatible_kinds(slide)
     priority = _VARIANT_KIND_PRIORITY[variant]
     available = {p.kind for p in profile.patterns}
@@ -572,9 +608,12 @@ def _choose_kind_and_pattern(
     kind_rank = {kind: i for i, kind in enumerate(kind_pool)}
     candidates = [p for p in profile.patterns if p.kind in kind_pool]
 
+    needs_image = slide.visual is not None and slide.visual.kind in ("photo", "icon")
     best = min(
         candidates,
-        key=lambda p: _pattern_rank_key(p, variant, item_count, char_len, kind_rank[p.kind], avoid, history),
+        key=lambda p: _pattern_rank_key(
+            p, variant, item_count, char_len, kind_rank[p.kind], avoid, history, needs_image,
+        ),
     )
     return best.kind, best.pattern_id
 
