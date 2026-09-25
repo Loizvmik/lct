@@ -193,7 +193,9 @@ def test_text_never_leaves_its_box():
 def test_only_template_colors_and_fonts_are_used():
     allowed_colors = set(PROFILE.palette_roles.values())
     allowed_fonts = set(PROFILE.type_scale.families) | set(PROFILE.type_scale.mono)
-    for slide in Presentation(str(build_deck(SAMPLE_SPEC, PROFILE, TEMPLATE, Variant.dense))).slides:
+    # Проверяется сборка с нуля: клон примера переносит поля рамок, шрифты
+    # и цвета шаблона как есть, по ссылкам на тему (см. compose.clone).
+    for slide in Presentation(str(build_deck(SAMPLE_SPEC, PROFILE, TEMPLATE, Variant.dense, clone_examples=False))).slides:
         for shape in slide.shapes:
             for run in _runs(shape):
                 assert run.font.name in allowed_fonts
@@ -256,7 +258,9 @@ def test_expanded_repeat_stays_within_the_canvas():
             ])],
         )],
     )
-    out = build_deck(spec, profile, template, Variant.dense)
+    # Проверяется сборка с нуля: клон примера переносит поля рамок, шрифты
+    # и цвета шаблона как есть, по ссылкам на тему (см. compose.clone).
+    out = build_deck(spec, profile, template, Variant.dense, clone_examples=False)
     prs = Presentation(str(out))
     canvas_w_in = prs.slide_width / 914400
     for slide in prs.slides:
@@ -502,7 +506,9 @@ def test_decor_shape_fills_use_only_template_colors():
     "не выдуман ли цвет", а не "назван ли он ролью"; для декора это
     `palette_roles.values() | theme.scheme.values()`."""
     allowed_colors = set(PROFILE.palette_roles.values()) | set(PROFILE.theme.scheme.values())
-    prs = Presentation(str(build_deck(CARDS_SPEC, PROFILE, TEMPLATE, Variant.visual)))
+    # Проверяется сборка с нуля: клон примера переносит поля рамок, шрифты
+    # и цвета шаблона как есть, по ссылкам на тему (см. compose.clone).
+    prs = Presentation(str(build_deck(CARDS_SPEC, PROFILE, TEMPLATE, Variant.visual, clone_examples=False)))
     checked = 0
     for slide in prs.slides:
         for shape in slide.shapes:
@@ -629,7 +635,9 @@ def test_text_box_has_no_internal_margins():
     чем предполагает замер, и перенос строк расходится с прогнозом.
     Поля обязаны быть обнулены, чтобы бокс, который меряет `measure()`, и
     бокс, в который реально рисует текст рендерер, совпадали."""
-    prs = Presentation(str(build_deck(SAMPLE_SPEC, PROFILE, TEMPLATE, Variant.dense)))
+    # Проверяется сборка с нуля: клон примера переносит поля рамок, шрифты
+    # и цвета шаблона как есть, по ссылкам на тему (см. compose.clone).
+    prs = Presentation(str(build_deck(SAMPLE_SPEC, PROFILE, TEMPLATE, Variant.dense, clone_examples=False)))
     checked = 0
     for slide in prs.slides:
         for shape in slide.shapes:

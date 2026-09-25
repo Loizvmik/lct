@@ -159,10 +159,21 @@ class RenderConfig(BaseModel):
         return None
 
 
+class ComposeConfig(BaseModel):
+    # Собирать слайд клоном слайда-примера шаблона (`compose.clone`), а
+    # сборку с нуля держать запасным путём. Выключатель нужен на случай,
+    # если на незнакомом шаблоне клон начнёт давать брак: вернуть старое
+    # поведение одной строкой конфига, не откатывая код.
+    clone_examples: bool = True
+
+
 class Settings(BaseModel):
     llm: LLMConfig
     paths: PathsConfig
     render: RenderConfig
+    # Со значением по умолчанию: конфиги без раздела `compose` (собранные
+    # вручную в тестах) не должны переставать парситься.
+    compose: ComposeConfig = ComposeConfig()
     yandex_api_key: str | None = None
     yandex_folder_id: str | None = None
 

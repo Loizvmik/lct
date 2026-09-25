@@ -34,9 +34,16 @@ from deckforge.compose.blocks import (
     expand_decor, filled_repeat_units, find_bullet_char,
 )
 from deckforge.compose.charts import ChartSpec, Series, add_chart
+from deckforge.compose.colorpick import slide_background_luminance
+from deckforge.compose.clone import (
+    allow_wrap, bind_text, clone_example_slide, fix_duplicate_partnames, inherited_text_size, mark_slide, match_slots,
+    prune_unfilled, remove_in_box, remove_sample_frames, remove_stray_text, replace_picture,
+    sample_slides_by_number, set_text_size, slide_refs, text_style,
+)
 from deckforge.compose.decor import apply_decor
 from deckforge.compose.tables import TableSpec, add_table
 from deckforge.compose.textfit import measure, register_template_fonts
+from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.customprops import write_custom_property
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
@@ -148,9 +155,13 @@ _ROLE_COLOR = {
 
 def build_deck(
     spec: DeckSpec, profile: TemplateProfile, template_path: Path, variant: Variant,
-    *, user_photos: dict[str, Path] | None = None,
+    *, user_photos: dict[str, Path] | None = None, clone_examples: bool | None = None,
 ) -> Path:
-    """`user_photos` (Task 20) — словарь `Visual.photo_name -> путь на диске`
+    """`clone_examples`: собирать ли слайды клоном слайда-примера
+    (`compose.clone`, см. `_try_clone`); `None`: как велит
+    `compose.clone_examples` в `config/app.yaml`.
+
+    `user_photos` (Task 20) — словарь `Visual.photo_name -> путь на диске`
     фотографий контент-пакета (`plan.photos.ContentPhoto`), собранный
     вызывающим кодом (`cli.py`, после `plan.photos.assign_photos`); `None`
     (запасное значение) — ни один слайд не несёт `photo_name`, поведение
@@ -164,6 +175,11 @@ def build_deck(
         bullet_char = find_bullet_char(pkg)
 
     prs = Presentation(str(template_path))
+    if clone_examples is None:
+        clone_examples = _clone_examples_enabled()
+    # Примеры запоминаются ДО очистки: после неё их нет в `prs.slides`, но
+    # части пакета живут в памяти, и клон берёт фигуры и связи прямо из них.
+    source_slides = sample_slides_by_number(prs) if clone_examples else {}
     _clear_sample_slides(prs)
     # Картинки декора берутся из САМОГО шаблона — один открытый zip на всю
     # презентацию, с памятью на уже прочитанные части: одна и та же иконка
@@ -203,6 +219,7 @@ def build_deck(
         pattern, notes = _place_best_candidate(
             prs, slide_spec, candidates, profile, canvas, audit_config,
             bullet_char=bullet_char, user_photos=user_photos, image_bytes=image_bytes,
+            source_slides=source_slides,
         )
         slide_spec.findings.extend(notes)
         _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
@@ -210,6 +227,7 @@ def build_deck(
 
     out_path = _output_path(spec, template_path, variant)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    fix_duplicate_partnames(prs)
     prs.save(str(out_path))
     write_custom_property(out_path, WORKFLOW_PROPERTY_NAME, workflow_manifest().as_property_value())
     return out_path
@@ -263,17 +281,7 @@ def place_slide(
     # заголовком досталась раскладка на три карточки, и три пустые белые
     # плашки 4×4 дюйма заняли больше половины слайда.
     contents, drops = assign_content_with_drops(slide_spec, pattern, grid)
-    for drop in drops:
-        # Содержание, которому в этой раскладке не нашлось слота, на слайд
-        # не попадает — это не ошибка сборки (слайд собирается), но и не
-        # повод молчать: расхождение между планом и файлом обязана назвать
-        # наша же проверка, а не глаз человека (см. докстроку
-        # `blocks.DroppedContent`).
-        slide_spec.findings.append(
-            f"Слайд {slide_spec.index}: {DROPPED_ROLE_TITLES.get(drop.role, drop.role)} не попал "
-            f"на слайд — в раскладке {pattern.pattern_id!r} нет слота под эту роль: "
-            f"«{drop.text}»."
-        )
+    _note_drops(slide_spec, pattern, drops)
     decor = expand_decor(
         pattern, _repeat_item_count(slide_spec), grid, filled_repeat_units(pattern, contents),
     )
@@ -344,6 +352,21 @@ def place_slide(
 
     _place_visual(slide, slide_spec, pattern, profile, user_photos)
     _remove_empty_placeholders(slide)
+
+
+def _note_drops(slide_spec: SlideSpec, pattern: Pattern, drops) -> None:
+    """Содержание, которому в этой раскладке не нашлось слота, на слайд
+    не попадает — это не ошибка сборки (слайд собирается), но и не
+    повод молчать: расхождение между планом и файлом обязана назвать
+    наша же проверка, а не глаз человека (см. докстроку
+    `blocks.DroppedContent`). Общая для обоих путей сборки: клон теряет
+    содержание по тем же ролям, что и сборка с нуля."""
+    for drop in drops:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: {DROPPED_ROLE_TITLES.get(drop.role, drop.role)} не попал "
+            f"на слайд — в раскладке {pattern.pattern_id!r} нет слота под эту роль: "
+            f"«{drop.text}»."
+        )
 
 
 def _placeholder_text_hit(content: SlotContent, audit_config: AuditConfig) -> str | None:
@@ -1103,6 +1126,7 @@ def _place_best_candidate(
     prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
     image_bytes: Callable[[str], bytes | None] | None = None,
+    source_slides: dict[int, object] | None = None,
 ) -> tuple[Pattern, list[str]]:
     """Собрали слайд — проверили — не понравилось — взяли другую раскладку
     и пересобрали (бриф, дословно). Пробует кандидатов `candidates` по
@@ -1122,12 +1146,25 @@ def _place_best_candidate(
 
     Возвращает `(выбранная_раскладка, лог_попыток)` — лог уходит в
     `slide_spec.findings` вызывающим кодом (`build_deck`): "это пойдёт на
-    защиту как доказательство, что аудит встроен, а не приделан" (бриф)."""
+    защиту как доказательство, что аудит встроен, а не приделан" (бриф).
+
+    `source_slides`: слайды-примеры шаблона по номеру (`build_deck`
+    берёт их до очистки колоды). Если у кандидата есть свой пример, сначала
+    пробуется клон (`_try_clone`), и только если он не собрался или не
+    прошёл тот же аудит, кандидат собирается с нуля. `None`/пусто: только
+    сборка с нуля, как было до клонирования."""
     tried = candidates[:_MAX_LAYOUT_ATTEMPTS]
     notes: list[str] = []
     best: tuple[int, Pattern, list[str]] | None = None  # (число находок, паттерн, коды находок)
 
     for attempt, pattern in enumerate(tried, start=1):
+        cloned = _try_clone(
+            prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
+            bullet_char=bullet_char, user_photos=user_photos,
+        )
+        if cloned is not None:
+            notes.extend(cloned)
+            return pattern, notes
         trial_spec = replace(slide_spec, findings=[])
         place_slide(
             prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char,
@@ -1164,6 +1201,424 @@ def _place_best_candidate(
     )
     notes.extend(trial_spec.findings)
     return best_pattern, notes
+
+
+# ---------------------------------------------------------------------------
+# Сборка клоном слайда-примера (CLONE → BIND → ADAPT, см. `compose.clone`)
+# ---------------------------------------------------------------------------
+
+# Метка пути сборки в имени слайда (`p:cSld/@name`), её читает
+# `scripts/inspect_deck.py`.
+CLONE_MARK_PREFIX = "deckforge:clone:"
+
+# Интерлиньяж, которым аудит (L03) меряет абзац без явного `a:lnSpc`
+# (`audit.deterministic._DEFAULT_LINE_SPACING`). Клон меряет тем же
+# числом: ужать текст по одному интерлиньяжу, а проверять по другому:
+# ровно та рассинхронизация, из-за которой 25 сентября половина
+# заголовков уехала на запасную раскладку (см. комментарий в `_draw_slot`).
+_AUDIT_DEFAULT_LINE_SPACING = 1.2
+
+_CLONE_PICTURE_ROLES = frozenset({"image", "icon"})
+
+# Роли «рамки» слайда: заголовок, подзаголовок, сноска. Слайд, на который
+# легли только они, содержания не несёт.
+_CLONE_FRAME_ROLES = frozenset({"headline", "subhead", "source"})
+
+
+@dataclass(frozen=True)
+class CloneOutcome:
+    """Итог `place_slide_by_clone`: `reason` равен `None`, если слайд
+    собран (он последний в колоде), иначе это причина отказа (слайда в
+    колоде нет)."""
+    reason: str | None
+
+
+def _clone_examples_enabled() -> bool:
+    try:
+        return Settings.load(APP_YAML_PATH).compose.clone_examples
+    except Exception:  # noqa: BLE001: нет конфига (тесты на чужом дереве): поведение по умолчанию
+        return True
+
+
+def _clone_source(pattern: Pattern, source_slides: dict[int, object] | None):
+    """(номер, слайд) примера, с которого снята раскладка, или `None`.
+    Берётся первый номер: `patterns._dedup` схлопывает похожие примеры в
+    один паттерн, и первый: тот, чьи коробки слотов лежат в профиле."""
+    if not source_slides or not pattern.source_slide_index:
+        return None
+    number = pattern.source_slide_index[0]
+    slide = source_slides.get(number)
+    return (number, slide) if slide is not None else None
+
+
+def _try_clone(
+    prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, canvas: Canvas,
+    audit_config: AuditConfig, source_slides: dict[int, object] | None, notes: list[str],
+    *, bullet_char: str, user_photos: dict[str, Path] | None,
+) -> list[str] | None:
+    """Пробует собрать слайд клоном примера раскладки `pattern`. Успех:
+    клон собрался (все слоты с содержимым нашли свою фигуру) и прошёл тот же
+    аудит, что и сборка с нуля (`audit_slide_layout`, L01-L04, D05): тогда
+    слайд остаётся в колоде, а функция отдаёт находки для `slide_spec`.
+    Неудача: слайд убран, причина дописана в `notes`, возвращается `None`
+    и вызывающий собирает этот же кандидат с нуля."""
+    source = _clone_source(pattern, source_slides)
+    if source is None:
+        return None
+    number, source_slide = source
+    trial_spec = replace(slide_spec, findings=[])
+    slides_before = len(prs.slides)
+    try:
+        outcome = place_slide_by_clone(
+            prs, trial_spec, pattern, profile, audit_config, source_slide,
+            bullet_char=bullet_char, user_photos=user_photos,
+        )
+    except Exception as exc:  # noqa: BLE001: незнакомая разметка примера: запасной путь, а не падение колоды
+        if len(prs.slides) > slides_before:
+            _remove_last_slide(prs)
+        outcome = CloneOutcome(f"клон не собрался ({type(exc).__name__}: {exc})")
+    reason = outcome.reason
+    if reason is None:
+        errors = _clone_errors(
+            audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index),
+        )
+        if not errors:
+            return [
+                f"Слайд {slide_spec.index}: собран клоном слайда-примера №{number} шаблона "
+                f"(раскладка {pattern.pattern_id!r}).",
+                *trial_spec.findings,
+            ]
+        _remove_last_slide(prs)
+        ids = sorted({f.check_id for f in errors})
+        reason = f"аудит нашёл {len(errors)} ошибок уровня ошибки: {', '.join(ids)}"
+    notes.append(
+        f"Слайд {slide_spec.index}: клон слайда-примера №{number} (раскладка {pattern.pattern_id!r}) "
+        f"не принят — {reason}; слайд собирается заново."
+    )
+    return None
+
+
+def _clone_errors(findings: list) -> list:
+    """Находки аудита, которые отклоняют клон: всё, кроме заполненности
+    холста (D05). У клона она та же, что у примера, минус незаполненные
+    единицы повтора: пустоватый титул в стиле шаблона лучше полного, но
+    белого листа, который даёт сборка с нуля. Остальное (выход за край,
+    наложения, переполнение рамки) судится строго, и по фигурам примера
+    тоже: итоговый аудит колоды не различает, кто нарисовал фигуру, и
+    слайд, который он забракует, лучше собрать с нуля (так на VK
+    Education отсеивается пример с линией, заходящей за край холста)."""
+    return [f for f in findings if f.check_id != "D05"]
+
+
+def place_slide_by_clone(
+    prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, audit_config: AuditConfig,
+    source_slide, *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
+) -> CloneOutcome:
+    """Клон примера `source_slide` с текстом `slide_spec` в слотах `pattern`.
+
+    Возвращает `CloneOutcome`: собран ли слайд (он последний в `prs`) или
+    почему нет; при отказе слайда в колоде нет. Аудит здесь не зовётся,
+    решение о приёме принимает `_try_clone`.
+
+    Содержание раскладывается по слотам тем же `assign_content_with_drops`,
+    что и в `place_slide`, чтобы оба пути клали один и тот же текст в одни
+    и те же роли. Отличается геометрия: клон не двигает фигуры, поэтому
+    единицы повтора возвращаются на свои места в примере
+    (`_native_repeat_contents`), а лишние единицы удаляются."""
+    layout = _find_layout(prs, pattern.layout_id)
+    if layout is None:
+        return CloneOutcome(f"лейаут {pattern.layout_id!r} не найден в открытом шаблоне")
+    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
+    grid = _grid_from_model(profile.grid)
+
+    contents, drops = assign_content_with_drops(slide_spec, pattern, grid)
+    clean: list[SlotContent] = []
+    for content in contents:
+        hit = _placeholder_text_hit(content, audit_config)
+        if hit is not None:
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: текст слота «{content.role_hint}» похож на "
+                f"текст-заглушку шаблона («{hit}») — не отрисован, слот оставлен пустым."
+            )
+            continue
+        clean.append(content)
+    if slide_spec.blocks and not any(c.role_hint not in _CLONE_FRAME_ROLES for c in clean):
+        # Сборка с нуля потеряла бы то же самое, но её слайд с одним
+        # заголовком отсеивает D05, а клон D05 не судит (см.
+        # `_clone_errors`). Без этой проверки клон принимал слайд, где из
+        # двух абзацев содержания не лёг ни один (два `TextBlock` на
+        # раскладке, у которой слоты только под список).
+        return CloneOutcome("ни один блок содержания не нашёл слота в раскладке")
+    native = _native_repeat_contents(pattern, clean)
+    if native is None:
+        return CloneOutcome("элементов больше, чем единиц повтора в примере")
+
+    slide = clone_example_slide(prs, source_slide, layout)
+    matched = match_slots(slide, pattern.slots, canvas)
+    index_of = {id(s): i for i, s in enumerate(pattern.slots)}
+    bound = []
+    for content in native:
+        ref = matched.get(index_of.get(id(content.slot), -1))
+        if ref is None:
+            _remove_last_slide(prs)
+            return CloneOutcome(f"в примере не нашлось фигуры под слот «{content.role_hint}»")
+        bound.append((content, ref))
+
+    family = _primary_family(profile)
+    for content, ref in bound:
+        bind_text(ref.element, content.paragraphs, bullet_char=bullet_char)
+        _fit_cloned_text(slide, slide_spec, content, ref, profile, family, canvas)
+        _fix_cloned_contrast(slide, ref, profile, canvas, audit_config)
+
+    keep = [ref.element for _, ref in bound]
+    filled = filled_repeat_units(pattern, native)
+    kept_decor = expand_decor(pattern, None, grid, filled)
+    kept_ids = {id(d) for d in kept_decor}
+    bound_slots = {id(content.slot) for content, _ in bound}
+    for slot in _ordinal_slots(pattern, filled):
+        ref = matched.get(index_of[id(slot)])
+        if id(slot) not in bound_slots and ref is not None:
+            bound_slots.add(id(slot))
+            keep.append(ref.element)
+    prune_unfilled(
+        slide,
+        [d for d in pattern.decor if id(d) not in kept_ids],
+        [s for s in pattern.slots if id(s) not in bound_slots and s.role not in _CLONE_PICTURE_ROLES],
+        canvas, keep=keep, protect=[d.box for d in kept_decor],
+    )
+    remove_stray_text(slide, canvas, keep=keep, badge_boxes=[d.box for d in kept_decor if d.badge_text])
+    remove_sample_frames(slide)
+    _place_visual_on_clone(slide, slide_spec, pattern, profile, canvas, matched, user_photos, keep)
+    _remove_empty_placeholders(slide)
+    _note_drops(slide_spec, pattern, drops)
+    mark_slide(slide, CLONE_MARK_PREFIX + pattern.pattern_id)
+    return CloneOutcome(None)
+
+
+def _native_repeat_contents(pattern: Pattern, contents: list[SlotContent]) -> list[SlotContent] | None:
+    """Возвращает содержание единиц повтора на РОДНЫЕ слоты примера.
+
+    `blocks.expand_repeat` пересчитывает коробки единиц под фактическое
+    число элементов (компактно от поля). Сборке с нуля это и нужно, а в
+    клоне фигуры стоят там, где их поставил дизайнер: i-я развёрнутая
+    единица: это i-я единица примера (нумерация по оси повтора, та же,
+    что у `blocks.filled_repeat_units` и `DecorShape.repeat_index`). Слот
+    внутри единицы выбирается по роли и положению поперёк оси.
+
+    `None`: элементов больше, чем единиц в примере, клоном такое не
+    собрать (лишним карточкам не на чем стоять)."""
+    native_ids = {id(s) for s in pattern.slots}
+    expanded = [c for c in contents if id(c.slot) not in native_ids]
+    if not expanded:
+        return contents
+    repeat = pattern.repeat
+    if repeat is None:
+        return None
+    along = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
+    across = (lambda b: (b.top, b.height, b.width)) if repeat.axis == "x" else (lambda b: (b.left, b.width, b.height))
+    members = [s for s in pattern.slots if s.role in repeat.slot_roles]
+    native_units = sorted({round(along(s.box), 3) for s in members})
+    expanded_units = sorted({round(along(c.slot.box), 3) for c in expanded})
+    if len(expanded_units) > len(native_units):
+        return None
+
+    result: list[SlotContent] = []
+    used: set[int] = set()
+    for content in contents:
+        if id(content.slot) in native_ids:
+            result.append(content)
+            continue
+        unit = native_units[expanded_units.index(round(along(content.slot.box), 3))]
+        want = across(content.slot.box)
+        candidates = [
+            s for s in members
+            if s.role == content.slot.role and round(along(s.box), 3) == unit and id(s) not in used
+        ]
+        if not candidates:
+            return None
+        slot = min(candidates, key=lambda s: sum(abs(a - b) for a, b in zip(across(s.box), want)))
+        used.add(id(slot))
+        result.append(replace(content, slot=slot))
+    return result
+
+
+_ORDINAL_RE = re.compile(r"\d{1,2}\.?")
+
+
+def _ordinal_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
+    """Слоты-номера заполненных единиц повтора: кружок с «1», «2» над
+    карточкой. Майнинг видит в нём слот (`kpi_value`), а содержания под
+    него у карточек нет, и без этой оговорки клон удалял бы кружок как
+    незаполненный слот, оставляя карточку без номера и с дырой на его
+    месте. Номер примера верен как есть: клон оставляет первые единицы
+    повтора по порядку, i-я карточка стоит в i-й единице."""
+    repeat = pattern.repeat
+    if repeat is None or not filled:
+        return []
+    along = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
+    members = [s for s in pattern.slots if s.role in repeat.slot_roles]
+    units = sorted({round(along(s.box), 3) for s in members})
+    return [
+        s for s in members
+        if s.sample_text and _ORDINAL_RE.fullmatch(s.sample_text.strip())
+        and round(along(s.box), 3) in units and units.index(round(along(s.box), 3)) in filled
+    ]
+
+
+def _fit_cloned_text(
+    slide, slide_spec: SlideSpec, content: SlotContent, ref, profile: TemplateProfile, family: str, canvas: Canvas,
+) -> None:
+    """ADAPT: текст клона обязан влезть в рамку примера. Кегль примера
+    остаётся, если текст помещается; иначе ужимается по той же шкале, что
+    у сборки с нуля (`_shrink_sequence`, не ниже подписи). Если не влез и
+    на подписи, кегль остаётся минимальным, а решение «не годится» примет
+    аудит (L03) и отправит слайд на сборку с нуля."""
+    style = text_style(ref.element)
+    # Кегль, которым PowerPoint нарисует текст: свой у run, иначе
+    # унаследованный от лейаута/мастера, и только если его нет, из профиля.
+    size = style.size_pt or inherited_text_size(slide, ref.element) or profile.denorm_pt(content.slot.size_pt)
+    fam = style.family or family
+    spacing = style.line_spacing or _AUDIT_DEFAULT_LINE_SPACING
+    left_in, top_in, right_in, bottom_in = style.insets_in
+    width_in = ref.box.width * canvas.width_emu / EMU_PER_INCH - left_in - right_in
+    height_in = ref.box.height * canvas.height_emu / EMU_PER_INCH - top_in - bottom_in
+    text = _joined_text(content.paragraphs)
+    if width_in <= 0 or height_in <= 0 or not text.strip():
+        return
+    if measure(text, fam, size, width_in, line_spacing=spacing).lines > len(content.paragraphs):
+        allow_wrap(ref.element)
+    sizes = [size] + [s for s in _shrink_sequence(profile, content.slot.size_pt) if s < size - 0.05]
+    for candidate in sizes:
+        if measure(text, fam, candidate, width_in, line_spacing=spacing).height_in <= height_in + _FIT_TOLERANCE_IN:
+            # Кегль пишется, только если его пришлось ужать (ступень шкалы
+            # шаблона). Влезший унаследованный кегль остаётся наследуемым:
+            # записанный явно, он мог бы не совпасть ни с одной ступенью
+            # шкалы (VK Tech: 47pt у заголовка лейаута, находка T02).
+            if candidate != size:
+                set_text_size(ref.element, candidate)
+            return
+    set_text_size(ref.element, sizes[-1])
+    slide_spec.findings.append(
+        f"Слайд {slide_spec.index}: текст слота «{content.role_hint}» не помещается в рамку "
+        f"примера даже кеглем {sizes[-1]:.1f}pt."
+    )
+
+
+def _fix_cloned_contrast(slide, ref, profile: TemplateProfile, canvas: Canvas, audit_config: AuditConfig) -> None:
+    """Текст клона обязан читаться. Шаблоны нередко набирают текст-образец
+    светло-серым, как подсказку «здесь будет текст» (VK Tech: описания
+    карточек серым по белому, 3.2:1), и наш текст в том же цвете аудит
+    справедливо бракует (T06). Если контраст ниже порога аудита, цвет
+    заменяется цветом палитры шаблона с лучшим контрастом, тем же
+    `_best_contrast_color`, что у сборки с нуля.
+
+    Фон ищется в том же порядке, что у аудита: своя заливка фигуры, самая
+    маленькая залитая фигура под ней, фон слайда, фон макета. Цвет без
+    явной заливки у run не трогается: аудит его тоже не судит, а
+    унаследованный цвет шаблон подбирал под свой фон."""
+    run = ref.element.find(".//" + qn("a:r"))
+    r_pr = run.find(qn("a:rPr")) if run is not None else None
+    fill = r_pr.find(qn("a:solidFill")) if r_pr is not None else None
+    if fill is None:
+        return
+    scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
+    color = resolve_color(fill, scheme, clr_map)
+    if not isinstance(color, Color):
+        return
+    bg_luminance = _clone_background_luminance(slide, ref, profile, canvas)
+    ratio = _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(color.hex))
+    size = int(r_pr.get("sz")) / 100 if r_pr.get("sz") else 0.0
+    cfg = audit_config.template
+    is_large = size >= cfg.large_text_pt or (r_pr.get("b") == "1" and size >= cfg.large_bold_pt)
+    if ratio >= (cfg.min_contrast_large if is_large else cfg.min_contrast_small):
+        return
+    better = _best_contrast_color(color.hex, bg_luminance, profile)
+    for rpr in ref.element.iter(qn("a:rPr")):
+        for old_fill in rpr.findall(qn("a:solidFill")):
+            rpr.remove(old_fill)
+        new_fill = etree.Element(qn("a:solidFill"))
+        etree.SubElement(new_fill, qn("a:srgbClr")).set("val", better.lstrip("#").upper())
+        # a:solidFill по схеме стоит сразу после a:ln (если он есть), до
+        # эффектов и гарнитур.
+        ln = rpr.find(qn("a:ln"))
+        if ln is not None:
+            ln.addnext(new_fill)
+        else:
+            rpr.insert(0, new_fill)
+
+
+def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Canvas) -> float:
+    scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
+
+    def solid(element) -> Color | None:
+        sp_pr = element.find(qn("p:spPr"))
+        fill = sp_pr.find(qn("a:solidFill")) if sp_pr is not None else None
+        color = resolve_color(fill, scheme, clr_map) if fill is not None else None
+        return color if isinstance(color, Color) else None
+
+    own = solid(ref.element)
+    if own is not None:
+        return _relative_luminance(own.hex)
+    plates = []
+    for other in slide_refs(slide, canvas):
+        if other.element is ref.element or other.kind != "shape" or other.box is None:
+            continue
+        color = solid(other.element)
+        if color is not None and _contains(other.box, ref.box):
+            plates.append((other.box.width * other.box.height, color))
+    if plates:
+        return _relative_luminance(min(plates, key=lambda t: t[0])[1].hex)
+    bg_fill = slide._element.find(  # noqa: SLF001
+        qn("p:cSld") + "/" + qn("p:bg") + "/" + qn("p:bgPr") + "/" + qn("a:solidFill")
+    )
+    bg = resolve_color(bg_fill, scheme, clr_map) if bg_fill is not None else None
+    if isinstance(bg, Color):
+        return _relative_luminance(bg.hex)
+    return slide_background_luminance(slide, profile)
+
+
+def _place_visual_on_clone(
+    slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, canvas: Canvas,
+    matched: dict, user_photos: dict[str, Path] | None, keep: list,
+) -> None:
+    """Визуал слайда на клоне. Таблица и график кладутся тем же кодом, что
+    и при сборке с нуля, но место под них сперва освобождается от образца.
+    Фото пользователя подменяет картинку в фигуре примера (рамка, обрезка
+    по форме и эффекты остаются дизайнерскими). Без фото пользователя
+    картинка примера остаётся как есть: это оформление шаблона, и класть
+    поверх неё ассет каталога значило бы закрыть его чужим."""
+    visual = slide_spec.visual
+    if visual is None:
+        return
+    if visual.kind in ("table", "chart"):
+        slot = (
+            _visual_slot(pattern, "table") if visual.kind == "table"
+            else _visual_slot(pattern, "chart") or _visual_slot(pattern, "table") or _visual_slot(pattern, "image")
+        )
+        if slot is not None:
+            remove_in_box(slide, slot.box, canvas, keep=keep)
+        _place_visual(slide, slide_spec, pattern, profile, user_photos)
+        return
+    if visual.kind not in ("photo", "icon"):
+        return
+    photo_name = visual.photo_name
+    photo_path = (user_photos or {}).get(photo_name) if photo_name else None
+    if photo_path is None:
+        return
+    slot = (
+        _visual_slot(pattern, "image") if visual.kind == "photo" else _visual_slot(pattern, "icon")
+    ) or _visual_slot(pattern, "image") or _visual_slot(pattern, "icon")
+    ref = matched.get(next((i for i, s in enumerate(pattern.slots) if s is slot), -1)) if slot else None
+    if ref is None:
+        _place_picture_visual(slide, slide_spec, pattern, profile, visual.kind, user_photos)
+        return
+    try:
+        replace_picture(slide, ref.element, Path(photo_path).read_bytes(), ref.box, canvas)
+    except Exception as exc:  # noqa: BLE001: битый файл пользователя: картинка примера остаётся
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: пользовательская фотография {photo_name!r} ({photo_path}) "
+            f"не вставлена ({exc})."
+        )
 
 
 # ---------------------------------------------------------------------------

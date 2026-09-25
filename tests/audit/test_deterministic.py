@@ -611,7 +611,9 @@ def _bullets_deck(n_bullets: int, words_each: int) -> Path:
             for p in PROFILE.patterns
         ],
     })
-    return build_deck(spec, profile, TEMPLATE, Variant.dense)
+    # Сборка с нуля по той же причине: клон слайда-примера переносит
+    # графику шаблона целиком, мимо вырезанного выше декора профиля.
+    return build_deck(spec, profile, TEMPLATE, Variant.dense, clone_examples=False)
 
 
 def test_D05_flags_both_empty_and_overstuffed_slides(blank_deck, clean_deck_path):

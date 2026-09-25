@@ -42,7 +42,7 @@ def main() -> int:
         canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
 
     print(f"{path.name}: слайдов {len(prs.slides)}")
-    print(f"{'№':>3} {'фигур':>6} {'текст':>6} {'карт':>5} {'плашек':>7} {'кегли':>16} {'занято':>7}  заголовок")
+    print(f"{'№':>3} {'фигур':>6} {'текст':>6} {'карт':>5} {'плашек':>7} {'кегли':>16} {'занято':>7} {'путь':>12}  заголовок")
     empty = 0
     for i, slide in enumerate(prs.slides, start=1):
         kinds = Counter(_kind(s) for s in slide.shapes)
@@ -59,9 +59,13 @@ def main() -> int:
             if ratio < 0.25:
                 empty += 1
         head = texts[0][:46] if texts else "— пусто —"
+        # Путь сборки: клон слайда-примера сборка метит в имени слайда
+        # (`compose.builder.CLONE_MARK_PREFIX`), слайд без метки собран с нуля.
+        name = slide._element.cSld.get("name") or ""
+        path_label = "клон " + name.rsplit(":", 1)[-1] if name.startswith("deckforge:clone:") else "с нуля"
         print(
             f"{i:>3} {len(slide.shapes):>6} {len(texts):>6} {kinds.get('picture', 0):>5} "
-            f"{kinds.get('auto_shape', 0):>7} {str(sizes)[:16]:>16} {fill:>7}  {head}"
+            f"{kinds.get('auto_shape', 0):>7} {str(sizes)[:16]:>16} {fill:>7} {path_label:>12}  {head}"
         )
     if canvas is not None:
         print(f"\nслайдов заполнено меньше четверти: {empty} из {len(prs.slides)}")
