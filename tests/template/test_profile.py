@@ -40,6 +40,7 @@ import pytest
 
 import deckforge.template as pkg
 from deckforge.provider.base import LLMProvider, VisionProvider
+from deckforge.render.soffice import RenderError
 from deckforge.template.profile import TemplateProfile
 
 TEMPLATES_DIR = Path("dataset/templates")
@@ -639,4 +640,144 @@ def test_cache_hit_needing_both_roles_and_kinds_refreshes_both_once(tmp_path, mo
     cache_file = cache_dir / f"{first.fingerprint}.json"
     reread = TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8"))
     assert reread == second
+
+
+# --- Задача C: превью PNG на каждый паттерн шаблона в кэше профиля ---------
+
+def _fake_to_pngs(monkeypatch, *, page_bytes: dict[int, bytes] | None = None):
+    """Подменяет `deckforge.template.profile.to_pngs` — пишет по одному
+    файлу-заглушке на каждую запрошенную страницу, в том же порядке, что и
+    `pages` (тот же контракт, что настоящий `render.soffice.to_pngs`
+    документирует для `_save_pattern_previews`: по одному PNG на страницу,
+    по возрастанию номера). Настоящий soffice/poppler не трогается —
+    контролируем только факт записи и порядок, не байты картинки."""
+    calls: list[dict] = []
+
+    def _fake(template_path, out_dir, dpi=110, pages=None):
+        calls.append({"template_path": Path(template_path), "dpi": dpi, "pages": list(pages or [])})
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        result = []
+        for page in pages or []:
+            content = (page_bytes or {}).get(page, f"PNG-страница-{page}".encode())
+            dest = out_dir / f"slide-{page}.png"
+            dest.write_bytes(content)
+            result.append(dest)
+        return result
+
+    monkeypatch.setattr("deckforge.template.profile.to_pngs", _fake)
+    return calls
+
+
+def test_preview_is_not_rendered_without_a_vision_key(tmp_path, monkeypatch):
+    """Задача C, честная деградация: без ключа `vision` рендер шаблона не
+    нужен ничему другому в `from_file` — заводить его ТОЛЬКО ради превью
+    значило бы платить рендером там, где сегодня не платится ничего
+    (`test_parsing_is_fast_enough` рассчитывает именно на это)."""
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("to_pngs вызван без ключа vision — превью не должны рендериться")
+
+    monkeypatch.setattr("deckforge.template.profile.to_pngs", _must_not_be_called)
+    cache_dir = tmp_path / "cache"
+
+    profile = TemplateProfile.from_file(TEMPLATES_DIR / "VK Tech шаблон.pptx", cache_dir=cache_dir)
+
+    assert profile.patterns
+    assert all(p.preview_path is None for p in profile.patterns)
+
+
+def test_preview_saved_next_to_the_profile_when_vision_is_available(tmp_path, monkeypatch):
+    """Главный случай задачи: с ключом `vision` каждый паттерн получает PNG
+    первого исходного слайда рядом с JSON профиля в кеше."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    _patch_vision_kind(monkeypatch)  # классификация видов не ходит в сеть/рендер
+    calls = _fake_to_pngs(monkeypatch)
+
+    profile = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=_FakeVision())
+
+    assert profile.patterns
+    assert calls, "to_pngs не был вызван, хотя ключ vision передан"
+    for pattern in profile.patterns:
+        assert pattern.preview_path == f"previews/{pattern.pattern_id}.png"
+        on_disk = profile.pattern_preview_path(pattern, cache_dir=cache_dir)
+        assert on_disk == cache_dir / profile.fingerprint / "previews" / f"{pattern.pattern_id}.png"
+        assert on_disk.exists()
+        assert on_disk.read_bytes()  # не пустой файл
+
+
+def test_render_failure_leaves_preview_path_none_without_crashing(tmp_path, monkeypatch):
+    """Задача C, п.3: нет soffice/poppler (или рендер иначе упал) — разбор
+    профиля не падает, превью просто отсутствуют."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    _patch_vision_kind(monkeypatch)
+
+    def _boom(*args, **kwargs):
+        raise RenderError("soffice недоступен (тест)")
+
+    monkeypatch.setattr("deckforge.template.profile.to_pngs", _boom)
+
+    profile = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=_FakeVision())
+
+    assert profile.patterns  # разбор целиком не пострадал
+    assert all(p.preview_path is None for p in profile.patterns)
+
+
+def test_cache_hit_reads_back_preview_paths_without_rerendering(tmp_path, monkeypatch):
+    """Кеш с превью читается обратно — второй вызов с той же конфигурацией
+    не трогает рендер повторно, а превью из первого прогона сохраняются."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    _patch_vision_kind(monkeypatch)
+    vision = _FakeVision()
+    _fake_to_pngs(monkeypatch)
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=vision)
+    assert first.patterns and all(p.preview_path is not None for p in first.patterns)
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("превью перерендерены на уже модельном кеш-хите")
+
+    monkeypatch.setattr("deckforge.template.profile.to_pngs", _must_not_be_called)
+
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=vision)
+    assert second == first
+    assert [p.preview_path for p in second.patterns] == [p.preview_path for p in first.patterns]
+
+    cache_file = cache_dir / f"{first.fingerprint}.json"
+    reread = TemplateProfile.model_validate_json(cache_file.read_text(encoding="utf-8"))
+    assert [p.preview_path for p in reread.patterns] == [p.preview_path for p in first.patterns]
+
+
+def test_reclassify_on_cache_hit_also_renders_previews(tmp_path, monkeypatch):
+    """Профиль лёг в кеш без ключа `vision` (превью тоже нет — см. тест
+    выше), следующий вызов с ключом дозапрашивает и виды, и превью, а не
+    оставляет их `None` до следующего разбора с нуля."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+    _patch_vision_kind(monkeypatch)
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)  # vision=None
+    assert all(p.preview_path is None for p in first.patterns)
+
+    _fake_to_pngs(monkeypatch)
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir, vision=_FakeVision())
+
+    assert second.pattern_kinds_source == "model"
+    assert second.patterns
+    assert all(p.preview_path is not None for p in second.patterns)
+
+
+def test_pattern_preview_path_is_none_without_a_saved_preview_or_cache_dir(tmp_path, monkeypatch):
+    """`pattern_preview_path` не выдумывает файл, которого нет: ни когда у
+    паттерна `preview_path is None`, ни когда каталог кеша выключен."""
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+
+    profile = TemplateProfile.from_file(path, cache_dir=cache_dir)  # vision=None -> нет превью
+    pattern = profile.patterns[0]
+    assert pattern.preview_path is None
+    assert profile.pattern_preview_path(pattern, cache_dir=cache_dir) is None
+    assert profile.pattern_preview_path(pattern, cache_dir=None) is None
 
