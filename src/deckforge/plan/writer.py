@@ -915,6 +915,12 @@ RERANK_VARIANTS = (Variant.visual, Variant.airy)
 DEFAULT_RERANK_MAX_WORKERS = 8
 DEFAULT_RERANK_BUDGET_SECONDS = 40.0
 
+# Стартовый бюджет ответа одного вызова. Живой прогон 26 сентября 2026 на
+# VK Education: с прежних 2048 (`PICKER_MAX_TOKENS`) провайдер эскалировал до
+# 4096 в 11 вызовах из 14 — модель рассуждает, прежде чем выбрать, и почти
+# каждый вызов платил лишний сетевой круг. Начинать сразу с 4096 дешевле.
+RERANK_MAX_TOKENS = 4096
+
 # Поля слайда, которые модели не нужны для выбора раскладки: находки и
 # заметки докладчика её только отвлекают, а `pattern_id` — это выбор
 # писателя для плотного варианта, не подсказка для этих двух.
@@ -958,7 +964,7 @@ def _rerank_one(
     ]
     fallback = candidate_ids[0]
     try:
-        raw = llm.complete(messages, schema=_PICKER_SCHEMA, max_tokens=PICKER_MAX_TOKENS)
+        raw = llm.complete(messages, schema=_PICKER_SCHEMA, max_tokens=RERANK_MAX_TOKENS)
         data = json.loads(raw)
     except Exception as exc:
         return fallback, f"модель не ответила — {_why(exc)}"
