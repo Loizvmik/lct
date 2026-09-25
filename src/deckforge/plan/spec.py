@@ -387,9 +387,45 @@ def block_from_dict(data: dict, where: str) -> Block:
     raise SpecValidationError([f"{where}: неизвестный тип блока {kind!r}"])
 
 
+# Поля, по которым видно, что модель положила содержимое визуала на уровень
+# выше — прямо в `visual`, минуя вложенный `table`/`chart`.
+_TABLE_FIELDS = ("rows",)
+
+
+def _lift_flattened_visual(data: dict) -> dict:
+    """Поднимает содержимое таблицы/графика во вложенный объект, если модель
+    прислала его плоско: `{"kind": "table", "rows": [...]}` вместо
+    `{"kind": "table", "table": {"rows": [...]}}`.
+
+    Это не послабление валидации, а разбор однозначного намерения. Схема с
+    двойной вложенностью — наше внутреннее устройство, и модель на нём
+    спотыкается: живой прогон 25 сентября 2026, слайд ушёл в запасной
+    вариант с ошибкой «неизвестные поля ['rows']», хотя таблица была
+    написана правильно. Терять готовый слайд из-за уровня вложенности
+    дороже, чем поднять поля кодом.
+
+    Трогает только случай, когда вложенного объекта НЕТ вовсе: присланный
+    `table` всегда главнее, и молча смешивать его с плоскими полями нельзя
+    — это было бы уже угадыванием.
+
+    Только таблица. У графика есть СВОЙ вид (столбики/линия/круг), и в
+    плоском виде его негде взять: `visual.kind` там занят словом "chart".
+    Подставлять вид графика за модель значит решать за неё, как показать
+    данные, — а это ровно то решение, которое мы ей и отдаём.
+    """
+    if data.get("kind") != "table" or data.get("table") is not None:
+        return data
+    flat = {f: data[f] for f in _TABLE_FIELDS if f in data}
+    if not flat:
+        return data
+    rest = {k: v for k, v in data.items() if k not in _TABLE_FIELDS}
+    return {**rest, "table": flat}
+
+
 def visual_from_dict(data: dict | None, where: str) -> Visual | None:
     if data is None:
         return None
+    data = _lift_flattened_visual(data)
     _check_keys(data, {"kind", "caption", "table", "chart"}, {"kind"}, where)
 
     table = None

@@ -80,6 +80,12 @@ MAX_BUDGET_ESCALATIONS = 2
 # стартует ровно на старом потолке 6144 (её же комментарий: "эскалация до
 # потолка срабатывала практически на каждом вызове slide-writer"), значит
 # получает тот же лишний шаг эскалации, что и `namer`, без отдельной правки.
+# Протокольная обвязка, не инструкция роли (см. `tests/test_no_hardcoded_
+# prompts.py`: содержательные промпты живут в `agents/*/AGENT.md`, короткая
+# техническая обвязка — в коде). Тем же размером и тем же тоном, что уже
+# стоящее рядом "Ответь одним объектом JSON по схеме, без markdown-ограды:".
+_JSON_ONLY_NUDGE = "Ответь ТОЛЬКО объектом JSON по схеме, без рассуждений."
+
 MAX_TOKENS_BUDGET_CAP = 7168
 
 # Потолок выше можно запросить на КОНКРЕТНЫЙ вызов (`complete(...,
@@ -180,6 +186,24 @@ class YandexProvider(LLMProvider, VisionProvider):
         payload, tried_budgets = self._post_with_budget_escalation(
             body, deadline_at=deadline_at, expects_json=schema is not None, budget_cap=budget_cap,
         )
+        if schema is not None and self._answer_is_unusable(payload):
+            # Модель отдала одни рассуждения и остановилась сама
+            # (`finish_reason=stop`, `content` пуст или не JSON). Эскалация
+            # бюджета сюда не помогает: модель не упёрлась в потолок, она
+            # решила, что закончила.
+            #
+            # Живой прогон 25 сентября 2026: из двенадцати слайдов три ушли
+            # в запасной вариант, и часть — именно по этой причине, а не по
+            # нехватке бюджета. Одна повторная попытка с прямым указанием
+            # отвечать только JSON дешевле, чем потерянный слайд: пустой
+            # слайд в презентации стоит дороже одного лишнего вызова.
+            retry_body = {
+                **body,
+                "messages": [*messages, {"role": "user", "content": _JSON_ONLY_NUDGE}],
+            }
+            payload, tried_budgets = self._post_with_budget_escalation(
+                retry_body, deadline_at=deadline_at, expects_json=True, budget_cap=budget_cap,
+            )
         content = self._extract(payload, tried_budgets=tried_budgets)
         if schema is not None:
             # Второй вид нехватки бюджета: content непустой, но обрезан на
@@ -333,6 +357,25 @@ class YandexProvider(LLMProvider, VisionProvider):
                 json.loads(content)
             except json.JSONDecodeError:
                 return True
+        return False
+
+    @staticmethod
+    def _answer_is_unusable(payload: dict) -> bool:
+        """Ответ непригоден, хотя модель остановилась сама: `content` пуст
+        или не разбирается как JSON при `finish_reason=stop`.
+
+        Именно `stop` — при `length` работает эскалация бюджета, она умнее
+        повтора с тем же бюджетом."""
+        choice = payload.get("choices", [{}])[0]
+        if choice.get("finish_reason") != "stop":
+            return False
+        content = (choice.get("message", {}).get("content") or "").strip()
+        if not content:
+            return True
+        try:
+            json.loads(content)
+        except json.JSONDecodeError:
+            return True
         return False
 
     @staticmethod

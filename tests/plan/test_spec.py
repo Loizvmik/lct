@@ -6,9 +6,12 @@ audit-visual` запускается на уже готовом `.pptx` и до�
 `DeckSpec`, который `deckforge generate` дампит для отладки."""
 from __future__ import annotations
 
+import pytest
+
 from deckforge.plan.spec import (
     BulletBlock, Card, CardBlock, ChartSeriesData, ChartVisual, DeckSpec, Kpi, KpiBlock,
-    QuoteBlock, SlideSpec, TableVisual, TextBlock, Visual, deck_spec_from_debug_dict, deck_spec_to_dict,
+    QuoteBlock, SlideSpec, SpecValidationError, TableVisual, TextBlock, Visual,
+    deck_spec_from_debug_dict, deck_spec_to_dict, visual_from_dict,
 )
 
 
@@ -84,3 +87,36 @@ def test_deck_spec_round_trip_handles_empty_deck():
     empty = DeckSpec(title="Пусто", language="ru", slides=[])
     restored = deck_spec_from_debug_dict(deck_spec_to_dict(empty))
     assert restored.slides == []
+
+
+# ---------------------------------------------------------------------------
+# Модель кладёт таблицу на уровень выше — живой прогон 25 сентября 2026,
+# слайд ушёл в запасной вариант с ошибкой «неизвестные поля ['rows']»
+# ---------------------------------------------------------------------------
+
+
+def test_a_flattened_table_is_lifted_into_place():
+    """Схема с двойной вложенностью — наше внутреннее устройство, и модель
+    на нём спотыкается. Терять готовый слайд из-за уровня вложенности
+    дороже, чем поднять поля кодом: намерение однозначно."""
+    visual = visual_from_dict({"kind": "table", "rows": [["Этап", "Часы"], ["Ожидание", "18"]]}, "x")
+
+    assert visual is not None and visual.table is not None
+    assert visual.table.rows[0] == ["Этап", "Часы"]
+
+
+def test_a_properly_nested_table_is_left_alone():
+    """Присланный `table` всегда главнее — смешивать его с плоскими полями
+    значило бы уже угадывать."""
+    visual = visual_from_dict({"kind": "table", "table": {"rows": [["a"]]}}, "x")
+
+    assert visual is not None and visual.table is not None
+    assert visual.table.rows == [["a"]]
+
+
+def test_a_flattened_chart_is_not_guessed():
+    """У графика есть СВОЙ вид (столбики/линия/круг), и в плоском виде его
+    негде взять. Подставлять его за модель — решать за неё, как показать
+    данные."""
+    with pytest.raises(SpecValidationError):
+        visual_from_dict({"kind": "chart", "categories": ["a"], "series": []}, "x")

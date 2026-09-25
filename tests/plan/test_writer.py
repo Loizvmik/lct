@@ -561,3 +561,20 @@ def test_a_malformed_try_slide_call_is_answered_not_raised(PROFILE, TEMPLATE_PAT
     assert deck.slides[0].headline == "После ошибки"
 
 
+
+
+def test_a_fallback_slide_says_what_data_it_needs(PROFILE):
+    """Слайд с ОДНИМ заголовком — брак по ТЗ (Приложение 1, «пустой слайд
+    или слайд с одним заголовком»), а запасной вариант выдавал ровно его:
+    на живом прогоне 25 сентября 2026 три слайда из двенадцати вышли
+    пустыми, и по слайду было не понять, что случилось."""
+    # Три пункта: у среднего (`_outline`) есть `needs` — именно он и
+    # проверяется; у титульного и финального их нет по построению.
+    outline = _outline(3)
+    llm = _QueueLLM([RuntimeError("сеть недоступна")] * 9)
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+
+    middle = deck.slides[1]
+    assert middle.blocks, "запасной слайд не должен оставаться с одним заголовком"
+    assert any("Нужны данные" in i for b in middle.blocks for i in getattr(b, "items", []))

@@ -61,7 +61,7 @@ from deckforge.compose.slide_tools import list_layouts, try_slide
 from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
-    SLIDE_KINDS, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems,
+    SLIDE_KINDS, BulletBlock, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems,
 )
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.yandex import WRITER_BUDGET_CAP
@@ -267,7 +267,21 @@ def _fallback_slide(kind: str, index: int, intent: str, needs: list[str], *, rea
         finding += f" Нужны данные: {', '.join(needs)}."
     source_note = "Источник не подтверждён — текст запасного варианта, требует проверки перед показом." \
         if _DIGIT_RE.search(headline) else None
-    return SlideSpec(index=index, kind=kind, headline=headline, source_note=source_note, findings=[finding])
+
+    # Слайд с ОДНИМ заголовком — брак по ТЗ (Приложение 1, «Целостность»:
+    # «пустой слайд или слайд с одним заголовком»). Раньше запасной вариант
+    # выдавал ровно его: на живом прогоне 25 сентября 2026 три слайда из
+    # двенадцати вышли пустыми, и по слайду было не понять, что случилось.
+    #
+    # Пункты структуры (`OutlineSlide.needs`) — это то, что планировщик
+    # просил найти в источниках для ЭТОГО слайда. Показать их честнее, чем
+    # пустоту: видно, чего не хватило, и слайд можно дописать руками, не
+    # разбираясь в отчёте.
+    blocks = [BulletBlock(items=[f"Нужны данные: {n}" for n in needs])] if needs else []
+    return SlideSpec(
+        index=index, kind=kind, headline=headline, blocks=blocks,
+        source_note=source_note, findings=[finding],
+    )
 
 
 _SLIDE_SCHEMA = {

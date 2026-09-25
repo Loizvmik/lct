@@ -476,3 +476,73 @@ def test_provider_missing_secrets_error_points_to_env():
     assert "YANDEX_API_KEY" in message
     assert "YANDEX_FOLDER_ID" in message
     assert ".env" in message
+
+
+# ---------------------------------------------------------------------------
+# Модель отдала одни рассуждения и остановилась сама — повторная попытка с
+# прямым указанием отвечать только JSON
+# ---------------------------------------------------------------------------
+
+
+def _stopped_without_json(content: str = ""):
+    """Ответ с `finish_reason=stop` и непригодным содержимым — модель
+    решила, что закончила, хотя JSON не прислала. Эскалация бюджета здесь
+    не помогает: потолок ни при чём."""
+    return {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+
+
+def _json_payload(text: str = '{"kind": "bullets"}'):
+    return {"choices": [{"finish_reason": "stop", "message": {"content": text}}]}
+
+
+def test_empty_answer_with_schema_is_retried_once_with_a_nudge(monkeypatch):
+    """Живой прогон 25 сентября 2026: три слайда из двенадцати ушли в
+    запасной вариант, часть — именно по этой причине. Пустой слайд в
+    презентации стоит дороже одного лишнего вызова."""
+    captured = _stub_post_sequence(monkeypatch, [_stopped_without_json(), _json_payload()])
+
+    out = _offline_provider().complete(
+        [{"role": "user", "content": "напиши слайд"}], schema={"type": "object"},
+    )
+
+    assert out == '{"kind": "bullets"}'
+    assert len(captured) == 2, "повтор обязан быть ровно один"
+    last_message = captured[1]["messages"][-1]["content"]
+    assert "ТОЛЬКО" in last_message and "JSON" in last_message
+
+
+def test_a_non_json_answer_is_retried_too(monkeypatch):
+    """Не только пустой ответ: рассуждение вслух вместо JSON — тот же
+    случай, и лечится тем же."""
+    captured = _stub_post_sequence(
+        monkeypatch, [_stopped_without_json("Думаю, что здесь стоит написать..."), _json_payload()],
+    )
+
+    out = _offline_provider().complete(
+        [{"role": "user", "content": "напиши слайд"}], schema={"type": "object"},
+    )
+
+    assert out == '{"kind": "bullets"}'
+    assert len(captured) == 2
+
+
+def test_a_good_answer_is_not_retried(monkeypatch):
+    """Цена приёма — ноль лишних вызовов, когда модель ответила как надо."""
+    captured = _stub_post_sequence(monkeypatch, [_json_payload()])
+
+    _offline_provider().complete(
+        [{"role": "user", "content": "напиши слайд"}], schema={"type": "object"},
+    )
+
+    assert len(captured) == 1
+
+
+def test_a_request_without_a_schema_is_not_retried(monkeypatch):
+    """Без запрошенной схемы судить о пригодности текста нечем — тот же
+    принцип, что у эскалации бюджета (`expects_json=False`)."""
+    captured = _stub_post_sequence(monkeypatch, [_stopped_without_json("обычный текст ответа")])
+
+    out = _offline_provider().complete([{"role": "user", "content": "привет"}])
+
+    assert out == "обычный текст ответа"
+    assert len(captured) == 1
