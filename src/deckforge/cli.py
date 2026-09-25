@@ -118,6 +118,16 @@ def _cmd_parse(args: argparse.Namespace) -> int:
     print(f"Лейаутов: {len(profile.layouts)}, паттернов: {len(profile.patterns)}")
     print(f"Роли палитры: {', '.join(f'{role}={hexv}' for role, hexv in sorted(profile.palette_roles.items())) or '(нет)'}")
 
+    if profile.patterns:
+        # Задача C ("превью PNG на каждый паттерн шаблона в кэше профиля") —
+        # человек, глядя на отчёт, должен уметь открыть глазами то, что
+        # разбор вытащил из шаблона, не только прочитать JSON целиком.
+        print("\nПаттерны:")
+        for pattern in profile.patterns:
+            preview = profile.pattern_preview_path(pattern)
+            preview_text = str(preview) if preview is not None else "(превью нет — soffice недоступен или ключ модели не передан)"
+            print(f"  - {pattern.pattern_id} ({pattern.kind}): {preview_text}")
+
     print("\nОткуда что взято:")
     for line in profile.provenance:
         print(f"  - {line}")
