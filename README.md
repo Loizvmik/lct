@@ -7,7 +7,8 @@
 `.pdf`, `.html`). Веб-интерфейс на Next.js, бэкенд на FastAPI, командная
 строка.
 
-Дальше: [ARCHITECTURE.md](docs/ARCHITECTURE.md) — пайплайн и границы слоёв,
+Дальше: [SPEC.md](docs/SPEC.md) — условия задачи, ссылки и уточнения организаторов,
+[ARCHITECTURE.md](docs/ARCHITECTURE.md) — пайплайн и границы слоёв,
 [MODELS.md](docs/MODELS.md) — модели и почему выбраны именно они,
 [AUDIT.md](docs/AUDIT.md) — все 35 проверок аудита.
 
