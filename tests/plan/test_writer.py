@@ -7,7 +7,8 @@ import time
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec, validate_deck_spec
 from deckforge.compose.slide_tools import list_layouts
-from deckforge.plan.writer import _flag_repeated_headlines, pick_patterns, write_slides
+from deckforge.plan.variants import Variant, apply_variant, rerank_candidates
+from deckforge.plan.writer import _flag_repeated_headlines, pick_patterns, rerank_patterns, write_slides
 from deckforge.provider.base import LLMProvider
 
 
@@ -594,3 +595,119 @@ def test_a_cover_slide_does_not_ask_for_data(PROFILE):
     deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
 
     assert not deck.slides[0].blocks, "обложка не должна просить данные"
+
+
+# ---------------------------------------------------------------------------
+# rerank_patterns — модель выбирает одну из трёх раскладок для airy/visual
+# ---------------------------------------------------------------------------
+
+
+def _rerank_deck() -> DeckSpec:
+    return DeckSpec(title="T", language="ru", slides=[
+        SlideSpec(index=0, kind="section", headline="Обложка"),
+        SlideSpec(index=1, kind="bullets", headline="Где уходит время", blocks=[BulletBlock(items=[
+            "Ожидание первого согласующего — медиана 18 часов",
+            "Ожидание второго согласующего — медиана 11 часов",
+            "Чистая работа людей — 28 минут",
+        ])]),
+        SlideSpec(index=2, kind="bullets", headline="Что изменилось", blocks=[BulletBlock(items=[
+            "Сквозная медиана сократилась до 6,2 часа", "Переназначений вручную — 4%",
+        ])]),
+    ])
+
+
+class _PayloadLLM(LLMProvider):
+    """Отвечает функцией от payload запроса; вызовы идут из пула потоков."""
+
+    def __init__(self, answer):
+        self._answer = answer
+        self.calls = 0
+        self._lock = threading.Lock()
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        with self._lock:
+            self.calls += 1
+        return self._answer(json.loads(messages[1]["content"]))
+
+
+def _jobs(profile) -> dict[tuple[Variant, int], list[str]]:
+    jobs = {
+        (variant, index): ids
+        for variant in (Variant.airy, Variant.visual)
+        for index, _slide, ids in rerank_candidates(_rerank_deck(), profile, variant)
+    }
+    assert jobs, "на контрольном шаблоне модели обязано быть из чего выбирать"
+    return jobs
+
+
+def test_rerank_applies_a_valid_model_choice(PROFILE):
+    jobs = _jobs(PROFILE)
+    llm = _PayloadLLM(lambda payload: json.dumps(
+        {"pattern_id": payload["candidates"][-1]["pattern_id"], "reason": "по смыслу"}, ensure_ascii=False,
+    ))
+    chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), llm)
+    assert llm.calls == len(jobs)
+    assert chosen == {key: ids[-1] for key, ids in jobs.items()}
+    # Выбор доходит до собранного варианта.
+    for variant in (Variant.airy, Variant.visual):
+        preferred = {i: pid for (v, i), pid in chosen.items() if v is variant}
+        spec = apply_variant(_rerank_deck(), PROFILE, variant, preferred=preferred)
+        for index, pid in preferred.items():
+            assert spec.slides[index].pattern_id == pid
+
+
+def test_rerank_model_sees_only_the_code_candidates_without_coordinates(PROFILE):
+    seen = []
+    llm = _PayloadLLM(lambda payload: seen.append(payload) or json.dumps({"pattern_id": "x"}))
+    rerank_patterns(_rerank_deck(), PROFILE, [Variant.visual], llm)
+    assert seen and all(p["variant"] == "visual" for p in seen)
+    for payload in seen:
+        assert 2 <= len(payload["candidates"]) <= 3
+        assert [c["rank"] for c in payload["candidates"]] == list(range(1, len(payload["candidates"]) + 1))
+        assert "box" not in json.dumps(payload)
+
+
+def test_rerank_rejects_a_pattern_outside_the_candidates(PROFILE):
+    jobs = _jobs(PROFILE)
+    llm = _PayloadLLM(lambda payload: json.dumps({"pattern_id": "not-a-real-pattern-id"}))
+    notes: list[str] = []
+    chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), llm, notes=notes)
+    assert chosen == {key: ids[0] for key, ids in jobs.items()}
+    assert len(notes) == len(jobs)
+
+
+def test_rerank_survives_a_model_failure(PROFILE):
+    jobs = _jobs(PROFILE)
+
+    def _boom(_payload):
+        raise RuntimeError("сеть недоступна")
+
+    chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), _PayloadLLM(_boom))
+    assert chosen == {key: ids[0] for key, ids in jobs.items()}
+
+
+def test_rerank_without_a_model_does_nothing(PROFILE):
+    assert rerank_patterns(_rerank_deck(), PROFILE, list(Variant), None) == {}
+
+
+def test_rerank_skips_dense(PROFILE):
+    llm = _PayloadLLM(lambda payload: json.dumps({"pattern_id": "x"}))
+    assert rerank_patterns(_rerank_deck(), PROFILE, [Variant.dense], llm) == {}
+    assert llm.calls == 0
+
+
+def test_rerank_does_not_wait_past_its_time_budget(PROFILE):
+    jobs = _jobs(PROFILE)
+    release = threading.Event()
+
+    def _slow(payload):
+        release.wait(5)
+        return json.dumps({"pattern_id": payload["candidates"][-1]["pattern_id"]})
+
+    started = time.monotonic()
+    try:
+        chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), _PayloadLLM(_slow), budget_seconds=0.2)
+    finally:
+        release.set()
+    assert time.monotonic() - started < 2
+    assert chosen == {key: ids[0] for key, ids in jobs.items()}

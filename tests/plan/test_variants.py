@@ -15,6 +15,7 @@ from deckforge.compose.builder import build_deck
 from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, QuoteBlock, SlideSpec, TextBlock, Visual
 from deckforge.plan.variants import (
     MAX_SLIDES, MIN_SLIDES, Variant, apply_variant, _choose_kind_and_pattern, _has_image_slot,
+    _ranked_candidates, rank_patterns, rerank_candidates,
 )
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.template.profile import TemplateProfile
@@ -465,3 +466,52 @@ def test_the_other_two_variants_do_not_inherit_the_writers_choice():
     }
 
     assert all(pid != chosen for pid in picked.values()), picked
+
+
+# ---------------------------------------------------------------------------
+# Кандидаты для переранжирования моделью и `preferred`
+# ---------------------------------------------------------------------------
+
+
+def test_rank_patterns_puts_the_deterministic_choice_first_and_keeps_tuple_order():
+    slide = DECK.slides[1]
+    ids = rank_patterns(slide, PROFILE, Variant.visual)
+    _kind, chosen = _choose_kind_and_pattern(slide, PROFILE, Variant.visual)
+    assert 1 <= len(ids) <= 3
+    assert ids[0] == chosen
+    keys = {p.pattern_id: key for key, p in _ranked_candidates(slide, PROFILE, Variant.visual)}
+    assert [keys[i] for i in ids] == sorted(keys[i] for i in ids)
+    # В кандидаты не попадает раскладка хуже лидера по вместимости.
+    assert len({keys[i][:2] for i in ids}) == 1
+
+
+def test_rerank_candidates_skip_bare_slides_and_use_variant_numbering():
+    for variant in (Variant.airy, Variant.visual):
+        spec = apply_variant(DECK, PROFILE, variant)
+        for index, slide, ids in rerank_candidates(DECK, PROFILE, variant):
+            assert slide.blocks or slide.visual is not None
+            assert len(ids) > 1
+            # Номер тот же, под которым слайд окажется в собранном варианте.
+            assert spec.slides[index].headline == slide.headline
+
+
+def test_apply_variant_takes_a_compatible_preferred_pattern():
+    index, _slide, ids = next(
+        (i, s, ids) for i, s, ids in rerank_candidates(DECK, PROFILE, Variant.visual)
+    )
+    baseline = apply_variant(DECK, PROFILE, Variant.visual)
+    assert baseline.slides[index].pattern_id == ids[0]
+    spec = apply_variant(DECK, PROFILE, Variant.visual, preferred={index: ids[1]})
+    assert spec.slides[index].pattern_id == ids[1]
+    assert spec.slides[index].kind == next(p.kind for p in PROFILE.patterns if p.pattern_id == ids[1])
+
+
+def test_apply_variant_ignores_an_incompatible_or_unknown_preferred_pattern():
+    cards_index = next(i for i, s in enumerate(DECK.slides) if s.kind == "cards")
+    baseline = apply_variant(DECK, PROFILE, Variant.visual)
+    section_id = next(p.pattern_id for p in PROFILE.patterns if p.kind == "section")
+    spec = apply_variant(
+        DECK, PROFILE, Variant.visual, preferred={cards_index: section_id, 1: "no-such-layout"},
+    )
+    assert spec.slides[cards_index].pattern_id == baseline.slides[cards_index].pattern_id
+    assert spec.slides[1].pattern_id == baseline.slides[1].pattern_id

@@ -25,6 +25,12 @@
   только числа `Capacity`, не координаты `Box`, тем самым план по-прежнему
   не знает ни одной координаты).
 
+Задача D: `rerank_patterns(deck, profile, variants, llm)` — для вариантов
+`airy` и `visual` код отбирает три лучшие раскладки слайда (`variants.
+rank_patterns`), модель выбирает одну по смыслу; результат уходит в
+`variants.apply_variant(..., preferred=...)`. В реальном пайплайне стоит
+между `write_slides` и `apply_variant` (`cli.py`, `api/jobs.py`).
+
 Task 19: `write_slides` — теперь настоящий агентный цикл, не одиночный
 вызов. Модель пишет текст вслепую, не зная, влезет ли он в слот выбранной
 раскладки, — самая частая находка аудита ("текст не помещается в свою
@@ -50,7 +56,8 @@ from __future__ import annotations
 import os
 import json
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import replace
 from pathlib import Path
 
@@ -61,8 +68,9 @@ from deckforge.compose.slide_tools import list_layouts, try_slide
 from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
-    SLIDE_KINDS, BulletBlock, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems,
+    SLIDE_KINDS, BulletBlock, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
 )
+from deckforge.plan.variants import Variant, rerank_candidates
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.yandex import WRITER_BUDGET_CAP
 
@@ -773,7 +781,7 @@ def _flag_repeated_headlines(slides: list[SlideSpec]) -> None:
 
 _PICKER_SCHEMA = {
     "type": "object",
-    "properties": {"pattern_id": {"type": "string"}},
+    "properties": {"pattern_id": {"type": "string"}, "reason": {"type": "string"}},
     "required": ["pattern_id"],
     "additionalProperties": False,
 }
@@ -890,3 +898,142 @@ def pick_patterns(deck_spec: DeckSpec, profile, llm: LLMProvider | None) -> Deck
         )
 
     return DeckSpec(title=deck_spec.title, language=deck_spec.language, slides=new_slides, meta=dict(deck_spec.meta))
+
+
+# ---------------------------------------------------------------------------
+# rerank_patterns — модель выбирает раскладку из трёх, отобранных кодом,
+# для вариантов airy и visual.
+# ---------------------------------------------------------------------------
+
+# Варианты, которым раскладку уточняет модель. `dense` сюда не входит: его
+# раскладку уже выбирал писатель текста инструментами (`list_layouts`/
+# `try_slide`), и `apply_variant` её наследует.
+RERANK_VARIANTS = (Variant.visual, Variant.airy)
+
+# Запасные дефолты, если вызывающий код не передал своих: те же числа, что
+# в `config/app.yaml` (`llm.pattern_picker_*`), см. обоснование там.
+DEFAULT_RERANK_MAX_WORKERS = 8
+DEFAULT_RERANK_BUDGET_SECONDS = 40.0
+
+# Поля слайда, которые модели не нужны для выбора раскладки: находки и
+# заметки докладчика её только отвлекают, а `pattern_id` — это выбор
+# писателя для плотного варианта, не подсказка для этих двух.
+_RERANK_HIDDEN_SLIDE_FIELDS = ("findings", "speaker_notes", "pattern_id", "index")
+
+
+def _rerank_candidate_card(pattern, rank: int) -> dict:
+    """Что модель знает о раскладке: роли и вместимость мест, сетка, декор.
+    Без координат: план их не знает (см. `tests/plan/test_no_pptx_import.
+    py`), а смысл выбора координатами и не выражается."""
+    return {
+        "pattern_id": pattern.pattern_id,
+        "rank": rank,
+        "kind": pattern.kind,
+        "slots": [{"role": slot.role, "max_chars": slot.max_chars} for slot in pattern.slots],
+        "repeat_count": pattern.repeat.count if pattern.repeat is not None else 0,
+        "decor_count": len(pattern.decor),
+        "has_image_slot": any(slot.role in ("image", "icon") for slot in pattern.slots),
+        "is_dark": pattern.is_dark,
+    }
+
+
+def _rerank_one(
+    variant: Variant, slide: SlideSpec, candidate_ids: list[str], profile, prompt_body: str, llm: LLMProvider,
+) -> tuple[str, str | None]:
+    """Один вызов модели на слайд. Возвращает `(pattern_id, причина сбоя)`:
+    при любом сбое — первого кандидата кода и причину, иначе `None`. Не
+    бросает: отказ модели на одном слайде не должен ронять шаг. Пояснение
+    модели (`reason`) нужно ей самой, чтобы выбирать осмысленно, коду оно
+    ни к чему."""
+    by_id = {p.pattern_id: p for p in profile.patterns}
+    slide_view = {k: v for k, v in slide_spec_to_dict(slide).items() if k not in _RERANK_HIDDEN_SLIDE_FIELDS}
+    payload = {
+        "variant": variant.value,
+        "slide": slide_view,
+        "candidates": [_rerank_candidate_card(by_id[pid], rank) for rank, pid in enumerate(candidate_ids, 1)],
+    }
+    messages = [
+        {"role": "system", "content": prompt_body},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    fallback = candidate_ids[0]
+    try:
+        raw = llm.complete(messages, schema=_PICKER_SCHEMA, max_tokens=PICKER_MAX_TOKENS)
+        data = json.loads(raw)
+    except Exception as exc:
+        return fallback, f"модель не ответила — {_why(exc)}"
+    proposed = data.get("pattern_id") if isinstance(data, dict) else None
+    if not isinstance(proposed, str) or proposed not in candidate_ids:
+        # Тот же принцип, что `_validate_chosen_layout`: номер вне списка
+        # кандидатов код не принимает.
+        return fallback, f"модель назвала раскладку вне списка кандидатов ({proposed!r})"
+    return proposed, None
+
+
+def rerank_patterns(
+    deck: DeckSpec, profile, variants, llm: LLMProvider | None,
+    *, max_workers: int = DEFAULT_RERANK_MAX_WORKERS, budget_seconds: float = DEFAULT_RERANK_BUDGET_SECONDS,
+    notes: list[str] | None = None,
+) -> dict[tuple[Variant, int], str]:
+    """Раскладки, выбранные моделью: `(вариант, номер слайда в варианте) ->
+    pattern_id`, готово к передаче в `apply_variant(..., preferred=...)`.
+
+    Зачем: для `airy` и `visual` выбор раньше был чисто числовым (`variants.
+    _pattern_rank_key`), без единого взгляда на смысл слайда, и два варианта
+    из трёх выглядели однообразно. Код по-прежнему решает, что вообще
+    допустимо (`variants.rank_patterns`: три лучших, все без переполнения),
+    модель выбирает одну по смыслу. `apply_variant` остаётся чистой и ещё
+    раз проверяет совместимость.
+
+    Время: вызовы параллельны (`max_workers`), а весь шаг ограничен
+    `budget_seconds`. Слайды, по которым модель не успела, просто остаются
+    на выборе кода: колода и так близка к 300с ТЗ, и ждать отстающих ради
+    вкуса дороже, чем их потерять. Без модели шаг ничего не делает.
+
+    `notes` (если передан) получает по строке на каждый слайд, где модель
+    не ответила или ответила не по правилам, — для отчёта командной строки."""
+    if llm is None:
+        return {}
+    wanted = [v for v in RERANK_VARIANTS if v in set(variants)]
+    jobs = [
+        (variant, index, slide, ids)
+        for variant in wanted
+        for index, slide, ids in rerank_candidates(deck, profile, variant)
+    ]
+    if not jobs:
+        return {}
+    _meta, prompt_body = _load_agent_prompt(AGENT_PATH_PICKER)
+
+    result: dict[tuple[Variant, int], str] = {}
+    pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
+    try:
+        futures = {
+            pool.submit(_rerank_one, variant, slide, ids, profile, prompt_body, llm): (variant, index, ids)
+            for variant, index, slide, ids in jobs
+        }
+        deadline = time.monotonic() + budget_seconds
+        pending = set(futures)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            for future in done:
+                variant, index, _ids = futures[future]
+                chosen, failure = future.result()
+                result[(variant, index)] = chosen
+                if notes is not None and failure:
+                    notes.append(f"[{variant.value}] слайд {index}: {failure}, взят первый кандидат кода")
+        for future in pending:
+            variant, index, ids = futures[future]
+            result[(variant, index)] = ids[0]
+            if notes is not None:
+                notes.append(
+                    f"[{variant.value}] слайд {index}: модель не уложилась в бюджет шага "
+                    f"({budget_seconds:.0f}с), взят первый кандидат кода"
+                )
+    finally:
+        # Не ждать отстающих: их вызовы сами оборвутся по дедлайну провайдера,
+        # а ответ уже никому не нужен.
+        pool.shutdown(wait=False, cancel_futures=True)
+    return result

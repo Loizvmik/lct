@@ -89,6 +89,13 @@ class LLMConfig(BaseModel):
     # workers`. Дефолт дублирует `vision_kind.DEFAULT_MAX_WORKERS` — см.
     # комментарий про происхождение числа в app.yaml.
     pattern_kind_max_workers: int = 4
+    # Задача D: переранжирование раскладок моделью (`plan.writer.rerank_
+    # patterns`) — короткий дедлайн вызова, свой параллелизм и бюджет всего
+    # шага; происхождение чисел см. в app.yaml. Со значениями по умолчанию
+    # по той же причине, что и поля выше.
+    pattern_picker_deadline_seconds: float = 20.0
+    pattern_picker_max_workers: int = 8
+    pattern_picker_step_budget_seconds: float = 40.0
 
     def model_for(self, role: str) -> str:
         """Модель для роли; если роль не описана явно — модель по умолчанию."""
@@ -167,6 +174,14 @@ class ComposeConfig(BaseModel):
     clone_examples: bool = True
 
 
+class PlanConfig(BaseModel):
+    # Переранжирование раскладок моделью для вариантов airy и visual
+    # (`plan.writer.rerank_patterns`). Выключатель на случай, если выбор
+    # модели на незнакомом шаблоне окажется хуже кода или не влезет в бюджет
+    # времени: вернуть чисто детерминированный выбор одной строкой конфига.
+    rerank_variants: bool = True
+
+
 class Settings(BaseModel):
     llm: LLMConfig
     paths: PathsConfig
@@ -174,6 +189,7 @@ class Settings(BaseModel):
     # Со значением по умолчанию: конфиги без раздела `compose` (собранные
     # вручную в тестах) не должны переставать парситься.
     compose: ComposeConfig = ComposeConfig()
+    plan: PlanConfig = PlanConfig()
     yandex_api_key: str | None = None
     yandex_folder_id: str | None = None
 

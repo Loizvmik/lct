@@ -27,7 +27,7 @@ from deckforge.plan.outline import build_outline, load_content_pack
 from deckforge.plan.photos import assign_photos, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, rerank_patterns, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
@@ -38,7 +38,7 @@ from deckforge.template.profile import TemplateProfile
 APP_YAML_PATH = Path(__file__).resolve().parents[2] / "config" / "app.yaml"
 
 
-def _build_role_provider(role: str) -> LLMProvider | None:
+def _build_role_provider(role: str, *, deadline_seconds: float | None = None) -> LLMProvider | None:
     """Провайдер для роли `role` (`outline`/`writer`/`pattern_picker`/
     `palette_namer`), либо `None`, если секретов нет или их не хватает для
     клиента — весь пайплайн (`parse`/`generate`) обязан продолжить работу
@@ -54,10 +54,34 @@ def _build_role_provider(role: str) -> LLMProvider | None:
             model=settings.llm.model_for(role),
             api_key=settings.yandex_api_key,
             folder_id=settings.yandex_folder_id,
-            deadline_seconds=settings.llm.deadline_seconds,
+            deadline_seconds=deadline_seconds if deadline_seconds is not None else settings.llm.deadline_seconds,
         )
     except (ValueError, ModelNotAllowed):
         return None
+
+
+def _rerank(deck, profile, variants) -> tuple[dict, list[str]]:
+    """Задача D: модель выбирает раскладку из трёх, отобранных кодом, для
+    airy и visual. Возвращает `(вариант -> {номер слайда -> pattern_id},
+    заметки)`. Выключено в конфиге, нет ключа или конфиг не читается —
+    пустой выбор, варианты собираются чисто детерминированно."""
+    try:
+        settings = Settings.load(APP_YAML_PATH)
+    except Exception:
+        return {}, []
+    if not settings.plan.rerank_variants:
+        return {}, []
+    llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
+    notes: list[str] = []
+    chosen = rerank_patterns(
+        deck, profile, variants, llm,
+        max_workers=settings.llm.pattern_picker_max_workers,
+        budget_seconds=settings.llm.pattern_picker_step_budget_seconds, notes=notes,
+    )
+    by_variant: dict = {}
+    for (variant, index), pattern_id in chosen.items():
+        by_variant.setdefault(variant, {})[index] = pattern_id
+    return by_variant, notes
 
 
 def _build_namer() -> LLMProvider | None:
@@ -228,9 +252,17 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     print(f"Содержание (для отладки) записано в {debug_path}")
     variants = [Variant[v] for v in args.variants] if args.variants else list(Variant)
 
+    rerank_started = time.monotonic()
+    preferred_by_variant, rerank_notes = _rerank(deck, profile, variants)
+    if preferred_by_variant:
+        picked = sum(len(v) for v in preferred_by_variant.values())
+        print(f"Раскладки airy/visual уточнены моделью: {picked} слайдов за {time.monotonic() - rerank_started:.1f}с")
+        for note in rerank_notes:
+            print(f"  ! {note}")
+
     for variant in variants:
         step_started = time.monotonic()
-        variant_deck = apply_variant(deck, profile, variant)
+        variant_deck = apply_variant(deck, profile, variant, preferred=preferred_by_variant.get(variant))
         built_path = build_deck(variant_deck, profile, args.template, variant, user_photos=user_photos)
         built_at = time.monotonic()
         path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-t13.pptx"

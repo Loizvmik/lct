@@ -37,7 +37,7 @@ from deckforge.export.bundle import export_bundle
 from deckforge.plan.outline import SourceDoc, build_outline
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, rerank_patterns, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
@@ -63,7 +63,7 @@ def finding_id(finding: Finding) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
-def _build_role_provider(role: str) -> LLMProvider | None:
+def _build_role_provider(role: str, *, deadline_seconds: float | None = None) -> LLMProvider | None:
     """Тот же приём, что `cli._build_role_provider` — без ключа/сети
     пайплайн обязан продолжать работать запасными вариантами, не падать."""
     try:
@@ -75,10 +75,32 @@ def _build_role_provider(role: str) -> LLMProvider | None:
     try:
         return YandexProvider(
             model=settings.llm.model_for(role), api_key=settings.yandex_api_key,
-            folder_id=settings.yandex_folder_id, deadline_seconds=settings.llm.deadline_seconds,
+            folder_id=settings.yandex_folder_id,
+            deadline_seconds=deadline_seconds if deadline_seconds is not None else settings.llm.deadline_seconds,
         )
     except (ValueError, ModelNotAllowed):
         return None
+
+
+def _rerank(deck: DeckSpec, profile: TemplateProfile) -> dict[Variant, dict[int, str]]:
+    """Тот же шаг, что `cli._rerank`: модель выбирает раскладку из трёх для
+    airy и visual. Выключено в конфиге или нет ключа — пустой выбор."""
+    try:
+        settings = Settings.load(APP_YAML_PATH)
+    except Exception:
+        return {}
+    if not settings.plan.rerank_variants:
+        return {}
+    llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
+    chosen = rerank_patterns(
+        deck, profile, list(Variant), llm,
+        max_workers=settings.llm.pattern_picker_max_workers,
+        budget_seconds=settings.llm.pattern_picker_step_budget_seconds,
+    )
+    by_variant: dict[Variant, dict[int, str]] = {}
+    for (variant, index), pattern_id in chosen.items():
+        by_variant.setdefault(variant, {})[index] = pattern_id
+    return by_variant
 
 
 def _writer_max_workers() -> int:
@@ -301,9 +323,12 @@ async def _run_job(
             pass
 
         job.enter_stage("compose")
+        preferred_by_variant = await asyncio.to_thread(_rerank, deck, profile)
         async with asyncio.TaskGroup() as tg:
             for variant in Variant:
-                tg.create_task(_compose_variant(job, variant, deck, profile, template.path))
+                tg.create_task(_compose_variant(
+                    job, variant, deck, profile, template.path, preferred_by_variant.get(variant),
+                ))
 
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
         # случайные номера, и найти «тот самый, который только что собрали»
@@ -365,8 +390,11 @@ async def _run_job(
         job.finish(error="; ".join(str(e) for e in eg.exceptions))
 
 
-async def _compose_variant(job: JobRecord, variant: Variant, deck: DeckSpec, profile: TemplateProfile, template_path: Path) -> None:
-    variant_deck = await asyncio.to_thread(apply_variant, deck, profile, variant)
+async def _compose_variant(
+    job: JobRecord, variant: Variant, deck: DeckSpec, profile: TemplateProfile, template_path: Path,
+    preferred: dict[int, str] | None = None,
+) -> None:
+    variant_deck = await asyncio.to_thread(apply_variant, deck, profile, variant, preferred)
     built_path = await asyncio.to_thread(build_deck, variant_deck, profile, template_path, variant)
     dest_dir = job.dir / variant.value
     dest_dir.mkdir(parents=True, exist_ok=True)

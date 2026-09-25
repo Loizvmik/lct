@@ -91,3 +91,57 @@ def test_audit_visual_runs_on_a_finished_pptx_without_regenerating_it(monkeypatc
     assert "Детерминированный аудит" in out
     assert "не выполнял" in out.lower() or "не задан" in out.lower()  # честная деградация без ключа
     assert "Сводный отчёт" in out
+
+
+def test_generate_passes_the_model_layout_choice_to_apply_variant(monkeypatch, capsys, tmp_path):
+    """Задача D: шаг переранжирования стоит между текстом и вариантами, и
+    выбор модели доходит до `apply_variant`. Модель подменена: сети нет."""
+    from deckforge.provider.base import LLMProvider
+
+    monkeypatch.delenv("YANDEX_API_KEY", raising=False)
+    monkeypatch.delenv("YANDEX_FOLDER_ID", raising=False)
+
+    class _LastCandidate(LLMProvider):
+        calls = 0
+
+        def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+            _LastCandidate.calls += 1
+            payload = json.loads(messages[1]["content"])
+            return json.dumps({"pattern_id": payload["candidates"][-1]["pattern_id"], "reason": "тест"})
+
+    real_build = cli_module._build_role_provider
+    monkeypatch.setattr(
+        cli_module, "_build_role_provider",
+        lambda role, **kw: _LastCandidate() if role == "pattern_picker" else real_build(role, **kw),
+    )
+    captured: dict = {}
+    real_apply = cli_module.apply_variant
+
+    def _spy(deck, profile, variant, preferred=None):
+        captured[variant] = preferred
+        return real_apply(deck, profile, variant, preferred=preferred)
+
+    monkeypatch.setattr(cli_module, "apply_variant", _spy)
+    # Без ключа запасной текст слайдов пуст, и модели не из чего выбирать:
+    # подставляем текст, как будто его написал писатель.
+    from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec
+
+    written = DeckSpec(title="T", language="ru", slides=[
+        SlideSpec(index=0, kind="section", headline="Обложка"),
+        *[
+            SlideSpec(index=i, kind="bullets", headline=f"Тезис {i}", blocks=[BulletBlock(items=[
+                "Ожидание первого согласующего — медиана 18 часов", "Чистая работа людей — 28 минут",
+            ])])
+            for i in range(1, 4)
+        ],
+    ])
+    monkeypatch.setattr(cli_module, "write_slides", lambda *a, **kw: written)
+
+    exit_code = main([
+        "generate", str(TEMPLATE), str(CONTENT_PACK), "-o", str(tmp_path / "decks"), "--variant", "visual",
+    ])
+    assert exit_code == 0
+    assert _LastCandidate.calls > 0
+    preferred = captured[cli_module.Variant.visual]
+    assert preferred and len(preferred) == _LastCandidate.calls
+    assert "уточнены моделью" in capsys.readouterr().out
