@@ -29,3 +29,22 @@ def test_bundle_renders_one_png_per_slide(PROFILE, PPTX, tmp_path):
 
     bundle = export_bundle(PPTX, PROFILE, tmp_path)
     assert len(bundle.pngs) == len(Presentation(str(PPTX)).slides)
+
+
+@pytest.mark.skipif(not soffice_available(), reason="LibreOffice не установлен")
+def test_bundle_converts_pptx_to_pdf_only_once(PROFILE, PPTX, tmp_path, monkeypatch):
+    """PDF и PNG-превью раньше рендерились из pptx по отдельности (`to_pdf`
+    внутри `to_pngs` конвертировал файл заново) — на трёх вариантах это 6
+    вызовов soffice вместо 3, замер: 302.8с против лимита ТЗ в 300с."""
+    import deckforge.render.soffice as soffice_mod
+
+    calls = []
+    orig_run_soffice = soffice_mod._run_soffice
+    monkeypatch.setattr(
+        soffice_mod, "_run_soffice",
+        lambda *a, **kw: calls.append(a) or orig_run_soffice(*a, **kw),
+    )
+
+    export_bundle(PPTX, PROFILE, tmp_path)
+
+    assert len(calls) == 1

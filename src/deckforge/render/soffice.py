@@ -159,7 +159,10 @@ def _pdftoppm_binary() -> str | None:
     return shutil.which("pdftoppm") or shutil.which("pdftocairo")
 
 
-def to_pngs(pptx: Path, out_dir: Path, dpi: int = 110, pages: list[int] | None = None) -> list[Path]:
+def to_pngs(
+    pptx: Path, out_dir: Path, dpi: int = 110, pages: list[int] | None = None,
+    pdf_path: Path | None = None,
+) -> list[Path]:
     """Растрирует слайды `pptx` в отдельные PNG (`{stem}-N.png`), по
     возрастанию номера страницы, с разрешением `dpi` точек на дюйм.
 
@@ -175,12 +178,25 @@ def to_pngs(pptx: Path, out_dir: Path, dpi: int = 110, pages: list[int] | None =
     "разбор незнакомого шаблона в бюджет" разбросаны по файлу, не идут
     подряд — см. докстроку модуля про живой замер, почему это того стоит).
     Конвертация в PDF (`to_pdf`) в обоих случаях одна на весь файл — этого
-    шага `pages` не касается, `soffice` не умеет конвертировать частично."""
+    шага `pages` не касается, `soffice` не умеет конвертировать частично.
+
+    `pdf_path` — если PDF уже отрендерен вызывающим кодом (типичный случай:
+    `export.bundle.export_bundle` сам вызывает `to_pdf` перед `to_pngs` для
+    итогового `.pdf` бандла), передайте готовый путь — так `soffice`
+    конвертирует файл один раз, а не дважды. Живой замер на контрольном
+    шаблоне (37 слайдов, три формата экспорта): двойной рендер PDF —
+    302.8с, дороже лимита ТЗ в 300с на всю генерацию колоды; без дубликата
+    укладывается. Без `pdf_path` поведение прежнее — рендерит сам."""
     pptx = Path(pptx)
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    pdf_path = to_pdf(pptx, out_dir)
+    if pdf_path is None:
+        pdf_path = to_pdf(pptx, out_dir)
+    else:
+        pdf_path = Path(pdf_path)
+        if not pdf_path.exists():
+            raise RenderError(f"переданный pdf_path не существует: {pdf_path}")
 
     poppler_bin = _pdftoppm_binary()
     if poppler_bin is None:

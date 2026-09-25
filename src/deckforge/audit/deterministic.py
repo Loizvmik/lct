@@ -1784,8 +1784,12 @@ def _check_I06(slide_texts: list[str], config: AuditConfig) -> list[Finding]:
                 findings.append(Finding(
                     check_id="I06", severity="major", slide_index=j, shape_ref=None,
                     message=f"Слайд {j} дублирует слайд {i} (схожесть текста {ratio:.0%}).",
-                    box=Box(0.0, 0.0, 1.0, 1.0), fixable=True,
-                    fix_hint="Удалить один из дублирующихся слайдов.",
+                    box=Box(0.0, 0.0, 1.0, 1.0), fixable=False,
+                    # Не автопочинка: удаление слайда по совпадению текста
+                    # опасно (ложное срабатывание уберёт настоящий слайд),
+                    # поэтому I06 нет в SUPPORTED_CHECKS/_FIXERS — совет
+                    # только для человека, apply_fixes его не трогает.
+                    fix_hint="Один из дублирующихся слайдов нужно убрать вручную.",
                 ))
     return findings
 

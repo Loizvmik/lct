@@ -305,12 +305,6 @@ async def _run_job(
             for variant in Variant:
                 tg.create_task(_compose_variant(job, variant, deck, profile, template.path))
 
-        job.enter_stage("audit")
-        config = AuditConfig.load()
-        async with asyncio.TaskGroup() as tg:
-            for variant in Variant:
-                tg.create_task(_audit_variant(job, variant.value, profile, config, autofix))
-
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
         # случайные номера, и найти «тот самый, который только что собрали»
         # иначе можно только по времени изменения. Ярлык переставляется на
@@ -323,10 +317,47 @@ async def _run_job(
         except Exception:  # noqa: BLE001 — удобство, не вправе ронять генерацию
             pass
 
-        job.enter_stage("export")
-        async with asyncio.TaskGroup() as tg:
-            for variant in Variant:
-                tg.create_task(_export_variant(job, variant.value, profile))
+        config = AuditConfig.load()
+        if autofix:
+            # autofix=True: экспорт зависит от результата автопочинки
+            # (`_audit_variant` перезаписывает pptx на диске), поэтому все
+            # три варианта должны ДОДЕЛАТЬ аудит, прежде чем хоть один
+            # уйдёт в экспорт — иначе можно экспортировать промежуточное
+            # состояние pptx одного варианта, пока соседний ещё чинится.
+            job.enter_stage("audit")
+            async with asyncio.TaskGroup() as tg:
+                for variant in Variant:
+                    tg.create_task(_audit_variant(job, variant.value, profile, config, autofix))
+
+            job.enter_stage("export")
+            async with asyncio.TaskGroup() as tg:
+                for variant in Variant:
+                    tg.create_task(_export_variant(job, variant.value, profile))
+        else:
+            # autofix=False: `_audit_variant` не трогает pptx на диске, так
+            # что экспорт варианта не зависит от аудита СОСЕДНИХ вариантов —
+            # одна задача на вариант "аудит, затем экспорт" в одном
+            # TaskGroup'е, а не два последовательных TaskGroup'а (лишнее
+            # ожидание самого медленного варианта аудита перед началом
+            # экспорта первого готового).
+            job.enter_stage("audit")
+            export_stage_entered = False
+
+            async def _audit_then_export(variant_name: str) -> None:
+                nonlocal export_stage_entered
+                await _audit_variant(job, variant_name, profile, config, autofix)
+                # Стадия "export" в прогрессе — общая на все три варианта,
+                # выставляем её один раз, когда до экспорта добрался первый
+                # вариант (порядок между вариантами не гарантирован, но сам
+                # список стадий job.stages не должен раздуться дублями).
+                if not export_stage_entered:
+                    export_stage_entered = True
+                    job.enter_stage("export")
+                await _export_variant(job, variant_name, profile)
+
+            async with asyncio.TaskGroup() as tg:
+                for variant in Variant:
+                    tg.create_task(_audit_then_export(variant.value))
 
         job.finish()
     except* Exception as eg:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,

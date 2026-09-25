@@ -12,7 +12,7 @@ from __future__ import annotations
 from pptx.dml.color import RGBColor
 from pptx.util import Inches, Pt
 
-from deckforge.audit.autofix import apply_fixes
+from deckforge.audit.autofix import SUPPORTED_CHECKS, apply_fixes
 from deckforge.audit.deterministic import run_deterministic
 
 from .conftest import CONFIG, PROFILE
@@ -117,3 +117,60 @@ def test_apply_fixes_only_touches_the_requested_finding(deck_with):
     ids_after = _ids(run_deterministic(path, PROFILE, CONFIG))
     assert "L01" not in ids_after
     assert "T06" in ids_after
+
+
+def test_every_fixable_check_id_is_in_supported_checks():
+    """Защита от повторения истории I06: находка обещала fixable=True, а
+    `apply_fixes` её тихо не чинил (не было ни в `SUPPORTED_CHECKS`, ни в
+    `_FIXERS` — `apply_fixes` клал такую находку в skipped молча).
+
+    Статически разбирает `audit/deterministic.py` (AST, не импорт и вызов
+    каждой проверки — часть checks нужны специфичные дефекты, которые
+    дорого/сложно каждый раз собирать): у КАЖДОГО литерального
+    `fixable=True` (что в вызовах `_finding(...)`, что в прямом
+    `Finding(...)`) обязан быть check_id из `SUPPORTED_CHECKS`. Ловит и
+    будущий check с `fixable=True`, для которого забыли завести фиксер."""
+    import ast
+    import inspect
+
+    from deckforge.audit import deterministic as det_module
+
+    source = inspect.getsource(det_module)
+    tree = ast.parse(source)
+
+    finding_def = next(
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "_finding"
+    )
+    finding_param_names = [a.arg for a in finding_def.args.args]
+
+    def _literal(node):
+        return node.value if isinstance(node, ast.Constant) else None
+
+    def _call_args(call: ast.Call, param_names: list[str]) -> dict[str, object]:
+        args: dict[str, object] = {}
+        for i, arg in enumerate(call.args):
+            if i < len(param_names):
+                args[param_names[i]] = _literal(arg)
+        for kw in call.keywords:
+            if kw.arg is not None:
+                args[kw.arg] = _literal(kw.value)
+        return args
+
+    offenders = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id == "_finding":
+            args = _call_args(node, finding_param_names)
+        elif node.func.id == "Finding":
+            args = _call_args(node, [])  # Finding(...) зовётся только с keyword'ами
+        else:
+            continue
+        check_id, fixable = args.get("check_id"), args.get("fixable")
+        if fixable is True and isinstance(check_id, str) and check_id not in SUPPORTED_CHECKS:
+            offenders.append((check_id, node.lineno))
+
+    assert not offenders, (
+        f"check_id с fixable=True вне SUPPORTED_CHECKS (apply_fixes тихо их пропустит): {offenders}"
+    )
