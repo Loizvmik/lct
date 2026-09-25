@@ -82,6 +82,18 @@ MAX_BUDGET_ESCALATIONS = 2
 # получает тот же лишний шаг эскалации, что и `namer`, без отдельной правки.
 MAX_TOKENS_BUDGET_CAP = 7168
 
+# Потолок выше можно запросить на КОНКРЕТНЫЙ вызов (`complete(...,
+# budget_cap=...)`). Замер выше снят на именовании палитры — роли с самым
+# коротким входом: ей дают список цветов, и рассуждать там почти не о чем.
+# У писателя слайдов вход на порядок больше (бриф, источники, каталог видов
+# раскладки с вместимостями, схема ответа с инструментами), и модель —
+# ризонинг: живой прогон 25 сентября 2026 на VK Education показал ЧЕТЫРЕ
+# отказа из двенадцати слайдов с диагнозом «весь бюджет ушёл на
+# reasoning_content». Потолок, снятый на короткой роли, для длинной мал, и
+# поднимать его ГЛОБАЛЬНО незачем — короткие роли платили бы временем за
+# чужую нужду.
+WRITER_BUDGET_CAP = 16384
+
 
 class YandexProvider(LLMProvider, VisionProvider):
     """OpenAI-совместимый клиент Yandex AI Studio.
@@ -128,7 +140,8 @@ class YandexProvider(LLMProvider, VisionProvider):
         )
 
     def complete(self, messages: list[Msg], *, schema: dict | None = None,
-                 max_tokens: int = 4096, temperature: float = 0.3) -> str:
+                 max_tokens: int = 4096, temperature: float = 0.3,
+                 budget_cap: int = MAX_TOKENS_BUDGET_CAP) -> str:
         # Дедлайн отсчитывается от начала вызова и действует на всё, что
         # происходит внутри — HTTP-ретраи и эскалации бюджета max_tokens.
         deadline_at = self._now() + self._deadline_seconds
@@ -165,7 +178,7 @@ class YandexProvider(LLMProvider, VisionProvider):
             "max_tokens": max_tokens, "temperature": temperature,
         }
         payload, tried_budgets = self._post_with_budget_escalation(
-            body, deadline_at=deadline_at, expects_json=schema is not None,
+            body, deadline_at=deadline_at, expects_json=schema is not None, budget_cap=budget_cap,
         )
         content = self._extract(payload, tried_budgets=tried_budgets)
         if schema is not None:
@@ -256,6 +269,7 @@ class YandexProvider(LLMProvider, VisionProvider):
 
     def _post_with_budget_escalation(
         self, body: dict, *, deadline_at: float, expects_json: bool = False,
+        budget_cap: int = MAX_TOKENS_BUDGET_CAP,
     ) -> tuple[dict, list[int]]:
         """Отправляет запрос; если бюджет весь ушёл в reasoning_content и
         результат непригоден, повторяет с удвоенным max_tokens — не больше
@@ -287,7 +301,7 @@ class YandexProvider(LLMProvider, VisionProvider):
                         tried_budgets,
                     )
                 return payload, tried_budgets
-            next_tokens = min(body["max_tokens"] * 2, MAX_TOKENS_BUDGET_CAP)
+            next_tokens = min(body["max_tokens"] * 2, budget_cap)
             if next_tokens <= body["max_tokens"]:
                 # Уже на потолке — повторный запрос с тем же max_tokens ничего
                 # не изменит, дальше эскалировать некуда.

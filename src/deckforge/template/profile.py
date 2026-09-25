@@ -170,7 +170,12 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # молча и без ошибки — и отдала бы раскладки БЕЗ фирменной графики, ради
 # которой всё и делалось. Поймано живьём: пользователь загрузил шаблон
 # заново, а получил прежний разбор из кеша.
-PROFILE_SCHEMA_VERSION = 12
+# 12 -> 13: у `PatternSlot` появилось `anchor` — вертикальное выравнивание
+# текста в рамке, снятое со слайда-примера. Старый кеш поля не несёт,
+# pydantic подставил бы `"t"` (верх) — формально то же, что было, но тогда
+# шаблон, где 40 слотов из 169 выровнены по центру (VK Education), так и
+# остался бы с текстом, липнущим к верху высоких карточек.
+PROFILE_SCHEMA_VERSION = 13
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -443,12 +448,17 @@ class PatternSlotModel(BaseModel):
     max_chars: int
     wraps: bool
     sample_text: str | None
+    # Вертикальное выравнивание текста в рамке, снятое со слайда-примера
+    # (`patterns.PatternSlot.anchor`). Значение по умолчанию — обратная
+    # совместимость со старым кешем.
+    anchor: str = "t"
 
 
 def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
     return PatternSlotModel(
         role=slot.role, box=_box_model(slot.box), size_pt=slot.size_pt, color_hex=slot.color_hex,
         align=slot.align, max_chars=slot.max_chars, wraps=slot.wraps, sample_text=slot.sample_text,
+        anchor=slot.anchor,
     )
 
 

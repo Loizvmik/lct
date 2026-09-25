@@ -115,6 +115,10 @@ class PatternSlot:
     max_chars: int
     wraps: bool
     sample_text: str | None = None
+    # Вертикальное выравнивание текста в рамке (`t`/`ctr`/`b`), снятое со
+    # слайда-примера — см. `_vertical_anchor`. Без него текст липнет к
+    # верху высокой карточки, и три её четверти пустуют.
+    anchor: str = "t"
 
 
 @dataclass(frozen=True)
@@ -411,6 +415,7 @@ class _TierInfo:
     text: str | None
     align: str
     color_hex: str | None
+    anchor: str = "t"
 
 
 _TIER_ORDER = ("micro", "caption", "body", "h2", "h1", "display")
@@ -705,6 +710,25 @@ def _has_bullets(element) -> bool:
     return non_empty >= 3
 
 
+def _vertical_anchor(element) -> str:
+    """Вертикальное выравнивание текста в рамке (`a:bodyPr/@anchor`): `t`
+    сверху, `ctr` по центру, `b` снизу. По умолчанию OOXML — `t`.
+
+    Переносится в собранный слайд, потому что иначе текст всегда липнет к
+    верху рамки. На карточных раскладках это видно сразу: рамка высокая по
+    замыслу дизайнера, текста две строки, и три четверти карточки пустые
+    (живой рендер 25 сентября 2026, VK Tech, раскладка на четыре карточки).
+    Дизайнер в шаблоне выравнивал такой текст по центру — мы это просто не
+    читали."""
+    tx_body = element.find(qn("p:txBody"))
+    if tx_body is None:
+        return "t"
+    body_pr = tx_body.find(qn("a:bodyPr"))
+    if body_pr is None:
+        return "t"
+    return body_pr.get("anchor") or "t"
+
+
 def _dominant_align(element, scale: TypeScale) -> str:
     tx_body = element.find(qn("p:txBody"))
     if tx_body is not None:
@@ -789,9 +813,11 @@ def _tier_info(ref: ShapeRef, canvas: Canvas, scale: TypeScale, theme: ThemeInfo
     numeric = bool(_NUMERIC_RE.match(stripped)) and len(stripped) <= 12
     bulleted = _has_bullets(ref.element)
     align = _dominant_align(ref.element, scale)
+    anchor = _vertical_anchor(ref.element)
     color_hex = _dominant_color(ref.element, theme)
     return _TierInfo(step=step, size_pt=size_pt, numeric=numeric, bulleted=bulleted,
-                      text=text if stripped else None, align=align, color_hex=color_hex)
+                      text=text if stripped else None, align=align, color_hex=color_hex,
+                      anchor=anchor)
 
 
 # --- поиск повтора (бриф, Step 2, п.4) --------------------------------------
@@ -1292,6 +1318,7 @@ def _build_slot(ref: ShapeRef, tier: _TierInfo | None, role: str, canvas: Canvas
     return PatternSlot(
         role=role, box=ref.box, size_pt=round(size_pt, 1), color_hex=color_hex,
         align=align, max_chars=max_chars, wraps=wraps, sample_text=text,
+        anchor=tier.anchor if tier is not None else "t",
     )
 
 

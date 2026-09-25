@@ -24,6 +24,7 @@ from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import PP_PLACEHOLDER
 from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_ANCHOR
 from pptx.util import Emu, Pt
 
 from deckforge.audit.config import AuditConfig
@@ -130,6 +131,8 @@ _SHRINK_STEPS = ("display", "h1", "h2", "body", "caption")
 # в template/grid.py, только по ролям слота, не по типу плейсхолдера
 # (`PatternSlot` не несёт `ph_type`).
 _HEADING_ROLES = frozenset({"headline", "subhead", "quote", "card_title", "kpi_value"})
+
+_ANCHOR_MAP = {"t": MSO_ANCHOR.TOP, "ctr": MSO_ANCHOR.MIDDLE, "b": MSO_ANCHOR.BOTTOM}
 
 _ROLE_COLOR = {
     "headline": "on_surface", "subhead": "muted", "body": "on_surface", "bullets": "on_surface",
@@ -1211,6 +1214,7 @@ def _pattern_from_model(model) -> Pattern:
         PatternSlot(
             role=s.role, box=_box_from_model(s.box), size_pt=s.size_pt, color_hex=s.color_hex,
             align=s.align, max_chars=s.max_chars, wraps=s.wraps, sample_text=s.sample_text,
+            anchor=s.anchor,
         )
         for s in model.slots
     ]
@@ -1602,6 +1606,13 @@ def _draw_slot(
     # содержимое ниже — бокс, который меряет `measure()`, обязан совпадать
     # с боксом, в который реально льётся текст у PowerPoint/LibreOffice.
     tf.margin_left = tf.margin_right = tf.margin_top = tf.margin_bottom = Emu(0)
+    # Вертикальное выравнивание — то, что стояло в шаблоне. Без него текст
+    # липнет к верху рамки: на карточных раскладках рамка высокая по
+    # замыслу, текста две строки, и три четверти карточки пустуют (живой
+    # рендер 25 сентября 2026, VK Tech, четыре карточки).
+    anchor = _ANCHOR_MAP.get(content.slot.anchor)
+    if anchor is not None:
+        tf.vertical_anchor = anchor
 
     line_spacing = _line_spacing_for(content.role_hint, profile)
     box_width_in = width / EMU_PER_INCH

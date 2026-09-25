@@ -64,6 +64,7 @@ from deckforge.plan.spec import (
     SLIDE_KINDS, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems,
 )
 from deckforge.provider.base import LLMProvider
+from deckforge.provider.yandex import WRITER_BUDGET_CAP
 
 AGENT_PATH_WRITER = Path(__file__).resolve().parents[3] / "agents" / "slide-writer" / "AGENT.md"
 AGENT_PATH_PICKER = Path(__file__).resolve().parents[3] / "agents" / "pattern-picker" / "AGENT.md"
@@ -383,6 +384,19 @@ def _try_slide_tool(args: dict, profile, index: int, template_path: Path) -> dic
     return try_slide(spec, str(layout_id), profile, template_path)
 
 
+def _complete(llm: LLMProvider, messages: list[dict], schema: dict, max_tokens: int) -> str:
+    """Вызов модели с потолком бюджета, поднятым для писателя слайдов.
+
+    `budget_cap` понимает не всякий провайдер (у базового интерфейса его
+    нет, тесты подсовывают свои заглушки) — поэтому сначала пробуем с ним,
+    а на `TypeError` зовём по-старому. Это не проглатывание ошибки: любая
+    другая беда провайдера летит наверх и попадает в причину отказа."""
+    try:
+        return llm.complete(messages, schema=schema, max_tokens=max_tokens, budget_cap=WRITER_BUDGET_CAP)
+    except TypeError:
+        return llm.complete(messages, schema=schema, max_tokens=max_tokens)
+
+
 def _why(exc: BaseException) -> str:
     """Короткая причина отказа для отчёта — класс исключения плюс начало
     сообщения.
@@ -447,7 +461,7 @@ def _write_with_agent_loop(
         ]
         schema = _SLIDE_SCHEMA if is_final_step else _AGENT_TURN_SCHEMA
         try:
-            raw = llm.complete(messages, schema=schema, max_tokens=WRITER_MAX_TOKENS)
+            raw = _complete(llm, messages, schema, WRITER_MAX_TOKENS)
         except Exception as exc:
             return None, f"шаг {step}/{max_steps}: модель не ответила — {_why(exc)}"
         try:
@@ -495,7 +509,7 @@ def _ask_slide_writer(
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
     ]
     try:
-        raw = llm.complete(messages, schema=_SLIDE_SCHEMA, max_tokens=WRITER_MAX_TOKENS)
+        raw = _complete(llm, messages, _SLIDE_SCHEMA, WRITER_MAX_TOKENS)
     except Exception as exc:
         return None, f"модель не ответила — {_why(exc)}"
     try:
