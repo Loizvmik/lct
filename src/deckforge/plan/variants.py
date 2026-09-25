@@ -499,7 +499,18 @@ def _pattern_rank_key(
     # осиротеть. Без той правки это предпочтение вредно, с ней — нужно:
     # из 34 раскладок VK Education 20 идут вообще без декора, и при
     # безразличии выбор садился именно на них.
-    decor = len(p.decor)
+    # Декор — тай-брейк ВНУТРИ вида раскладки, не вместо него.
+    #
+    # Пробовал 25 сентября 2026 поднять его выше вкуса варианта, чтобы уйти
+    # от белых листов. Стало заметно хуже: пять слайдов из двенадцати сели
+    # на ОДНУ И ТУ ЖЕ нарядную раскладку («слайды одинаковые»), а текстовый
+    # слайд получил раскладку с 207 декоративными картинками. Оформление,
+    # поставленное выше смысла, делает колоду однообразной.
+    #
+    # Считается КОРЕНЬ, а не число фигур: раскладка с шестью украшениями
+    # заметно наряднее голой, а с двумястами — не в тридцать раз наряднее
+    # шести, просто её слайд-пример был сложным.
+    decor = len(p.decor) ** 0.5
     decor_bias = -decor * (2 if variant is Variant.visual else 1)
 
     # Второй тай-брейк стиля — вместимость самой раскладки (`Capacity.
@@ -545,8 +556,8 @@ def _pattern_rank_key(
     # находку «нет слота под фото/иконку».
     image_penalty = 0 if (not needs_image or _has_image_slot(p)) else 1
     return (
-        fit_bucket, image_penalty, avoid_penalty, repeat_penalty, decor_bias, kind_rank,
-        capacity_bias, roominess_bias, -p.score,
+        fit_bucket, image_penalty, avoid_penalty, repeat_penalty, kind_rank,
+        decor_bias, capacity_bias, roominess_bias, -p.score,
     )
 
 
