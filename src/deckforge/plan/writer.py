@@ -686,6 +686,7 @@ def write_slides(
             slides[index] = future.result()
 
     ordered_slides: list[SlideSpec] = slides  # type: ignore[assignment] — каждый индекс заполнен ровно один раз выше
+    ordered_slides = _drop_thin_duplicates(ordered_slides)
     _flag_repeated_headlines(ordered_slides)
     return DeckSpec(title=outline.title, language=outline.language, slides=ordered_slides)
 
@@ -734,6 +735,64 @@ _NOTABLE_NUMBER_RE = re.compile(r"\d+[.,]\d+%?|\d+%")
 
 def _notable_numbers(text: str) -> set[str]:
     return {n.replace(",", ".").rstrip("%") for n in _NOTABLE_NUMBER_RE.findall(text)}
+
+
+# Колода короче стольких слайдов дублей не теряет: там повтор заметен и
+# глазом, а выбрасывание сделало бы её куцей.
+_MIN_SLIDES_TO_DEDUP = 6
+
+# «Тонкий» слайд: столько или меньше единиц содержания (пунктов, карточек,
+# метрик, абзацев) и без таблицы/графика. Такой слайд, повторяющий факт
+# соседа, не добавляет ничего, кроме самого повтора.
+_THIN_SLIDE_MAX_UNITS = 1
+
+
+def _content_units(slide: SlideSpec) -> int:
+    units = 0
+    for block in slide.blocks:
+        items = getattr(block, "items", None)
+        units += len(items) if items is not None else 1
+    if slide.visual is not None and slide.visual.kind in ("table", "chart"):
+        units += 3
+    return units
+
+
+def _same_fact(a: SlideSpec, b: SlideSpec) -> bool:
+    words_a, words_b = _significant_words(a.headline), _significant_words(b.headline)
+    overlap = len(words_a & words_b) / min(len(words_a), len(words_b)) if words_a and words_b else 0.0
+    return overlap >= _HEADLINE_OVERLAP_THRESHOLD or bool(_notable_numbers(a.headline) & _notable_numbers(b.headline))
+
+
+def _drop_thin_duplicates(slides: list[SlideSpec]) -> list[SlideSpec]:
+    """Убирает слайд, который повторяет факт другого слайда (тот же признак,
+    что у `_flag_repeated_headlines`) и при этом тонкий (`_content_units`
+    не больше `_THIN_SLIDE_MAX_UNITS`). Прогон 26 сентября 2026 на VK
+    Education: слайды 3, 4 и 5 все про «98,5% времени ожидание», два из них
+    с одним пунктом; из двенадцати слайдов уникальных восемь. Находка
+    `_flag_repeated_headlines` это видела, но ничего не меняла.
+
+    Из пары выбрасывается тонкий; если тонкие оба, тот, что позже.
+    Обложка (первый) и финал (последний) не трогаются: у них по одному
+    заголовку по замыслу. Индексы оставшихся пересчитываются подряд, чтобы
+    находки и сборка ссылались на итоговые номера."""
+    if len(slides) < _MIN_SLIDES_TO_DEDUP:
+        return slides
+    dropped: set[int] = set()
+    for i in range(len(slides)):
+        for j in range(i + 1, len(slides)):
+            if i in dropped or j in dropped or not _same_fact(slides[i], slides[j]):
+                continue
+            protected = {0, len(slides) - 1}
+            thin_i = _content_units(slides[i]) <= _THIN_SLIDE_MAX_UNITS and i not in protected
+            thin_j = _content_units(slides[j]) <= _THIN_SLIDE_MAX_UNITS and j not in protected
+            if thin_j:
+                dropped.add(j)
+            elif thin_i:
+                dropped.add(i)
+    if not dropped:
+        return slides
+    kept = [s for k, s in enumerate(slides) if k not in dropped]
+    return [replace(s, index=k) for k, s in enumerate(kept)]
 
 
 def _flag_repeated_headlines(slides: list[SlideSpec]) -> None:

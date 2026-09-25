@@ -148,6 +148,11 @@ def assign_content_with_drops(
             _drop(drops, "headline", slide_spec.headline)
 
     subhead_slot = _take_one(by_role, "subhead") or _take_one(by_role, "caption")
+    if slide_spec.subhead and subhead_slot is None and not slide_spec.blocks:
+        # Обложка и разделитель: слота под подзаголовок в примере нет, а
+        # `body` (подпись под заголовком) свободен, раз блоков на слайде
+        # нет. Иначе подзаголовок обложки пропадал (прогон 26 сентября 2026).
+        subhead_slot = _take_one(by_role, "body")
     if slide_spec.subhead:
         if subhead_slot is not None:
             result.append(SlotContent(subhead_slot, "subhead", [Paragraph(slide_spec.subhead)]))

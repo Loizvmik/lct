@@ -366,6 +366,12 @@ def _run_from_end_props(p) -> etree._Element:
     if end is not None:
         r_pr = copy.deepcopy(end)
         r_pr.tag = qn("a:rPr")
+        # Кегль из `endParaRPr` не переносится: у пустого плейсхолдера это
+        # заглушка экспорта (VK Education, обложка раздела: 16 pt при
+        # заголовке макета 48 pt), и записанный явно он перекрывал
+        # унаследованный от макета, тот самый, что измерил разбор шаблона.
+        # Без `sz` текст наследует кегль макета, как и напечатанный руками.
+        r_pr.attrib.pop("sz", None)
         run.append(r_pr)
     etree.SubElement(run, qn("a:t"))
     return run

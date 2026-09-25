@@ -392,6 +392,7 @@ def _has_image_slot(p) -> bool:
 def _pattern_rank_key(
     p, variant: Variant, item_count: int | None, char_len: int, kind_rank: int, avoid: frozenset[str],
     history: _SelectionHistory = _EMPTY_HISTORY, needs_image: bool = False,
+    is_cover: bool = False,
 ) -> tuple:
     """Ключ сортировки одного паттерна-кандидата — ОБЩИЙ для всех `kind` из
     предпочтения варианта (см. `_choose_kind_and_pattern`), не только внутри
@@ -555,10 +556,26 @@ def _pattern_rank_key(
     # раскладки с картинкой по-прежнему собирается, а сборка честно пишет
     # находку «нет слота под фото/иконку».
     image_penalty = 0 if (not needs_image or _has_image_slot(p)) else 1
+
+    # Обложке — раскладка с самым крупным заголовком среди героических. У
+    # VK Education шесть раскладок вида section: обложка с заголовком 40 pt
+    # и разделители с подписью 14 pt; при безразличии первый слайд садился
+    # на разделитель (прогон 26 сентября 2026: обложка кеглем текста и
+    # подзаголовок внизу). Только для первого слайда: разделителям внутри
+    # колоды крупный заголовок не нужен.
+    # Второй признак обложки: место примера в шаблоне. Обложки лежат в
+    # начале, «Спасибо за внимание» с QR-кодом в конце, а по кеглю
+    # заголовка они равны (VK Education: все семь героических раскладок
+    # по 48 pt), и без этого признака обложка садилась на финальный слайд.
+    cover_bias = (-_headline_size(p), min(p.source_slide_index or [0])) if is_cover else (0.0, 0)
     return (
         fit_bucket, image_penalty, avoid_penalty, repeat_penalty, kind_rank,
-        decor_bias, capacity_bias, roominess_bias, -p.score,
+        cover_bias, decor_bias, capacity_bias, roominess_bias, -p.score,
     )
+
+
+def _headline_size(p) -> float:
+    return max((s.size_pt or 0.0 for s in p.slots if s.role == "headline"), default=0.0)
 
 
 # `kind`, чей `Pattern.repeat`/визуал требует контента, который приносит
@@ -648,7 +665,12 @@ def _choose_kind_and_pattern(
     # Номер проверяется по каталогу профиля: выдуманный не годится (та же
     # сверка, что `writer._validate_chosen_layout`, но здесь она защищает
     # от профиля ДРУГОГО шаблона, а не от фантазии модели).
-    if variant is Variant.dense and slide.pattern_id:
+    # Обложка (первый слайд) выбор писателя не наследует: у неё один
+    # заголовок, писателю нечего под раскладку подгонять, а его выбор
+    # садился на разделитель с подписью 14 pt вместо обложки с 40 pt
+    # (прогон 26 сентября 2026, VK Education). Для неё решает ранжир ниже
+    # с `cover_bias`.
+    if variant is Variant.dense and slide.pattern_id and slide.index != 0:
         authored = next((p for p in profile.patterns if p.pattern_id == slide.pattern_id), None)
         if authored is not None:
             return authored.kind, authored.pattern_id
@@ -694,7 +716,13 @@ def _ranked_candidates(
 
     needs_image = slide.visual is not None and slide.visual.kind in ("photo", "icon")
     keyed = [
-        (_pattern_rank_key(p, variant, item_count, char_len, kind_rank[p.kind], avoid, history, needs_image), p)
+        (
+            _pattern_rank_key(
+                p, variant, item_count, char_len, kind_rank[p.kind], avoid, history, needs_image,
+                is_cover=(slide.index == 0),
+            ),
+            p,
+        )
         for p in candidates
     ]
     keyed.sort(key=lambda pair: pair[0])

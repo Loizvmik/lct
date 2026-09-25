@@ -236,3 +236,23 @@ def test_bind_text_marks_a_bold_paragraph_and_keeps_the_rest_regular(deck):
     assert runs[0].find(qn("a:rPr")).get("b") == "1"
     assert runs[1].find(qn("a:rPr")) is None or runs[1].find(qn("a:rPr")).get("b") != "1"
 
+
+def test_bind_text_into_an_empty_placeholder_leaves_the_size_to_the_layout(deck):
+    """Пустой плейсхолдер примера несёт в `endParaRPr` кегль-заглушку
+    экспорта (VK Education, обложка раздела: 16 pt при заголовке макета
+    48 pt). Записанный явно, он перекрывал унаследованный: обложка выходила
+    кеглем текста (прогон 26 сентября 2026)."""
+    _prs, sources = deck
+    element = next(
+        (sp for slide in sources.values() for sp in slide._element.iter(qn("p:sp"))
+         if sp.find(".//" + qn("p:ph")) is not None and sp.find(".//" + qn("a:r")) is None
+         and sp.find(".//" + qn("a:endParaRPr")) is not None),
+        None,
+    )
+    if element is None:
+        pytest.skip("в шаблоне нет пустого плейсхолдера с endParaRPr")
+    bind_text(element, [Paragraph("Итоги пилота")])
+
+    run_pr = element.find(".//" + qn("a:r")).find(qn("a:rPr"))
+    assert run_pr is None or run_pr.get("sz") is None
+

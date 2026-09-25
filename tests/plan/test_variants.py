@@ -7,6 +7,8 @@
 см. `tests/audit/conftest.py`)."""
 from __future__ import annotations
 import re
+
+import pytest
 from itertools import combinations
 from pathlib import Path
 
@@ -428,7 +430,7 @@ def test_dense_variant_keeps_the_layout_the_writer_chose():
     другую."""
     chosen = PROFILE.patterns[0].pattern_id
     slide = SlideSpec(
-        index=0, kind="bullets", headline="Где уходит время",
+        index=1, kind="bullets", headline="Где уходит время",
         blocks=[BulletBlock(items=["Ожидание — 18 часов"])], pattern_id=chosen,
     )
 
@@ -456,7 +458,7 @@ def test_the_other_two_variants_do_not_inherit_the_writers_choice():
     наследует его ровно один вариант."""
     chosen = PROFILE.patterns[0].pattern_id
     slide = SlideSpec(
-        index=0, kind="bullets", headline="Где уходит время",
+        index=1, kind="bullets", headline="Где уходит время",
         blocks=[BulletBlock(items=["Ожидание — 18 часов"])], pattern_id=chosen,
     )
 
@@ -515,3 +517,44 @@ def test_apply_variant_ignores_an_incompatible_or_unknown_preferred_pattern():
     )
     assert spec.slides[cards_index].pattern_id == baseline.slides[cards_index].pattern_id
     assert spec.slides[1].pattern_id == baseline.slides[1].pattern_id
+
+
+# ---------------------------------------------------------------------------
+# Обложка садится на раскладку с самым крупным заголовком
+# ---------------------------------------------------------------------------
+
+
+def test_cover_prefers_the_section_layout_with_the_largest_headline():
+    """VK Education: шесть раскладок вида section, обложка с заголовком
+    40 pt и разделители с подписью 14 pt; при безразличии первый слайд
+    садился на разделитель (прогон 26 сентября 2026)."""
+    from deckforge.plan.variants import _headline_size
+
+    sections = [p for p in PROFILE.patterns if p.kind == "section"]
+    if len({_headline_size(p) for p in sections}) < 2:
+        pytest.skip("в этом шаблоне заголовки героических раскладок одного кегля")
+    cover = SlideSpec(index=0, kind="section", headline="Итоги пилота")
+
+    _kind, pattern_id = _choose_kind_and_pattern(cover, PROFILE, Variant.dense)
+
+    chosen = next(p for p in PROFILE.patterns if p.pattern_id == pattern_id)
+    assert _headline_size(chosen) == max(_headline_size(p) for p in sections)
+
+
+def test_cover_does_not_inherit_the_writer_layout():
+    """Писатель выбирает раскладку под текст, а у обложки текста нет: его
+    выбор (разделитель с мелкой подписью) для первого слайда не наследуется
+    даже вариантом dense."""
+    from deckforge.plan.variants import _headline_size
+
+    sections = [p for p in PROFILE.patterns if p.kind == "section"]
+    smallest = min(sections, key=_headline_size)
+    cover = SlideSpec(index=0, kind="section", headline="Итоги пилота", pattern_id=smallest.pattern_id)
+
+    _kind, pattern_id = _choose_kind_and_pattern(cover, PROFILE, Variant.dense)
+
+    chosen = next(p for p in PROFILE.patterns if p.pattern_id == pattern_id)
+    assert _headline_size(chosen) >= _headline_size(smallest)
+    inner = SlideSpec(index=3, kind="section", headline="Раздел", pattern_id=smallest.pattern_id)
+    assert _choose_kind_and_pattern(inner, PROFILE, Variant.dense)[1] == smallest.pattern_id
+

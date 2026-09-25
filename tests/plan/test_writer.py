@@ -1,14 +1,15 @@
 """Тесты `plan.writer.write_slides`/`pick_patterns` (Task 13, Step 3 брифа)."""
 from __future__ import annotations
+from dataclasses import replace
 import json
 import threading
 import time
 
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
-from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec, validate_deck_spec
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, validate_deck_spec
 from deckforge.compose.slide_tools import list_layouts
 from deckforge.plan.variants import Variant, apply_variant, rerank_candidates
-from deckforge.plan.writer import _flag_repeated_headlines, pick_patterns, rerank_patterns, write_slides
+from deckforge.plan.writer import _drop_thin_duplicates, _flag_repeated_headlines, pick_patterns, rerank_patterns, write_slides
 from deckforge.provider.base import LLMProvider
 
 
@@ -711,3 +712,61 @@ def test_rerank_does_not_wait_past_its_time_budget(PROFILE):
         release.set()
     assert time.monotonic() - started < 2
     assert chosen == {key: ids[0] for key, ids in jobs.items()}
+
+
+# ---------------------------------------------------------------------------
+# _drop_thin_duplicates
+# ---------------------------------------------------------------------------
+
+
+def _deck_with_repeated_fact() -> list[SlideSpec]:
+    return [
+        SlideSpec(index=0, kind="section", headline="Оптимизация согласования"),
+        SlideSpec(index=1, kind="bullets", headline="98,5% времени заявка ждёт",
+                  blocks=[BulletBlock(items=["31,5 ч на цикл", "28 мин работы", "ошибки маршрутизации"])]),
+        SlideSpec(index=2, kind="bullets", headline="98,5% времени — ожидание",
+                  blocks=[BulletBlock(items=["31,5 ч на цикл, 28 мин работы"])]),
+        SlideSpec(index=3, kind="cards", headline="Риски раскатки",
+                  blocks=[CardBlock(items=[Card(title="Данные", body="задержка"), Card(title="Регламенты", body="4 из 11")])]),
+        SlideSpec(index=4, kind="bullets", headline="План раскатки",
+                  blocks=[BulletBlock(items=["сентябрь", "декабрь"])]),
+        SlideSpec(index=5, kind="section", headline="Согласовать бюджет"),
+    ]
+
+
+def test_thin_duplicate_of_a_fact_is_dropped_and_indexes_are_renumbered():
+    """Прогон 26 сентября 2026 на VK Education: три слайда про «98,5%
+    времени ожидание», два из них с одним пунктом. Тонкий повтор уходит,
+    полный остаётся, номера идут подряд."""
+    slides = _drop_thin_duplicates(_deck_with_repeated_fact())
+
+    assert [s.headline for s in slides][:3] == [
+        "Оптимизация согласования", "98,5% времени заявка ждёт", "Риски раскатки",
+    ]
+    assert [s.index for s in slides] == list(range(len(slides)))
+
+
+def test_two_full_slides_on_the_same_fact_are_both_kept():
+    """Полные слайды с общей цифрой не выбрасываются: это может быть
+    «проблема» и «решение» с одним показателем. Их по-прежнему только
+    помечает `_flag_repeated_headlines`."""
+    slides = _deck_with_repeated_fact()
+    slides[2] = replace(slides[2], blocks=[BulletBlock(items=["а", "б", "в"])])
+
+    assert len(_drop_thin_duplicates(slides)) == len(slides)
+
+
+def test_cover_and_closing_slides_are_never_dropped():
+    slides = _deck_with_repeated_fact()
+    slides[0] = replace(slides[0], headline="98,5% времени заявка ждёт")
+    slides[-1] = replace(slides[-1], headline="98,5% времени заявка ждёт")
+
+    kept = _drop_thin_duplicates(slides)
+
+    assert kept[0].kind == "section" and kept[-1].kind == "section"
+
+
+def test_short_decks_are_left_alone():
+    slides = _deck_with_repeated_fact()[:4]
+    assert _drop_thin_duplicates(slides) is slides
+

@@ -244,6 +244,25 @@ def _headline_only_pattern() -> Pattern:
     )
 
 
+def _headline_and_body_pattern() -> Pattern:
+    """Обложка VK Education: заголовок и подпись под ним (`body`), без
+    слота `subhead`."""
+    headline = PatternSlot(
+        role="headline", box=Box(0.05, 0.3, 0.45, 0.22), size_pt=48.0, color_hex=None,
+        align="l", max_chars=80, wraps=True,
+    )
+    body = PatternSlot(
+        role="body", box=Box(0.05, 0.55, 0.45, 0.05), size_pt=16.0, color_hex=None,
+        align="l", max_chars=80, wraps=True,
+    )
+    return Pattern(
+        pattern_id="cover", source_slide_index=[1], layout_id="L", kind="section",
+        slots=[headline, body], repeat=None, decor=[],
+        capacity=Capacity(max_items=0, max_chars_per_item=80, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=True,
+    )
+
+
 def _three_card_pattern(with_card_title: bool = False) -> Pattern:
     """Раскладка на три карточки с плашкой под каждой — слепок
     `slide24` контрольного ЛЦТ2026 (три белых прямоугольника
@@ -452,3 +471,32 @@ def test_plaques_all_go_when_units_cannot_be_matched_and_nothing_landed():
     pattern = _six_card_pattern()
     result = expand_decor(pattern, None, _grid(), set())
     assert result == []
+
+
+def test_subhead_without_its_own_slot_takes_the_free_body_slot_on_a_blockless_slide():
+    """Обложка VK Education: слоты `headline` и `body` (подпись под
+    заголовком), слота `subhead` нет. Подзаголовок обложки ложится в `body`,
+    раз блоков на слайде нет, а не пропадает."""
+    pattern = _headline_and_body_pattern()
+    slide = SlideSpec(index=0, kind="section", headline="Итоги пилота", subhead="Срок с 31,5 до 6,2 часа")
+
+    result, drops = assign_content_with_drops(slide, pattern, _grid())
+
+    assert [c.role_hint for c in result] == ["headline", "subhead"]
+    assert drops == []
+
+
+def test_subhead_without_its_own_slot_leaves_body_to_the_blocks():
+    """А когда на слайде есть текстовый блок, `body` нужен ему: подзаголовок
+    без слота честно теряется, а не вытесняет содержание."""
+    pattern = _headline_and_body_pattern()
+    slide = SlideSpec(
+        index=1, kind="bullets", headline="Где уходит время", subhead="Подзаголовок",
+        blocks=[TextBlock(text="Абзац")],
+    )
+
+    result, drops = assign_content_with_drops(slide, pattern, _grid())
+
+    assert [c.role_hint for c in result] == ["headline", "body"]
+    assert [d.role for d in drops] == ["subhead"]
+
