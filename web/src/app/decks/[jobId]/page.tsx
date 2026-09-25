@@ -18,7 +18,7 @@ export default function JobProgressPage() {
       (update) => {
         setConnectionLost(false);
         setJob(update);
-        if (update.status === "done" && update.deck_id && !redirected.current) {
+        if ((update.status === "done" || update.status === "done_with_warnings") && update.deck_id && !redirected.current) {
           redirected.current = true;
           router.push(`/decks/${update.deck_id}/variants`);
         }
@@ -28,7 +28,7 @@ export default function JobProgressPage() {
   }, [params.jobId, router]);
 
   useEffect(() => {
-    if (job?.status === "done" && job.deck_id && !redirected.current) {
+    if ((job?.status === "done" || job?.status === "done_with_warnings") && job.deck_id && !redirected.current) {
       redirected.current = true;
       router.push(`/decks/${job.deck_id}/variants`);
     }
@@ -45,13 +45,13 @@ export default function JobProgressPage() {
       {job?.status === "error" && <div className="error-banner" role="alert">Не удалось создать презентацию: {job.error}</div>}
       {connectionLost && <div className="notice" role="status">Связь с сервером прервалась. Обновите страницу, чтобы проверить состояние.</div>}
 
-      <section className="card" aria-live="polite" aria-busy={job?.status !== "done"}>
+      <section className="card" aria-live="polite" aria-busy={job?.status === "running"}>
         <div className="stage-track">
           {STAGE_ORDER.map((stage) => {
             const currentIndex = job?.stage ? STAGE_ORDER.indexOf(job.stage) : 0;
             const index = STAGE_ORDER.indexOf(stage);
-            const done = job?.status === "done" || job?.stages.includes(stage) && index < currentIndex;
-            const active = job?.status !== "done" && (job?.stage ?? "parse") === stage;
+            const done = job?.status === "done" || job?.status === "done_with_warnings" || job?.stages.includes(stage) && index < currentIndex;
+            const active = job?.status === "running" && (job?.stage ?? "parse") === stage;
             return <div className={`stage ${done ? "done" : active ? "active" : ""}`} key={stage}>{STAGE_LABELS[stage]}</div>;
           })}
         </div>

@@ -62,7 +62,8 @@ from deckforge.compose.slide_tools import list_layouts, try_slide
 from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
-    SLIDE_KINDS, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems,
+    SLIDE_KINDS, DeckSpec, SlideSpec, slide_numeric_facts, slide_spec_from_dict,
+    slide_spec_problems, slide_spec_to_dict,
 )
 from deckforge.provider.base import LLMProvider
 
@@ -134,7 +135,7 @@ DEFAULT_WRITER_MAX_WORKERS = 2
 # который модель написала уверенно с первого раза (без вызова инструмента),
 # по-прежнему стоит ОДИН сетевой вызов — цикл не удорожает уже хороший
 # случай, только даёт модели путь исправиться в плохом.
-AGENT_MAX_STEPS_DEFAULT = 1
+AGENT_MAX_STEPS_DEFAULT = 2
 
 
 class SlideGenerationError(RuntimeError):
@@ -294,12 +295,56 @@ def _fallback_slide(kind: str, index: int, intent: str, needs: list[str], *, rea
         finding += f" Причина: {reason}."
     if needs:
         finding += f" Нужны данные: {', '.join(needs)}."
-    source_note = "Источник не подтверждён — текст запасного варианта, требует проверки перед показом." \
-        if _DIGIT_RE.search(headline) else None
+    probe = SlideSpec(index=index, kind=kind, headline=headline)
+    if slide_numeric_facts(probe):
+        headline = _DIGIT_RE.sub("", headline)
+        headline = " ".join(headline.split()).strip(" —–-,:;") or "Данные требуют уточнения"
     return SlideSpec(
-        index=index, kind=kind, headline=headline, source_note=source_note,
-        findings=[finding], generation_origin="fallback", generation_error=reason,
+        index=index, kind=kind, headline=headline,
+        findings=[finding], generation_origin="degraded", generation_error=reason,
     )
+
+
+def _normalize_fact(value: str) -> str:
+    return value.replace("\u00a0", "").replace(" ", "").replace(",", ".").replace("−", "-").casefold()
+
+
+def _apply_verified_provenance(slide: SlideSpec, sources: list[SourceDoc]) -> tuple[SlideSpec, list[str]]:
+    """Проверяет числа по реальным SourceDoc и ставит source_note кодом.
+
+    Произвольная строка source_note от модели не считается
+    доказательством: каждое число должно буквально встречаться в
+    брифе или приложенном источнике.
+    """
+    facts = slide_numeric_facts(slide)
+    if not facts:
+        return slide, []
+    used_names: list[str] = []
+    missing: list[str] = []
+    for fact in facts:
+        normalized = _normalize_fact(fact)
+        matched = [source.name for source in sources if normalized in _normalize_fact(source.text)]
+        if not matched:
+            missing.append(fact)
+            continue
+        for name in matched:
+            if name not in used_names:
+                used_names.append(name)
+    if missing:
+        return slide, missing
+    label = "Источник" if len(used_names) == 1 else "Источники"
+    return replace(slide, source_note=f"{label}: {', '.join(used_names)}"), []
+
+
+def _validated_slide_problems(slide: SlideSpec, sources: list[SourceDoc]) -> tuple[SlideSpec, list[str]]:
+    verified, missing = _apply_verified_provenance(slide, sources)
+    problems = slide_spec_problems(verified)
+    if missing:
+        values = ", ".join(dict.fromkeys(missing))
+        problems.append(
+            f"слайд {slide.index}: числовые факты не найдены в брифе или источниках: {values}"
+        )
+    return verified, problems
 
 
 _SLIDE_SCHEMA = {
@@ -524,6 +569,7 @@ def _write_with_agent_loop(
 
 def _ask_slide_writer(
     prompt_body: str, payload: dict, index: int, llm: LLMProvider, *, repair: list[str] | None = None,
+    previous_answer: dict | None = None,
 ) -> tuple[SlideSpec | None, str | None]:
     """Один вызов модели за слайдом. Возвращает `(слайд, причина_отказа)` —
     тем же контрактом, что и `_write_with_agent_loop` выше и по той же
@@ -531,6 +577,11 @@ def _ask_slide_writer(
     user_payload = dict(payload)
     if repair:
         user_payload["previous_answer_problems"] = repair
+        user_payload["previous_answer"] = previous_answer
+        user_payload["repair_instruction"] = (
+            "Исправь только перечисленные проблемы. Не меняй поля, которые уже валидны. "
+            "Если число не подтверждено исходными материалами, убери или переформулируй его."
+        )
     messages = [
         {"role": "system", "content": prompt_body},
         {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
@@ -551,7 +602,7 @@ def _ask_slide_writer(
 def _write_one_slide(
     index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
     *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, template_path: Path | None = None,
-    allow_fallback: bool = True,
+    allow_fallback: bool = True, sources: list[SourceDoc] | None = None,
 ) -> SlideSpec:
     """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
     чтобы её можно было независимо запускать в пуле потоков (слайды друг от
@@ -591,14 +642,21 @@ def _write_one_slide(
             max_steps=agent_max_steps, template_path=template_path,
         )
         if slide is not None:
-            problems = slide_spec_problems(slide)
+            source_docs = sources or []
+            slide, problems = _validated_slide_problems(slide, source_docs)
             if problems:
                 # Один шанс на исправление — код показывает модели её
                 # собственные ошибки (брифом: "валидатор ловит то, что
                 # иначе всплывёт при сборке" — здесь оно ловится ДО
                 # сборки и ДО того, как испортит остальную колоду).
-                repaired, repair_reason = _ask_slide_writer(prompt_body, payload, index, llm, repair=problems)
-                still_broken = slide_spec_problems(repaired) if repaired is not None else []
+                repaired, repair_reason = _ask_slide_writer(
+                    prompt_body, payload, index, llm, repair=problems,
+                    previous_answer=slide_spec_to_dict(slide),
+                )
+                if repaired is not None:
+                    repaired, still_broken = _validated_slide_problems(repaired, source_docs)
+                else:
+                    still_broken = []
                 if repaired is not None and not still_broken:
                     slide = repaired
                 else:
@@ -678,7 +736,7 @@ def write_slides(
             pool.submit(
                 _write_one_slide, index, item, profile, prompt_body, source_text, total, llm,
                 agent_max_steps=agent_max_steps, template_path=template_path,
-                allow_fallback=allow_fallback,
+                allow_fallback=allow_fallback, sources=sources,
             ): index
             for index, item in enumerate(outline.slides)
         }

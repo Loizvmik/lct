@@ -12,7 +12,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 Stage = Literal["parse", "outline", "write", "compose", "audit", "export"]
-JobStatus = Literal["running", "done", "error"]
+JobStatus = Literal["running", "done", "done_with_warnings", "error"]
 
 
 class TemplateUploadResponse(BaseModel):

@@ -121,13 +121,52 @@ def test_write_slides_repairs_once_then_falls_back_to_valid_answer(PROFILE):
     # код обязан попросить исправление один раз и принять второй, валидный
     # ответ, а не сразу деградировать до запасного варианта.
     bad = json.dumps({"kind": "bullets", "headline": "Заголовок", "blocks": [
-        {"type": "bullets", "items": ["Медиана — 6,2 часа"]},
+        {"type": "bullets", "items": ["Медиана — 7,3 часа"]},
     ]}, ensure_ascii=False)  # цифра есть, source_note нет — невалидно
     good = _valid_slide_json("Заголовок исправлен", with_number=True)
     llm = _QueueLLM([_valid_slide_json("Первый"), bad, good, _valid_slide_json("Третий")])
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)  # см. комментарий выше — FIFO нужен последовательно
+    deck = write_slides(
+        outline, [SourceDoc(name="brief.md", text="Сквозная медиана — 6,2 часа")],
+        PROFILE, llm=llm, max_workers=1,
+    )  # см. комментарий выше — FIFO нужен последовательно
     assert deck.slides[1].headline == "Заголовок исправлен"
     assert validate_deck_spec(deck) == []
+
+
+def test_repair_receives_previous_answer_and_preserves_valid_fields(PROFILE):
+    bad = json.dumps({
+        "kind": "bullets", "headline": "Неподтверждённый рост — 99%",
+        "blocks": [{"type": "bullets", "items": ["Нужна проверка"]}],
+        "source_note": "Источник: придуман моделью",
+    }, ensure_ascii=False)
+    good = json.dumps({
+        "kind": "bullets", "headline": "Материал готов к правке",
+        "blocks": [{"type": "bullets", "items": ["Проверьте язык и структуру"]}],
+    }, ensure_ascii=False)
+    llm = _CapturingLLM([bad, good])
+
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1)
+
+    repair_payload = json.loads(llm.messages[1][1]["content"])
+    assert repair_payload["previous_answer"]["headline"].endswith("99%")
+    assert repair_payload["previous_answer_problems"]
+    assert deck.slides[0].headline == "Материал готов к правке"
+
+
+def test_brief_is_a_real_source_and_source_note_is_set_by_code(PROFILE):
+    response = json.dumps({
+        "kind": "bullets", "headline": "Срок сократился на 27%",
+        "blocks": [{"type": "bullets", "items": ["Результат подтверждён в брифе"]}],
+        "source_note": "Источник: любая строка",
+    }, ensure_ascii=False)
+
+    deck = write_slides(
+        _one_slide_outline(), [SourceDoc(name="brief.md", text="Срок сократился на 27%")],
+        PROFILE, llm=_QueueLLM([response]), max_workers=1,
+    )
+
+    assert deck.slides[0].generation_origin == "model"
+    assert deck.slides[0].source_note == "Источник: brief.md"
 
 
 def test_write_slides_falls_back_when_model_keeps_sending_invalid_json(PROFILE):
@@ -278,10 +317,9 @@ class _SlowIndexAwareLLM(LLMProvider):
             time.sleep(self._delay_by_index(index))
             if index in self._fail_indices:
                 raise RuntimeError(f"слайд {index}: модель недоступна (тест)")
-            # with_number=True: заголовок несёт цифру индекса ("Заголовок 0"
-            # и т.п.) — без source_note такой слайд невалиден
-            # (`slide_spec_problems`, "цифра без источника"), с ним — валиден.
-            return _valid_slide_json(f"Заголовок {index}", with_number=True)
+            # Индекс вида "Заголовок 0" — структурная нумерация,
+            # а не факт о предмете слайда; фиктивный source_note ему не нужен.
+            return _valid_slide_json(f"Заголовок {index}")
         finally:
             with self._lock:
                 self.concurrent_calls -= 1

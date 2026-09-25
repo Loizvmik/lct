@@ -10,6 +10,7 @@ from lxml import etree
 
 from deckforge.plan.spec import (
     BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock,
+    numeric_facts,
 )
 
 _NUMBER_RE = re.compile(r"(?<![\w])(?:[+−-]?\d+(?:[\s\u00a0]\d{3})*(?:[.,]\d+)?\s*%?)(?![\w])")
@@ -41,9 +42,12 @@ def extract_source_facts(sources: list[str]) -> list[SourceFact]:
     facts: list[SourceFact] = []
     seen: set[str] = set()
     for source in sources:
+        allowed = {_normalize_number(value) for value in numeric_facts(source)}
         for match in _NUMBER_RE.finditer(source):
             value = match.group(0).strip()
             normalized = _normalize_number(value)
+            if normalized not in allowed:
+                continue
             if normalized in seen:
                 continue
             seen.add(normalized)
@@ -117,7 +121,7 @@ def _normalize_text(value: str) -> str:
 
 def source_coverage_report(deck: DeckSpec, sources: list[str]) -> dict:
     facts = extract_source_facts(sources)
-    deck_numbers = {_normalize_number(match.group(0)) for match in _NUMBER_RE.finditer(deck_text(deck))}
+    deck_numbers = {_normalize_number(value) for value in numeric_facts(deck_text(deck))}
     items = [
         {
             "value": fact.value,
@@ -179,7 +183,7 @@ def pptx_slide_text(path: Path) -> str:
 def validate_pptx_content(path: Path, deck: DeckSpec, coverage: dict) -> dict:
     rendered = pptx_slide_text(path)
     normalized_rendered = _normalize_text(rendered)
-    rendered_numbers = {_normalize_number(match.group(0)) for match in _NUMBER_RE.finditer(rendered)}
+    rendered_numbers = {_normalize_number(value) for value in numeric_facts(rendered)}
     required = [
         _normalize_number(item["value"]) for item in coverage.get("facts", []) if item.get("used")
     ]

@@ -18,12 +18,13 @@ from deckforge.audit.config import AuditConfig
 from deckforge.compose.builder import (
     Variant, _avoid_decor_overlap, _best_contrast_color, _clear_sample_slides, _is_cosmetic_truncation,
     _local_background_luminance, _overlap_ratio, _pick_pattern, _place_best_candidate, _relative_luminance,
-    _SelectionHistory, build_deck, count_embedded_photos, fits,
+    _SelectionHistory, build_deck, build_safe_deck, count_embedded_photos, fits,
 )
 from deckforge.compose.textfit import measure
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock
+from deckforge.plan.coverage import pptx_slide_text
 from deckforge.template.grid import Grid
 from deckforge.template.naming import MIN_CONTRAST, contrast_ratio
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
@@ -122,6 +123,17 @@ def test_slide_is_built_on_a_layout_from_the_template():
     assert len(prs.slides) == len(SAMPLE_SPEC.slides)
     for slide in prs.slides:
         assert slide.slide_layout.name in template_layout_names
+
+
+def test_safe_deck_preserves_slide_count_and_every_block():
+    out = build_safe_deck(CARDS_SPEC, PROFILE, TEMPLATE, Variant.dense)
+    prs = Presentation(str(out))
+    rendered = " ".join(pptx_slide_text(out).split())
+
+    assert len(prs.slides) == len(CARDS_SPEC.slides)
+    assert "Задержка данных кадровой системы" in rendered
+    assert "Правила закупок" in rendered
+    assert "Доработка правил для закупок свыше 5 млн ₽ — 3 недели" in rendered
 
 
 def test_no_empty_layout_placeholder_survives_into_the_built_slide():

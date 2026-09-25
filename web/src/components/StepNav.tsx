@@ -37,7 +37,7 @@ export default function StepNav() {
       .then((job) => {
         if (cancelled) return;
         setJobTemplateId(job.template_id);
-        setDeckReady(job.status === "done");
+        setDeckReady(job.status === "done" || job.status === "done_with_warnings");
       })
       .catch(() => undefined);
     return () => {

@@ -11,6 +11,7 @@ from deckforge.plan.outline import (
 from deckforge.provider.base import LLMProvider
 
 CONTENT_PACK = Path("fixtures/content-packs/queue-latency")
+SCREENSHOT_PACK = Path("fixtures/content-packs/text-editing-screenshots")
 
 
 class _FakeLLM(LLMProvider):
@@ -25,6 +26,16 @@ class _FakeLLM(LLMProvider):
         if isinstance(self._response, Exception):
             raise self._response
         return self._response
+
+
+class _QueueLLM(LLMProvider):
+    def __init__(self, responses: list[str]):
+        self.responses = list(responses)
+        self.messages: list[list[dict]] = []
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        self.messages.append(messages)
+        return self.responses.pop(0)
 
 
 def _valid_outline_json(n: int) -> str:
@@ -87,6 +98,28 @@ def test_build_outline_falls_back_on_malformed_json():
     assert MIN_SLIDES <= len(outline.slides) <= MAX_SLIDES
 
 
+def test_build_outline_respects_the_requested_slide_count_when_model_returns_more():
+    outline = build_outline(
+        "бриф", [], profile=None, llm=_FakeLLM(_valid_outline_json(12)), target_slides=8,
+    )
+
+    assert len(outline.slides) == 8
+    assert outline.slides[0].kind == "title"
+    assert outline.slides[-1].kind == "closing"
+
+
+def test_build_outline_repairs_malformed_json_with_the_previous_answer():
+    llm = _QueueLLM(['{"slides": [{"kind": "title"', _valid_outline_json(6)])
+
+    outline = build_outline("бриф", [], profile=None, llm=llm, target_slides=6)
+
+    assert len(llm.messages) == 2
+    repair_payload = json.loads(llm.messages[1][1]["content"])
+    assert repair_payload["previous_answer"].startswith('{"slides"')
+    assert repair_payload["json_error"]
+    assert len(outline.slides) == 6
+
+
 class _RecordingLLM(LLMProvider):
     """Запоминает `messages` последнего вызова — нужен, чтобы проверить, ЧТО
     именно код кладёт в payload модели (Task 18: `available_forms`), не
@@ -140,3 +173,13 @@ def test_load_content_pack_reads_frontmatter_and_sources():
     assert meta["target_slides"] == 12
     assert len(sources) == 1
     assert "1 240 заявок" in sources[0].text
+
+
+def test_three_screenshot_materials_are_preserved_as_a_regression_pack():
+    brief, sources, meta = load_content_pack(SCREENSHOT_PACK)
+
+    assert meta["title"] == "Как подготовить текст к публикации"
+    assert "Подготовить учебную презентацию для студентов" in brief
+    assert len(sources) == 1
+    assert "Последовательность работы" in sources[0].text
+    assert "Пример после правки" in sources[0].text

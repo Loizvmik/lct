@@ -224,11 +224,69 @@ class SpecValidationError(ValueError):
         self.problems = list(problems)
 
 
-_DIGIT_RE = re.compile(r"\d")
+_NUMBER_RE = re.compile(
+    r"(?<![\w])(?:[+−-]?\d+(?:[\s\u00a0]\d{3})*(?:[.,]\d+)?\s*%?)(?![\w])"
+)
+_NON_FACTUAL_NUMBER_PATTERNS = (
+    # Маркеры нумерованного списка: `1. Проверить`, `2) Исправить`.
+    re.compile(r"(?m)^\s*\d+[.)](?=\s)"),
+    # Имена продуктов и версий: Dota 2, Python 3, версия 2.
+    re.compile(
+        r"(?i)\b(?:dota|python|windows|office|version|версия)\s*[v№#]?\s*\d+(?:[.,]\d+)*\b"
+    ),
+    # Буквенно-цифровые идентификаторы: B2B, 3D, H2O.
+    re.compile(r"(?i)\b(?:[a-zа-я]\d+[a-zа-я0-9]*|\d+[a-zа-я][a-zа-я0-9]*)\b"),
+    # Нумерация и структура слайда — не факт о предмете презентации.
+    re.compile(
+        r"(?i)\b(?:шаг|этап|колонка|столбец|слайд|заголовок|пункт|глава|раздел|урок|модуль|"
+        r"вариант|пример|часть)\s*[№#]?\s*\d+(?:[.,]\d+)*\b"
+    ),
+    re.compile(
+        r"(?i)\b\d+(?:[.,]\d+)?\s+(?:элемент(?:а|ов)?|схем(?:а|ы)?|колонок|"
+        r"карточ(?:ка|ки|ек)|блок(?:а|ов)?|слайд(?:а|ов)?)\b"
+    ),
+)
 
 
-def _has_digits(*texts: str | None) -> bool:
-    return any(t and _DIGIT_RE.search(t) for t in texts)
+def numeric_facts(text: str | None) -> list[str]:
+    """Возвращает числовые утверждения, которым нужен источник.
+
+    Цифры в именах, версиях и структурной нумерации не считаются
+    фактами: `Dota 2`, `B2B`, `шаг 1`, `4 элемента`. Проценты, даты,
+    деньги, KPI и остальные числа остаются проверяемыми.
+    """
+    if not text:
+        return []
+    ignored: list[tuple[int, int]] = []
+    for pattern in _NON_FACTUAL_NUMBER_PATTERNS:
+        ignored.extend(match.span() for match in pattern.finditer(text))
+    return [
+        match.group(0).strip()
+        for match in _NUMBER_RE.finditer(text)
+        if not any(start <= match.start() and match.end() <= end for start, end in ignored)
+    ]
+
+
+def slide_numeric_facts(slide: SlideSpec) -> list[str]:
+    texts: list[str | None] = [slide.headline, slide.subhead]
+    for block in slide.blocks:
+        if isinstance(block, TextBlock):
+            texts.append(block.text)
+        elif isinstance(block, BulletBlock):
+            texts.extend(block.items)
+        elif isinstance(block, CardBlock):
+            for card in block.items:
+                texts.extend((card.title, card.body))
+        elif isinstance(block, KpiBlock):
+            texts.extend(item.value for item in block.items)
+        elif isinstance(block, QuoteBlock):
+            texts.append(block.text)
+    if slide.visual is not None:
+        if slide.visual.table is not None:
+            texts.extend(cell for row in slide.visual.table.rows for cell in row)
+        if slide.visual.chart is not None:
+            texts.extend(str(value) for series in slide.visual.chart.series for value in series.values)
+    return [fact for text in texts for fact in numeric_facts(text)]
 
 
 def slide_spec_problems(slide: SlideSpec) -> list[str]:
@@ -244,27 +302,22 @@ def slide_spec_problems(slide: SlideSpec) -> list[str]:
     if not slide.headline or not slide.headline.strip():
         problems.append(f"{where}: пустой обязательный headline")
 
-    has_digits = _has_digits(slide.headline, slide.subhead)
-
     for block in slide.blocks:
         if isinstance(block, TextBlock):
             if not block.text.strip():
                 problems.append(f"{where}: пустой TextBlock.text")
-            has_digits = has_digits or _has_digits(block.text)
         elif isinstance(block, BulletBlock):
             if not block.items:
                 problems.append(f"{where}: BulletBlock без пунктов")
             for i, item in enumerate(block.items):
                 if not item.strip():
                     problems.append(f"{where}: пустой пункт {i} в BulletBlock")
-                has_digits = has_digits or _has_digits(item)
         elif isinstance(block, CardBlock):
             if not block.items:
                 problems.append(f"{where}: CardBlock без карточек")
             for i, card in enumerate(block.items):
                 if not card.body.strip():
                     problems.append(f"{where}: пустое тело карточки {i}")
-                has_digits = has_digits or _has_digits(card.body, card.title)
         elif isinstance(block, KpiBlock):
             if not block.items:
                 problems.append(f"{where}: KpiBlock без метрик")
@@ -273,8 +326,6 @@ def slide_spec_problems(slide: SlideSpec) -> list[str]:
                     problems.append(f"{where}: пустое значение KPI {i}")
                 if not kpi.label.strip():
                     problems.append(f"{where}: пустая подпись KPI {i}")
-            if block.items:
-                has_digits = True  # KPI по природе несёт число — вход
         elif isinstance(block, QuoteBlock):
             if not block.text.strip():
                 problems.append(f"{where}: пустая цитата")
@@ -292,9 +343,6 @@ def slide_spec_problems(slide: SlideSpec) -> list[str]:
                             f"{where}: строка {i} таблицы несёт {len(row)} ячеек, "
                             f"а шапка — {header_len}"
                         )
-                has_digits = has_digits or any(
-                    _has_digits(cell) for row in table.rows for cell in row
-                )
         chart = slide.visual.chart
         if chart is not None:
             n_cat = len(chart.categories)
@@ -306,10 +354,8 @@ def slide_spec_problems(slide: SlideSpec) -> list[str]:
                         f"{where}: ряд {series.name!r} несёт {len(series.values)} значений, "
                         f"а категорий {n_cat}"
                     )
-            has_digits = True
-
-    if has_digits and not (slide.source_note and slide.source_note.strip()):
-        problems.append(f"{where}: на слайде есть цифры, а source_note не указан")
+    if slide_numeric_facts(slide) and not (slide.source_note and slide.source_note.strip()):
+        problems.append(f"{where}: на слайде есть числовой факт, а source_note не указан")
 
     return problems
 

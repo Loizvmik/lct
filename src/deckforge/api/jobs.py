@@ -22,6 +22,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import shutil
 import zipfile
 from dataclasses import dataclass, field
@@ -34,11 +35,14 @@ from deckforge.audit.autofix import SUPPORTED_CHECKS, apply_fixes
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.findings import Finding
-from deckforge.compose.builder import build_deck
+from deckforge.compose.builder import build_deck, build_safe_deck
 from deckforge.export.bundle import export_bundle
 from deckforge.plan.coverage import ContentValidationError, validate_deck_content, validate_pptx_content
 from deckforge.plan.outline import SourceDoc, build_outline
-from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
+from deckforge.plan.spec import (
+    BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock,
+    deck_spec_to_dict,
+)
 from deckforge.plan.variants import Variant, apply_variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
@@ -48,6 +52,7 @@ from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
+logger = logging.getLogger(__name__)
 
 STAGES: tuple[str, ...] = ("parse", "outline", "write", "compose", "audit", "export")
 
@@ -219,8 +224,8 @@ class JobRecord:
         self.stages.append(stage)
         self._notify()
 
-    def finish(self, *, error: str | None = None) -> None:
-        self.status = "error" if error else "done"
+    def finish(self, *, error: str | None = None, warnings: bool = False) -> None:
+        self.status = "error" if error else ("done_with_warnings" if warnings else "done")
         self.error = error
         self._notify()
 
@@ -233,11 +238,15 @@ class JobStore:
         self, root: Path | None = None, *, provider_factory: ProviderFactory | None = None,
         template_provider_factory: ProviderFactory | None = None,
         allow_offline_fallback: bool = False,
+        require_provider: bool = True,
+        allow_content_fallback: bool = True,
     ) -> None:
         self.root = root if root is not None else _artifacts_root()
         self.provider_factory = provider_factory or _build_role_provider
         self.template_provider_factory = template_provider_factory or _build_role_provider
         self.allow_offline_fallback = allow_offline_fallback
+        self.require_provider = require_provider and not allow_offline_fallback
+        self.allow_content_fallback = allow_content_fallback
         self.templates: dict[str, TemplateRecord] = {}
         self.jobs: dict[str, JobRecord] = {}
 
@@ -291,7 +300,7 @@ class JobStore:
             raise ProviderUnavailableError(
                 "Не удалось подключить AI для создания презентации. Проверьте настройки Yandex Cloud."
             ) from exc
-        if not self.allow_offline_fallback and (outline_llm is None or writer_llm is None):
+        if self.require_provider and (outline_llm is None or writer_llm is None):
             raise ProviderUnavailableError(
                 "AI для создания презентации недоступен. Проверьте YANDEX_API_KEY и "
                 "YANDEX_FOLDER_ID в файле .env и перезапустите сервер."
@@ -305,7 +314,7 @@ class JobStore:
             job=job, template=template, brief=brief, sources=sources, title=title,
             language=language, target_slides=target_slides, autofix=autofix,
             outline_llm=outline_llm, writer_llm=writer_llm,
-            allow_fallback=self.allow_offline_fallback,
+            allow_fallback=self.allow_content_fallback,
         ))
         return job
 
@@ -317,7 +326,7 @@ class JobStore:
 
     def get_deck(self, deck_id: str) -> JobRecord:
         job = self.get_job(deck_id)
-        if job.status != "done":
+        if job.status not in ("done", "done_with_warnings"):
             raise JobError(f"Колода {deck_id!r} ещё не готова (статус: {job.status}).")
         return job
 
@@ -338,7 +347,8 @@ async def _run_job(
         job.profile = profile
 
         job.enter_stage("outline")
-        source_docs = [SourceDoc(name=f"source-{i + 1}.md", text=text) for i, text in enumerate(sources)]
+        source_docs = [SourceDoc(name="brief.md", text=brief)]
+        source_docs.extend(SourceDoc(name=f"source-{i + 1}.md", text=text) for i, text in enumerate(sources))
         outline = await asyncio.to_thread(
             build_outline, brief, source_docs, profile, outline_llm, target_slides,
             title=title or "Презентация", language=language, allow_fallback=allow_fallback,
@@ -351,7 +361,7 @@ async def _run_job(
             max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
             template_path=template.path, allow_fallback=allow_fallback,
         )
-        coverage = await asyncio.to_thread(validate_deck_content, deck, sources)
+        coverage = await asyncio.to_thread(validate_deck_content, deck, [brief, *sources])
         _write_json(job.dir / "deck-spec.json", deck_spec_to_dict(deck))
         report.update({
             "slide_count": len(deck.slides),
@@ -366,14 +376,31 @@ async def _run_job(
             "source_fact_count": coverage["source_fact_count"],
             "used_fact_count": coverage["used_fact_count"],
             "coverage_ratio": coverage["coverage_ratio"],
-            "fallback_slide_count": sum(1 for slide in deck.slides if slide.generation_origin == "fallback"),
+            "fallback_slide_count": sum(
+                1 for slide in deck.slides if slide.generation_origin in ("fallback", "degraded")
+            ),
         }
         _write_json(job.dir / "generation-report.json", report)
 
         job.enter_stage("compose")
-        async with asyncio.TaskGroup() as tg:
-            for variant in Variant:
-                tg.create_task(_compose_variant(job, variant, deck, profile, template.path, coverage))
+        compose_results = await asyncio.gather(*(
+            _compose_variant(job, variant, deck, profile, template.path, coverage)
+            for variant in Variant
+        ), return_exceptions=True)
+        variant_errors: list[dict] = []
+        for variant, result in zip(Variant, compose_results):
+            if isinstance(result, BaseException):
+                logger.error(
+                    "generation variant failed",
+                    extra={"job_id": job.job_id, "stage": "compose", "variant": variant.value},
+                    exc_info=(type(result), result, result.__traceback__),
+                )
+                variant_errors.append(_variant_error("compose", variant.value, result))
+        if not job.variants:
+            raise RuntimeError(
+                "Не удалось собрать ни один вариант: "
+                + "; ".join(item["message"] for item in variant_errors)
+            )
         report["variants"] = {
             name: state.content_verification for name, state in sorted(job.variants.items())
         }
@@ -381,24 +408,60 @@ async def _run_job(
 
         job.enter_stage("audit")
         config = AuditConfig.load()
-        async with asyncio.TaskGroup() as tg:
-            for variant in Variant:
-                tg.create_task(_audit_variant(job, variant.value, profile, config, autofix))
+        audit_names = list(job.variants)
+        audit_results = await asyncio.gather(*(
+            _audit_variant(job, name, profile, config, autofix) for name in audit_names
+        ), return_exceptions=True)
+        for name, result in zip(audit_names, audit_results):
+            if isinstance(result, BaseException):
+                variant_errors.append(_variant_error("audit", name, result))
 
         job.enter_stage("export")
-        async with asyncio.TaskGroup() as tg:
-            for variant in Variant:
-                tg.create_task(_export_variant(job, variant.value, profile))
+        export_names = list(job.variants)
+        export_results = await asyncio.gather(*(
+            _export_variant(job, name, profile) for name in export_names
+        ), return_exceptions=True)
+        for name, result in zip(export_names, export_results):
+            if isinstance(result, BaseException):
+                variant_errors.append(_variant_error("export", name, result))
+                job.variants.pop(name, None)
+        if not job.variants:
+            raise RuntimeError("Ни один собранный вариант не удалось подготовить к выдаче.")
 
-        report["status"] = "done"
+        warnings = bool(variant_errors) or any(
+            slide.generation_origin in ("fallback", "degraded") for slide in deck.slides
+        ) or any(
+            slide.generation_origin == "degraded"
+            for state in job.variants.values() for slide in state.deck_spec.slides
+        )
+        report["variant_errors"] = variant_errors
+        report["status"] = "done_with_warnings" if warnings else "done"
         _write_json(job.dir / "generation-report.json", report)
-        job.finish()
-    except* Exception as eg:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
+        job.finish(warnings=warnings)
+    except Exception as exc:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
         # не остаться молчаливым "running" навсегда
-        error = "; ".join(_safe_error(e) for e in eg.exceptions)
-        report.update({"status": "error", "error": error})
+        logger.exception("generation job failed", extra={"job_id": job.job_id, "stage": job.stage})
+        error = _safe_error(exc)
+        report.update({
+            "status": "error", "error": error,
+            "errors": [{
+                "stage": job.stage, "variant": None, "slide_index": None,
+                "exception_type": type(exc).__name__, "attempt": 1, "message": error,
+            }],
+        })
         _write_json(job.dir / "generation-report.json", report)
         job.finish(error=error)
+
+
+def _variant_error(stage: str, variant: str, exc: BaseException) -> dict:
+    return {
+        "stage": stage,
+        "variant": variant,
+        "slide_index": None,
+        "exception_type": type(exc).__name__,
+        "attempt": 1,
+        "message": _safe_error(exc),
+    }
 
 
 async def _compose_variant(
@@ -408,7 +471,7 @@ async def _compose_variant(
     dest_dir = job.dir / variant.value
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "deck.pptx"
-    strategies: list[tuple[str, Variant | None]] = [(variant.value, variant)]
+    strategies: list[tuple[str, Variant | str | None]] = [(variant.value, variant)]
     strategies.extend(
         (name, candidate) for name, candidate in (
             ("visual-compatible", Variant.visual),
@@ -417,21 +480,33 @@ async def _compose_variant(
         )
         if candidate is None or candidate is not variant
     )
+    strategies.append(("safe-basic", "safe-basic"))
     attempted: list[str] = []
     seen: set[tuple] = set()
     selected: tuple[DeckSpec, Path, dict, str] | None = None
     for strategy_name, strategy_variant in strategies:
         base = copy.deepcopy(deck)
-        variant_deck = (
-            await asyncio.to_thread(apply_variant, base, profile, strategy_variant)
-            if strategy_variant is not None else base
-        )
-        signature = tuple((slide.kind, slide.pattern_id, len(slide.blocks)) for slide in variant_deck.slides)
+        if strategy_variant == "safe-basic":
+            variant_deck = base
+            for slide in variant_deck.slides:
+                slide.findings.append(
+                    "Использована базовая безопасная компоновка: макеты шаблона теряли часть содержания."
+                )
+                slide.generation_origin = "degraded"
+                slide.generation_error = "использована безопасная компоновка"
+        elif strategy_variant is not None:
+            variant_deck = await asyncio.to_thread(apply_variant, base, profile, strategy_variant)
+        else:
+            variant_deck = base
+        signature = (strategy_name, tuple(
+            (slide.kind, slide.pattern_id, len(slide.blocks)) for slide in variant_deck.slides
+        ))
         if signature in seen:
             continue
         seen.add(signature)
+        builder = build_safe_deck if strategy_variant == "safe-basic" else build_deck
         built_path = await asyncio.to_thread(
-            build_deck, variant_deck, profile, template_path, variant,
+            builder, variant_deck, profile, template_path, variant,
         )
         try:
             verification = await asyncio.to_thread(

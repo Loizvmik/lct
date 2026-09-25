@@ -5,7 +5,7 @@ export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
 export type Stage = "parse" | "outline" | "write" | "compose" | "audit" | "export";
-export type JobStatus = "running" | "done" | "error";
+export type JobStatus = "running" | "done" | "done_with_warnings" | "error";
 export type VariantName = "dense" | "airy" | "visual";
 
 export interface TemplateUploadResponse {
@@ -159,7 +159,7 @@ export function subscribeJobEvents(
   source.onmessage = (event) => {
     const job = JSON.parse(event.data) as JobResponse;
     onUpdate(job);
-    if (job.status === "done" || job.status === "error") {
+    if (job.status === "done" || job.status === "done_with_warnings" || job.status === "error") {
       source.close();
     }
   };

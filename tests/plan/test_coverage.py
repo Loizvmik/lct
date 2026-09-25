@@ -5,6 +5,12 @@ from deckforge.plan.coverage import (
     ContentValidationError, extract_source_facts, source_coverage_report, validate_deck_content,
     validate_pptx_content,
 )
+
+
+def test_numbered_list_markers_are_not_source_facts():
+    source = """Порядок работы:\n1. Проверить текст.\n2. Исправить ошибки.\nРост на 27%."""
+
+    assert [fact.value for fact in extract_source_facts([source])] == ["27%"]
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec
 
 

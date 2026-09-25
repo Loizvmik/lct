@@ -22,7 +22,7 @@ from PIL import Image
 from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import PP_PLACEHOLDER
-from pptx.enum.text import PP_ALIGN
+from pptx.enum.text import MSO_AUTO_SIZE, PP_ALIGN
 from pptx.util import Emu, Pt
 
 from deckforge.audit.config import AuditConfig
@@ -188,7 +188,11 @@ def build_deck(
             bullet_char=bullet_char, user_photos=user_photos,
         )
         slide_spec.findings.extend(notes)
-        _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
+        if not _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes):
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: текст докладчика не записан — "
+                "в notes master шаблона нет текстового placeholder."
+            )
         history = history.with_choice(pattern.pattern_id)
 
     out_path = _output_path(spec, template_path, variant)
@@ -198,7 +202,139 @@ def build_deck(
     return out_path
 
 
-def _write_speaker_notes(slide, text: str | None) -> None:
+def build_safe_deck(
+    spec: DeckSpec, profile: TemplateProfile, template_path: Path, variant: Variant,
+) -> Path:
+    """Build a lossless last-resort deck without trusting mined placeholders.
+
+    Some valid user templates contain decorative samples whose inferred slots
+    overstate their real capacity.  The normal builder remains the preferred
+    path; this function is used only after the finished PPTX has failed the
+    content-preservation check.  It keeps the template package, masters,
+    theme, canvas and slide count, but draws two predictable text frames over
+    a real template layout.  PowerPoint performs the final text-to-fit step,
+    so no source block is truncated or moved to an unexpected extra slide.
+    """
+    prs = Presentation(str(template_path))
+    _clear_sample_slides(prs)
+    if not prs.slide_layouts:
+        raise BuildError("template has no slide layouts for safe composition")
+
+    layout = prs.slide_layouts[0]
+    family = _primary_family(profile)
+    title_size = max(20.0, float(profile.type_scale_pt("h2", 28.0) or 28.0))
+    body_size = max(11.0, float(profile.type_scale_pt("body", 18.0) or 18.0))
+    caption_size = max(8.0, float(profile.type_scale_pt("caption", 10.0) or 10.0))
+    ink = _safe_profile_color(profile, "on_surface", "17171D")
+    muted = _safe_profile_color(profile, "muted", ink)
+
+    width = int(profile.canvas_width_emu)
+    height = int(profile.canvas_height_emu)
+    for slide_spec in spec.slides:
+        slide = prs.slides.add_slide(layout)
+        # Placeholders copied from the selected layout are precisely the part
+        # we cannot trust here. Master artwork is inherited and remains intact.
+        for shape in list(slide.shapes):
+            if shape.is_placeholder:
+                slide.shapes._spTree.remove(shape._element)
+
+        _add_safe_textbox(
+            slide, slide_spec.headline, family=family, size_pt=title_size,
+            color=ink, bold=True,
+            left=round(width * 0.075), top=round(height * 0.07),
+            box_width=round(width * 0.85), box_height=round(height * 0.17),
+        )
+        body_lines = _safe_slide_lines(slide_spec)
+        _add_safe_textbox(
+            slide, "\n".join(body_lines), family=family, size_pt=body_size,
+            color=ink, bold=False,
+            left=round(width * 0.075), top=round(height * 0.275),
+            box_width=round(width * 0.85), box_height=round(height * 0.59),
+        )
+        if slide_spec.source_note:
+            _add_safe_textbox(
+                slide, slide_spec.source_note, family=family, size_pt=caption_size,
+                color=muted, bold=False,
+                left=round(width * 0.075), top=round(height * 0.9),
+                box_width=round(width * 0.85), box_height=round(height * 0.045),
+            )
+        if not _write_speaker_notes(slide, slide_spec.speaker_notes):
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: текст докладчика не записан — "
+                "в notes master шаблона нет текстового placeholder."
+            )
+
+    out_path = _output_path(spec, template_path, variant)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    prs.save(str(out_path))
+    write_custom_property(out_path, WORKFLOW_PROPERTY_NAME, workflow_manifest().as_property_value())
+    return out_path
+
+
+def _safe_profile_color(profile: TemplateProfile, role: str, fallback: str) -> str:
+    value = profile.palette_roles.get(role, fallback).lstrip("#")
+    return value if re.fullmatch(r"[0-9a-fA-F]{6}", value) else fallback
+
+
+def _safe_slide_lines(slide_spec: SlideSpec) -> list[str]:
+    lines: list[str] = []
+    if slide_spec.subhead:
+        lines.append(slide_spec.subhead)
+    for block in slide_spec.blocks:
+        if isinstance(block, TextBlock):
+            lines.append(block.text)
+        elif isinstance(block, BulletBlock):
+            lines.extend(f"• {item}" for item in block.items)
+        elif isinstance(block, CardBlock):
+            lines.extend(
+                f"{card.title} — {card.body}" if card.title else card.body
+                for card in block.items
+            )
+        elif isinstance(block, KpiBlock):
+            lines.extend(f"{item.value} — {item.label}" for item in block.items)
+        elif isinstance(block, QuoteBlock):
+            lines.append(f"«{block.text}»" + (f" — {block.author}" if block.author else ""))
+    if slide_spec.visual is not None:
+        if slide_spec.visual.caption:
+            lines.append(slide_spec.visual.caption)
+        if slide_spec.visual.table is not None:
+            lines.extend(" | ".join(row) for row in slide_spec.visual.table.rows)
+        if slide_spec.visual.chart is not None:
+            chart = slide_spec.visual.chart
+            for series in chart.series:
+                lines.append(
+                    f"{series.name}: " + ", ".join(
+                        f"{category} — {value}"
+                        for category, value in zip(chart.categories, series.values)
+                    )
+                )
+    return [line for line in lines if line and line.strip()]
+
+
+def _add_safe_textbox(
+    slide, text: str, *, family: str, size_pt: float, color: str, bold: bool,
+    left: int, top: int, box_width: int, box_height: int,
+) -> None:
+    textbox = slide.shapes.add_textbox(
+        Emu(left), Emu(top), Emu(max(1, box_width)), Emu(max(1, box_height)),
+    )
+    frame = textbox.text_frame
+    frame.clear()
+    frame.word_wrap = True
+    frame.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+    frame.margin_left = frame.margin_right = Emu(0)
+    frame.margin_top = frame.margin_bottom = Emu(0)
+    for index, line in enumerate(text.splitlines() or [""]):
+        paragraph = frame.paragraphs[0] if index == 0 else frame.add_paragraph()
+        run = paragraph.add_run()
+        run.text = line
+        run.font.name = family
+        run.font.size = Pt(size_pt)
+        run.font.bold = bold
+        run.font.color.rgb = RGBColor.from_string(color)
+
+
+def _write_speaker_notes(slide, text: str | None) -> bool:
     """Кладёт текст докладчика на страницу заметок слайда.
 
     Заказчик 23 сентября 2026 назвал ожидаемым результатом «готовые слайды
@@ -212,8 +348,12 @@ def _write_speaker_notes(slide, text: str | None) -> None:
     заметок), поэтому безусловный вызов приделал бы пустой лист заметок
     каждому слайду колоды, которого в исходном шаблоне не было."""
     if not text or not text.strip():
-        return
-    slide.notes_slide.notes_text_frame.text = text.strip()
+        return True
+    text_frame = slide.notes_slide.notes_text_frame
+    if text_frame is None:
+        return False
+    text_frame.text = text.strip()
+    return True
 
 
 def place_slide(

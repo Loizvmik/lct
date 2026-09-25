@@ -153,7 +153,7 @@ def create_app(store: JobStore | None = None) -> FastAPI:
                 while True:
                     snapshot = await queue.get()
                     yield f"data: {json.dumps(snapshot, ensure_ascii=False)}\n\n"
-                    if snapshot["status"] in ("done", "error"):
+                    if snapshot["status"] in ("done", "done_with_warnings", "error"):
                         break
             finally:
                 job.unsubscribe(queue)

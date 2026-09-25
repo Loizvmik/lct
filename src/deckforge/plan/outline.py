@@ -162,13 +162,14 @@ def _clamp_slide_count(slides: list[OutlineSlide], target: int) -> list[OutlineS
     if slides[-1].kind != "closing":
         slides.append(OutlineSlide(kind="closing", intent="Итог и следующий шаг"))
 
-    if len(slides) > MAX_SLIDES:
-        keep_middle = MAX_SLIDES - 2
+    requested = max(MIN_SLIDES, min(MAX_SLIDES, target))
+    if len(slides) > requested:
+        keep_middle = requested - 2
         slides = [slides[0], *slides[1:-1][:keep_middle], slides[-1]]
 
     filler_kinds = ("context", "data", "case")
     i = 0
-    while len(slides) < min(target, MAX_SLIDES) or len(slides) < MIN_SLIDES:
+    while len(slides) < requested:
         kind = filler_kinds[i % len(filler_kinds)]
         slides.insert(-1, OutlineSlide(kind=kind, intent="Дополнительный контекст"))
         i += 1
@@ -249,9 +250,29 @@ def build_outline(
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
 
+    raw = ""
     try:
         raw = llm.complete(messages, schema=_SCHEMA, max_tokens=OUTLINE_MAX_TOKENS)
-        data = json.loads(raw)
+        try:
+            data = json.loads(raw)
+        except (json.JSONDecodeError, TypeError) as parse_exc:
+            repair_payload = {
+                "previous_answer": raw,
+                "json_error": str(parse_exc),
+                "repair_instruction": (
+                    "Исправь JSON по переданной схеме. Не добавляй пояснений и markdown, "
+                    "верни только цельный объект JSON."
+                ),
+                "schema": _SCHEMA,
+            }
+            repair_messages = [
+                {"role": "system", "content": prompt_body},
+                {"role": "user", "content": json.dumps(repair_payload, ensure_ascii=False)},
+            ]
+            repaired_raw = llm.complete(
+                repair_messages, schema=_SCHEMA, max_tokens=OUTLINE_MAX_TOKENS,
+            )
+            data = json.loads(repaired_raw)
         raw_slides = data["slides"]
         if not isinstance(raw_slides, list):
             raise ValueError(f"'slides' должен быть списком, получено {type(raw_slides).__name__}")

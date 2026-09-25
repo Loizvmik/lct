@@ -9,6 +9,7 @@ from __future__ import annotations
 from deckforge.plan.spec import (
     BulletBlock, Card, CardBlock, ChartSeriesData, ChartVisual, DeckSpec, Kpi, KpiBlock,
     QuoteBlock, SlideSpec, TableVisual, TextBlock, Visual, deck_spec_from_debug_dict, deck_spec_to_dict,
+    numeric_facts, slide_spec_problems,
 )
 
 
@@ -84,3 +85,21 @@ def test_deck_spec_round_trip_handles_empty_deck():
     empty = DeckSpec(title="Пусто", language="ru", slides=[])
     restored = deck_spec_from_debug_dict(deck_spec_to_dict(empty))
     assert restored.slides == []
+
+
+def test_identifiers_and_layout_numbers_do_not_require_a_fake_source_note():
+    slide = SlideSpec(
+        index=0,
+        kind="bullets",
+        headline="Dota 2 и B2B: версия 2",
+        blocks=[BulletBlock(items=["Шаг 1", "колонка 1", "4 элемента", "1 схема", "2. Проверить текст"])],
+    )
+
+    assert numeric_facts(slide.headline) == []
+    assert slide_spec_problems(slide) == []
+
+
+def test_percent_dates_money_and_kpi_still_require_a_source_note():
+    for text in ("Рост на 27%", "Итоги 2026 года", "Бюджет 500 000 рублей"):
+        slide = SlideSpec(index=0, kind="bullets", headline=text)
+        assert any("source_note" in problem for problem in slide_spec_problems(slide))
