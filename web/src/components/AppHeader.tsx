@@ -1,5 +1,6 @@
 "use client";
 
+import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
@@ -248,9 +249,9 @@ export default function AppHeader() {
 
   return (
     <header className="topbar">
-      <Link className="brand" href="/" aria-label="Слайды — на главную">
-        <span className="brand-mark" aria-hidden="true">С</span>
-        <span className="brand-text">Слайды</span>
+      <Link className="brand" href="/" aria-label="Донор — на главную">
+        <Image className="brand-mark" src="/brand/donor-mark.svg" width={36} height={36} alt="" aria-hidden="true" />
+        <Image className="brand-wordmark" src="/brand/donor-wordmark.svg" width={94} height={29} alt="" aria-hidden="true" />
       </Link>
       <StepNav />
       <div className="topbar-actions">

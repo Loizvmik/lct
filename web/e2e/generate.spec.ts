@@ -49,6 +49,9 @@ test("полный путь: шаблон, задание, варианты, п�
 
 test("настройки и управление с клавиатуры", async ({ page }) => {
   await page.goto("/");
+  await expect(page).toHaveTitle("Донор — презентации по вашему образцу");
+  await expect(page.getByRole("link", { name: "Донор — на главную" })).toBeVisible();
+  await expect(page.locator('link[rel="icon"]')).toHaveCount(2);
   await page.getByRole("button", { name: /настройки/i }).click();
   await expect(page.getByRole("dialog", { name: "Настройки" })).toBeVisible();
   await expect(page.getByRole("heading", { name: "Создание презентации" })).toBeVisible();

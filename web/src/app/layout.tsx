@@ -3,7 +3,8 @@ import AppHeader from "@/components/AppHeader";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Слайды — презентации по вашему шаблону",
+  applicationName: "Донор",
+  title: "Донор — презентации по вашему образцу",
   description: "Создание и проверка презентаций по загруженному шаблону",
 };
 

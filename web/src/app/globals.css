@@ -14,8 +14,9 @@ button, input, textarea, select { font: inherit; }
 button, a, input, textarea, select, summary { outline: none; }
 :focus-visible { outline: 3px solid var(--focus); outline-offset: 3px; }
 .topbar { position: sticky; top: 0; z-index: 20; display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 24px; min-height: 72px; padding: 12px clamp(18px,4vw,56px); background: rgba(255,255,255,.94); border-bottom: 1px solid var(--border); backdrop-filter: blur(12px); }
-.brand { display: inline-flex; align-items: center; gap: 10px; color: var(--text); font-size: 18px; font-weight: 750; text-decoration: none; }
-.brand-mark { display: grid; place-items: center; width: 34px; height: 34px; border-radius: 9px; background: var(--brand); color: #fff; font-weight: 800; }
+.brand { display: inline-flex; align-items: center; gap: 12px; min-width: 142px; color: var(--text); text-decoration: none; }
+.brand-mark { display: block; flex: 0 0 36px; width: 36px; height: 36px; }
+.brand-wordmark { display: block; width: 94px; height: auto; }
 .topbar-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
 .shell { width: min(1180px,calc(100% - 40px)); margin: 0 auto; padding: 52px 0 80px; }
 .page-header { max-width: 780px; margin-bottom: 28px; }
@@ -157,7 +158,8 @@ textarea::-webkit-scrollbar-thumb,.thumb-strip::-webkit-scrollbar-thumb { border
 }
 @media (max-width:720px) {
   .topbar { gap: 10px; padding: 10px 16px; }
-  .brand-text { display: none; }
+  .brand { min-width: 36px; }
+  .brand-wordmark { display: none; }
   .topbar .button { padding-inline: 12px; }
   .shell { width: min(100% - 28px,1180px); padding-top: 34px; }
   .grid-2,.summary-grid { grid-template-columns: 1fr; }
