@@ -51,6 +51,8 @@ _ALIGN_MAP = {"l": PP_ALIGN.LEFT, "ctr": PP_ALIGN.CENTER, "r": PP_ALIGN.RIGHT}
 # высота была бы теснее того, что реально покажет редактор, и строка всё
 # равно подрастала бы неожиданно на живом файле.
 _CELL_VPAD_IN = 0.05
+# Боковые поля ячейки: дефолт `a:tcPr` (`marL`/`marR` = 91440 EMU = 0.1″).
+_CELL_HPAD_IN = 0.1
 
 # Нижний предел кегля таблицы при принудительном ужимании — доля от
 # ступени "caption" типографической шкалы шаблона. caption — уже самый
@@ -81,9 +83,11 @@ class TableSpec:
     align: list[str] | None = None
 
 
-def add_table(slide, box: Box, spec: TableSpec, profile: TemplateProfile):
+def add_table(slide, box: Box, spec: TableSpec, profile: TemplateProfile, *, floor_pt: float | None = None):
     """Строит нативную таблицу в `box` (доли холста) на `slide`. Возвращает
-    `GraphicFrame` (`.table`, `.has_table` — интерфейс `python-pptx`)."""
+    `GraphicFrame` (`.table`, `.has_table` — интерфейс `python-pptx`).
+    `floor_pt`: нижний предел кегля вместо `FONT_FLOOR_RATIO * caption`
+    (таблица-единственный блок слайда держит ступень caption)."""
     if not spec.header:
         raise ValueError("TableSpec.header пуст — таблице нечем озаглавить столбцы")
     n_cols = len(spec.header)
@@ -99,13 +103,13 @@ def add_table(slide, box: Box, spec: TableSpec, profile: TemplateProfile):
     body_line_spacing = profile.type_scale.body_line_spacing
     box_width_in = box.width * (profile.canvas_width_emu / EMU_PER_INCH)
     box_height_in = box.height * (profile.canvas_height_emu / EMU_PER_INCH)
-    col_width_in = box_width_in / n_cols
+    col_widths_in = [box_width_in * share for share in column_shares(all_rows)]
 
     size_pt, row_heights_in = _fit_font_size(
-        all_rows, family, body_line_spacing, col_width_in, box_height_in, profile,
+        all_rows, family, body_line_spacing, col_widths_in, box_height_in, profile, floor_pt=floor_pt,
     )
 
-    header_fill_hex = profile.palette_roles.get("accent") or profile.palette_roles.get("brand", "#000000")
+    header_fill_hex = header_fill(profile)
     header_text_hex = best_contrast_text_color(header_fill_hex, profile.palette_roles)
     # Тело таблицы — заливкой того же "полюса" светлый/тёмный, что и
     # фактический фон СЛАЙДА под ней (см. докстроку `colorpick.
@@ -119,7 +123,7 @@ def add_table(slide, box: Box, spec: TableSpec, profile: TemplateProfile):
 
     align = spec.align or ["l"] * n_cols
     for col in range(n_cols):
-        table.columns[col].width = Emu(round(col_width_in * EMU_PER_INCH))
+        table.columns[col].width = Emu(round(col_widths_in[col] * EMU_PER_INCH))
 
     for row_idx, row_values in enumerate(all_rows):
         table.rows[row_idx].height = Emu(max(1, round(row_heights_in[row_idx] * EMU_PER_INCH)))
@@ -141,16 +145,57 @@ def add_table(slide, box: Box, spec: TableSpec, profile: TemplateProfile):
                 run.font.bold = is_header and profile.type_scale.bold_is_idiomatic
                 run.font.color.rgb = _rgb(text_hex)
 
+    # Рамка по сумме строк, а не по коробке слота: строки короче коробки
+    # оставили бы у рамки пустой хвост, и аудит (L02, D05) считал бы
+    # площадь, которой на слайде нет.
+    frame.height = Emu(sum(table.rows[i].height for i in range(n_rows)))
     return frame
 
 
+def header_fill(profile: TemplateProfile) -> str:
+    """Заливка шапки таблицы: accent1 темы, затем роли `brand`/`accent`.
+
+    Роли палитры назначает модель, и от прогона к прогону по-разному: на
+    VK Education `accent` бывал то `#3782BA`, то розовым `#FF3885` (accent2
+    темы, цвет точечных выделений), и шапка выходила розовой (прогон 26
+    сентября 2026); без модели запасная разметка ставит в `brand` бледный
+    `#A0DFE0`. accent1 темы от модели не зависит, им же PowerPoint красит
+    шапки встроенных стилей таблиц, и на всех трёх шаблонах VK он совпадает
+    с цветом бренда (`#0077FF`), которым шаблон заливает свои таблицы."""
+    scheme = profile.theme.scheme if profile.theme is not None else {}
+    return (
+        scheme.get("accent1") or profile.palette_roles.get("brand")
+        or profile.palette_roles.get("accent") or "#000000"
+    )
+
+
+def column_shares(rows: list[list[str]]) -> list[float]:
+    """Доли ширины столбцов по содержанию: столбец с длинными словами и
+    фразами шире столбца с числами. Равные доли рвали слова по буквам
+    («Показа/тель», «Сквозн/ая») в первом столбце, пока соседние с «31,5 ч»
+    стояли полупустыми (прогон 26 сентября 2026). Вес столбца: самое
+    длинное слово или половина самой длинной ячейки, что больше, плюс
+    запас на поля ячейки; считается в символах, точность замера здесь не
+    нужна, нужна пропорция."""
+    n_cols = max((len(r) for r in rows), default=0)
+    weights = []
+    for col in range(n_cols):
+        cells = [str(r[col]) if col < len(r) else "" for r in rows]
+        longest_word = max((len(w) for c in cells for w in c.split()), default=0)
+        longest_cell = max((len(c) for c in cells), default=0)
+        weights.append(max(longest_word, 0.5 * longest_cell) + 2)
+    total = sum(weights)
+    return [w / total for w in weights] if total else []
+
+
 def _fit_font_size(
-    rows: list[list[str]], family: str, line_spacing: float, col_width_in: float,
-    box_height_in: float, profile: TemplateProfile,
+    rows: list[list[str]], family: str, line_spacing: float, col_widths_in: list[float],
+    box_height_in: float, profile: TemplateProfile, *, floor_pt: float | None = None,
 ) -> tuple[float, list[float]]:
     """Кегль и высоты строк, подобранные циклом вниз от `body` до тех пор,
     пока сумма замеренных высот строк не влезет в `box_height_in`, но не
-    ниже `FONT_FLOOR_RATIO * caption` (см. докстроку модуля)."""
+    ниже `FONT_FLOOR_RATIO * caption` (см. докстроку модуля) или
+    `floor_pt`, если он задан."""
     # `type_scale.steps` нормирован к эталонному холсту 13.333″ —
     # `type_scale_pt` денормирует ОБА кегля к РЕАЛЬНОМУ холсту профиля ОДНИМ
     # и тем же коэффициентом (см. `TemplateProfile.denorm_pt`), поэтому
@@ -159,24 +204,28 @@ def _fit_font_size(
     # находка аудита T02: без денормировки тело таблицы на VK Tech выходило
     # завышенным на треть).
     base = profile.type_scale_pt("body", 18.0)
-    floor = profile.type_scale_pt("caption", 12.0) * FONT_FLOOR_RATIO
+    floor = floor_pt if floor_pt is not None else profile.type_scale_pt("caption", 12.0) * FONT_FLOOR_RATIO
 
     size = base
-    heights = _measure_row_heights(rows, family, size, line_spacing, col_width_in)
+    heights = _measure_row_heights(rows, family, size, line_spacing, col_widths_in)
     while sum(heights) > box_height_in and size > floor:
         size = max(size * _SHRINK_FACTOR, floor)
-        heights = _measure_row_heights(rows, family, size, line_spacing, col_width_in)
+        heights = _measure_row_heights(rows, family, size, line_spacing, col_widths_in)
     return size, heights
 
 
 def _measure_row_heights(
-    rows: list[list[str]], family: str, size_pt: float, line_spacing: float, col_width_in: float,
+    rows: list[list[str]], family: str, size_pt: float, line_spacing: float, col_widths_in: list[float],
 ) -> list[float]:
     heights: list[float] = []
     for row in rows:
         tallest = 0.0
-        for cell_text in row:
-            metrics = measure(str(cell_text), family, size_pt, col_width_in, line_spacing=line_spacing)
+        for col, cell_text in enumerate(row):
+            # Текст переносится по ширине столбца ЗА ВЫЧЕТОМ боковых полей
+            # ячейки (по умолчанию 0.1″ с каждой стороны): без них замер
+            # обещал строку там, где редактор делал две.
+            width = max(col_widths_in[min(col, len(col_widths_in) - 1)] - 2 * _CELL_HPAD_IN, 0.1)
+            metrics = measure(str(cell_text), family, size_pt, width, line_spacing=line_spacing)
             tallest = max(tallest, metrics.height_in)
         heights.append(tallest + 2 * _CELL_VPAD_IN)
     return heights

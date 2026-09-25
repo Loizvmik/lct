@@ -36,18 +36,21 @@ from deckforge.compose.blocks import (
 from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
-    allow_wrap, bind_text, clone_example_slide, fix_duplicate_partnames, inherited_text_size, mark_slide, match_slots,
-    prune_unfilled, remove_in_box, remove_sample_frames, remove_stray_text, replace_picture,
-    sample_slides_by_number, set_text_size, slide_refs, text_style,
+    allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames, inherited_text_size,
+    mark_slide, match_slots, native_table, prune_unfilled, remove_in_box, remove_sample_frames, remove_stray_text,
+    replace_picture, sample_slides_by_number, set_native_table_geometry, set_table_text_size, set_text_size,
+    shape_text,
+    slide_refs, table_cell_styles, template_row_heights_emu, text_style,
 )
 from deckforge.compose.decor import apply_decor
-from deckforge.compose.tables import TableSpec, add_table
+from deckforge.compose.tables import TableSpec, add_table, column_shares
 from deckforge.compose.textfit import measure, register_template_fonts
 from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.customprops import write_custom_property
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
+from deckforge.ooxml.walk import walk_shapes
 from deckforge.plan.spec import BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 from deckforge.plan.variants import Variant
 from deckforge.settings import Settings
@@ -350,8 +353,14 @@ def place_slide(
             _local_background_luminance(content.slot.box, effective_pattern, layout_bg_luminance),
         )
 
-    _place_visual(slide, slide_spec, pattern, profile, user_photos)
+    _place_visual(slide, slide_spec, pattern, profile, user_photos, sole_content=_only_frame_text(contents))
     _remove_empty_placeholders(slide)
+
+
+def _only_frame_text(contents: list[SlotContent]) -> bool:
+    """На слайде нет текста содержания, только заголовок, подзаголовок и
+    источник: визуал тогда единственный блок и может занять всю ширину."""
+    return not any(c.role_hint not in _CLONE_FRAME_ROLES for c in contents)
 
 
 def _note_drops(slide_spec: SlideSpec, pattern: Pattern, drops) -> None:
@@ -469,21 +478,23 @@ def _visual_slot(pattern: Pattern, role: str) -> PatternSlot | None:
 
 def _place_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile,
-    user_photos: dict[str, Path] | None = None,
+    user_photos: dict[str, Path] | None = None, *, sole_content: bool = False,
 ) -> None:
     visual = slide_spec.visual
     if visual is None:
         return
 
     if visual.kind == "table" and visual.table is not None:
-        _place_table_visual(slide, slide_spec, pattern, profile, visual.table)
+        _place_table_visual(slide, slide_spec, pattern, profile, visual.table, sole_content=sole_content)
     elif visual.kind == "chart" and visual.chart is not None:
         _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart)
     elif visual.kind in ("photo", "icon"):
         _place_picture_visual(slide, slide_spec, pattern, profile, visual.kind, user_photos)
 
 
-def _place_table_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, table) -> None:
+def _place_table_visual(
+    slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, table, *, sole_content: bool = False,
+) -> None:
     slot = _visual_slot(pattern, "table")
     if slot is None:
         slide_spec.findings.append(
@@ -494,10 +505,39 @@ def _place_table_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile:
     if not table.rows:
         return
 
-    header, body_rows = table.rows[0], table.rows[1:]
+    header, body_rows = _table_rows_within_capacity(slide_spec, pattern, table, sole_content)
+    align = _column_align(header, body_rows)
+    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
+    box, floor = slot.box, None
+    if sole_content:
+        box = _table_frame_box(slide, slot.box, profile, canvas)
+        floor = profile.type_scale_pt("caption", 12.0)
+    add_table(slide, box, TableSpec(header=header, rows=body_rows, align=align), profile, floor_pt=floor)
+
+
+def _column_align(header: list[str], body_rows: list[list[str]]) -> list[str]:
+    """Числовой столбец по правому краю, текстовый по левому. Судит тело:
+    шапка числового столбца почти всегда слово («До», «После»), и с ней
+    ни один столбец не выходил числовым."""
+    align = []
+    for i in range(len(header)):
+        cells = [r[i] for r in body_rows if i < len(r) and r[i].strip()] or [header[i]]
+        align.append("r" if all(_looks_numeric(c) for c in cells) else "l")
+    return align
+
+
+def _table_rows_within_capacity(
+    slide_spec: SlideSpec, pattern: Pattern, table, sole_content: bool,
+) -> tuple[list[str], list[list[str]]]:
+    """Шапка и строки тела, усечённые до вместимости раскладки. Столбцы
+    таблицы-единственного-блока не усекаются: вместимость по столбцам снята
+    с узкой таблицы примера, а наша растянута на ширину слайда (п. 2
+    задачи о родных таблицах), и срезать из-за неё «Изменение» значило бы
+    потерять главный столбец."""
+    header, body_rows = list(table.rows[0]), [list(r) for r in table.rows[1:]]
     cap = pattern.capacity
     truncated = False
-    if cap.max_cols and len(header) > cap.max_cols:
+    if cap.max_cols and len(header) > cap.max_cols and not sole_content:
         header = header[: cap.max_cols]
         body_rows = [row[: cap.max_cols] for row in body_rows]
         truncated = True
@@ -510,13 +550,86 @@ def _place_table_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile:
             f"Слайд {slide_spec.index}: таблица усечена до вместимости раскладки "
             f"({pattern.pattern_id!r}, max_rows={cap.max_rows}, max_cols={cap.max_cols})."
         )
-
-    align = ["r" if all(_looks_numeric(c) for c in [h] + [r[i] for r in body_rows if i < len(r)])
-             else "l" for i, h in enumerate(header)]
-    add_table(slide, slot.box, TableSpec(header=header, rows=body_rows, align=align), profile)
+    return header, body_rows
 
 
-_NUMERIC_CELL_RE = re.compile(r"^[+-]?[\d\s.,%]+[a-zа-яё%]*$", re.IGNORECASE)
+# Таблица-единственный блок слайда не уже стольких долей холста: узкая
+# таблица рвёт слова в ячейках по буквам.
+_TABLE_MIN_WIDTH = 0.6
+# Зазор между рамкой таблицы и графикой или текстом рядом, доли холста.
+_TABLE_GAP = 0.02
+# Фигура крупнее стольких долей холста по обеим осям: фон, а не соседка.
+_BACKGROUND_SHARE = 0.9
+_AUTO_PH_TYPES = frozenset({"sldNum", "dt", "ftr", "hdr"})
+
+
+def _table_frame_box(
+    slide, slot_box: Box, profile: TemplateProfile, canvas: Canvas, *, exclude: list | tuple = (),
+    min_width: float = _TABLE_MIN_WIDTH, max_right: float | None = None,
+) -> Box:
+    """Рамка таблицы: от левого края слота до правого поля сетки (не уже
+    `min_width` холста, для этого левый край при нужде сдвигается влево) и
+    от верха слота до нижнего поля. Узкая таблица на четверть слайда
+    (прогон 26 сентября 2026) получалась из рамки примера, записанной
+    Google Slides как 3 000 000 EMU при таблице втрое шире.
+
+    Рамка не заходит на соседей: картинки и фигуры слайда и его лейаута
+    (та же логика, что у сужения текстовой рамки клона от графики) и
+    текст самого слайда. Соседка режет рамку с той стороны, где потеря
+    площади меньше: справа (графика сбоку) или снизу (источник под
+    таблицей). Если после этого рамка уже слота, остаётся слот."""
+    grid = profile.grid
+    right = 1 - grid.margin_right
+    if max_right is not None:
+        right = min(right, max_right)
+    bottom = 1 - grid.margin_bottom
+    left = max(min(slot_box.left, right - min_width), grid.margin_left)
+    top = slot_box.top
+    exclude_ids = {id(e) for e in exclude}
+    for other in _table_obstacles(slide, canvas, exclude_ids):
+        ob = other.box
+        if ob.right <= left or ob.left >= right or ob.bottom <= top or ob.top >= bottom:
+            continue
+        if ob.width >= _BACKGROUND_SHARE and ob.height >= _BACKGROUND_SHARE:
+            continue
+        if _contains(ob, Box(left=left, top=top, width=right - left, height=bottom - top)):
+            continue
+        cut_right = (right - (ob.left - _TABLE_GAP)) * (bottom - top) if ob.left > left else float("inf")
+        cut_bottom = (bottom - (ob.top - _TABLE_GAP)) * (right - left) if ob.top > top else float("inf")
+        if cut_right == cut_bottom == float("inf"):
+            continue
+        if cut_right <= cut_bottom:
+            right = ob.left - _TABLE_GAP
+        else:
+            bottom = ob.top - _TABLE_GAP
+    if right - left < slot_box.width or bottom - top <= 0:
+        return slot_box
+    return Box(left=left, top=top, width=right - left, height=bottom - top)
+
+
+def _table_obstacles(slide, canvas: Canvas, exclude_ids: set[int]) -> list:
+    """Соседи таблицы: всё видимое на самом слайде (текст, картинки,
+    фигуры), кроме самозаполняемых плейсхолдеров, и графика лейаута
+    (картинки и фигуры без текста; плейсхолдеры лейаута на слайде не
+    видны). Лейаут обязателен: графика VK Education часто лежит именно
+    там."""
+    own = [
+        r for r in slide_refs(slide, canvas)
+        if r.box is not None and id(r.element) not in exclude_ids
+        and not (r.is_placeholder and r.ph_type in _AUTO_PH_TYPES)
+        and (r.kind in ("picture", "graphic_frame") or shape_text(r.element).strip() or not r.is_placeholder)
+    ]
+    layout = [
+        r for r in walk_shapes(slide.slide_layout._element, canvas)  # noqa: SLF001
+        if r.box is not None and not r.is_placeholder
+        and (r.kind == "picture" or (r.kind == "shape" and not shape_text(r.element).strip()))
+    ]
+    return own + layout
+
+
+# Знак: и ASCII-дефис, и типографский минус «−» (U+2212), которым модель
+# пишет изменения; хвост единиц может нести точки и пробелы («п.п.»).
+_NUMERIC_CELL_RE = re.compile(r"^[+\-−±]?[\d\s.,%]+[a-zа-яё%.\s]*$", re.IGNORECASE)
 
 
 def _looks_numeric(cell: str) -> bool:
@@ -1342,12 +1455,17 @@ def place_slide_by_clone(
             )
             continue
         clean.append(content)
-    if slide_spec.blocks and not any(c.role_hint not in _CLONE_FRAME_ROLES for c in clean):
+    visual = slide_spec.visual
+    table_rows = visual.table.rows if visual is not None and visual.kind == "table" and visual.table else None
+    table_slot = _visual_slot(pattern, "table") if table_rows else None
+    if slide_spec.blocks and _only_frame_text(clean) and table_slot is None:
         # Сборка с нуля потеряла бы то же самое, но её слайд с одним
         # заголовком отсеивает D05, а клон D05 не судит (см.
         # `_clone_errors`). Без этой проверки клон принимал слайд, где из
         # двух абзацев содержания не лёг ни один (два `TextBlock` на
-        # раскладке, у которой слоты только под список).
+        # раскладке, у которой слоты только под список). Таблица в слоте
+        # под неё: содержание, слайд не пуст, а блок-пояснение уходит в
+        # находки (`_note_drops`) так же, как у сборки с нуля.
         return CloneOutcome("ни один блок содержания не нашёл слота в раскладке")
     native = _native_repeat_contents(pattern, clean)
     if native is None:
@@ -1371,6 +1489,10 @@ def place_slide_by_clone(
         _fix_cloned_contrast(slide, ref, profile, canvas, audit_config)
 
     keep = [ref.element for _, ref in bound]
+    table_ref = matched.get(index_of.get(id(table_slot), -1)) if table_slot is not None else None
+    native_frame = table_ref.element if table_ref is not None and native_table(table_ref.element) is not None else None
+    if native_frame is not None:
+        keep.append(native_frame)
     filled = filled_repeat_units(pattern, native)
     kept_decor = expand_decor(pattern, None, grid, filled)
     kept_ids = {id(d) for d in kept_decor}
@@ -1387,8 +1509,16 @@ def place_slide_by_clone(
         canvas, keep=keep, protect=[d.box for d in kept_decor],
     )
     remove_stray_text(slide, canvas, keep=keep, badge_boxes=[d.box for d in kept_decor if d.badge_text])
-    remove_sample_frames(slide)
-    _place_visual_on_clone(slide, slide_spec, pattern, profile, canvas, matched, user_photos, keep)
+    remove_sample_frames(slide, keep=keep)
+    if native_frame is not None:
+        _fill_native_table_on_clone(
+            slide, slide_spec, pattern, profile, canvas, native_frame, table_ref.box, _only_frame_text(clean),
+        )
+    else:
+        _place_visual_on_clone(
+            slide, slide_spec, pattern, profile, canvas, matched, user_photos, keep,
+            sole_content=_only_frame_text(clean),
+        )
     _remove_empty_placeholders(slide)
     _note_drops(slide_spec, pattern, drops)
     mark_slide(slide, CLONE_MARK_PREFIX + pattern.pattern_id)
@@ -1579,7 +1709,7 @@ def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Ca
 
 def _place_visual_on_clone(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, canvas: Canvas,
-    matched: dict, user_photos: dict[str, Path] | None, keep: list,
+    matched: dict, user_photos: dict[str, Path] | None, keep: list, *, sole_content: bool = False,
 ) -> None:
     """Визуал слайда на клоне. Таблица и график кладутся тем же кодом, что
     и при сборке с нуля, но место под них сперва освобождается от образца.
@@ -1597,7 +1727,7 @@ def _place_visual_on_clone(
         )
         if slot is not None:
             remove_in_box(slide, slot.box, canvas, keep=keep)
-        _place_visual(slide, slide_spec, pattern, profile, user_photos)
+        _place_visual(slide, slide_spec, pattern, profile, user_photos, sole_content=sole_content)
         return
     if visual.kind not in ("photo", "icon"):
         return
@@ -1619,6 +1749,89 @@ def _place_visual_on_clone(
             f"Слайд {slide_spec.index}: пользовательская фотография {photo_name!r} ({photo_path}) "
             f"не вставлена ({exc})."
         )
+
+
+# Ячейка примера с заливкой темнее этого (относительная яркость) выделена
+# дизайнером: «Итого», строка-акцент. Светлые полосы чередования (EBF3F9 у
+# VK Education, яркость около 0.9) выделением не считаются.
+_HIGHLIGHT_LUMINANCE = 0.4
+# Кегль ячейки, у которой своего нет: дефолт PowerPoint для таблицы.
+_TABLE_DEFAULT_PT = 18.0
+_TABLE_SHRINK = 0.9
+
+
+def _fill_native_table_on_clone(
+    slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, canvas: Canvas,
+    frame, slot_box: Box, sole_content: bool,
+) -> None:
+    """BIND/ADAPT для таблицы: заполняется родная таблица примера (стиль,
+    заливки, линии, кегль дизайнера), а не рисуется своя поверх её места.
+    Идея из PPTAgent (EMNLP 2025): референсный слайд правится на месте.
+
+    Геометрия пересчитывается: ширина от левого края слота до правого поля
+    (таблица-единственный блок не уже 0.6 холста, иначе не уже таблицы
+    примера), столбцы по содержанию (`tables.column_shares`), строки по
+    замеру, но не ниже высоты строки примера, пока всё влезает до нижнего
+    поля. Кегль не ниже ступени caption шкалы: у примера-расписания он 9 pt,
+    и наши пять строк на всю ширину читались бы с трудом. Не влезло и на
+    caption: кегль остаётся caption, а решение примет аудит."""
+    header, body_rows = _table_rows_within_capacity(slide_spec, pattern, slide_spec.visual.table, sole_content)
+    rows = [header] + body_rows
+    scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
+
+    def is_highlight(tc) -> bool:
+        tc_pr = tc.find(qn("a:tcPr"))
+        fill = tc_pr.find(qn("a:solidFill")) if tc_pr is not None else None
+        color = resolve_color(fill, scheme, clr_map) if fill is not None else None
+        return isinstance(color, Color) and _relative_luminance(color.hex) < _HIGHLIGHT_LUMINANCE
+
+    tbl = native_table(frame)
+    example_width = sum(int(gc.get("w") or 0) for gc in tbl.iter(qn("a:gridCol"))) / canvas.width_emu
+    fill_native_table(frame, rows, is_highlight=is_highlight, align=_column_align(header, body_rows))
+
+    if sole_content:
+        box = _table_frame_box(slide, slot_box, profile, canvas, exclude=[frame])
+    else:
+        box = _table_frame_box(
+            slide, slot_box, profile, canvas, exclude=[frame], min_width=0.0,
+            max_right=slot_box.left + max(slot_box.width, example_width),
+        )
+    width_in, height_in = box.width * canvas.width_in, box.height * canvas.height_in
+    col_widths_in = [width_in * share for share in column_shares(rows)]
+    family = _primary_family(profile)
+    caption = profile.type_scale_pt("caption", 12.0)
+    styles = table_cell_styles(frame)
+    own_sizes = [max((c.size_pt or _TABLE_DEFAULT_PT) for c in row) for row in styles]
+    sizes = [max(s, caption) for s in own_sizes]
+
+    def measure_rows(row_sizes: list[float]) -> list[float]:
+        heights = []
+        for values, row_styles, size in zip(rows, styles, row_sizes):
+            tallest = 0.0
+            for c, style in enumerate(row_styles):
+                l_in, t_in, r_in, b_in = style.margins_in
+                text = str(values[c]) if c < len(values) else ""
+                metrics = measure(
+                    text, style.family or family, size, max(col_widths_in[c] - l_in - r_in, 0.1),
+                    line_spacing=style.line_spacing or _AUDIT_DEFAULT_LINE_SPACING,
+                )
+                tallest = max(tallest, metrics.height_in + t_in + b_in)
+            heights.append(tallest)
+        return heights
+
+    measured = measure_rows(sizes)
+    while sum(measured) > height_in and any(s > caption for s in sizes):
+        sizes = [max(s * _TABLE_SHRINK, caption) for s in sizes]
+        measured = measure_rows(sizes)
+    set_table_text_size(frame, [s if abs(s - own) > 0.01 else None for s, own in zip(sizes, own_sizes)])
+
+    example_rows_in = [h / 914400 for h in template_row_heights_emu(frame)]
+    roomy = [max(m, e) for m, e in zip(measured, example_rows_in)]
+    heights_in = roomy if sum(roomy) <= height_in else measured
+    set_native_table_geometry(
+        frame, box,
+        [round(w * 914400) for w in col_widths_in], [round(h * 914400) for h in heights_in], canvas,
+    )
 
 
 # ---------------------------------------------------------------------------

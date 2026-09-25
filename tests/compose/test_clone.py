@@ -7,6 +7,7 @@
 разбором без сети (`cache_dir=None`, как в `conftest.py`).
 """
 from __future__ import annotations
+import copy
 from dataclasses import replace
 import zipfile
 from collections import Counter
@@ -19,11 +20,13 @@ from pptx import Presentation
 from deckforge.audit.config import AuditConfig
 from deckforge.compose import builder
 from deckforge.compose.blocks import Paragraph
-from deckforge.compose.clone import bind_text, clone_example_slide, sample_slides_by_number, shape_text
+from deckforge.compose.clone import (
+    bind_text, clone_example_slide, fill_native_table, native_table, sample_slides_by_number, shape_text,
+)
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.walk import walk_shapes
-from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, Visual
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TableVisual, Visual
 from deckforge.plan.variants import Variant
 
 TEMPLATE = Path("dataset/templates/Шаблон презентации VK Education.pptx")
@@ -256,3 +259,113 @@ def test_bind_text_into_an_empty_placeholder_leaves_the_size_to_the_layout(deck)
     run_pr = element.find(".//" + qn("a:r")).find(qn("a:rPr"))
     assert run_pr is None or run_pr.get("sz") is None
 
+
+
+# ---------------------------------------------------------------------------
+# Родная таблица примера
+# ---------------------------------------------------------------------------
+
+_TABLE_ROWS = [
+    ["Показатель", "До", "После", "Изменение"],
+    ["Сквозная медиана", "31,5 ч", "6,2 ч", "−80%"],
+    ["Доля переназначений вручную", "39%", "4%", "−35 п.п."],
+    ["Заявок с просрочкой SLA", "23%", "6%", "−17 п.п."],
+    ["Оценка удобства авторами (1–5)", "2,8", "4,1", "+1,3"],
+    ["Обращений в поддержку", "120", "45", "−63%"],
+]
+
+
+def _table_frame(slide):
+    return next(f for f in slide._element.iter(qn("p:graphicFrame")) if native_table(f) is not None)
+
+
+def _table_texts(frame) -> list[list[str]]:
+    return [
+        ["".join(t.text or "" for t in tc.iter(qn("a:t"))) for tc in tr.findall(qn("a:tc"))]
+        for tr in native_table(frame).findall(qn("a:tr"))
+    ]
+
+
+def _dark_fill(tc) -> bool:
+    """Ячейка с заливкой accent1: так VK Education выделяет «Акцент» и «Итого»."""
+    clr = tc.find(qn("a:tcPr") + "/" + qn("a:solidFill") + "/" + qn("a:schemeClr"))
+    return clr is not None and clr.get("val") == "accent1"
+
+
+def _table_spec(rows) -> SlideSpec:
+    return SlideSpec(
+        index=6, kind="table", headline="Пилот: −80% к сроку согласования",
+        visual=Visual(kind="table", table=TableVisual(rows=rows)),
+    )
+
+
+def test_fill_native_table_matches_data_and_keeps_the_example_style(deck):
+    """Пример №38: три столбца, шапка, строка-акцент на заливке accent1 и
+    четыре обычные строки. Наша таблица 4×6: столбец добавлен, строка-акцент
+    не стала второй шапкой, недостающая строка тела склонирована с
+    последней строки тела, шапка осталась шапкой примера."""
+    _prs, sources = deck
+    frame = copy.deepcopy(_table_frame(sources[38]))
+    tbl = native_table(frame)
+    style_before = tbl.find(qn("a:tblPr") + "/" + qn("a:tableStyleId")).text
+    header_pr_before = _xml(tbl.find(qn("a:tr")).findall(qn("a:tc"))[1].find(qn("a:tcPr")))
+
+    fill_native_table(frame, _TABLE_ROWS, is_highlight=_dark_fill)
+
+    assert _table_texts(frame) == _TABLE_ROWS
+    assert len(tbl.find(qn("a:tblGrid")).findall(qn("a:gridCol"))) == 4
+    assert tbl.find(qn("a:tblPr") + "/" + qn("a:tableStyleId")).text == style_before
+    header = tbl.find(qn("a:tr")).findall(qn("a:tc"))
+    assert _xml(header[1].find(qn("a:tcPr"))) == header_pr_before
+    body = tbl.findall(qn("a:tr"))[1:]
+    assert not any(_dark_fill(tc) for tr in body for tc in tr.findall(qn("a:tc")))
+    # Пустой угол шапки примера без своего кегля получил кегль соседки.
+    assert header[0].find(".//" + qn("a:rPr")).get("sz") == header[1].find(".//" + qn("a:rPr")).get("sz")
+
+
+def test_fill_native_table_drops_extra_rows_columns_and_merges(deck):
+    """Пример №40: расписание 4×12 с объединёнными ячейками. Лишние строки
+    и столбцы уходят, объединения примера к нашим данным не относятся."""
+    _prs, sources = deck
+    frame = copy.deepcopy(_table_frame(sources[40]))
+    rows = [["Этап", "Срок"], ["Пилот", "июнь"], ["Раскатка", "сентябрь"]]
+
+    fill_native_table(frame, rows, is_highlight=_dark_fill)
+
+    tbl = native_table(frame)
+    assert _table_texts(frame) == rows
+    assert len(tbl.find(qn("a:tblGrid")).findall(qn("a:gridCol"))) == 2
+    for tc in tbl.iter(qn("a:tc")):
+        assert not any(tc.get(a) for a in ("gridSpan", "rowSpan", "hMerge", "vMerge"))
+
+
+def test_sole_table_clone_fills_the_native_table_wide_and_passes_audit(profile, deck):
+    """Прогон 26 сентября 2026: на месте таблицы примера рисовалась своя,
+    на четверть слайда. Теперь заполняется родная таблица примера;
+    таблица-единственный блок не уже 0.6 холста, рамка равна сумме
+    столбцов и строк, кегль не ниже caption, и клон проходит тот же аудит,
+    что при сборке колоды."""
+    prs, sources = deck
+    pattern = _pattern(profile, "slide38")
+    spec = _table_spec(_TABLE_ROWS[:5])
+
+    outcome = builder.place_slide_by_clone(prs, spec, pattern, profile, AuditConfig.load(), sources[38])
+
+    assert outcome.reason is None
+    slide = prs.slides[-1]
+    frames = [f for f in slide._element.iter(qn("p:graphicFrame")) if native_table(f) is not None]
+    assert len(frames) == 1, "своя таблица поверх родной: рамок две"
+    frame = frames[0]
+    assert _table_texts(frame) == _TABLE_ROWS[:5]
+    tbl = native_table(frame)
+    widths = [int(gc.get("w")) for gc in tbl.iter(qn("a:gridCol"))]
+    heights = [int(tr.get("h")) for tr in tbl.findall(qn("a:tr"))]
+    ext = frame.find(qn("p:xfrm") + "/" + qn("a:ext"))
+    assert int(ext.get("cx")) == sum(widths) and int(ext.get("cy")) == sum(heights)
+    assert sum(widths) / profile.canvas_width_emu >= 0.6 - 1e-6
+    caption = profile.type_scale_pt("caption")
+    assert all(int(r.get("sz")) / 100 >= caption - 0.01 for r in tbl.iter(qn("a:rPr")) if r.get("sz"))
+    errors = builder._clone_errors(
+        builder.audit_slide_layout(slide, _canvas(profile), profile, AuditConfig.load(), index=spec.index),
+    )
+    assert not errors, errors

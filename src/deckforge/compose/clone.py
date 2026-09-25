@@ -21,7 +21,7 @@ import copy
 import io
 import re
 from dataclasses import dataclass, replace
-from typing import Iterable
+from typing import Callable, Iterable
 
 from lxml import etree
 from PIL import Image
@@ -297,6 +297,12 @@ def bind_text(shape_element, paragraphs, *, bullet_char: str | None = None) -> N
     tx_body = shape_element.find(qn("p:txBody"))
     if tx_body is None:
         raise ValueError("bind_text: у фигуры нет p:txBody")
+    _bind_tx_body(tx_body, paragraphs, bullet_char)
+
+
+def _bind_tx_body(tx_body, paragraphs, bullet_char: str | None) -> None:
+    """Общая часть `bind_text` и ячейки таблицы (`a:tc/a:txBody`): у фигуры
+    и у ячейки разметка абзацев одна и та же, различается только обёртка."""
     old_paragraphs = tx_body.findall(qn("a:p"))
     proto_p = next((p for p in old_paragraphs if p.find(qn("a:r")) is not None), None)
     if proto_p is None:
@@ -528,6 +534,264 @@ def set_text_size(shape_element, size_pt: float) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Родная таблица примера
+# ---------------------------------------------------------------------------
+
+# Атрибуты объединения ячеек. Объединение примера относится к его данным
+# («Обсуждение доклада» на три столбца), к нашим строкам оно не подходит.
+_MERGE_ATTRS = ("gridSpan", "rowSpan", "hMerge", "vMerge")
+
+# Поля ячейки по умолчанию OOXML (`a:tcPr`), EMU: 0.1″ по бокам, 0.05″
+# сверху и снизу.
+_CELL_MAR_DEFAULTS = {"marL": 91440, "marR": 91440, "marT": 45720, "marB": 45720}
+
+
+@dataclass(frozen=True)
+class CellStyle:
+    """Чем будет нарисован текст ячейки: нужен замеру высоты строки."""
+    size_pt: float | None
+    family: str | None
+    line_spacing: float | None
+    margins_in: tuple[float, float, float, float]  # слева, сверху, справа, снизу
+
+
+class _CellText:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.bullet = False
+
+
+def native_table(frame_element):
+    """`a:tbl` рамки `p:graphicFrame` или `None`, если в рамке не таблица."""
+    if frame_element is None or frame_element.tag != qn("p:graphicFrame"):
+        return None
+    return frame_element.find(qn("a:graphic") + "/" + qn("a:graphicData") + "/" + qn("a:tbl"))
+
+
+def _cells(tr) -> list:
+    return tr.findall(qn("a:tc"))
+
+
+def _mostly(flags: list[bool]) -> bool:
+    return bool(flags) and sum(flags) * 2 > len(flags)
+
+
+def fill_native_table(
+    frame_element, rows: list[list[str]], *, is_highlight: Callable[[object], bool] = lambda _tc: False,
+    align: list[str] | None = None,
+) -> None:
+    """Заполняет родную таблицу примера нашими строками (первая: шапка).
+
+    Правится таблица примера на месте, а не рисуется своя: заливки, линии,
+    стиль таблицы, кегль и цвет ячеек остаются дизайнерскими. Число
+    столбцов и строк подгоняется под данные: лишние удаляются, недостающие
+    клонируются с последнего столбца и последней строки ТЕЛА (шапка
+    остаётся одна и остаётся шапкой). Строки и столбцы, выделенные
+    дизайнером (`is_highlight` у большинства их ячеек: тёмная заливка
+    «Итого», строка-акцент), в нашу таблицу не переносятся: выделение
+    относилось к данным примера, а наша первая строка тела от него стала
+    бы второй шапкой. Если выделено всё, берётся как есть.
+
+    Текст ячейки заменяется с сохранением `a:rPr` её первого run (тот же
+    приём, что `bind_text`); ячейка без своего кегля (пустой угол шапки)
+    получает его у соседки по строке, иначе наш текст в ней вышел бы
+    кеглем по умолчанию 18 pt. `align` ("l"/"ctr"/"r" по столбцам)
+    переписывает выравнивание абзацев: у примера шапка бывает выровнена
+    вправо целиком, под числа, и наш текстовый первый столбец «Показатель»
+    повис бы справа. Геометрию (ширины, высоты, рамку) ставит
+    `set_native_table_geometry`."""
+    tbl = native_table(frame_element)
+    if tbl is None:
+        raise ValueError("fill_native_table: в рамке нет a:tbl")
+    if not rows or not any(rows[0]):
+        raise ValueError("fill_native_table: у таблицы нет шапки")
+    grid = tbl.find(qn("a:tblGrid"))
+    trs = tbl.findall(qn("a:tr"))
+    if grid is None or not trs:
+        raise ValueError("fill_native_table: у таблицы примера нет сетки или строк")
+    n_cols = max(len(r) for r in rows)
+    n_body = len(rows) - 1
+
+    _unmerge(trs)
+
+    grid_cols = grid.findall(qn("a:gridCol"))
+    body = trs[1:]
+    col_flags = [
+        _mostly([is_highlight(_cells(tr)[i]) for tr in body if i < len(_cells(tr))])
+        for i in range(len(grid_cols))
+    ]
+    plain_cols = [i for i, hl in enumerate(col_flags) if not hl] or list(range(len(grid_cols)))
+    order = plain_cols[:n_cols]
+    order += [plain_cols[-1]] * (n_cols - len(order))
+    new_cols = [copy.deepcopy(grid_cols[i]) for i in order]
+    for gc in grid_cols:
+        grid.remove(gc)
+    for gc in new_cols:
+        grid.append(gc)
+    for tr in trs:
+        tcs = _cells(tr)
+        fresh = [copy.deepcopy(tcs[min(i, len(tcs) - 1)]) for i in order]
+        for tc in tcs:
+            tr.remove(tc)
+        tail = tr.find(qn("a:extLst"))
+        for tc in fresh:
+            _insert_before(tr, tc, tail)
+
+    header, body = trs[0], trs[1:]
+    plain_rows = [tr for tr in body if not _mostly([is_highlight(tc) for tc in _cells(tr)])] or body
+    kept = plain_rows[:n_body]
+    proto = copy.deepcopy(plain_rows[-1] if plain_rows else header)
+    for tr in body:
+        if not any(tr is k for k in kept):
+            tbl.remove(tr)
+    last = kept[-1] if kept else header
+    for _ in range(n_body - len(kept)):
+        new_tr = copy.deepcopy(proto)
+        last.addnext(new_tr)
+        last = new_tr
+
+    for tr, values in zip(tbl.findall(qn("a:tr")), rows):
+        tcs = _cells(tr)
+        row_rpr = next((r for tc in tcs for r in tc.iter(qn("a:rPr")) if r.get("sz")), None)
+        for c, tc in enumerate(tcs):
+            _fill_cell(tc, str(values[c]) if c < len(values) else "", row_rpr)
+            if align is not None and c < len(align):
+                for p in tc.iter(qn("a:p")):
+                    p_pr = p.find(qn("a:pPr"))
+                    if p_pr is None:
+                        p_pr = etree.Element(qn("a:pPr"))
+                        p.insert(0, p_pr)
+                    p_pr.set("algn", align[c])
+
+
+def _unmerge(trs: list) -> None:
+    """Снимает объединения ячеек. Ячейка-продолжение (`hMerge`/`vMerge`)
+    получает оформление ячейки, в которую была влита: на экране это была
+    одна ячейка, и после разъединения полоса не должна стать пёстрой."""
+    above: list = []
+    for tr in trs:
+        row: list = []
+        for i, tc in enumerate(_cells(tr)):
+            origin = None
+            if tc.get("hMerge") and row:
+                origin = row[-1]
+            elif tc.get("vMerge") and i < len(above):
+                origin = above[i]
+            if origin is not None:
+                src = origin.find(qn("a:tcPr"))
+                own = tc.find(qn("a:tcPr"))
+                if src is not None:
+                    if own is not None:
+                        tc.remove(own)
+                    tc.append(copy.deepcopy(src))
+            for attr in _MERGE_ATTRS:
+                tc.attrib.pop(attr, None)
+            row.append(origin if origin is not None else tc)
+        above = row
+
+
+def _fill_cell(tc, text: str, row_rpr) -> None:
+    tx_body = tc.find(qn("a:txBody"))
+    if tx_body is None:
+        tx_body = etree.Element(qn("a:txBody"))
+        etree.SubElement(tx_body, qn("a:bodyPr"))
+        etree.SubElement(tx_body, qn("a:lstStyle"))
+        etree.SubElement(tx_body, qn("a:p"))
+        tc.insert(0, tx_body)
+    run = tx_body.find(".//" + qn("a:r"))
+    if row_rpr is not None:
+        if run is None:
+            p = tx_body.find(qn("a:p"))
+            if p is None:
+                p = etree.SubElement(tx_body, qn("a:p"))
+            run = etree.Element(qn("a:r"))
+            etree.SubElement(run, qn("a:t"))
+            _insert_before(p, run, p.find(qn("a:endParaRPr")))
+        r_pr = run.find(qn("a:rPr"))
+        if r_pr is None:
+            run.insert(0, copy.deepcopy(row_rpr))
+        elif not r_pr.get("sz"):
+            r_pr.set("sz", row_rpr.get("sz"))
+    _bind_tx_body(tx_body, [_CellText(text)], None)
+
+
+def table_cell_styles(frame_element) -> list[list[CellStyle]]:
+    """Стиль каждой ячейки таблицы по строкам (после `fill_native_table`)."""
+    tbl = native_table(frame_element)
+    out = []
+    for tr in tbl.findall(qn("a:tr")) if tbl is not None else []:
+        row = []
+        for tc in _cells(tr):
+            r_pr = tc.find(".//" + qn("a:r") + "/" + qn("a:rPr"))
+            size = int(r_pr.get("sz")) / 100 if r_pr is not None and r_pr.get("sz") else None
+            family = None
+            latin = r_pr.find(qn("a:latin")) if r_pr is not None else None
+            if latin is not None and latin.get("typeface") and not latin.get("typeface").startswith("+"):
+                family = latin.get("typeface")
+            pct = tc.find(".//" + qn("a:pPr") + "/" + qn("a:lnSpc") + "/" + qn("a:spcPct"))
+            spacing = int(pct.get("val")) / 100000 if pct is not None and pct.get("val") else None
+            tc_pr = tc.find(qn("a:tcPr"))
+
+            def mar(name: str, pr=tc_pr) -> float:
+                raw = pr.get(name) if pr is not None else None
+                return (int(raw) if raw is not None else _CELL_MAR_DEFAULTS[name]) / 914400
+
+            row.append(CellStyle(size, family, spacing, (mar("marL"), mar("marT"), mar("marR"), mar("marB"))))
+        out.append(row)
+    return out
+
+
+def template_row_heights_emu(frame_element) -> list[int]:
+    """Высоты строк таблицы, как их задал пример (`a:tr/@h`, EMU)."""
+    tbl = native_table(frame_element)
+    return [int(tr.get("h") or 0) for tr in tbl.findall(qn("a:tr"))] if tbl is not None else []
+
+
+def set_table_text_size(frame_element, row_sizes_pt: list[float | None]) -> None:
+    """Проставляет кегль всем run и концам абзацев каждой строки таблицы
+    (`None`: строка остаётся как есть)."""
+    tbl = native_table(frame_element)
+    for tr, size in zip(tbl.findall(qn("a:tr")), row_sizes_pt):
+        if size is None:
+            continue
+        value = str(int(round(size * 100)))
+        for run in tr.iter(qn("a:r")):
+            if run.find(qn("a:rPr")) is None:
+                run.insert(0, etree.Element(qn("a:rPr")))
+        for tag in ("a:rPr", "a:endParaRPr"):
+            for el in tr.iter(qn(tag)):
+                el.set("sz", value)
+
+
+def set_native_table_geometry(
+    frame_element, box: Box, col_widths_emu: list[int], row_heights_emu: list[int], canvas: Canvas,
+) -> None:
+    """Ширины столбцов, высоты строк и рамка `p:graphicFrame` одним
+    движением. Рамка обязана совпасть с суммой столбцов и строк: у
+    примеров из Google Slides она записана как 3 000 000 × 3 000 000 EMU
+    при таблице втрое шире, а аудит (L01/L02) видит именно рамку."""
+    tbl = native_table(frame_element)
+    for gc, w in zip(tbl.find(qn("a:tblGrid")).findall(qn("a:gridCol")), col_widths_emu):
+        gc.set("w", str(int(w)))
+    for tr, h in zip(tbl.findall(qn("a:tr")), row_heights_emu):
+        tr.set("h", str(int(h)))
+    xfrm = frame_element.find(qn("p:xfrm"))
+    if xfrm is None:
+        xfrm = etree.Element(qn("p:xfrm"))
+        frame_element.find(qn("p:nvGraphicFramePr")).addnext(xfrm)
+    off = xfrm.find(qn("a:off"))
+    if off is None:
+        off = etree.SubElement(xfrm, qn("a:off"))
+    ext = xfrm.find(qn("a:ext"))
+    if ext is None:
+        ext = etree.SubElement(xfrm, qn("a:ext"))
+    off.set("x", str(round(box.left * canvas.width_emu)))
+    off.set("y", str(round(box.top * canvas.height_emu)))
+    ext.set("cx", str(int(sum(col_widths_emu))))
+    ext.set("cy", str(int(sum(row_heights_emu))))
+
+
+# ---------------------------------------------------------------------------
 # Удаление лишнего
 # ---------------------------------------------------------------------------
 
@@ -640,12 +904,17 @@ def remove_stray_text(slide, canvas: Canvas, *, keep: Iterable = (), badge_boxes
     return removed
 
 
-def remove_sample_frames(slide) -> int:
+def remove_sample_frames(slide, *, keep: Iterable = ()) -> int:
     """Убирает таблицы и графики примера: в них данные образца («Показатель
     1», «Категория 2»), к содержанию колонки они отношения не имеют. Свои
-    таблицу и график сборка кладёт отдельно (`builder._place_visual`)."""
+    таблицу и график сборка кладёт отдельно (`builder._place_visual`).
+    `keep`: рамки, уже заполненные нашими данными (родная таблица примера,
+    `fill_native_table`)."""
+    keep_ids = {id(el) for el in keep}
     removed = 0
     for frame in list(slide._element.iter(qn("p:graphicFrame"))):  # noqa: SLF001
+        if id(frame) in keep_ids:
+            continue
         data = frame.find(qn("a:graphic") + "/" + qn("a:graphicData"))
         uri = data.get("uri", "") if data is not None else ""
         if uri.endswith("/table") or uri.endswith("/chart"):
