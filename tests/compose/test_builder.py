@@ -1134,3 +1134,41 @@ def test_a_slide_without_speaker_notes_gets_no_notes_page():
     prs = Presentation(str(out))
 
     assert not prs.slides[0].has_notes_slide
+
+
+def test_truncation_keeps_bullets_apart():
+    """Живой прогон 25 сентября 2026 на VK WorkSpace: четыре отдельных
+    факта слиплись в одно нечитаемое предложение без разделителей, потому
+    что усечение резало текст всего блока по словам и теряло границы
+    абзацев. Слипшийся текст хуже отброшенного хвоста: читатель видит
+    бессмыслицу вместо сокращения."""
+    from deckforge.compose.builder import _truncate_to_fit
+
+    text = "\n".join([
+        "71 заявка ушла не тому согласующему",
+        "48 заявок попали к сотруднику в отпуске без автоподмены",
+        "39 заявок ждали, пока автор допишет обоснование",
+        "22 заявки застряли из-за дублирующего согласования",
+    ])
+
+    out, truncated = _truncate_to_fit(
+        text, PROFILE.type_scale.families[0], 16.0, box_width_in=3.0, box_height_in=0.9,
+        line_spacing=1.1,
+    )
+
+    assert truncated, "текст заведомо не влезает в такую рамку"
+    assert "согласующему 48" not in out, f"абзацы слиплись: {out!r}"
+    kept = [line for line in out.split("\n") if line.strip()]
+    assert kept, "усечение не должно оставлять пустоту"
+    assert kept[0].startswith("71 заявка"), f"первый факт обязан уцелеть: {out!r}"
+
+
+def test_truncation_returns_text_unchanged_when_it_fits():
+    from deckforge.compose.builder import _truncate_to_fit
+
+    out, truncated = _truncate_to_fit(
+        "Короткая строка", PROFILE.type_scale.families[0], 12.0,
+        box_width_in=6.0, box_height_in=3.0, line_spacing=1.1,
+    )
+
+    assert out == "Короткая строка" and not truncated

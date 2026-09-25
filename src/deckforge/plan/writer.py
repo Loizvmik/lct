@@ -130,6 +130,12 @@ _FALLBACK_CAPACITY = {
 # типичный заголовок-вывод на одну-две строки, не подгонка под файл.
 _FALLBACK_HEADLINE_CHARS = 70
 
+# Виды слайда, где заголовок без содержания — законная вёрстка: обложка,
+# разделитель раздела, героическая картинка. Тот же смысл, что у
+# `patterns._HEADLINE_EXEMPT_KINDS`, но с другой стороны: там решают, нужен
+# ли заголовок, здесь — нужно ли содержание под ним.
+_HEADLINE_ONLY_KINDS = frozenset({"section", "image"})
+
 # Пункт структуры (`OutlineSlide.kind`, словарь outline-writer) -> желаемый
 # `SlideSpec.kind` (закрытый список `plan.spec.SLIDE_KINDS`, десять значений
 # с Task 18) — грубое, но детерминированное первое приближение вёрстки,
@@ -277,7 +283,13 @@ def _fallback_slide(kind: str, index: int, intent: str, needs: list[str], *, rea
     # просил найти в источниках для ЭТОГО слайда. Показать их честнее, чем
     # пустоту: видно, чего не хватило, и слайд можно дописать руками, не
     # разбираясь в отчёте.
-    blocks = [BulletBlock(items=[f"Нужны данные: {n}" for n in needs])] if needs else []
+    # На обложке и разделителе слайд с одним заголовком — норма вёрстки, а
+    # не брак: ТЗ имеет в виду содержательный слайд, на котором кроме
+    # заголовка ничего нет. Живой прогон 25 сентября 2026 на VK Tech:
+    # титульный слайд получил строку «Нужны данные: Название инициативы» —
+    # для обложки это мусор, а не честность.
+    needs_fit_this_slide = needs and kind not in _HEADLINE_ONLY_KINDS
+    blocks = [BulletBlock(items=[f"Нужны данные: {n}" for n in needs])] if needs_fit_this_slide else []
     return SlideSpec(
         index=index, kind=kind, headline=headline, blocks=blocks,
         source_note=source_note, findings=[finding],

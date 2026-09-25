@@ -578,3 +578,19 @@ def test_a_fallback_slide_says_what_data_it_needs(PROFILE):
     middle = deck.slides[1]
     assert middle.blocks, "запасной слайд не должен оставаться с одним заголовком"
     assert any("Нужны данные" in i for b in middle.blocks for i in getattr(b, "items", []))
+
+
+def test_a_cover_slide_does_not_ask_for_data(PROFILE):
+    """На обложке и разделителе заголовок без содержания — законная
+    вёрстка, а не брак. Живой прогон 25 сентября 2026 на VK Tech: титульный
+    слайд получил строку «Нужны данные: Название инициативы» — для обложки
+    это мусор, а не честность."""
+    outline = Outline(
+        slides=[OutlineSlide(kind="title", intent="Тема доклада", needs=["Название инициативы"])],
+        title="Колода", language="ru",
+    )
+    llm = _QueueLLM([RuntimeError("сеть недоступна")] * 4)
+
+    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+
+    assert not deck.slides[0].blocks, "обложка не должна просить данные"

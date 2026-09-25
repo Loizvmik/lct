@@ -1535,14 +1535,21 @@ def _is_cosmetic_truncation(original: str, truncated: str) -> bool:
 def _truncate_to_fit(
     text: str, family: str, size_pt: float, box_width_in: float, box_height_in: float, line_spacing: float,
 ) -> tuple[str, bool]:
-    """Двоичный поиск самого длинного слова-выровненного префикса, который
-    ещё влезает по высоте (брифом: "усекай, но оставь след" — многоточие,
-    не тихий обрыв слова). Границы абзацев (`\\n`) при этом не сохраняются
-    отдельно — усечение схлопывает содержание в одну проверяемую строку;
-    честно объявленное упрощение: сюда доходит только контент, для
-    которого ужимание по всей шкале уже не помогло (редкий, аварийный
-    путь — находка о самом факте усечения важнее аккуратности разбивки
-    остатка на исходные абзацы).
+    """Самый длинный префикс, который ещё влезает по высоте — с многоточием
+    на месте обрыва (брифом: "усекай, но оставь след", не тихий обрыв
+    слова).
+
+    Границы абзацев СОХРАНЯЮТСЯ. Раньше усечение резало текст по словам
+    всего блока сразу, схлопывая его в одну строку, — и это было объявлено
+    «честным упрощением аварийного пути». Живой прогон 25 сентября 2026 на
+    VK WorkSpace показал цену: четыре отдельных факта («71 заявка ушла не
+    тому согласующему», «48 заявок попали к сотруднику в отпуске»…) слиплись
+    в одно нечитаемое предложение без единого разделителя. Слипшийся текст
+    хуже, чем отброшенный хвост: читатель видит бессмыслицу вместо
+    сокращения.
+
+    Целые абзацы берутся, пока влезают; первый не влезший режется по словам
+    и получает многоточие; остальные отбрасываются.
 
     Возвращает КАНДИДАТА на усечение и было ли оно вообще нужно — не
     решает, принять ли его: разрушительное усечение (меньше
@@ -1554,22 +1561,38 @@ def _truncate_to_fit(
     if metrics.height_in <= box_height_in + _FIT_TOLERANCE_IN:
         return text, False
 
-    words = text.split()
-    if not words:
-        return text, False
+    def fits(candidate: str) -> bool:
+        m = measure(candidate, family, size_pt, box_width_in, line_spacing=line_spacing)
+        return m.height_in <= box_height_in + _FIT_TOLERANCE_IN
 
-    lo, hi, best = 0, len(words), ""
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        candidate = " ".join(words[:mid])
-        marked = candidate + "…" if mid < len(words) else candidate
-        m = measure(marked, family, size_pt, box_width_in, line_spacing=line_spacing)
-        if m.height_in <= box_height_in + _FIT_TOLERANCE_IN:
-            best = marked
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return (best or "…"), True
+    paragraphs = text.split("\n")
+    kept: list[str] = []
+    for i, para in enumerate(paragraphs):
+        candidate = "\n".join([*kept, para])
+        last = i == len(paragraphs) - 1
+        if fits(candidate if last else candidate + "…"):
+            kept.append(para)
+            continue
+
+        # Этот абзац целиком не влезает — режем ЕГО по словам, остальные
+        # отбрасываем.
+        words = para.split()
+        lo, hi, best = 0, len(words), ""
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            head = " ".join(words[:mid])
+            marked = head + "…" if (mid < len(words) or not last) else head
+            if fits("\n".join([*kept, marked]) if kept else marked):
+                best = marked
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best:
+            kept.append(best)
+        break
+
+    result = "\n".join(kept)
+    return (result or "…"), True
 
 
 def _apply_bullet(paragraph, bullet_char: str, family: str) -> None:
