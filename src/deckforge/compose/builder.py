@@ -584,10 +584,22 @@ def _table_frame_box(
     if max_right is not None:
         right = min(right, max_right)
     bottom = 1 - grid.margin_bottom
-    left = max(min(slot_box.left, right - min_width), grid.margin_left)
     top = slot_box.top
     exclude_ids = {id(e) for e in exclude}
-    for other in _table_obstacles(slide, canvas, exclude_ids):
+    obstacles = _table_obstacles(slide, canvas, exclude_ids)
+    # Левый край: от поля сетки, если слева от слота на высоте таблицы
+    # ничего нет. Слот справа от текстовой колонки примера (VK Education
+    # slide38: список слева, таблица справа), у которого колонка осталась
+    # пустой и удалена, иначе давал таблицу с середины слайда и пустую
+    # левую половину (прогон 26 сентября 2026, слайд 7).
+    left = grid.margin_left
+    for other in obstacles:
+        ob = other.box
+        if ob.right <= slot_box.left + 0.01 and ob.bottom > top and ob.top < bottom \
+                and not (ob.width >= _BACKGROUND_SHARE and ob.height >= _BACKGROUND_SHARE):
+            left = max(left, ob.right + _TABLE_GAP)
+    left = min(left, slot_box.left)
+    for other in obstacles:
         ob = other.box
         if ob.right <= left or ob.left >= right or ob.bottom <= top or ob.top >= bottom:
             continue

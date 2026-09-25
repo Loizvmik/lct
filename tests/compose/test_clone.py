@@ -395,3 +395,30 @@ def test_sole_table_clone_fills_the_native_table_wide_and_passes_audit(profile, 
         builder.audit_slide_layout(slide, _canvas(profile), profile, AuditConfig.load(), index=spec.index),
     )
     assert not errors, errors
+
+
+def test_lone_table_frame_starts_at_the_left_margin_when_the_left_column_is_gone(profile, deck):
+    """VK Education slide38: список слева, таблица справа. Когда список
+    пуст и удалён, таблица одна на слайде и начинается от левого поля, а
+    не с середины (прогон 26 сентября 2026, слайд 7). Пока список на
+    месте, таблица его не задевает."""
+    prs, sources = deck
+    pattern = _pattern(profile, "slide38")
+    canvas = _canvas(profile)
+    slide = clone_example_slide(prs, sources[38], builder._find_layout(prs, pattern.layout_id))
+    matched = match_slots(slide, pattern.slots, canvas)
+    table_slot = next(s for s in pattern.slots if s.role == "table")
+    bullet_index = next(i for i, s in enumerate(pattern.slots) if s.role == "bullet")
+    bullet_ref = matched[bullet_index]
+    assert bullet_ref is not None
+    table_ref = matched[next(i for i, s in enumerate(pattern.slots) if s.role == "table")]
+    exclude = [table_ref.element] if table_ref is not None else []
+
+    with_column = builder._table_frame_box(slide, table_slot.box, profile, canvas, exclude=exclude)
+    assert with_column.left >= bullet_ref.box.right
+
+    bullet_ref.element.getparent().remove(bullet_ref.element)
+    alone = builder._table_frame_box(slide, table_slot.box, profile, canvas, exclude=exclude)
+    assert abs(alone.left - profile.grid.margin_left) < 0.01
+    assert alone.width >= builder._TABLE_MIN_WIDTH
+
