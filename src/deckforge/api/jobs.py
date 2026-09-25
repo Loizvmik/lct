@@ -19,6 +19,7 @@ subprocess `soffice`, CPU); каждый вызов уходит в `asyncio.to_
 собранные файлы."""
 from __future__ import annotations
 import asyncio
+import json
 import hashlib
 import shutil
 import zipfile
@@ -34,7 +35,7 @@ from deckforge.audit.findings import Finding
 from deckforge.compose.builder import build_deck
 from deckforge.export.bundle import export_bundle
 from deckforge.plan.outline import SourceDoc, build_outline
-from deckforge.plan.spec import DeckSpec
+from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
@@ -285,6 +286,19 @@ async def _run_job(
             max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
             template_path=template.path,
         )
+
+        # План презентации на диск рядом с результатом. Командная строка
+        # это делала всегда, интерфейс — нет, и разбирать жалобу «слайд
+        # выглядит плохо» приходилось по собранному .pptx, где уже не видно
+        # ни выбранной раскладки, ни находок сборки, ни того, что писала
+        # модель (25 сентября 2026: полдня ушло на попытку восстановить по
+        # файлу, почему заголовок вышел мелким, — без плана это гадание).
+        try:
+            (job.dir / "deck.json").write_text(
+                json.dumps(deck_spec_to_dict(deck), ensure_ascii=False, indent=2), encoding="utf-8",
+            )
+        except Exception:  # noqa: BLE001 — отладочный артефакт не вправе ронять генерацию
+            pass
 
         job.enter_stage("compose")
         async with asyncio.TaskGroup() as tg:

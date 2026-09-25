@@ -47,6 +47,8 @@ color`) — тот же принцип, что и у уже пропускаем
 и остаётся видна пустой — это уже лучше, чем сплошная синяя клякса, и не
 хуже, чем то, что и так наследуется от лейаута/мастера."""
 from __future__ import annotations
+import io
+from typing import Callable
 
 from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_CONNECTOR, MSO_SHAPE
@@ -66,11 +68,16 @@ _LINE_THICKNESS_SHARE = 0.01
 
 def apply_decor(
     slide, decor: list[DecorShape], canvas_width_emu: int, canvas_height_emu: int,
+    image_bytes: Callable[[str], bytes | None] | None = None,
 ) -> None:
     """Добавляет на `slide` (python-pptx `Slide`) автофигуры/линии,
     воспроизводящие декор паттерна — вызывается builder'ом ПОСЛЕ добавления
     слайда на лейаут паттерна и ДО укладки текстового содержания (декор
-    ложится под содержание по z-order документного порядка добавления)."""
+    ложится под содержание по z-order документного порядка добавления).
+
+    `image_bytes` — как достать байты картинки по имени части пакета
+    (`ppt/media/imageN.png`). Без него картиночный декор пропускается, как
+    и раньше: прямые вызовы из тестов и старый код продолжают работать."""
     for shape in decor:
         if shape.fill_kind == "picture":
             # Контейнер под фото/скриншот (мокап телефона и т.п.) — см.
@@ -86,7 +93,36 @@ def apply_decor(
                 _add_connector(slide, shape, canvas_width_emu, canvas_height_emu)
             else:
                 _add_plaque(slide, shape, canvas_width_emu, canvas_height_emu)
-        # "picture"/"graphic_frame" — см. докстроку модуля, намеренно пропускаются.
+        elif shape.kind == "picture" and shape.image_part and image_bytes is not None:
+            # Фирменная графика шаблона — иконки, орнаменты, цветные
+            # композиции. Раньше пропускалась вместе со всем картиночным
+            # декором «потому что среднего цвета мало», и собранный слайд
+            # выходил белым листом там, где в шаблоне цветная композиция
+            # (замер 25 сентября 2026 на VK Education: пять голых макетов
+            # на двенадцать слайдов). Байты картинки берутся из САМОГО
+            # шаблона, поэтому воспроизводится она точно, а не средним
+            # цветом.
+            _add_picture(slide, shape, canvas_width_emu, canvas_height_emu, image_bytes)
+        # "graphic_frame" — см. докстроку модуля, намеренно пропускается.
+
+
+def _add_picture(
+    slide, shape: DecorShape, canvas_width_emu: int, canvas_height_emu: int,
+    image_bytes: Callable[[str], bytes | None],
+) -> None:
+    data = image_bytes(shape.image_part or "")
+    if not data:
+        return
+    left = round(shape.box.left * canvas_width_emu)
+    top = round(shape.box.top * canvas_height_emu)
+    width = max(1, round(shape.box.width * canvas_width_emu))
+    height = max(1, round(shape.box.height * canvas_height_emu))
+    try:
+        pic = slide.shapes.add_picture(io.BytesIO(data), Emu(left), Emu(top), Emu(width), Emu(height))
+    except Exception:  # noqa: BLE001 — битая картинка шаблона не вправе ронять сборку
+        return
+    if shape.rotation:
+        pic.rotation = shape.rotation
 
 
 def _is_line_like(box: Box) -> bool:

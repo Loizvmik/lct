@@ -91,10 +91,19 @@ def test_slots_respect_template_margins(profile_fixture):
 
 def test_capacity_is_derived_from_measured_box_not_guessed(profile_fixture):
     """max_chars слота должен считаться замером текста в его рамке,
-    иначе генератор напишет текст, который не влезет."""
+    иначе генератор напишет текст, который не влезет.
+
+    Нижняя граница 15, а не 20: с 25 сентября 2026 разбор перестал
+    выбрасывать слайды, вся графика которых нарисована картинками (см.
+    `patterns._split_content_and_decor`), и на VK Tech прибавилось семь
+    раскладок. Первая из них — двухколоночная, её слот заголовка занимает
+    44% ширины холста при кегле 32 и вмещает 18 знаков. Это настоящая
+    геометрия шаблона, а не ошибка замера: прежний порог был подобран под
+    прежний набор раскладок. Смысл проверки не в конкретном числе, а в
+    том, что вместимость ИЗМЕРЕНА — не круглая догадка вроде 0 или 999."""
     pattern = profile_fixture("VK Tech шаблон.pptx").patterns[0]
     headline = next(s for s in pattern.slots if s.role == "headline")
-    assert 20 <= headline.max_chars <= 300
+    assert 15 <= headline.max_chars <= 300
 
 
 def test_soft_line_break_does_not_corrupt_slot_text(profile_fixture):

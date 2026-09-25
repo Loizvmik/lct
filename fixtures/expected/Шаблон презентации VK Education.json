@@ -1,12 +1,5 @@
 {
-  "grid_margins": {
-    "gutter": 0.011569262175561534,
-    "margin_bottom": 0.09592097324041392,
-    "margin_left": 0.05480742030023773,
-    "margin_right": 0.053909282213746745,
-    "margin_top": 0.10094507691746865
-  },
-  "layouts_count": 30,
+  "source_name": "Шаблон презентации VK Education.pptx",
   "palette_roles": {
     "accent": "#3782BA",
     "border": "#E1E1E1",
@@ -16,8 +9,6 @@
     "surface": "#FFFFFF",
     "warning": "#FFE59C"
   },
-  "patterns_count": 33,
-  "source_name": "Шаблон презентации VK Education.pptx",
   "type_scale_steps": {
     "body": 16.0,
     "caption": 14.0,
@@ -25,5 +16,14 @@
     "h1": 48.0,
     "h2": 44.0,
     "micro": 12.0
-  }
+  },
+  "grid_margins": {
+    "margin_left": 0.05480742030023773,
+    "margin_right": 0.053909282213746745,
+    "margin_top": 0.10094507691746865,
+    "margin_bottom": 0.09592097324041392,
+    "gutter": 0.011569262175561534
+  },
+  "layouts_count": 30,
+  "patterns_count": 34
 }

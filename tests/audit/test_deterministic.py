@@ -592,12 +592,26 @@ def test_D04_catches_too_many_chart_series(blank_deck):
 
 
 def _bullets_deck(n_bullets: int, words_each: int) -> Path:
+    """Колода из одного слайда с заданным числом буллетов.
+
+    Декоративные картинки из профиля вырезаны по той же причине, что и в
+    `conftest.clean_deck_path`: проверяется ПЛОТНОСТЬ СОДЕРЖАНИЯ, а
+    фирменная графика шаблона (её сборка переносит на слайд с 25 сентября
+    2026) сама по себе заполняет холст и делает «слишком пустой» слайд
+    непустым. Для продукта это верно — слайд с крупным орнаментом
+    действительно не выглядит пустым, — но здесь измеряется другое."""
     items = [" ".join(f"слово{j}" for j in range(words_each)) for _ in range(n_bullets)]
     spec = DeckSpec(
         title="D05", language="ru",
         slides=[SlideSpec(index=0, kind="bullets", headline="Заголовок", blocks=[BulletBlock(items=items)])],
     )
-    return build_deck(spec, PROFILE, TEMPLATE, Variant.dense)
+    profile = PROFILE.model_copy(update={
+        "patterns": [
+            p.model_copy(update={"decor": [d for d in p.decor if d.kind != "picture"]})
+            for p in PROFILE.patterns
+        ],
+    })
+    return build_deck(spec, profile, TEMPLATE, Variant.dense)
 
 
 def test_D05_flags_both_empty_and_overstuffed_slides(blank_deck, clean_deck_path):
@@ -692,13 +706,18 @@ def test_I04_flags_a_slide_that_is_one_big_picture(blank_deck, tmp_path):
     slide = blank_deck.add_slide()
     slide.shapes.add_picture(str(img_path), Inches(0.05), Inches(0.05), Inches(9.9), Inches(5.55))
     path = blank_deck.save_as("raster.pptx")
-    # D05/L06 в наборе находок ОЖИДАЕМО, не маскируются: картинка, крупная
+    # D05 в наборе находок ОЖИДАЕМО, не маскируется: картинка, крупная
     # достаточно, чтобы I04 счёл слайд "выгруженным целиком растром" (порог
-    # `single_picture_coverage=0.9`), почти по построению заходит за поля
-    # (L06) и заполняет больше трёх четвертей холста (D05) — то же самое
-    # свойство геометрии ("картинка занимает почти весь холст"), увиденное
-    # тремя разными проверками, не побочный эффект теста.
-    assert _ids(run_deterministic(path, PROFILE, CONFIG)) == {"I04", "D05", "L06"}
+    # `single_picture_coverage=0.9`), по построению заполняет больше трёх
+    # четвертей холста — то же свойство геометрии, увиденное двумя разными
+    # проверками, не побочный эффект теста.
+    #
+    # L06 (поля) здесь БОЛЬШЕ НЕ ожидается: с 25 сентября 2026 картинка без
+    # текста из проверки полей исключена — оформление выпускают за поля
+    # намеренно, «под обрез» (см. `_check_L06`). Слайд, выгруженный целиком
+    # растром, ловит I04, и это правильная проверка для такого брака;
+    # ругать его ещё и за поля значило бы ругать всякий фон.
+    assert _ids(run_deterministic(path, PROFILE, CONFIG)) == {"I04", "D05"}
 
 
 # ---------------------------------------------------------------------------

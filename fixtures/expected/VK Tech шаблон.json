@@ -1,12 +1,5 @@
 {
-  "grid_margins": {
-    "gutter": 0.009158132864366175,
-    "margin_bottom": 0.17222709198387234,
-    "margin_left": 0.031153163758941897,
-    "margin_right": 0.04129560698852036,
-    "margin_top": 0.2351986649816921
-  },
-  "layouts_count": 39,
+  "source_name": "VK Tech шаблон.pptx",
   "palette_roles": {
     "accent": "#00D3E6",
     "border": "#0077FF",
@@ -17,8 +10,6 @@
     "surface": "#000000",
     "warning": "#FFD91D"
   },
-  "patterns_count": 20,
-  "source_name": "VK Tech шаблон.pptx",
   "type_scale_steps": {
     "body": 16.0,
     "caption": 14.0,
@@ -26,5 +17,14 @@
     "h1": 32.0,
     "h2": 26.5,
     "micro": 11.5
-  }
+  },
+  "grid_margins": {
+    "margin_left": 0.031153163758941897,
+    "margin_right": 0.04129560698852036,
+    "margin_top": 0.2351986649816921,
+    "margin_bottom": 0.17222709198387234,
+    "gutter": 0.009158132864366175
+  },
+  "layouts_count": 39,
+  "patterns_count": 27
 }

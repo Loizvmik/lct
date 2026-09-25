@@ -877,6 +877,17 @@ def _check_L06(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
             continue
         if not (item.text.strip() or item.kind in ("picture", "graphic_frame")):
             continue  # декоративные плашки без текста намеренно доходят до краёв
+        if item.kind == "picture" and not item.text.strip():
+            # Картинка без текста — оформление: фон, орнамент, иконка у
+            # края. Дизайнер выпускает такое за поля намеренно, это и есть
+            # приём вёрстки («под обрез»). С 25 сентября 2026 сборка
+            # переносит фирменную графику шаблона на слайд как есть
+            # (`compose.decor._add_picture`), и без этого исключения КАЖДАЯ
+            # такая картинка давала находку про поля — проверка ругалась на
+            # замысел самого шаблона. Диаграмма и таблица
+            # (`graphic_frame`) сюда не попадают: они контент и поля
+            # обязаны соблюдать.
+            continue
         b = item.box
         if b.right > 1 + _BOUNDS_EPS or b.left < -_BOUNDS_EPS:
             continue  # это L01, не L06

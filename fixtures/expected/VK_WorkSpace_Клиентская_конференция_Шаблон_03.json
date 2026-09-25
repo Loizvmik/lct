@@ -1,12 +1,5 @@
 {
-  "grid_margins": {
-    "gutter": 0.01643944389763774,
-    "margin_bottom": 0.19623224180310794,
-    "margin_left": 0.03515224436231185,
-    "margin_right": 0.04555733267716533,
-    "margin_top": 0.12563918051910178
-  },
-  "layouts_count": 15,
+  "source_name": "VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx",
   "palette_roles": {
     "accent": "#EE5959",
     "border": "#808080",
@@ -16,8 +9,6 @@
     "on_surface": "#FFFFFF",
     "surface": "#000000"
   },
-  "patterns_count": 13,
-  "source_name": "VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx",
   "type_scale_steps": {
     "body": 16.0,
     "caption": 14.0,
@@ -25,5 +16,14 @@
     "h1": 36.0,
     "h2": 24.0,
     "micro": 11.5
-  }
+  },
+  "grid_margins": {
+    "margin_left": 0.03515224436231185,
+    "margin_right": 0.04555733267716533,
+    "margin_top": 0.12563918051910178,
+    "margin_bottom": 0.19623224180310794,
+    "gutter": 0.01643944389763774
+  },
+  "layouts_count": 15,
+  "patterns_count": 14
 }

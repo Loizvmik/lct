@@ -645,8 +645,25 @@ def _decor_of_filled_units(
         return list(pattern.decor)
     unit_count = len({d.repeat_index for d in grouped})
     if unit_count != len(_repeat_unit_coords(pattern)):
-        return list(pattern.decor) if filled else ungrouped
-    return [d for d in pattern.decor if not d.repeat_group or d.repeat_index in filled]
+        return list(pattern.decor) if filled else [d for d in pattern.decor if not _is_empty_plaque(d)]
+    return [
+        d for d in pattern.decor
+        if not d.repeat_group or d.repeat_index in filled or not _is_empty_plaque(d)
+    ]
+
+
+def _is_empty_plaque(decor: DecorShape) -> bool:
+    """Читается ли этот декор как «здесь должна была быть карточка».
+
+    Убирать незаполненные единицы повтора нужно только ради ЗАЛИТЫХ
+    ПЛАШЕК — пустой белый прямоугольник в пол-слайда выглядит браком (см.
+    комментарий в `_decor_of_filled_units`). Картинка и линия — рисунок сам
+    по себе: иконка без подписи по-прежнему выглядит частью оформления, а
+    её удаление стоит дорого. Живой разбор 25 сентября 2026 на VK
+    Education: правило про плашки убирало вместе с ними четыре фирменные
+    иконки раскладки `slide26`, и собранный слайд выходил белым листом там,
+    где в шаблоне цветная композиция."""
+    return decor.kind == "shape" and decor.has_fill
 
 
 # ---------------------------------------------------------------------------

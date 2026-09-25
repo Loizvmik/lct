@@ -216,6 +216,14 @@ class DecorShape:
     repeat_index: int = 0
     prst: str | None = None
     adj: float | None = None
+    # Часть пакета с самой картинкой (`ppt/media/imageN.png`) — только для
+    # `kind == "picture"`. Без неё декоративную картинку нечем нарисовать:
+    # `DecorShape` намеренно не держит lxml-элемент, а геометрии для
+    # картинки мало. До появления этого поля `compose.decor` картиночный
+    # декор просто пропускал, и фирменная графика шаблона (иконки, плашки,
+    # орнаменты) терялась целиком — собранный слайд выходил белым листом
+    # там, где в шаблоне цветная композиция.
+    image_part: str | None = None
 
 
 @dataclass(frozen=True)
@@ -603,6 +611,9 @@ def _split_content_decor(
     смысла переизобретать это решение здесь."""
     content: list[ShapeRef] = []
     decor: list[ShapeRef] = []
+    # Картинки, не опознанные как логотип/фон, решаются НЕ по одной, а всем
+    # набором слайда — см. развилку после цикла.
+    pictures: list[ShapeRef] = []
     for ref in refs:
         if ref.kind == "connector":
             decor.append(ref)
@@ -611,7 +622,7 @@ def _split_content_decor(
             if target is not None and (target == logo_target or target in bg_targets):
                 decor.append(ref)
             else:
-                content.append(ref)
+                pictures.append(ref)
         elif ref.kind == "graphic_frame":
             content.append(ref)
         elif ref.kind == "shape":
@@ -642,6 +653,30 @@ def _split_content_decor(
                 # линия БЕЗ неё остаются декором, если это не плейсхолдер.
                 decor.append(ref)
         # kind == "group" не встречается: walk_shapes(include_groups=False)
+
+    # Картинки слайда-примера: САМАЯ КРУПНАЯ — место под контент, остальные
+    # — декор.
+    #
+    # Раньше контентом считалась КАЖДАЯ картинка, не опознанная как логотип
+    # или фон. На экспортированных из Google Slides шаблонах фирменная
+    # графика нарисована именно картинками, и каждая из них становилась
+    # «местом, куда пользователь положит фото». Фотографий у пользователя
+    # обычно нет вовсе — места оставались пустыми, декор не рисовался, и
+    # слайд выходил белым листом. Живой замер 25 сентября 2026 на VK
+    # Education: 23 раскладки из 33 без единой декоративной фигуры, в
+    # собранной презентации пять одинаковых белых макетов на двенадцать
+    # слайдов.
+    #
+    # Правило исходит из асимметрии последствий: назвать декор контентом —
+    # потерять вид шаблона на КАЖДОМ слайде; назвать контентное место
+    # декором — потерять одно место под фотографию на слайде, где их и так
+    # несколько. Самая крупная картинка остаётся слотом, чтобы
+    # пользовательские фотографии не лишились дома совсем.
+    if pictures:
+        largest = max(pictures, key=lambda r: r.box.width * r.box.height)
+        for ref in pictures:
+            (content if ref is largest else decor).append(ref)
+
     return content, decor
 
 
@@ -1870,12 +1905,13 @@ def _to_decor(
         fill_hex = _picture_fill_average_color(pkg, rels, fill_el, decor_image_cache)
 
     prst, adj = _decor_prst_geom(ref.element) if ref.kind == "shape" else (None, None)
+    image_part = _picture_target(ref.element, rels) if ref.kind == "picture" else None
 
     return DecorShape(
         kind=ref.kind, box=ref.box, rotation=ref.rotation, flip_h=ref.flip_h, flip_v=ref.flip_v,
         fill_hex=fill_hex, has_fill=has_fill, fill_kind=fill_kind,
         repeat_group=repeat_index is not None, repeat_index=repeat_index or 0,
-        prst=prst, adj=adj,
+        prst=prst, adj=adj, image_part=image_part,
     )
 
 

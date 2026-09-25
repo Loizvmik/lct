@@ -497,6 +497,12 @@ class DecorShapeModel(BaseModel):
     # что и было её фактическим поведением до этой правки.
     repeat_group: bool = False
     repeat_index: int = 0
+    # Часть пакета с картинкой (`ppt/media/imageN.png`) для `kind ==
+    # "picture"` — без неё картиночный декор нечем нарисовать, и фирменная
+    # графика шаблона терялась целиком (см. `patterns.DecorShape.
+    # image_part`). Значение по умолчанию — обратная совместимость со
+    # старым диск-кешем, тем же приёмом, что и поля повтора выше.
+    image_part: str | None = None
 
 
 def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
@@ -505,6 +511,7 @@ def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
         flip_h=decor.flip_h, flip_v=decor.flip_v, fill_hex=decor.fill_hex,
         has_fill=decor.has_fill, fill_kind=decor.fill_kind,
         repeat_group=decor.repeat_group, repeat_index=decor.repeat_index,
+        image_part=decor.image_part,
     )
 
 

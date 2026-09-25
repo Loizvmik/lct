@@ -15,6 +15,7 @@ import io
 import re
 import zipfile
 from dataclasses import dataclass, field, replace
+from typing import Callable
 from pathlib import Path
 
 from lxml import etree
@@ -161,6 +162,19 @@ def build_deck(
 
     prs = Presentation(str(template_path))
     _clear_sample_slides(prs)
+    # Картинки декора берутся из САМОГО шаблона — один открытый zip на всю
+    # презентацию, с памятью на уже прочитанные части: одна и та же иконка
+    # встречается на нескольких слайдах колоды.
+    image_cache: dict[str, bytes | None] = {}
+
+    def image_bytes(part_name: str) -> bytes | None:
+        if part_name not in image_cache:
+            try:
+                with zipfile.ZipFile(template_path) as zf:
+                    image_cache[part_name] = zf.read(part_name)
+            except Exception:  # noqa: BLE001 — нет части/битый zip: декор просто не рисуется
+                image_cache[part_name] = None
+        return image_cache[part_name]
 
     canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
     audit_config = AuditConfig.load()
@@ -185,7 +199,7 @@ def build_deck(
             continue
         pattern, notes = _place_best_candidate(
             prs, slide_spec, candidates, profile, canvas, audit_config,
-            bullet_char=bullet_char, user_photos=user_photos,
+            bullet_char=bullet_char, user_photos=user_photos, image_bytes=image_bytes,
         )
         slide_spec.findings.extend(notes)
         _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
@@ -219,6 +233,7 @@ def _write_speaker_notes(slide, text: str | None) -> None:
 def place_slide(
     prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, audit_config: AuditConfig,
     *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
+    image_bytes: Callable[[str], bytes | None] | None = None,
 ) -> None:
     layout = _find_layout(prs, pattern.layout_id)
     if layout is None:
@@ -259,7 +274,7 @@ def place_slide(
     decor = expand_decor(
         pattern, _repeat_item_count(slide_spec), grid, filled_repeat_units(pattern, contents),
     )
-    apply_decor(slide, decor, canvas_width_emu, canvas_height_emu)
+    apply_decor(slide, decor, canvas_width_emu, canvas_height_emu, image_bytes)
     # `_local_background_is_dark` ищет охватывающую плашку декора ПОД
     # слотом (см. её докстроку) — обязана видеть УЖЕ развёрнутые позиции
     # плашек (`decor`, не статический `pattern.decor`), иначе контраст
@@ -1084,6 +1099,7 @@ def _remove_last_slide(prs) -> None:
 def _place_best_candidate(
     prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
+    image_bytes: Callable[[str], bytes | None] | None = None,
 ) -> tuple[Pattern, list[str]]:
     """Собрали слайд — проверили — не понравилось — взяли другую раскладку
     и пересобрали (бриф, дословно). Пробует кандидатов `candidates` по
@@ -1111,7 +1127,8 @@ def _place_best_candidate(
     for attempt, pattern in enumerate(tried, start=1):
         trial_spec = replace(slide_spec, findings=[])
         place_slide(
-            prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char, user_photos=user_photos,
+            prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char,
+            user_photos=user_photos, image_bytes=image_bytes,
         )
         errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index)
         if not errors:
@@ -1134,7 +1151,8 @@ def _place_best_candidate(
     best_errors, best_pattern, best_ids = best
     trial_spec = replace(slide_spec, findings=[])
     place_slide(
-        prs, trial_spec, best_pattern, profile, audit_config, bullet_char=bullet_char, user_photos=user_photos,
+        prs, trial_spec, best_pattern, profile, audit_config, bullet_char=bullet_char,
+        user_photos=user_photos, image_bytes=image_bytes,
     )
     notes.append(
         f"Слайд {slide_spec.index}: ни один из {len(tried)} проверенных кандидатов не прошёл аудит "
@@ -1207,6 +1225,7 @@ def _pattern_from_model(model) -> Pattern:
             kind=d.kind, box=_box_from_model(d.box), rotation=d.rotation, flip_h=d.flip_h, flip_v=d.flip_v,
             fill_hex=d.fill_hex, has_fill=d.has_fill, fill_kind=d.fill_kind,
             repeat_group=d.repeat_group, repeat_index=d.repeat_index,
+            image_part=d.image_part,
         )
         for d in model.decor
     ]
