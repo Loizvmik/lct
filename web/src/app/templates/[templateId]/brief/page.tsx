@@ -5,7 +5,7 @@ import { useEffect, useState } from "react";
 import { createDeckBatch, VariantName, VARIANT_DESCRIPTIONS, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
 import { getAppSettings } from "@/lib/appSettings";
 import { clearBriefDraft, loadBriefDraft, saveBriefDraft } from "@/lib/briefDraft";
-import { EXAMPLE_BRIEF, EXAMPLE_SOURCES, EXAMPLE_TARGET_SLIDES, EXAMPLE_TITLE } from "@/lib/exampleContent";
+import { EXAMPLES } from "@/lib/exampleContent";
 
 const MIN_SLIDES = 4;
 const MAX_SLIDES = 15;
@@ -73,11 +73,12 @@ export default function BriefPage() {
   // требует придумывать бриф, а главное, у модели есть исходные цифры.
   // Черновиком по умолчанию он не становится: `briefDraft` намеренно не
   // подставляет встроенный пример вместо пустой формы.
-  function fillExample() {
-    setTitle(EXAMPLE_TITLE);
-    setBrief(EXAMPLE_BRIEF);
-    setSources(EXAMPLE_SOURCES);
-    setTargetSlides(EXAMPLE_TARGET_SLIDES);
+  function fillExample(name: keyof typeof EXAMPLES = "queue-latency") {
+    const example = EXAMPLES[name];
+    setTitle(example.title);
+    setBrief(example.brief);
+    setSources(example.sources);
+    setTargetSlides(example.targetSlides);
     setError(null);
   }
 
@@ -197,7 +198,12 @@ export default function BriefPage() {
         <button type="button" onClick={submit} disabled={!canSubmit}>
           {busy ? "Начинаем…" : style === "all" ? "Создать три варианта" : "Создать презентацию"}
         </button>
-        <button type="button" className="secondary" onClick={fillExample} disabled={busy}>Вставить пример</button>
+        <button type="button" className="secondary" onClick={() => fillExample("queue-latency")} disabled={busy}>
+          Пример: заявки
+        </button>
+        <button type="button" className="secondary" onClick={() => fillExample("edu-platform")} disabled={busy}>
+          Пример: учебная платформа
+        </button>
         <button type="button" className="secondary" onClick={clearForm} disabled={busy}>Очистить поля</button>
       </div>
     </div>

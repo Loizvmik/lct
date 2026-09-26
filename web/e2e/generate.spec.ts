@@ -17,7 +17,7 @@ test("полный путь: шаблон, задание, варианты, п�
   await expect(page.getByRole("heading", { level: 1, name: "Опишите задачу" })).toBeVisible();
   const task = page.getByLabel(/Задача презентации/);
   await expect(task).toHaveValue("");
-  await page.getByRole("button", { name: "Вставить пример" }).click();
+  await page.getByRole("button", { name: "Пример: заявки" }).click();
   await expect(task).not.toHaveValue("");
   await page.getByRole("button", { name: "Очистить поля" }).click();
   await expect(task).toHaveValue("");
@@ -98,7 +98,7 @@ test("пустая форма, черновик и проверка числа �
 
   await expect(title).toHaveValue("");
   await expect(task).toHaveValue("");
-  await page.getByRole("button", { name: "Вставить пример" }).click();
+  await page.getByRole("button", { name: "Пример: заявки" }).click();
   await expect(task).not.toHaveValue("");
   await page.getByRole("button", { name: "Очистить поля" }).click();
   await expect(task).toHaveValue("");
