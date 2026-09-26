@@ -24,6 +24,7 @@
 именно сериализуемая, а не питоновская объектная форма.
 """
 from __future__ import annotations
+import hashlib
 import json
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
@@ -860,6 +861,64 @@ def _default_cache_dir() -> Path | None:
     return settings.paths.profile_cache
 
 
+# Задача V4, отпечаток модельной части кэша. Ответ модели зависит не только
+# от `MODEL_SCHEMA_VERSION`, но и от того, какая модель отвечала и каким
+# промптом её спрашивали. Правка AGENT.md без бампа версии раньше оставляла
+# в кэше ответы старого промпта. Детерминированная часть (`det_key`) от
+# модели не зависит и отпечатка не несёт: смена промпта перезапрашивает
+# модель, геометрию нет.
+AGENTS_DIR = Path(__file__).resolve().parents[3] / "agents"
+# Агенты, которые спрашиваются при разборе шаблона: имена ролей палитры,
+# вид раскладки по картинке, схема слотов.
+MODEL_CACHE_AGENTS: tuple[str, ...] = ("palette-namer", "pattern-kind-vision", "pattern-schema")
+# Роли тех же вызовов в `llm.roles` конфига (схема слотов идёт провайдером
+# вида, своей роли в конфиге у неё может не быть, тогда модель по умолчанию).
+MODEL_CACHE_ROLES: tuple[str, ...] = ("palette_namer", "pattern_kind", "pattern_schema")
+
+
+def _model_ids_from_config() -> list[str]:
+    """Модели ролей разбора из конфига. Берутся из конфига, а не у
+    переданного провайдера: прогон без ключа должен находить тот же кэш,
+    что положил прогон с моделью, иначе оффлайн-путь терял бы ответы модели."""
+    try:
+        llm = Settings.load(APP_YAML_PATH).llm
+    except Exception:
+        return ["?"]
+    return [f"{role}={llm.model_for(role)}" for role in MODEL_CACHE_ROLES]
+
+
+def model_cache_fingerprint(
+    *, model_ids: list[str] | None = None, agents_dir: Path | None = None,
+) -> str:
+    """8 hex-символов от id моделей и текстов промптов разбора. Недоступный
+    AGENT.md входит в хэш как отметка «нет файла», а не роняет разбор."""
+    ids = _model_ids_from_config() if model_ids is None else model_ids
+    root = AGENTS_DIR if agents_dir is None else agents_dir
+    digest = hashlib.sha256()
+    for model_id in ids:
+        digest.update(model_id.encode("utf-8") + b"\0")
+    for name in MODEL_CACHE_AGENTS:
+        digest.update(name.encode("utf-8") + b"\0")
+        try:
+            digest.update((root / name / "AGENT.md").read_bytes())
+        except OSError:
+            digest.update(b"<missing>")
+        digest.update(b"\0")
+    return digest.hexdigest()[:8]
+
+
+def model_cache_key(template_bytes: bytes, *, model_ids: list[str] | None = None,
+                    agents_dir: Path | None = None) -> str:
+    """Ключ полного профиля: `sha256(шаблон)-v<PROFILE_SCHEMA_VERSION>-m<отпечаток>`."""
+    fingerprint = model_cache_fingerprint(model_ids=model_ids, agents_dir=agents_dir)
+    return f"{profile_key(template_bytes, PROFILE_SCHEMA_VERSION)}-m{fingerprint}"
+
+
+def deterministic_cache_key(template_bytes: bytes) -> str:
+    """Ключ детерминированной части: без отпечатка модели и промптов."""
+    return profile_key(template_bytes, DETERMINISTIC_SCHEMA_VERSION)
+
+
 def _default_preview_dpi() -> int:
     """dpi рендера превью паттернов — та же настройка, что уже откалибрована
     для уточнения вида раскладки моделью (`config/app.yaml`, `render.
@@ -1137,7 +1196,7 @@ class TemplateProfile(BaseModel):
         # снимается.
         schema_llm = vision if schema is _SCHEMA_FROM_VISION else schema
         template_bytes = path.read_bytes()
-        fingerprint = profile_key(template_bytes, PROFILE_SCHEMA_VERSION)
+        fingerprint = model_cache_key(template_bytes)
 
         # Найдено этой задачей: `cache_dir` объявлен типом `Path | None`, но
         # Python не приводит аргументы к аннотации сама — вызывающий код,
@@ -1218,7 +1277,7 @@ class TemplateProfile(BaseModel):
         # читают именно `usage`, не геометрию), но сама геометрия (`build_
         # grid`/`build_layout_catalog`/`build_asset_catalog`/`mine_patterns`/
         # `build_shape_vocabulary`) — нет.
-        det_key = profile_key(template_bytes, DETERMINISTIC_SCHEMA_VERSION)
+        det_key = deterministic_cache_key(template_bytes)
         det_cached = (
             _load_deterministic_cache(effective_cache_dir, det_key)
             if vision is None and schema_llm is None else None
