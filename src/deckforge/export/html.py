@@ -83,21 +83,34 @@ class _Ctx:
     profile: TemplateProfile
 
 
-def to_html(deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path) -> Path:
+def to_html(
+    deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
+    *, visual: "VisualAuditResult | AuditReport | None" = None,
+) -> Path:
     """Собирает `out` — единый `.html` без внешних запросов. Возвращает `out`
     (интерфейс брифа); подробности деградаций — `to_html_report` ниже, для
     вызывающего кода, которому нужен не только путь, но и что подставлено
-    запасным вариантом."""
-    return to_html_report(deck_spec, profile, pptx_path, out).path
+    запасным вариантом.
+
+    `visual` — необязательные оценки PPTEval задачи G (`audit.visual.
+    VisualAuditResult` или уже сведённый `audit.report.AuditReport`);
+    `None` (по умолчанию) держит старое поведение буквально — экспорт не
+    обязан знать про аудит, чтобы работать (интерфейс брифа Task 14 старше
+    самих оценок, см. докстроку `_extract_visual_scores`)."""
+    return to_html_report(deck_spec, profile, pptx_path, out, visual=visual).path
 
 
-def to_html_report(deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path) -> HtmlExportResult:
+def to_html_report(
+    deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
+    *, visual: "VisualAuditResult | AuditReport | None" = None,
+) -> HtmlExportResult:
     pptx_path = Path(pptx_path)
     out = Path(out)
     canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
     layouts_by_part = {entry.part_name.lstrip("/"): entry for entry in profile.layouts}
     scheme = dict(profile.theme.scheme)
     clr_map = dict(profile.theme.clr_map)
+    slide_scores, deck_score, content_avg, design_avg = _extract_visual_scores(visual)
 
     warnings: list[str] = []
     slides_html: list[str] = []
@@ -113,18 +126,44 @@ def to_html_report(deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Pat
             layout_entry = layouts_by_part.get(layout_part.lstrip("/")) if layout_part else None
             bg_css, is_dark = _slide_background(layout_entry, profile)
 
-            spec_slide, spec_cursor = _match_spec_slide(deck_spec, full_text, spec_cursor)
+            spec_slide, matched_index, spec_cursor = _match_spec_slide(deck_spec, full_text, spec_cursor)
+            score = slide_scores.get(matched_index) if matched_index is not None else None
             slides_html.append(
-                _slide_section(index, blocks_html, bg_css, is_dark, spec_slide)
+                _slide_section(index, blocks_html, bg_css, is_dark, spec_slide, score)
             )
 
     fonts_css, font_warnings = _embed_fonts(profile)
     warnings.extend(font_warnings)
 
-    document = _wrap_document(deck_spec, profile, canvas, slides_html, fonts_css)
+    document = _wrap_document(
+        deck_spec, profile, canvas, slides_html, fonts_css,
+        deck_score=deck_score, content_avg=content_avg, design_avg=design_avg,
+    )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(document, encoding="utf-8")
     return HtmlExportResult(path=out, warnings=warnings)
+
+
+def _extract_visual_scores(
+    visual: "VisualAuditResult | AuditReport | None",
+) -> tuple[dict[int, dict], dict | None, float | None, float | None]:
+    """Задача G: и `VisualAuditResult` (прямой результат `audit.visual.
+    run_visual`), и уже сведённый `audit.report.AuditReport` несут одни и те
+    же четыре поля с оценками PPTEval под одинаковыми именами — эта функция
+    просто читает их дюк-тайпингом (`getattr` с фолбэком), не импортируя ни
+    один из модулей на верхнем уровне: `export/` не обязан тянуть `audit/`
+    как обязательную зависимость только ради типов в аннотации (они и так
+    строковые, см. `from __future__ import annotations` модуля). `None` —
+    честный случай "оценок нет вовсе" (аудит не прогонялся или его результат
+    не передали), а не сигнал ошибки."""
+    if visual is None:
+        return {}, None, None, None
+    return (
+        dict(getattr(visual, "slide_scores", {}) or {}),
+        getattr(visual, "deck_score", None),
+        getattr(visual, "content_avg", None),
+        getattr(visual, "design_avg", None),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -153,15 +192,19 @@ def _related_layout_part(pkg: PptxPackage, slide_part: str) -> str | None:
     return related[0] if related else None
 
 
-def _match_spec_slide(deck_spec: DeckSpec, full_text: str, cursor: int) -> tuple[SlideSpec | None, int]:
+def _match_spec_slide(deck_spec: DeckSpec, full_text: str, cursor: int) -> tuple[SlideSpec | None, int | None, int]:
     """Первый ещё не сопоставленный `SlideSpec`, чей `headline` входит в
     текст этого pptx-слайда — по порядку, не по индексу (см. докстроку
-    модуля: `build_deck` может пропустить слайд плана)."""
+    модуля: `build_deck` может пропустить слайд плана). Средний элемент
+    возврата — индекс найденного `SlideSpec` в `deck_spec.slides` (задача G:
+    тот же индекс, что ключ `VisualAuditResult.slide_scores` — `run_visual`
+    нумерует слайды по позиции в `spec.slides`, см. `audit/visual.py`), не
+    путать с новым значением курсора (третий элемент)."""
     for i in range(cursor, len(deck_spec.slides)):
         candidate = deck_spec.slides[i]
         if candidate.headline and candidate.headline in full_text:
-            return candidate, i + 1
-    return None, cursor
+            return candidate, i, i + 1
+    return None, None, cursor
 
 
 # ---------------------------------------------------------------------------
@@ -881,7 +924,31 @@ def _embed_fonts(profile: TemplateProfile) -> tuple[str, list[str]]:
 # ---------------------------------------------------------------------------
 
 
-def _slide_section(index: int, blocks_html: str, bg_css: str, is_dark: bool, spec_slide: SlideSpec | None) -> str:
+def _score_badge_html(score: dict | None) -> str:
+    """Задача G: бейдж с оценками PPTEval этого слайда (content/design,
+    1-5) в углу слайда — необязательный, как и сама оценка (см. докстроку
+    `_parse_scores` в `audit.visual`: слайд без валидной оценки просто не
+    попадает в `slide_scores`, `score` тогда `None` или без нужных ключей).
+    `why` — не в подписи (одна фраза может быть длинной, ломает бейдж), а в
+    `title` — всплывающая подсказка браузера при наведении."""
+    if not score:
+        return ""
+    parts = []
+    if isinstance(score.get("content"), int):
+        parts.append(f"С {score['content']}")
+    if isinstance(score.get("design"), int):
+        parts.append(f"Д {score['design']}")
+    if not parts:
+        return ""
+    why = score.get("why")
+    title_attr = f' title="{_esc(why)}"' if isinstance(why, str) and why else ""
+    return f'<div class="slide-score"{title_attr}>{_esc(" · ".join(parts))}</div>'
+
+
+def _slide_section(
+    index: int, blocks_html: str, bg_css: str, is_dark: bool, spec_slide: SlideSpec | None,
+    score: dict | None = None,
+) -> str:
     kind = spec_slide.kind if spec_slide is not None else ""
     title = spec_slide.headline if spec_slide is not None else f"Слайд {index + 1}"
     theme = "dark" if is_dark else "light"
@@ -892,10 +959,11 @@ def _slide_section(index: int, blocks_html: str, bg_css: str, is_dark: bool, spe
     # рассказывающего, а не для зала.
     notes = getattr(spec_slide, "speaker_notes", None) if spec_slide is not None else None
     notes_html = f'<aside class="slide-notes">{_esc(notes.strip())}</aside>' if notes and notes.strip() else ""
+    score_html = _score_badge_html(score)
     return (
         f'<section class="slide" data-index="{index}" data-kind="{_esc(kind)}" '
         f'data-theme="{theme}" aria-label="{_esc(title)}" style="background:{bg_css};">'
-        f'<div class="slide-inner">{blocks_html}</div>{notes_html}'
+        f'<div class="slide-inner">{blocks_html}</div>{notes_html}{score_html}'
         f"</section>"
     )
 
@@ -914,8 +982,30 @@ def _css_vars(profile: TemplateProfile) -> str:
     return "\n".join(lines)
 
 
+def _deck_score_html(deck_score: dict | None, content_avg: float | None, design_avg: float | None) -> str:
+    """Задача G: сводка PPTEval по колоде целиком — средние по content/
+    design (считает `audit.visual._axis_average`, не эта функция — export
+    только показывает готовое число) плюс coherence с колоды. Пустая
+    строка, если оценок нет вовсе (аудит не запускался/не передан) — тот
+    же принцип честной деградации, что и у `HtmlExportResult.warnings`."""
+    parts = []
+    if content_avg is not None:
+        parts.append(f"содержание {content_avg:.1f}")
+    if design_avg is not None:
+        parts.append(f"дизайн {design_avg:.1f}")
+    coherence = deck_score.get("coherence") if deck_score else None
+    if isinstance(coherence, int):
+        parts.append(f"связность {coherence}")
+    if not parts:
+        return ""
+    why = deck_score.get("why") if deck_score else None
+    title_attr = f' title="{_esc(why)}"' if isinstance(why, str) and why else ""
+    return f'<div id="deck-score"{title_attr}>PPTEval: {_esc(", ".join(parts))}</div>'
+
+
 def _wrap_document(
     deck_spec: DeckSpec, profile: TemplateProfile, canvas: Canvas, slides_html: list[str], fonts_css: str,
+    *, deck_score: dict | None = None, content_avg: float | None = None, design_avg: float | None = None,
 ) -> str:
     width_px = round(canvas.width_in * 96)
     height_px = round(canvas.height_in * 96)
@@ -923,6 +1013,7 @@ def _wrap_document(
     slides_joined = "\n".join(slides_html)
     n_slides = len(slides_html)
     lang = (deck_spec.language or "ru")[:2]
+    deck_score_html = _deck_score_html(deck_score, content_avg, design_avg)
 
     return f"""<!DOCTYPE html>
 <html lang="{_esc(lang)}">
@@ -970,6 +1061,22 @@ body.notes .slide.is-current .slide-notes {{
   font: 400 15px/1.45 var(--font-fallback); white-space: pre-wrap;
 }}
 body.overview .slide-notes {{ display: none !important; }}
+/* Задача G (PPTEval): бейдж с оценками слайда — угол слайда, не мешает
+   контенту (шрифт мельче любого реального текста слайда). Пуст (нет
+   элемента в DOM), если у слайда нет валидной оценки — см. `_score_badge_
+   html`, не только CSS прячет отсутствующее. */
+.slide-score {{
+  position: absolute; right: 8px; top: 8px; z-index: 4;
+  font: 600 11px var(--font-fallback); color: #fff;
+  background: rgba(17,17,17,.72); padding: 2px 8px; border-radius: 999px;
+  pointer-events: none;
+}}
+#deck-score {{
+  display: none; position: fixed; left: 16px; top: 12px; z-index: 10;
+  font: 13px var(--font-fallback); color: #fff; background: rgba(0,0,0,.55);
+  padding: 4px 10px; border-radius: 999px;
+}}
+body.overview #deck-score {{ display: block; }}
 .block {{ position: absolute; }}
 .text-frame {{ position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-start; }}
 .text-frame p, .text-frame li {{ margin: 0 0 .25em 0; padding: 0; }}
@@ -1021,7 +1128,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 }}
 @media print {{
   html, body {{ background: #fff; }}
-  #hud, #help {{ display: none !important; }}
+  #hud, #help, #deck-score {{ display: none !important; }}
   body.overview #grid {{ display: none !important; }}
   #viewport {{ position: static; display: block; }}
   #stage {{ display: none; }}
@@ -1038,6 +1145,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 <div id="viewport"><div id="stage">
 {slides_joined}
 </div></div>
+{deck_score_html}
 <div id="grid"></div>
 <div class="print-pages" aria-hidden="true">
 {slides_joined}
