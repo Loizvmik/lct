@@ -5,7 +5,9 @@
 from __future__ import annotations
 from pathlib import Path
 
-from deckforge.audit.fidelity import template_fidelity
+import pytest
+
+from deckforge.audit.fidelity import EDITABILITY_KINDS, template_fidelity
 from deckforge.compose.builder import Variant, build_deck
 from deckforge.plan.spec import Card, CardBlock, DeckSpec, SlideSpec
 from deckforge.template.profile import TemplateProfile
@@ -130,3 +132,101 @@ def test_report_summary_mentions_every_metric_word():
 
     for word in ("клоном", "фигур", "типографика", "разнообразие", "нативных", "плотности"):
         assert word in report.summary, report.summary
+
+
+# --- Задача V4: метрика редактируемости. ---
+
+
+def test_editability_on_cloned_and_scratch_decks():
+    """Колода из текста (клоном и с нуля): всё содержание редактируемо,
+    счётчики по видам есть, текстовых объектов больше нуля."""
+    for clone in (True, False):
+        spec = DeckSpec(title="Редактируемость", language="ru", slides=[_cards_spec(2)])
+        pptx_path = build_deck(spec, EDU_PROFILE, EDU_TEMPLATE, Variant.dense, clone_examples=clone)
+
+        report = template_fidelity(pptx_path, spec, EDU_PROFILE)
+
+        assert report.editable_content_coverage == 1.0, (clone, report.editable_counts, report.notes)
+        assert report.editable_counts["editable_text"] > 0
+        assert report.editable_counts["raster_content"] == 0
+        assert set(report.editable_counts) == set(EDITABILITY_KINDS)
+        assert "редактируемо 100%" in report.summary
+
+
+def _synthetic_deck(tmp_path: Path) -> Path:
+    """Четыре слайда: текст, родная таблица, родной график и слайд одной
+    картинкой во весь холст."""
+    import io
+
+    from PIL import Image
+    from pptx import Presentation
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE
+    from pptx.util import Emu
+
+    prs = Presentation()
+    width, height = prs.slide_width, prs.slide_height
+    blank = prs.slide_layouts[6]
+
+    s = prs.slides.add_slide(blank)
+    s.shapes.add_textbox(Emu(0), Emu(0), Emu(width // 2), Emu(height // 4)).text_frame.text = "Текст"
+    s = prs.slides.add_slide(blank)
+    s.shapes.add_table(2, 2, Emu(0), Emu(0), Emu(width // 2), Emu(height // 4))
+    s = prs.slides.add_slide(blank)
+    data = CategoryChartData()
+    data.categories = ["a", "b"]
+    data.add_series("s", (1, 2))
+    s.shapes.add_chart(XL_CHART_TYPE.COLUMN_CLUSTERED, Emu(0), Emu(0), Emu(width // 2), Emu(height // 4), data)
+    s = prs.slides.add_slide(blank)
+    png = io.BytesIO()
+    Image.new("RGB", (40, 30), (200, 10, 10)).save(png, format="PNG")
+    png.seek(0)
+    s.shapes.add_picture(png, Emu(0), Emu(0), Emu(width), Emu(height))
+
+    path = tmp_path / "synthetic.pptx"
+    prs.save(str(path))
+    return path
+
+
+def test_editability_counts_native_objects_and_flags_slide_as_image(tmp_path):
+    from pptx import Presentation
+
+    from deckforge.audit.fidelity import _editability
+    from deckforge.ooxml.geometry import Canvas
+
+    path = _synthetic_deck(tmp_path)
+    prs = Presentation(str(path))
+    canvas = Canvas(prs.slide_width, prs.slide_height)
+    notes: list[str] = []
+
+    coverage, counts = _editability(path, prs, canvas, set(), notes)
+
+    assert counts["editable_text"] == 1
+    assert counts["native_table"] == 1
+    assert counts["native_chart"] == 1
+    assert counts["raster_content"] == 1, "картинка во весь пустой слайд не фото, а вёрстка в растре"
+    assert counts["user_image"] == 0
+    # Три объекта по 1/8 холста редактируемы, растр во весь холст нет.
+    assert coverage == pytest.approx(3 * 0.125 / (3 * 0.125 + 1.0), abs=1e-3)
+
+
+def test_template_picture_is_decor_not_content(tmp_path):
+    """Та же картинка, если её байты есть в медиа шаблона, считается
+    декором и в знаменатель не входит."""
+    import hashlib
+
+    from pptx import Presentation
+
+    from deckforge.audit.fidelity import _editability
+    from deckforge.ooxml.geometry import Canvas
+    from deckforge.ooxml.package import PptxPackage
+
+    path = _synthetic_deck(tmp_path)
+    with PptxPackage.open(path) as pkg:
+        hashes = {hashlib.md5(pkg.part(n)).hexdigest() for n in pkg.names() if n.startswith("ppt/media/")}
+    prs = Presentation(str(path))
+    coverage, counts = _editability(path, prs, Canvas(prs.slide_width, prs.slide_height), hashes, [])
+
+    assert counts["template_decor"] >= 1
+    assert counts["raster_content"] == 0
+    assert coverage == 1.0

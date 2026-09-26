@@ -84,6 +84,28 @@ class FidelityReport:
     density_delta: float | None
     summary: str
     notes: list[str] = field(default_factory=list)
+    # Задача V4: доля площади содержательных объектов, которые человек может
+    # править в PowerPoint (текст, родная таблица, родной график, фото
+    # пользователя), против растра на месте содержания. Декор шаблона в
+    # знаменатель не входит: его никто не редактирует и не должен.
+    editable_content_coverage: float | None = None
+    # Счётчики объектов по видам (`EDITABILITY_KINDS`).
+    editable_counts: dict[str, int] = field(default_factory=dict)
+
+
+# Виды объектов для метрики редактируемости. Первые четыре редактируемы,
+# `template_decor` в метрику не входит, `raster_content` не редактируемо.
+EDITABILITY_KINDS: tuple[str, ...] = (
+    "editable_text", "native_table", "native_chart", "user_image", "template_decor", "raster_content",
+)
+_EDITABLE_KINDS = frozenset({"editable_text", "native_table", "native_chart", "user_image"})
+
+# Картинка не из шаблона, закрывающая почти весь слайд, на котором больше
+# нет ни текста, ни таблицы, ни графика: слайд собран одной картинкой, а
+# это ровно то, что ТЗ запрещает. Порог с запасом на поля и обрезку.
+_SLIDE_AS_IMAGE_AREA = 0.85
+
+_CHART_URI_MARK = "drawingml/2006/chart"
 
 
 def _clone_pattern_id(slide) -> str | None:
@@ -199,19 +221,120 @@ def _pattern_diversity_and_entropy(deck_spec: DeckSpec, notes: list[str]) -> tup
     return diversity, entropy
 
 
-def _native_asset_usage(pptx_path: Path, prs, canvas: Canvas, profile, notes: list[str]) -> float | None:
+def _template_media_hashes(profile) -> tuple[set[str] | None, str | None]:
+    """md5 медиа шаблона либо причина, почему их нет."""
     source_path = Path(profile.source_path) if profile.source_path else None
     if source_path is None or not source_path.exists():
-        notes.append(
-            "Использование нативных ассетов не посчитано: путь к исходному файлу шаблона недоступен "
-            "(profile.source_path пуст либо файл переехал на диске с момента разбора)."
+        return None, (
+            "путь к исходному файлу шаблона недоступен "
+            "(profile.source_path пуст либо файл переехал на диске с момента разбора)"
         )
-        return None
     try:
         with PptxPackage.open(source_path) as tpl_pkg:
-            template_hashes = {m.md5 for m in tpl_pkg.media()}
+            return {m.md5 for m in tpl_pkg.media()}, None
     except Exception:  # noqa: BLE001 — шаблон недоступен/повреждён, метрика честно пропускается
-        notes.append("Использование нативных ассетов не посчитано: исходный файл шаблона не открылся.")
+        return None, "исходный файл шаблона не открылся"
+
+
+def _picture_bytes(pkg, rels: dict[str, str], ref) -> bytes | None:
+    blip_fill = ref.element.find(qn("p:blipFill"))
+    blip = blip_fill.find(qn("a:blip")) if blip_fill is not None else None
+    rid = blip.get(qn("r:embed")) if blip is not None else None
+    part_name = rels.get(rid) if rid is not None else None
+    if part_name is None:
+        return None
+    try:
+        return pkg.part(part_name)
+    except KeyError:
+        return None
+
+
+def _frame_kind(ref) -> str:
+    graphic_data = ref.element.find(f"{qn('a:graphic')}/{qn('a:graphicData')}")
+    if graphic_data is None:
+        return "raster_content"
+    if graphic_data.find(qn("a:tbl")) is not None:
+        return "native_table"
+    if _CHART_URI_MARK in (graphic_data.get("uri") or ""):
+        return "native_chart"
+    # SmartArt правится в PowerPoint как текст; OLE-объект и прочее нет.
+    if "diagram" in (graphic_data.get("uri") or ""):
+        return "editable_text"
+    return "raster_content"
+
+
+def _area(box) -> float:
+    if box is None:
+        return 0.0
+    width = max(0.0, min(box.right, 1.0) - max(box.left, 0.0))
+    height = max(0.0, min(box.bottom, 1.0) - max(box.top, 0.0))
+    return width * height
+
+
+def _editability(
+    pptx_path: Path, prs, canvas: Canvas, template_hashes: set[str] | None, notes: list[str],
+) -> tuple[float | None, dict[str, int]]:
+    """Доля редактируемой площади содержания и счётчики по видам.
+
+    Картинка с байтами из медиа шаблона считается декором шаблона (иконка,
+    плашка, фон), прочие картинки фотографиями пользователя. Без медиа
+    шаблона отличить их нельзя, и все картинки идут фотографиями: метрика
+    тогда завышена, о чём пишется заметка."""
+    counts = {kind: 0 for kind in EDITABILITY_KINDS}
+    editable_area = 0.0
+    content_area = 0.0
+    with PptxPackage.open(pptx_path) as pkg:
+        for slide in prs.slides:
+            slide_part = str(slide.part.partname).lstrip("/")
+            root = pkg.xml(slide_part)
+            rels = pkg.rels(slide_part)
+            items: list[tuple[str, float]] = []
+            for ref in walk_shapes(root, canvas, include_groups=False):
+                kind: str | None = None
+                if ref.kind == "shape":
+                    tx_body = ref.element.find(qn("p:txBody"))
+                    text = "".join(t.text or "" for t in tx_body.iter(qn("a:t"))) if tx_body is not None else ""
+                    kind = "editable_text" if text.strip() else "template_decor"
+                elif ref.kind == "graphic_frame":
+                    kind = _frame_kind(ref)
+                elif ref.kind == "picture":
+                    data = _picture_bytes(pkg, rels, ref)
+                    if data is None:
+                        continue
+                    native = template_hashes is not None and hashlib.md5(data).hexdigest() in template_hashes
+                    kind = "template_decor" if native else "user_image"
+                elif ref.kind == "connector":
+                    kind = "template_decor"
+                if kind is not None:
+                    items.append((kind, _area(ref.box)))
+            # Слайд одной картинкой: единственное содержание — растр почти во
+            # весь холст. Такая картинка не фото, а вёрстка, залитая в растр.
+            content = [(k, a) for k, a in items if k != "template_decor"]
+            if len(content) == 1 and content[0][0] == "user_image" and content[0][1] >= _SLIDE_AS_IMAGE_AREA:
+                items = [("raster_content", a) if k == "user_image" else (k, a) for k, a in items]
+            for kind, area in items:
+                counts[kind] += 1
+                if kind == "template_decor":
+                    continue
+                content_area += area
+                if kind in _EDITABLE_KINDS:
+                    editable_area += area
+    if template_hashes is None and counts["user_image"]:
+        notes.append(
+            "Редактируемость: медиа шаблона недоступны, все картинки посчитаны фотографиями пользователя."
+        )
+    if content_area <= 0:
+        notes.append("Редактируемость не посчитана: в колоде нет содержательных объектов с площадью.")
+        return None, counts
+    return editable_area / content_area, counts
+
+
+def _native_asset_usage(
+    pptx_path: Path, prs, canvas: Canvas, template_hashes: set[str] | None, why_missing: str | None,
+    notes: list[str],
+) -> float | None:
+    if template_hashes is None:
+        notes.append(f"Использование нативных ассетов не посчитано: {why_missing}.")
         return None
 
     total = 0
@@ -224,17 +347,8 @@ def _native_asset_usage(pptx_path: Path, prs, canvas: Canvas, profile, notes: li
             for ref in walk_shapes(root, canvas, include_groups=False):
                 if ref.kind != "picture":
                     continue
-                blip_fill = ref.element.find(qn("p:blipFill"))
-                blip = blip_fill.find(qn("a:blip")) if blip_fill is not None else None
-                rid = blip.get(qn("r:embed")) if blip is not None else None
-                if rid is None:
-                    continue
-                part_name = rels.get(rid)
-                if part_name is None:
-                    continue
-                try:
-                    data = pkg.part(part_name)
-                except KeyError:
+                data = _picture_bytes(pkg, rels, ref)
+                if data is None:
                     continue
                 total += 1
                 if hashlib.md5(data).hexdigest() in template_hashes:
@@ -291,6 +405,7 @@ def _summarize(report_values: dict) -> str:
             if report_values['pattern_entropy'] is not None else "разнообразие раскладок — н/д"
         ),
         f"нативных ассетов {_fmt_pct(report_values['native_asset_usage'])}",
+        f"редактируемо {_fmt_pct(report_values.get('editable_content_coverage'))} площади содержания",
         (
             f"дельта плотности к паттерну {report_values['density_delta']:.1%}"
             if report_values['density_delta'] is not None else "дельта плотности — н/д"
@@ -327,7 +442,9 @@ def template_fidelity(pptx_path: Path, deck_spec: DeckSpec, profile) -> Fidelity
         pptx_path, prs, canvas, profile, AuditConfig.load(), notes,
     )
     pattern_diversity, pattern_entropy = _pattern_diversity_and_entropy(deck_spec, notes)
-    native_asset_usage = _native_asset_usage(pptx_path, prs, canvas, profile, notes)
+    template_hashes, why_missing = _template_media_hashes(profile)
+    native_asset_usage = _native_asset_usage(pptx_path, prs, canvas, template_hashes, why_missing, notes)
+    editable_coverage, editable_counts = _editability(pptx_path, prs, canvas, template_hashes, notes)
     density_delta = _density_delta(prs, canvas, profile, clone_pattern_by_index, patterns_by_id, notes)
 
     values = {
@@ -339,5 +456,6 @@ def template_fidelity(pptx_path: Path, deck_spec: DeckSpec, profile) -> Fidelity
         "pattern_entropy": pattern_entropy,
         "native_asset_usage": native_asset_usage,
         "density_delta": density_delta,
+        "editable_content_coverage": editable_coverage,
     }
-    return FidelityReport(**values, summary=_summarize(values), notes=notes)
+    return FidelityReport(**values, summary=_summarize(values), notes=notes, editable_counts=editable_counts)
