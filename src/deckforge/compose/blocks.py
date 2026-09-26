@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 from collections import Counter
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field, replace
 
 from deckforge.ooxml.geometry import Box
@@ -722,6 +723,80 @@ def expand_decor(
     return result
 
 
+# Допуск геометрии «лежит в колонке единицы повтора», доли холста: иконка
+# над карточкой стоит чуть левее или правее текста под ней.
+_UNIT_BAND_TOLERANCE = 0.02
+# Фигура шире единицы повтора в столько раз единице не принадлежит:
+# заголовок слайда или сноска на всю ширину не удаляются вместе с колонкой.
+_UNIT_WIDTH_SLACK = 1.25
+
+
+def unfilled_unit_test(
+    pattern: Pattern, filled: set[int], occupied: Iterable[Box] = (),
+) -> Callable[[Box], bool]:
+    """Предикат «коробка лежит в колонке (строке) незаполненной единицы
+    повтора».
+
+    Номер единицы (`repeat_index`) не всегда доходит до всех её фигур:
+    майнинг VK Education (`slide26`, три тезиса под иконками) собрал повтор
+    из двух единиц, третий тезис стал `body`, а его иконка получила
+    `repeat_index=2` при `repeat.count=2`. Правило «удалить единицы с
+    номером не из `filled`» такую единицу не видит, и при двух заполненных
+    тезисах третья иконка оставалась без текста (наблюдение 8.4). Поэтому
+    единица определяется по геометрии: колонки известных единиц плюс
+    продолжение ряда с шагом `repeat.step` до края холста. Колонка занята,
+    если в ней заполненная единица (`filled`) или коробка из `occupied`
+    (слот, в который лёг текст). Фигура считается принадлежащей колонке,
+    если её центр по оси повтора внутри колонки, сама она не шире единицы
+    и по поперечной оси пересекается с полосой повтора (слоты и декор
+    группы повтора)."""
+    repeat = pattern.repeat
+    coords = _repeat_unit_coords(pattern)
+    if repeat is None or not coords:
+        return lambda box: False
+    x_axis = repeat.axis == "x"
+
+    def along(b: Box) -> tuple[float, float]:
+        return (b.left, b.width) if x_axis else (b.top, b.height)
+
+    def across(b: Box) -> tuple[float, float]:
+        return (b.top, b.top + b.height) if x_axis else (b.left, b.left + b.width)
+
+    members = [s.box for s in pattern.slots if s.role in repeat.slot_roles]
+    band_boxes = members + [d.box for d in pattern.decor if d.repeat_group]
+    band = (min(across(b)[0] for b in band_boxes), max(across(b)[1] for b in band_boxes))
+    size = max(along(b)[1] for b in members)
+    step = repeat.step if repeat.step > size * 0.5 else size
+    columns = list(coords)
+    while columns[-1] + step < 1.0:
+        columns.append(columns[-1] + step)
+    while columns[0] - step + size > 0.0:
+        columns.insert(0, columns[0] - step)
+
+    def column_of(b: Box) -> float | None:
+        start, length = along(b)
+        center = start + length / 2
+        return next(
+            (c for c in columns if c - _UNIT_BAND_TOLERANCE <= center <= c + size + _UNIT_BAND_TOLERANCE),
+            None,
+        )
+
+    taken = {coords[i] for i in filled if 0 <= i < len(coords)}
+    narrow = [b for b in occupied if along(b)[1] <= size * _UNIT_WIDTH_SLACK]
+    taken |= {c for c in map(column_of, narrow) if c is not None}
+
+    def test(box: Box) -> bool:
+        if along(box)[1] > size * _UNIT_WIDTH_SLACK:
+            return False
+        lo, hi = across(box)
+        if hi < band[0] - _UNIT_BAND_TOLERANCE or lo > band[1] + _UNIT_BAND_TOLERANCE:
+            return False
+        column = column_of(box)
+        return column is not None and column not in taken
+
+    return test
+
+
 def _decor_of_filled_units(
     pattern: Pattern, grouped: list[DecorShape], ungrouped: list[DecorShape], filled: set[int] | None,
 ) -> list[DecorShape]:
@@ -743,7 +818,13 @@ def _decor_of_filled_units(
         return list(pattern.decor)
     unit_count = len({d.repeat_index for d in grouped})
     if unit_count != len(_repeat_unit_coords(pattern)):
-        return list(pattern.decor) if filled else ungrouped
+        if not filled:
+            return ungrouped
+        # Номера разошлись, но колонка незаполненной единицы видна по
+        # геометрии (`unfilled_unit_test`): её декор уходит, остальной
+        # остаётся весь.
+        orphan = unfilled_unit_test(pattern, filled)
+        return [d for d in pattern.decor if not orphan(d.box)]
     # Пробовал 25 сентября 2026 оставлять КАРТИНКИ незаполненных единиц
     # повтора — рассуждая, что иконка без подписи всё равно выглядит
     # оформлением. Живой рендер показал обратное: семь синих квадратов

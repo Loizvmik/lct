@@ -558,3 +558,19 @@ def test_cover_does_not_inherit_the_writer_layout():
     inner = SlideSpec(index=3, kind="section", headline="Раздел", pattern_id=smallest.pattern_id)
     assert _choose_kind_and_pattern(inner, PROFILE, Variant.dense)[1] == smallest.pattern_id
 
+
+
+def test_airy_dividers_always_carry_a_visible_headline():
+    """Разделитель с пустым заголовком клон собрал бы с пустым
+    плейсхолдером (наблюдение 8.2). Заголовок разделителя берётся из
+    статичного списка, а не из содержания, и пустым не бывает ни при каком
+    числе слайдов: список идёт по кругу."""
+    many = DeckSpec(title="Т", language="ru", slides=[
+        DECK.slides[0],
+        *[SlideSpec(index=i, kind="bullets", headline=f"Слайд {i}", blocks=[BulletBlock(items=["пункт"])])
+          for i in range(1, 9)],
+    ])
+    airy = apply_variant(many, PROFILE, Variant.airy)
+    dividers = [s for s in airy.slides if s.kind == "section" and not s.blocks and s is not airy.slides[0]]
+    assert dividers
+    assert all(s.headline and s.headline.strip() for s in dividers)

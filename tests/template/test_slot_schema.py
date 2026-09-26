@@ -82,34 +82,37 @@ def test_manifest_numbers_slots_from_one_and_marks_repeat_units():
 def test_foreign_index_is_dropped_and_valid_fields_accepted():
     pattern = _steps_pattern()
     accepted, notes = validate_slot_schema(pattern, {
-        "2": {"purpose": "номер шага", "content_hint": "не менять", "max_words": 1, "ordinal": True},
-        "3": {"purpose": "описание шага", "content_hint": "одно предложение", "max_words": 20},
-        "42": {"purpose": "выдумка"},
+        "2": {"purpose": "номер шага", "content_hint": "не менять", "max_words": 1, "ordinal": True, "confidence": 0.9},
+        "3": {"purpose": "описание шага", "content_hint": "одно предложение", "max_words": 20, "confidence": 0.7},
+        "42": {"purpose": "выдумка", "confidence": 1.0},
     })
     assert set(accepted) == {1, 2}
     assert accepted[1]["ordinal"] is True
-    assert accepted[2] == {"purpose": "описание шага", "content_hint": "одно предложение", "max_words": 20}
+    assert accepted[2] == {
+        "purpose": "описание шага", "content_hint": "одно предложение", "max_words": 20, "schema_confidence": 0.7,
+    }
     assert any("'42'" in n for n in notes)
 
 
 def test_ordinal_on_a_long_sample_is_rejected():
     pattern = _steps_pattern()
     accepted, notes = validate_slot_schema(pattern, {
-        "3": {"purpose": "описание", "ordinal": True},  # «Описание шага» — не номер
+        "3": {"purpose": "описание", "ordinal": True, "confidence": 0.95},  # «Описание шага» — не номер
     })
     assert "ordinal" not in accepted[2]
     assert accepted[2]["purpose"] == "описание"
     assert any("ordinal не принят" in n for n in notes)
 
 
-def test_bad_max_words_and_empty_fixed_are_ignored():
+def test_bad_max_words_and_sample_filler_fixed_are_ignored():
+    """«Заголовок» в примере: рыба, а не постоянный текст, `fixed` не принят."""
     pattern = _steps_pattern()
     accepted, _ = validate_slot_schema(pattern, {
-        "1": {"purpose": "заголовок слайда", "max_words": 500, "fixed": True},
-        "3": {"max_words": True},  # bool — не число слов
+        "1": {"purpose": "заголовок слайда", "max_words": 500, "fixed": True, "confidence": 0.9},
+        "3": {"max_words": True, "confidence": 0.9},  # bool — не число слов
     })
-    assert accepted[0] == {"purpose": "заголовок слайда", "fixed": True}
-    assert 2 not in accepted
+    assert accepted[0] == {"purpose": "заголовок слайда", "schema_confidence": 0.9}
+    assert accepted[2] == {"schema_confidence": 0.9}
 
 
 def test_without_model_nothing_is_described_and_nothing_breaks():
@@ -130,12 +133,12 @@ def test_model_answer_is_validated_per_pattern():
     def _respond(prompt):
         payload = _payload(prompt)
         assert payload["kind"] == "cards"
-        return "```json\n" + json.dumps({"2": {"purpose": "номер шага", "ordinal": True}}) + "\n```"
+        return "```json\n" + json.dumps({"2": {"purpose": "номер шага", "ordinal": True, "confidence": 0.9}}) + "\n```"
 
     fake = _FakeVision(_respond)
     schema, notes = describe_pattern_slots([_steps_pattern()], {"steps": b"png"}, fake, max_workers=1)
     assert fake.calls == 1
-    assert schema == {"steps": {1: {"purpose": "номер шага", "ordinal": True}}}
+    assert schema == {"steps": {1: {"purpose": "номер шага", "ordinal": True, "schema_confidence": 0.9}}}
     assert "из них порядковых номеров: 1" in notes[0]
 
 
@@ -177,7 +180,7 @@ def _fake_to_pngs(monkeypatch):
 
 
 def _describe_first_slot(prompt):
-    return json.dumps({"1": {"purpose": "заголовок слайда", "content_hint": "вывод", "max_words": 8}})
+    return json.dumps({"1": {"purpose": "заголовок слайда", "content_hint": "вывод", "max_words": 8, "confidence": 0.9}})
 
 
 def test_full_parse_with_schema_provider_describes_slots(tmp_path, monkeypatch):

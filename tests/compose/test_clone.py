@@ -516,3 +516,78 @@ def test_pattern_from_model_keeps_source_shape_ids(profile):
         pattern = builder._pattern_from_model(model)
         assert [s.source_shape_id for s in pattern.slots] == [s.source_shape_id for s in model.slots]
         assert [d.source_shape_id for d in pattern.decor] == [d.source_shape_id for d in model.decor]
+
+
+def _divider(profile, pattern_id: str):
+    """Разделитель VK Education, как его записал кеш v18/v20: подпись-
+    подсказка «Точки используются для навигации» помечена моделью `fixed`."""
+    pattern = _pattern(profile, pattern_id)
+    slots = [replace(s, fixed=True) if s.role != "headline" else s for s in pattern.slots]
+    return replace(pattern, slots=slots)
+
+
+@pytest.mark.parametrize(("pattern_id", "number"), [("slide10", 10), ("slide11", 11)])
+def test_divider_clone_drops_designer_hint_even_if_marked_fixed(profile, deck, pattern_id, number):
+    """Скриншот 8.2: на разделителе остался текст шаблона «Точки
+    используются для навигации». Флаг `fixed` от модели его больше не
+    удерживает: подсказка не проходит фильтр постоянного текста."""
+    prs, sources = deck
+    pattern = _divider(profile, pattern_id)
+    spec = SlideSpec(index=1, kind="section", headline="Дальше — контекст")
+
+    outcome = builder.place_slide_by_clone(prs, spec, pattern, profile, AuditConfig.load(), sources[number])
+
+    assert outcome.reason is None
+    texts = _texts(prs.slides[-1])
+    assert "Дальше — контекст" in texts
+    assert not any("Точки" in t or "Пример" in t for t in texts), texts
+
+
+def test_blank_headline_rejects_the_clone(profile, deck):
+    """Пустая привязка не оставляет на слайде пустой плейсхолдер: клон
+    отклоняется, и слайд собирается другим путём."""
+    prs, sources = deck
+    spec = SlideSpec(index=1, kind="section", headline="\u200b ")
+
+    outcome = builder.place_slide_by_clone(
+        prs, spec, _pattern(profile, "slide10"), profile, AuditConfig.load(), sources[10],
+    )
+
+    assert outcome.reason is not None and "пустой текст" in outcome.reason
+    assert len(prs.slides) == 0
+
+
+def _boxes(slide, canvas):
+    return [ref for ref in walk_shapes(slide._element, canvas) if ref.box is not None]
+
+
+def test_third_icon_of_an_unrecognised_unit_goes_with_its_column(profile, deck):
+    """Наблюдение 8.4: у `slide26` майнинг собрал повтор из двух тезисов,
+    третий тезис стал `body`, а его иконка получила `repeat_index=2` при
+    `repeat.count=2`. При двух заполненных тезисах третья колонка уходит
+    целиком: и иконка-декор, и кружок-картинка, и тезис примера."""
+    prs, sources = deck
+    pattern = _pattern(profile, "slide26")
+    assert pattern.repeat.count == 2 and any(d.repeat_index >= pattern.repeat.count for d in pattern.decor)
+    canvas = _canvas(profile)
+
+    outcome = builder.place_slide_by_clone(prs, _cards_spec(2), pattern, profile, AuditConfig.load(), sources[26])
+
+    assert outcome.reason is None
+    third = [r for r in _boxes(prs.slides[-1], canvas) if 0.6 < r.box.left < 1.0 and r.box.top > 0.3]
+    assert third == [], [(r.kind, r.box) for r in third]
+    icons = [r for r in _boxes(prs.slides[-1], canvas) if r.kind == "picture"]
+    assert len(icons) == 3  # иконка первой единицы, кружок и иконка второй
+
+
+def test_unit_columns_of_filled_cards_survive_on_slide21(profile, deck):
+    prs, sources = deck
+    canvas = _canvas(profile)
+
+    outcome = builder.place_slide_by_clone(
+        prs, _cards_spec(3), _pattern(profile, "slide21"), profile, AuditConfig.load(), sources[21],
+    )
+
+    assert outcome.reason is None
+    lefts = sorted({round(r.box.left, 2) for r in _boxes(prs.slides[-1], canvas) if r.box.top > 0.3})
+    assert lefts == [0.05, 0.28, 0.5]

@@ -92,6 +92,48 @@ KINDS = ("cards", "two_col", "kpi", "section", "image", "table", "bullets")
 _HEADLINE_EXEMPT_KINDS = frozenset({"section", "image"})
 
 
+# Постоянный текст шаблона («Спасибо за внимание!», «Вопросы?») короткий и
+# обращён к зрителю. Модель же метит флагом `fixed` и инструкции дизайнера
+# («Точки используются для навигации. Число разделов = число точек»,
+# «Вставить фото»), и такой текст оставался на готовом слайде (наблюдение
+# 8.2, 27 сентября 2026). Флаг модели поэтому принимается, только если
+# текст примера проходит детерминированный фильтр ниже: не длиннее четырёх
+# слов, без повелительного наклонения и без слов подсказок дизайнера.
+FIXED_MAX_WORDS = 4
+# Основы слов, которыми дизайнер пишет подсказки к макету. Сравнение по
+# началу слова: «точки», «точек»; «используются», «используйте». Вторая
+# строка: рыба, которую промпт схемы и так запрещает метить `fixed`.
+_DESIGNER_HINT_STEMS = (
+    "нажм", "встав", "использ", "точк", "точе", "пример", "шаблон", "здесь", "текст", "заголов",
+    "фамил", "должност", "назван", "lorem", "ipsum",
+)
+# Повелительное наклонение на «вы»: «нажмите», «вставьте», «замените».
+# Единственное число («нажми») встречается в подсказках реже, и его ловят
+# основы выше.
+_IMPERATIVE_RE = re.compile(r"\w+(?:ите|йте|ьте)")
+_WORD_RE = re.compile(r"\w+(?:-\w+)*")
+
+
+def is_fixed_phrase(text: str | None) -> bool:
+    """Может ли текст примера быть постоянным текстом шаблона, а не
+    подсказкой дизайнера или рыбой. Общая проверка для схемы слотов
+    (`vision_kind.validate_slot_schema`) и для сборки (`keeps_sample_text`):
+    кеш, записанный до фильтра, тоже не оставит подсказку на слайде."""
+    words = _WORD_RE.findall((text or "").lower())
+    if not words or len(words) > FIXED_MAX_WORDS:
+        return False
+    if any(w.startswith(_DESIGNER_HINT_STEMS) for w in words):
+        return False
+    return not any(_IMPERATIVE_RE.fullmatch(w) for w in words)
+
+
+def keeps_sample_text(slot) -> bool:
+    """Место, куда содержание не кладётся и где остаётся текст примера:
+    порядковый номер или постоянный текст, прошедший `is_fixed_phrase`.
+    Принимает и `PatternSlot`, и его JSON-зеркало."""
+    return bool(slot.ordinal) or (bool(slot.fixed) and is_fixed_phrase(slot.sample_text))
+
+
 @dataclass(frozen=True)
 class PatternSlot:
     """Один параметрический слот раскладки — место под один кусок будущего
@@ -132,6 +174,10 @@ class PatternSlot:
     max_words: int | None = None
     ordinal: bool = False
     fixed: bool = False
+    # Уверенность модели в схеме этого места (0..1, `vision_kind.
+    # validate_slot_schema` по ней решает, какие поля принять). `None`:
+    # модель не спрашивали.
+    schema_confidence: float | None = None
     # `p:cNvPr/@id` фигуры слайда-примера, с которой снят слот. Клон
     # (`compose.clone.match_slots`) находит по нему фигуру прямо, а не
     # угадывает по совпадению коробок: коробку слота сдвигает притяжка к
@@ -144,7 +190,7 @@ class PatternSlot:
     @property
     def keeps_sample_text(self) -> bool:
         """Место, куда содержание не кладётся: текст примера остаётся."""
-        return self.ordinal or self.fixed
+        return keeps_sample_text(self)
 
 
 @dataclass(frozen=True)
@@ -1793,7 +1839,7 @@ def chars_per_item(slots) -> int:
     return max(
         (
             slot_char_capacity(s) for s in slots
-            if s.role in _BODY_LIKE_ROLES and not (s.ordinal or s.fixed)
+            if s.role in _BODY_LIKE_ROLES and not keeps_sample_text(s)
         ),
         default=0,
     )

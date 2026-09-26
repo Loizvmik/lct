@@ -28,10 +28,10 @@ from pptx.enum.text import MSO_ANCHOR
 from pptx.util import Emu, Pt
 
 from deckforge.audit.config import AuditConfig
-from deckforge.audit.deterministic import audit_slide_layout
+from deckforge.audit.deterministic import audit_slide_layout, slide_fill_ratio
 from deckforge.compose.blocks import (
     DROPPED_ROLE_TITLES, Paragraph, SlotContent, assign_content, assign_content_with_drops,
-    expand_decor, filled_repeat_units, find_bullet_char,
+    expand_decor, filled_repeat_units, find_bullet_char, unfilled_unit_test,
 )
 from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.colorpick import slide_background_luminance
@@ -435,7 +435,7 @@ def _placeholder_is_empty(shape) -> bool:
     (см. докстроку раздела) — проверка на текст/картинку, а не безусловное
     удаление, оставлена честно: если однажды появится путь, кладущий
     контент прямо в плейсхолдер, эта функция не снесёт его."""
-    if shape.has_text_frame and shape.text_frame.text.strip():
+    if shape.has_text_frame and shape.text_frame.text.strip().strip(_INVISIBLE_CHARS).strip():
         return False
     if shape._element.findall(".//" + qn("a:blip")):
         return False
@@ -1286,13 +1286,49 @@ def _place_best_candidate(
     notes: list[str] = []
     best: tuple[int, Pattern, list[str]] | None = None  # (число находок, паттерн, коды находок)
 
+    # Заполненность клона (D05) не повод его отклонять: сборка с нуля на том
+    # же содержании даёт тот же белый лист, только без оформления шаблона.
+    # Но и принимать первый пустоватый клон, когда следующий кандидат лёг
+    # бы плотнее, незачем (наблюдение 8.1: два коротких пункта на две
+    # колонки). Клон ниже порога запоминается с его заполненностью, перебор
+    # идёт дальше; первый клон не ниже порога принимается сразу, а если
+    # таких нет, берётся самый заполненный из принятых. Героический слайд
+    # (титул, разделитель: один заголовок без блоков и визуала) пуст по
+    # замыслу, и его заполненность не судится вовсе: иначе выбор раскладки
+    # разделителя решали бы доли процента разницы в длине заголовка.
+    heroic = not slide_spec.blocks and slide_spec.visual is None
+    fill_min = 0.0 if heroic else audit_config.density.fill_ratio_min
+    underfilled: list[tuple[float, Pattern]] = []
     for pattern in tried:
         cloned = _try_clone(
             prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
             bullet_char=bullet_char, user_photos=user_photos,
         )
-        if cloned is not None:
-            notes.extend(cloned)
+        if cloned is None:
+            continue
+        clone_notes, fill = cloned
+        if fill >= fill_min:
+            notes.extend(clone_notes)
+            return pattern, notes
+        _remove_last_slide(prs)
+        underfilled.append((fill, pattern))
+        notes.append(
+            f"Слайд {slide_spec.index}: клон раскладки {pattern.pattern_id!r} заполнен на {fill:.0%} "
+            f"(порог {fill_min:.0%}) — ищем раскладку плотнее."
+        )
+    if underfilled:
+        fill, pattern = max(underfilled, key=lambda item: item[0])
+        rebuilt = _try_clone(
+            prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
+            bullet_char=bullet_char, user_photos=user_photos,
+        )
+        if rebuilt is not None:
+            clone_notes, fill = rebuilt
+            notes.extend(clone_notes)
+            notes.append(
+                f"Слайд {slide_spec.index}: слайд заполнен на {fill:.0%}: содержания мало для любой "
+                f"раскладки (выбран самый заполненный клон, {pattern.pattern_id!r})."
+            )
             return pattern, notes
 
     for attempt, pattern in enumerate(tried, start=1):
@@ -1387,11 +1423,14 @@ def _try_clone(
     prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, source_slides: dict[int, object] | None, notes: list[str],
     *, bullet_char: str, user_photos: dict[str, Path] | None,
-) -> list[str] | None:
+) -> tuple[list[str], float] | None:
     """Пробует собрать слайд клоном примера раскладки `pattern`. Успех:
     клон собрался (все слоты с содержимым нашли свою фигуру) и прошёл тот же
-    аудит, что и сборка с нуля (`audit_slide_layout`, L01-L04, D05): тогда
-    слайд остаётся в колоде, а функция отдаёт находки для `slide_spec`.
+    аудит, что и сборка с нуля (`audit_slide_layout`, L01-L04; D05 не
+    отклоняет, см. `_clone_errors`): тогда слайд остаётся в колоде, а
+    функция отдаёт находки для `slide_spec` и заполненность слайда (то же
+    число, что судит D05), по которой `_place_best_candidate` выбирает
+    между принятыми клонами.
     Неудача: слайд убран, причина дописана в `notes`, возвращается `None`
     и вызывающий пробует клон следующего кандидата, а с нуля собирает,
     только когда не принят ни один клон."""
@@ -1416,11 +1455,12 @@ def _try_clone(
             audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index),
         )
         if not errors:
+            fill = slide_fill_ratio(prs.slides[-1], canvas, profile, index=slide_spec.index)
             return [
                 f"Слайд {slide_spec.index}: собран клоном слайда-примера №{number} шаблона "
                 f"(раскладка {pattern.pattern_id!r}).",
                 *trial_spec.findings,
-            ]
+            ], fill
         _remove_last_slide(prs)
         ids = sorted({f.check_id for f in errors})
         reason = f"аудит нашёл {len(errors)} ошибок уровня ошибки: {', '.join(ids)}"
@@ -1435,7 +1475,9 @@ def _clone_errors(findings: list) -> list:
     """Находки аудита, которые отклоняют клон: всё, кроме заполненности
     холста (D05). У клона она та же, что у примера, минус незаполненные
     единицы повтора: пустоватый титул в стиле шаблона лучше полного, но
-    белого листа, который даёт сборка с нуля. Остальное (выход за край,
+    белого листа, который даёт сборка с нуля. Заполненность при этом не
+    забыта: между принятыми клонами выбирает `_place_best_candidate`,
+    предпочитая клон не ниже порога D05. Остальное (выход за край,
     наложения, переполнение рамки) судится строго, и по фигурам примера
     тоже: итоговый аудит колоды не различает, кто нарисовал фигуру, и
     слайд, который он забракует, лучше собрать с нуля (так на VK
@@ -1475,6 +1517,13 @@ def place_slide_by_clone(
             )
             continue
         clean.append(content)
+    blank = next((c for c in clean if not _visible_text(c)), None)
+    if blank is not None:
+        # Пустая привязка оставила бы фигуру примера без текста: плейсхолдер
+        # в PowerPoint показывает подсказку «Нажмите дважды», а заголовок
+        # разделителя выходит пустым (наблюдение 8.2). Такой клон честнее
+        # отклонить, чем собрать с пустым местом.
+        return CloneOutcome(f"слот «{blank.role_hint}» получил пустой текст")
     visual = slide_spec.visual
     table_rows = visual.table.rows if visual is not None and visual.kind == "table" and visual.table else None
     table_slot = _visual_slot(pattern, "table") if table_rows else None
@@ -1516,18 +1565,33 @@ def place_slide_by_clone(
     if native_frame is not None:
         keep.append(native_frame)
     filled = filled_repeat_units(pattern, native)
-    kept_decor = expand_decor(pattern, None, grid, filled)
+    # Колонка единицы повтора, в которую ничего не легло, уходит целиком,
+    # даже если майнинг не узнал в ней единицу (`unfilled_unit_test`):
+    # иначе при двух тезисах из трёх третья иконка стоит без текста.
+    orphan = unfilled_unit_test(pattern, filled, occupied=[content.slot.box for content, _ in bound])
+    kept_decor = [d for d in expand_decor(pattern, None, grid, filled) if not orphan(d.box)]
     kept_ids = {id(d) for d in kept_decor}
     bound_slots = {id(content.slot) for content, _ in bound}
     for slot in _sample_text_slots(pattern, filled):
         ref = matched.get(index_of[id(slot)])
-        if id(slot) not in bound_slots and ref is not None:
+        if id(slot) not in bound_slots and ref is not None and not orphan(slot.box):
             bound_slots.add(id(slot))
             keep.append(ref.element)
+    # Картинка примера вне повтора остаётся оформлением (`_place_visual_on_
+    # clone`), а в колонке пустой единицы она осиротевшая иконка. Место,
+    # куда ляжет фото пользователя, не трогается.
+    visual_targets = (
+        {id(_visual_slot(pattern, "image")), id(_visual_slot(pattern, "icon"))}
+        if slide_spec.visual is not None and slide_spec.visual.kind in ("photo", "icon") else set()
+    )
     prune_unfilled(
         slide,
         [d for d in pattern.decor if id(d) not in kept_ids],
-        [s for s in pattern.slots if id(s) not in bound_slots and s.role not in _CLONE_PICTURE_ROLES],
+        [
+            s for s in pattern.slots
+            if id(s) not in bound_slots
+            and (s.role not in _CLONE_PICTURE_ROLES or (orphan(s.box) and id(s) not in visual_targets))
+        ],
         canvas, keep=keep, protect=[d.box for d in kept_decor],
     )
     remove_stray_text(slide, canvas, keep=keep, badge_boxes=[d.box for d in kept_decor if d.badge_text])
@@ -1545,6 +1609,15 @@ def place_slide_by_clone(
     _note_drops(slide_spec, pattern, drops)
     mark_slide(slide, CLONE_MARK_PREFIX + pattern.pattern_id)
     return CloneOutcome(None)
+
+
+# Символы нулевой ширины: `str.strip` их не срезает, а на слайде они
+# невидимы, и текст из одних таких символов для глаза пуст.
+_INVISIBLE_CHARS = "​‌‍⁠﻿"
+
+
+def _visible_text(content: SlotContent) -> str:
+    return "".join(p.text for p in content.paragraphs).strip().strip(_INVISIBLE_CHARS).strip()
 
 
 def _native_repeat_contents(pattern: Pattern, contents: list[SlotContent]) -> list[SlotContent] | None:
@@ -1977,7 +2050,7 @@ def _pattern_from_model(model) -> Pattern:
             align=s.align, max_chars=s.max_chars, wraps=s.wraps, sample_text=s.sample_text,
             anchor=s.anchor, purpose=s.purpose, content_hint=s.content_hint,
             max_words=s.max_words, ordinal=s.ordinal, fixed=s.fixed,
-            source_shape_id=s.source_shape_id,
+            schema_confidence=s.schema_confidence, source_shape_id=s.source_shape_id,
         )
         for s in model.slots
     ]

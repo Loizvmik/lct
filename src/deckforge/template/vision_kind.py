@@ -256,7 +256,7 @@ from PIL import Image, ImageDraw, ImageFont
 from deckforge.provider.base import VisionProvider
 from deckforge.provider.yandex import JSON_ONLY_NUDGE
 from deckforge.render.soffice import RenderError, to_pngs
-from deckforge.template.patterns import Pattern
+from deckforge.template.patterns import Pattern, is_fixed_phrase
 
 AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "pattern-kind-vision" / "AGENT.md"
 KINDS_CONFIG_PATH = Path(__file__).resolve().parents[3] / "config" / "pattern-kinds.yaml"
@@ -721,6 +721,16 @@ _SCHEMA_SKIP_ROLES = frozenset({"image", "icon", "chart", "table"})
 # навсегда запереть рабочий слот текстом шаблона.
 _ORDINAL_MAX_SAMPLE_CHARS = 3
 
+# Пороги уверенности модели (`confidence` на место, 0..1). Флаги `ordinal`
+# и `fixed` запирают место текстом примера навсегда, и ошибка в них видна
+# на каждом слайде этой раскладки, поэтому для них порог строже. Описание
+# места (`purpose`, `content_hint`, `max_words`) только подсказывает
+# писателю, и промах стоит меньше. Ниже порога поле остаётся пустым: лучше
+# «неизвестно», чем уверенно неправильно. Ответ без `confidence` считается
+# нулевой уверенностью по тому же принципу.
+_FLAG_MIN_CONFIDENCE = 0.8
+_DESCRIPTION_MIN_CONFIDENCE = 0.5
+
 # Разумные пределы `max_words`: меньше одного слова не бывает, а больше
 # восьмидесяти на одно место слайда не пишут (это уже страница текста).
 # Число вне пределов значит, что модель не поняла вопрос, и поле
@@ -805,6 +815,15 @@ def _clean_phrase(value) -> str | None:
     return text
 
 
+def _confidence(value) -> float | None:
+    """Уверенность модели в описании места: число от 0 до 1 или `None`,
+    если поля нет или оно не число."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if 0.0 <= value <= 1.0 else None
+
+
 def validate_slot_schema(pattern, answer: dict) -> tuple[dict[int, dict], list[str]]:
     """Проверяет ответ модели по одному паттерну. Возвращает (индекс слота
     с нуля -> принятые поля, заметки об отброшенном).
@@ -826,21 +845,33 @@ def validate_slot_schema(pattern, answer: dict) -> tuple[dict[int, dict], list[s
             continue
         slot = pattern.slots[index - 1]
         fields: dict = {}
-        purpose = _clean_phrase(entry.get("purpose"))
-        if purpose is not None:
-            fields["purpose"] = purpose
-        hint = _clean_phrase(entry.get("content_hint"))
-        if hint is not None:
-            fields["content_hint"] = hint
-        words = entry.get("max_words")
-        if isinstance(words, int) and not isinstance(words, bool):
-            if _MAX_WORDS_RANGE[0] <= words <= _MAX_WORDS_RANGE[1]:
-                fields["max_words"] = words
-            else:
-                notes.append(f"{pattern.pattern_id}: место {index}: max_words={words} вне пределов — не принято.")
+        confidence = _confidence(entry.get("confidence"))
+        if confidence is None:
+            notes.append(f"{pattern.pattern_id}: место {index}: нет уверенности (confidence) — схема места не принята.")
+            continue
+        fields["schema_confidence"] = confidence
+        if confidence >= _DESCRIPTION_MIN_CONFIDENCE:
+            purpose = _clean_phrase(entry.get("purpose"))
+            if purpose is not None:
+                fields["purpose"] = purpose
+            hint = _clean_phrase(entry.get("content_hint"))
+            if hint is not None:
+                fields["content_hint"] = hint
+            words = entry.get("max_words")
+            if isinstance(words, int) and not isinstance(words, bool):
+                if _MAX_WORDS_RANGE[0] <= words <= _MAX_WORDS_RANGE[1]:
+                    fields["max_words"] = words
+                else:
+                    notes.append(f"{pattern.pattern_id}: место {index}: max_words={words} вне пределов — не принято.")
         sample = (slot.sample_text or "").strip()
+        flags_trusted = confidence >= _FLAG_MIN_CONFIDENCE
         if entry.get("ordinal") is True:
-            if len(sample) <= _ORDINAL_MAX_SAMPLE_CHARS:
+            if not flags_trusted:
+                notes.append(
+                    f"{pattern.pattern_id}: место {index}: уверенность {confidence:.2f} ниже "
+                    f"{_FLAG_MIN_CONFIDENCE} — ordinal не принят."
+                )
+            elif len(sample) <= _ORDINAL_MAX_SAMPLE_CHARS:
                 fields["ordinal"] = True
             else:
                 notes.append(
@@ -849,11 +880,23 @@ def validate_slot_schema(pattern, answer: dict) -> tuple[dict[int, dict], list[s
                 )
         if entry.get("fixed") is True:
             # Постоянный текст без текста не бывает: пустое место, объявленное
-            # неизменным, просто навсегда осталось бы пустым.
-            if sample:
-                fields["fixed"] = True
-            else:
+            # неизменным, просто навсегда осталось бы пустым. Подсказка
+            # дизайнера («Точки используются для навигации») постоянным
+            # текстом не бывает тоже (`patterns.is_fixed_phrase`).
+            if not flags_trusted:
+                notes.append(
+                    f"{pattern.pattern_id}: место {index}: уверенность {confidence:.2f} ниже "
+                    f"{_FLAG_MIN_CONFIDENCE} — fixed не принят."
+                )
+            elif not sample:
                 notes.append(f"{pattern.pattern_id}: место {index} пусто в примере — fixed не принят.")
+            elif not is_fixed_phrase(sample):
+                notes.append(
+                    f"{pattern.pattern_id}: место {index}: «{sample[:30]}» похоже на подсказку "
+                    "дизайнера или рыбу, а не на постоянный текст — fixed не принят."
+                )
+            else:
+                fields["fixed"] = True
         if fields:
             accepted[index - 1] = fields
     return accepted, notes

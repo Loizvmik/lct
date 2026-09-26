@@ -1192,7 +1192,7 @@ def _record_paths(monkeypatch, accept_clone_of: str | None) -> list[tuple[str, s
 
     def fake_clone(prs, slide_spec, pattern, *args, **kwargs):
         calls.append(("clone", pattern.pattern_id))
-        return ["клон принят"] if pattern.pattern_id == accept_clone_of else None
+        return (["клон принят"], 1.0) if pattern.pattern_id == accept_clone_of else None
 
     real_place = builder.place_slide
 
@@ -1234,3 +1234,85 @@ def test_scratch_build_starts_only_after_all_clones_failed(monkeypatch):
     assert calls[:2] == [("clone", "first"), ("clone", "second")]
     assert calls[2:] and all(path == "scratch" for path, _ in calls[2:])
     assert len(prs.slides) == 1
+
+
+def _record_fills(monkeypatch, fills: dict[str, float]) -> list[tuple[str, str]]:
+    """Клон каждой раскладки принимается аудитом и кладёт на слайд пустой
+    слайд-заглушку; заполненность берётся из `fills`. Сборка с нуля
+    записывается, как в `_record_paths`."""
+    from deckforge.compose import builder
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_clone(prs, slide_spec, pattern, *args, **kwargs):
+        calls.append(("clone", pattern.pattern_id))
+        prs.slides.add_slide(prs.slide_layouts[0])
+        return [f"клон {pattern.pattern_id}"], fills[pattern.pattern_id]
+
+    real_place = builder.place_slide
+
+    def fake_place(prs, slide_spec, pattern, *args, **kwargs):
+        calls.append(("scratch", pattern.pattern_id))
+        return real_place(prs, slide_spec, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(builder, "_try_clone", fake_clone)
+    monkeypatch.setattr(builder, "place_slide", fake_place)
+    return calls
+
+
+def _sparse_bullets() -> SlideSpec:
+    return SlideSpec(
+        index=2, kind="bullets", headline="98,5% времени заявка ждёт",
+        blocks=[BulletBlock(items=["Сквозная медиана: 31,5 ч", "Чистое время работы: 28 мин"])],
+    )
+
+
+def test_heroic_slide_takes_the_first_clone_whatever_its_fill(monkeypatch):
+    """Разделитель пуст по замыслу: его заполненность не судится, и выбор
+    раскладки не отдаётся долям процента."""
+    patterns = [_clean_section_pattern(n) for n in ("a", "b")]
+    slide_spec = SlideSpec(index=2, kind="section", headline="Дальше — цифры")
+    prs, canvas, audit_config = _new_deck_in_progress()
+    calls = _record_fills(monkeypatch, {"a": 0.05, "b": 0.1})
+
+    chosen, notes = _place_best_candidate(prs, slide_spec, patterns, PROFILE, canvas, audit_config)
+
+    assert chosen.pattern_id == "a" and calls == [("clone", "a")]
+    assert not any("содержания мало" in n for n in notes)
+
+
+def test_underfilled_clone_is_kept_in_reserve_while_a_denser_one_is_searched(monkeypatch):
+    """Наблюдение 8.1: пустоватый клон (два пункта по четыре слова на две
+    колонки) принимался сразу. Теперь перебор идёт дальше, и первый клон
+    не ниже порога D05 выигрывает."""
+    names = ("sparse", "dense", "third")
+    patterns = [_clean_section_pattern(n) for n in names]
+    slide_spec = _sparse_bullets()
+    prs, canvas, audit_config = _new_deck_in_progress()
+    calls = _record_fills(monkeypatch, {"sparse": 0.08, "dense": 0.4, "third": 0.6})
+
+    chosen, notes = _place_best_candidate(prs, slide_spec, patterns, PROFILE, canvas, audit_config)
+
+    assert chosen.pattern_id == "dense"
+    assert calls == [("clone", "sparse"), ("clone", "dense")]
+    assert len(prs.slides) == 1
+    assert any("заполнен на 8%" in n for n in notes)
+    assert "клон dense" in notes
+
+
+def test_when_every_clone_is_underfilled_the_fullest_wins_and_it_is_reported(monkeypatch):
+    """Все клоны ниже порога: берётся самый заполненный, а не сборка с нуля
+    (на том же содержании она даёт тот же белый лист), и это честно
+    записано в находках."""
+    patterns = [_clean_section_pattern(n) for n in ("a", "b", "c")]
+    slide_spec = _sparse_bullets()
+    prs, canvas, audit_config = _new_deck_in_progress()
+    calls = _record_fills(monkeypatch, {"a": 0.05, "b": 0.18, "c": 0.1})
+
+    chosen, notes = _place_best_candidate(prs, slide_spec, patterns, PROFILE, canvas, audit_config)
+
+    assert chosen.pattern_id == "b"
+    assert not any(path == "scratch" for path, _ in calls)
+    assert calls[-1] == ("clone", "b")
+    assert len(prs.slides) == 1
+    assert any("слайд заполнен на 18%: содержания мало для любой раскладки" in n for n in notes)
