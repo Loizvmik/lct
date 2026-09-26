@@ -172,8 +172,10 @@ paths:
   profile_cache: cache/profiles
 
 render:
-  # Путь к бинарнику soffice. Если не задан — автопоиск по типичным путям
-  # macOS (Homebrew, /Applications) и через PATH.
+  # Путь к бинарнику soffice. Если не задан — сначала PATH (на Ubuntu после
+  # `apt install libreoffice-impress` бинарник там и находится), затем
+  # типичные пути macOS (Homebrew, /Applications) как запасной вариант —
+  # см. `RenderConfig.resolve_soffice` в settings.py.
   soffice_path: null
   # dpi рендера слайдов-примеров под уточнение вида раскладки моделью
   # (`template.vision_kind`) — см. обоснование и живой замер в докстроке
