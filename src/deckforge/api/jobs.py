@@ -23,14 +23,16 @@ import json
 import hashlib
 import shutil
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from deckforge.audit.autofix import SUPPORTED_CHECKS, apply_fixes
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
+from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.findings import Finding
 from deckforge.compose.builder import build_deck
 from deckforge.export.bundle import export_bundle
@@ -183,6 +185,10 @@ class VariantState:
     # ручной починки (`fix_deck`) детерминированный аудит пересчитывается, а
     # модель заново не спрашивают, и её находки иначе бы пропали.
     visual_findings: list[Finding] = field(default_factory=list)
+    # Задача T: метрики верности шаблону на вариант — снимок
+    # (`dataclasses.asdict(FidelityReport)`) для `api.app._variant_summary`,
+    # посчитан в `_export_variant` рядом с экспортом (см. её докстроку).
+    fidelity: dict | None = None
 
     def set_findings(self, findings: list[Finding]) -> None:
         self.findings = findings + self.visual_findings
@@ -530,9 +536,14 @@ async def _visual_audit_dense(job: JobRecord, profile: TemplateProfile, sources:
     # пошёл, тоже часть отчёта задачи L, не только оценки модели.
     if state.html_path is not None:
         try:
+            # `state.fidelity` — уже снятый слепок (`_export_variant`), не
+            # пересчитывается здесь заново: тот же приём, что и с оценками
+            # PPTEval, — перерисовка HTML не должна повторять дорогую работу.
+            fidelity_obj = SimpleNamespace(**state.fidelity) if state.fidelity else None
             await asyncio.to_thread(
                 to_html_report, state.deck_spec, profile, state.pptx_path, state.html_path,
                 visual=outcome.result, budget=job.budget.summary(), risky_slides=summary.get("risk"),
+                fidelity=fidelity_obj,
             )
         except Exception:  # noqa: BLE001: HTML без оценок лучше, чем упавшее задание
             pass
@@ -547,8 +558,19 @@ async def _export_variant(job: JobRecord, variant_name: str, profile: TemplatePr
     # audit_dense`, перерисовав HTML dense-варианта заново, когда аудит
     # реально пройдёт.
     budget_summary = job.budget.summary() if job.budget is not None else None
+    # Задача T: метрики верности шаблону — рядом с экспортом (не отдельная
+    # стадия пайплайна), необязательны для готовой колоды: сбой метрики не
+    # должен ронять экспорт (та же честная деградация, что и у остальных
+    # необязательных шагов этого файла).
+    fidelity_report = None
+    try:
+        fidelity_report = await asyncio.to_thread(template_fidelity, state.pptx_path, state.deck_spec, profile)
+        state.fidelity = asdict(fidelity_report)
+    except Exception:  # noqa: BLE001 — метрика необязательна, экспорт не вправе упасть из-за неё
+        state.fidelity = None
     bundle = await asyncio.to_thread(
         export_bundle, state.pptx_path, profile, out_dir, deck_spec=state.deck_spec, budget=budget_summary,
+        fidelity=fidelity_report,
     )
     state.pdf_path = bundle.pdf
     state.html_path = bundle.html

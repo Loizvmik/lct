@@ -54,6 +54,7 @@ def export_bundle(
     pptx_path: Path, profile: TemplateProfile, out_dir: Path, *,
     deck_spec: DeckSpec | None = None, preview_dpi: int = DEFAULT_PREVIEW_DPI,
     budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
+    fidelity: "FidelityReport | None" = None,
 ) -> Bundle:
     pptx_path = Path(pptx_path)
     out_dir = Path(out_dir)
@@ -69,7 +70,7 @@ def export_bundle(
     spec = deck_spec if deck_spec is not None else DeckSpec(title=pptx_path.stem, language="ru", slides=[])
     html_result = to_html_report(
         spec, profile, pptx_path, out_dir / f"{pptx_path.stem}.html",
-        budget=budget, risky_slides=risky_slides,
+        budget=budget, risky_slides=risky_slides, fidelity=fidelity,
     )
 
     return Bundle(
