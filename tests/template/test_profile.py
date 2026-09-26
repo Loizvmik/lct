@@ -793,3 +793,52 @@ def test_source_shape_ids_survive_the_json_roundtrip():
     assert slots and all(s.source_shape_id for s in slots)
     assert decor and all(d.source_shape_id for d in decor)
     assert restored == profile
+
+
+# --- Задача T: раздельный кэш разбора — бамп только модельной версии не
+# должен заново запускать детерминированный разбор (геометрию), только
+# кеш комбинированного профиля. ---
+
+
+def test_bumping_the_combined_version_reuses_the_deterministic_cache_without_remining(tmp_path, monkeypatch):
+    """Тот же сценарий, что `test_stale_cache_with_an_older_schema_version_
+    triggers_a_fresh_parse` (комбинированный кеш инвалидирован сменой
+    версии), но здесь версия НЕ старее, а просто ДРУГАЯ — ровно то, что
+    происходит на бампе `MODEL_SCHEMA_VERSION` (сам бамп в проде задан
+    константой в коде, здесь подменяется монки для изоляции теста от
+    привязки к конкретному числу). Деterministic-кеш (свой файл, версия
+    независима) обязан пережить эту смену: геометрия не должна пересчитываться,
+    только `collect_usage`/именование палитры (см. докстроку
+    `DeterministicProfile`)."""
+    from deckforge.template import profile as profile_module
+
+    cache_dir = tmp_path / "cache"
+    path = TEMPLATES_DIR / "VK Tech шаблон.pptx"
+
+    first = TemplateProfile.from_file(path, cache_dir=cache_dir)  # без модели вовсе
+
+    # Симулируем бамп версии модельной части: комбинированная версия
+    # меняется (другой файл кеша), детерминированная — нет.
+    monkeypatch.setattr(
+        profile_module, "PROFILE_SCHEMA_VERSION", profile_module.PROFILE_SCHEMA_VERSION + 1000,
+    )
+
+    def _must_not_be_called(*args, **kwargs):
+        raise AssertionError("геометрия перемайнена заново на бампе только модельной версии")
+
+    for name in ("mine_patterns", "build_grid", "build_layout_catalog", "build_asset_catalog", "build_shape_vocabulary"):
+        monkeypatch.setattr(f"deckforge.template.profile.{name}", _must_not_be_called)
+
+    started = time.monotonic()
+    second = TemplateProfile.from_file(path, cache_dir=cache_dir)
+    elapsed = time.monotonic() - started
+
+    assert second.layouts == first.layouts
+    assert second.patterns == first.patterns
+    assert second.grid == first.grid
+    assert second.type_scale == first.type_scale
+    assert second.shape_vocabulary == first.shape_vocabulary
+    # `test_parsing_is_fast_enough` даёт полному разбору без модели 30с с
+    # большим запасом — кеш-хит детерминированной части обязан быть намного
+    # быстрее полного разбора, не только уложиться в тот же бюджет.
+    assert elapsed < 10, f"кеш-хит детерминированной части занял {elapsed:.2f}с — геометрия пересчитана?"
