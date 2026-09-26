@@ -195,7 +195,9 @@ def _slots_by_role(pattern: Pattern, slide_spec: SlideSpec) -> dict[str, list[Pa
     repeat_roles = set(pattern.repeat.slot_roles) if (pattern.repeat is not None and reserved_for_repeat) else set()
     by_role: dict[str, list[PatternSlot]] = {}
     for slot in pattern.slots:
-        if slot.role in repeat_roles:
+        # Номер шага и постоянный текст шаблона (схема слотов от модели,
+        # `PatternSlot.keeps_sample_text`) содержания не получают вовсе.
+        if slot.role in repeat_roles or slot.keeps_sample_text:
             continue
         by_role.setdefault(slot.role, []).append(slot)
     # Task 9 повторное ревью, находка №2 ("важное"): слоты одной роли не
@@ -313,7 +315,7 @@ def _spread_bullets_over_repeat(
     result: list[SlotContent] = []
     used: set[int] = set()
     for item, group in zip(items, groups):
-        body_slot = _pick_body_slot(group)
+        body_slot = _pick_body_slot(_open_slots(group))
         if body_slot is None:
             return None  # единица повтора без места под текст — приём не годится
         result.append(SlotContent(body_slot, "card_body", [Paragraph(item)]))
@@ -339,6 +341,7 @@ def _assign_cards(
     lost_titles: list[str] = []
     lost_bodies: list[str] = []
     for card, group in zip(block.items, groups):
+        group = _open_slots(group)
         body_slot = _pick_body_slot(group)
         has_title_slot = any(slot.role == "card_title" for slot in group)
         for slot in group:
@@ -378,6 +381,17 @@ def _assign_cards(
 # одну-две цифры, и «71 заявка» ломалось переносом на «71 / заяв / ка».
 # Такой слот годится под заголовок карточки только если тот в него влезает,
 # а решать это должен замер, а не роль.
+
+
+def _open_slots(group: list[PatternSlot]) -> list[PatternSlot]:
+    """Слоты единицы повтора, куда можно класть содержание. Кружок с
+    номером шага модель помечает `ordinal` (схема слотов при разборе
+    шаблона): геометрически он неотличим от заголовка карточки, и без
+    пометки заголовок «71 заявка» ломался переносом в кружке под одну цифру
+    (см. комментарий выше). Помеченный слот остаётся с текстом примера,
+    а заголовок карточки уходит жирным абзацем в тело, как у единицы без
+    слота под заголовок."""
+    return [s for s in group if not s.keeps_sample_text]
 
 
 def _pick_body_slot(group: list[PatternSlot]) -> PatternSlot | None:

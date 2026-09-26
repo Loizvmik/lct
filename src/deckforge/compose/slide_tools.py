@@ -63,6 +63,27 @@ def _holds(pattern) -> list[str]:
     return sorted(name for name, needed in _HOLDS.items() if roles.intersection(needed))
 
 
+def _slot_guide(pattern) -> list[dict]:
+    """Что писать в каждое место раскладки: схема слотов, которую модель
+    сняла при разборе шаблона (`purpose`, `content_hint`, `max_words`).
+    Без неё писатель знал только вместимость в знаках и не мог понять, что
+    узкое место над карточкой — номер шага, а широкое под ним — описание.
+    Номера и постоянный текст шаблона не отдаются: писать туда нечего.
+    Одинаковые описания карточек одного ряда сливаются в одно, иначе
+    шесть карточек дали бы шесть одинаковых строк. Без схемы — пусто."""
+    guide: list[dict] = []
+    seen: set[tuple] = set()
+    for slot in pattern.slots:
+        if slot.keeps_sample_text or slot.purpose is None:
+            continue
+        key = (slot.purpose, slot.content_hint, slot.max_words)
+        if key in seen:
+            continue
+        seen.add(key)
+        guide.append({"purpose": slot.purpose, "content_hint": slot.content_hint, "max_words": slot.max_words})
+    return guide
+
+
 def list_layouts(profile: TemplateProfile, *, kind: str | None = None) -> list[dict]:
     """Каталог раскладок шаблона в том виде, в каком его читает агент.
 
@@ -91,6 +112,7 @@ def list_layouts(profile: TemplateProfile, *, kind: str | None = None) -> list[d
             "max_cols": cap.max_cols,
             "max_series": cap.max_series,
             "is_dark": pattern.is_dark,
+            "places": _slot_guide(pattern),
         })
     out.sort(key=lambda row: (row["kind"], -row["max_items"], row["layout_id"]))
     return out

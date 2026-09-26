@@ -56,6 +56,10 @@ class LLMRoles(BaseModel):
     # `pattern_kind` выше, роль новая и не обязана быть расписана в старых
     # конфигах (`model_for` падает на `self.model` без явной записи).
     photo_picker: str | None = None
+    # Задача F: схема слотов раскладки по превью слайда-примера
+    # (`template.vision_kind.describe_pattern_slots`), мультимодальная роль,
+    # необязательная тем же приёмом, что и `pattern_kind`.
+    pattern_schema: str | None = None
 
 
 class LLMConfig(BaseModel):
@@ -93,6 +97,9 @@ class LLMConfig(BaseModel):
     # patterns`) — короткий дедлайн вызова, свой параллелизм и бюджет всего
     # шага; происхождение чисел см. в app.yaml. Со значениями по умолчанию
     # по той же причине, что и поля выше.
+    # Задача F: сколько паттернов описывает модель одновременно при снятии
+    # схемы слотов. Дефолт дублирует `vision_kind.DEFAULT_SCHEMA_MAX_WORKERS`.
+    pattern_schema_max_workers: int = 4
     pattern_picker_deadline_seconds: float = 20.0
     pattern_picker_max_workers: int = 8
     pattern_picker_step_budget_seconds: float = 40.0

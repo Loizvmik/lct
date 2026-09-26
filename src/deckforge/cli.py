@@ -110,6 +110,13 @@ def _build_pattern_kind_vlm() -> LLMProvider | None:
     return _build_role_provider("pattern_kind")
 
 
+def _build_pattern_schema_vlm() -> LLMProvider | None:
+    """Провайдер схемы слотов раскладки (задача F, роль `pattern_schema`):
+    своя строка в `llm.roles`, чтобы роль можно было перевести на другую
+    модель, не трогая вид раскладки. Без ключа — `None`, схема не снимается."""
+    return _build_role_provider("pattern_schema")
+
+
 def _writer_max_workers() -> int:
     """Число слайдов, чей текст пишется одновременно (`plan.writer.write_
     slides`) — из `config/app.yaml` (`llm.slide_writer_max_workers`, см. её
@@ -137,7 +144,9 @@ def _cmd_parse(args: argparse.Namespace) -> int:
     namer = _build_namer()
     vision = _build_pattern_kind_vlm()
     started = time.monotonic()
-    profile = TemplateProfile.from_file(args.template, namer=namer, vision=vision)
+    profile = TemplateProfile.from_file(
+        args.template, namer=namer, vision=vision, schema=_build_pattern_schema_vlm(),
+    )
     elapsed = time.monotonic() - started
 
     args.output.write_text(profile.to_json(), encoding="utf-8")
@@ -193,7 +202,9 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     writer_llm = _build_role_provider("writer")
 
     started = time.monotonic()
-    profile = TemplateProfile.from_file(args.template, namer=namer, vision=vision)
+    profile = TemplateProfile.from_file(
+        args.template, namer=namer, vision=vision, schema=_build_pattern_schema_vlm(),
+    )
     parsed_at = time.monotonic()
     budget.record("parse", parsed_at - started)
     print(f"{args.template.name}: разобран за {parsed_at - started:.1f}с, паттернов: {len(profile.patterns)}")

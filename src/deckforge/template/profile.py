@@ -25,7 +25,6 @@
 """
 from __future__ import annotations
 import json
-import shutil
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -43,13 +42,15 @@ from deckforge.template.chart_palette import build_chart_series
 from deckforge.template.grid import ColumnAxis, Grid, build_grid
 from deckforge.template.layouts import Background, LayoutEntry, PlaceholderSlot, build_layout_catalog
 from deckforge.template.naming import PaletteNote, name_palette_roles_report
-from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec, mine_patterns
+from deckforge.template.patterns import (
+    Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec, chars_per_item, mine_patterns,
+)
 from deckforge.template.shapes import ShapeVocabEntry, build_shape_vocabulary
 from deckforge.template.store import profile_key
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
 from deckforge.template.typography import TypeScale, build_type_scale
 from deckforge.template.usage import Usage, collect_usage
-from deckforge.template.vision_kind import classify_patterns_by_vision
+from deckforge.template.vision_kind import classify_patterns_by_vision, describe_pattern_slots
 
 # config/app.yaml — единственная точка настройки, как и всё остальное в
 # проекте (см. cli.py: тот же путь, тот же parents[N] от файла до корня
@@ -195,7 +196,13 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # 16 -> 17: `patterns._mine_slide` отбрасывает слайды-листы ассетов
 # (больше `_MAX_DECOR_SHAPES` декоративных фигур). Набор паттернов в старом
 # кеше на один лишний, и без бампа лист иконок так и оставался бы раскладкой.
-PROFILE_SCHEMA_VERSION = 17
+# 17 -> 18: задача F — у `PatternSlotModel` появилась схема места от
+# модели (`purpose`, `content_hint`, `max_words`, `ordinal`, `fixed`), у
+# профиля — признак `pattern_schema_source`, а `Capacity.max_chars_per_item`
+# теперь учитывает `max_words`. Старый кеш прочитался бы молча с пустой
+# схемой и признаком «none», и дозапрос на кеш-хите это бы исправил, но
+# версия бампается по правилу выше: смысл полей изменился.
+PROFILE_SCHEMA_VERSION = 18
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -472,13 +479,26 @@ class PatternSlotModel(BaseModel):
     # (`patterns.PatternSlot.anchor`). Значение по умолчанию — обратная
     # совместимость со старым кешем.
     anchor: str = "t"
+    # Схема места от модели (`patterns.PatternSlot.purpose` и соседние,
+    # см. их комментарий). Пустые значения: модель не спрашивали.
+    purpose: str | None = None
+    content_hint: str | None = None
+    max_words: int | None = None
+    ordinal: bool = False
+    fixed: bool = False
+
+
+# Поля схемы места: одним списком для применения ответа модели и для
+# переноса схемы между зеркалами при перемайнинге (`_carry_slot_schema`).
+_SLOT_SCHEMA_FIELDS = ("purpose", "content_hint", "max_words", "ordinal", "fixed")
 
 
 def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
     return PatternSlotModel(
         role=slot.role, box=_box_model(slot.box), size_pt=slot.size_pt, color_hex=slot.color_hex,
         align=slot.align, max_chars=slot.max_chars, wraps=slot.wraps, sample_text=slot.sample_text,
-        anchor=slot.anchor,
+        anchor=slot.anchor, purpose=slot.purpose, content_hint=slot.content_hint,
+        max_words=slot.max_words, ordinal=slot.ordinal, fixed=slot.fixed,
     )
 
 
@@ -607,6 +627,46 @@ def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> Pattern
     )
 
 
+def _apply_slot_schema(
+    models: list[PatternModel], schema: dict[str, dict[int, dict]],
+) -> list[PatternModel]:
+    """Кладёт принятую схему мест (`vision_kind.describe_pattern_slots`) в
+    зеркала паттернов и пересчитывает `max_chars_per_item` той же функцией,
+    что и майнинг (`patterns.chars_per_item`): иначе ранжир раскладок
+    продолжал бы обещать писателю абзац там, где модель видит три слова."""
+    result = []
+    for model in models:
+        entries = schema.get(model.pattern_id)
+        if not entries:
+            result.append(model)
+            continue
+        slots = [
+            slot.model_copy(update=entries[i]) if i in entries else slot
+            for i, slot in enumerate(model.slots)
+        ]
+        capacity = model.capacity.model_copy(update={"max_chars_per_item": chars_per_item(slots)})
+        result.append(model.model_copy(update={"slots": slots, "capacity": capacity}))
+    return result
+
+
+def _slot_schema_of(models: list[PatternModel]) -> dict[str, dict[int, dict]]:
+    """Схема мест, уже лежащая в зеркалах: то же представление, что отдаёт
+    `describe_pattern_slots`. Нужна, когда паттерны перемайниваются заново
+    (`_reclassify_pattern_kinds`), а схема от модели уже есть в кеше и
+    терять её нельзя."""
+    defaults = PatternSlotModel.model_fields
+    schema: dict[str, dict[int, dict]] = {}
+    for model in models:
+        for i, slot in enumerate(model.slots):
+            fields = {
+                name: getattr(slot, name) for name in _SLOT_SCHEMA_FIELDS
+                if getattr(slot, name) != defaults[name].default
+            }
+            if fields:
+                schema.setdefault(model.pattern_id, {})[i] = fields
+    return schema
+
+
 # ---------------------------------------------------------------------------
 # TemplateProfile
 # ---------------------------------------------------------------------------
@@ -661,8 +721,39 @@ def _default_preview_dpi() -> int:
         return 72  # тот же запасной dpi, что и у vision_kind.DEFAULT_RENDER_DPI
 
 
+def _render_pattern_pngs(patterns, template_path: Path) -> dict[str, bytes]:
+    """PNG первого исходного слайда каждого паттерна, `pattern_id -> байты`.
+    Один рендер на превью в кеше и на схему слотов от модели: рендер
+    шаблона стоит десятки секунд, платить его дважды незачем. Принимает и
+    `Pattern`, и `PatternModel` (нужны `pattern_id` и `source_slide_index`).
+    Никогда не бросает: нет soffice, рендер упал — пустой словарь."""
+    needed_pages = sorted({p.source_slide_index[0] for p in patterns if p.source_slide_index})
+    if not needed_pages:
+        return {}
+    try:
+        with tempfile.TemporaryDirectory(prefix="deckforge-pattern-previews-") as tmp_dir:
+            try:
+                pngs = to_pngs(template_path, Path(tmp_dir), dpi=_default_preview_dpi(), pages=needed_pages)
+            except RenderError:
+                return {}
+            # `to_pngs(..., pages=needed_pages)` возвращает по одному PNG на
+            # страницу, по возрастанию номера (её докстрока), `needed_pages`
+            # отсортирован и без дублей: позиционное сопоставление верно.
+            if len(pngs) != len(needed_pages):
+                return {}
+            by_page = {page: png.read_bytes() for page, png in zip(needed_pages, pngs)}
+    except OSError:
+        return {}
+    return {
+        p.pattern_id: by_page[p.source_slide_index[0]]
+        for p in patterns
+        if p.source_slide_index and p.source_slide_index[0] in by_page
+    }
+
+
 def _save_pattern_previews(
     patterns: list[Pattern], template_path: Path, preview_dir: Path | None,
+    pngs: dict[str, bytes] | None = None,
 ) -> dict[str, str]:
     """Рендерит PNG первого исходного слайда (`Pattern.source_slide_index[0]`)
     КАЖДОГО паттерна и сохраняет их рядом с JSON профиля в кеше
@@ -689,51 +780,56 @@ def _save_pattern_previews(
     (пустой словарь, разбор профиля продолжается как есть)."""
     if preview_dir is None or not patterns:
         return {}
-    needed_pages = sorted({p.source_slide_index[0] for p in patterns if p.source_slide_index})
-    if not needed_pages:
+    if pngs is None:
+        pngs = _render_pattern_pngs(patterns, template_path)
+    if not pngs:
         return {}
-    dpi = _default_preview_dpi()
     try:
-        with tempfile.TemporaryDirectory(prefix="deckforge-pattern-previews-") as tmp_dir:
-            try:
-                pngs = to_pngs(template_path, Path(tmp_dir), dpi=dpi, pages=needed_pages)
-            except RenderError:
-                return {}
-            # `to_pngs(..., pages=needed_pages)` возвращает по одному PNG на
-            # страницу из `needed_pages`, по возрастанию номера страницы (её
-            # докстрока) — `needed_pages` уже отсортирован и не содержит
-            # дублей, значит позиционное сопоставление верно без
-            # реимплементации разбора номера страницы из имени файла (тот
-            # же независимый-копии принцип модульной границы избегается
-            # здесь просто за ненадобностью третьей копии `_page_number`,
-            # см. её уже две копии в `render/soffice.py` и `vision_kind.py`).
-            if len(pngs) != len(needed_pages):
-                return {}
-            png_by_page = dict(zip(needed_pages, pngs))
-
-            try:
-                preview_dir.mkdir(parents=True, exist_ok=True)
-            except OSError:
-                return {}
-
-            mapping: dict[str, str] = {}
-            for pattern in patterns:
-                if not pattern.source_slide_index:
-                    continue
-                src = png_by_page.get(pattern.source_slide_index[0])
-                if src is None:
-                    continue
-                dest = preview_dir / f"{pattern.pattern_id}.png"
-                try:
-                    shutil.copy2(src, dest)
-                except OSError:
-                    continue
-                mapping[pattern.pattern_id] = f"previews/{pattern.pattern_id}.png"
-            return mapping
+        preview_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
-        # Временный каталог не создался (диск полон/нет прав) — превью не
-        # критичны для профиля, тот же принцип, что и у `LocalProfileStore`.
         return {}
+    mapping: dict[str, str] = {}
+    for pattern in patterns:
+        data = pngs.get(pattern.pattern_id)
+        if data is None:
+            continue
+        try:
+            (preview_dir / f"{pattern.pattern_id}.png").write_bytes(data)
+        except OSError:
+            continue
+        mapping[pattern.pattern_id] = f"previews/{pattern.pattern_id}.png"
+    return mapping
+
+
+def _previews_and_slot_schema(
+    patterns: list[Pattern], template_path: Path, preview_dir: Path | None,
+    schema_llm: VisionProvider | None,
+) -> tuple[dict[str, str], dict[str, dict[int, dict]], list[str], bool]:
+    """Превью в кеш и схема слотов от модели одним рендером. Возвращает
+    (превью, схема, заметки схемы, снималась ли схема). Без модели и без
+    каталога превью ничего не рендерит (разбор без ключа обязан оставаться
+    быстрым, см. `test_parsing_is_fast_enough`)."""
+    if preview_dir is None and schema_llm is None:
+        return {}, {}, [], False
+    pngs = _render_pattern_pngs(patterns, template_path)
+    previews = _save_pattern_previews(patterns, template_path, preview_dir, pngs=pngs)
+    if schema_llm is None:
+        return previews, {}, [], False
+    if not pngs:
+        return previews, {}, ["Схема слотов не снималась: рендер слайдов-примеров не удался."], False
+    schema, notes = describe_pattern_slots(patterns, pngs, schema_llm)
+    return previews, schema, notes, True
+
+
+# Начало строк провенанса про схему слотов (сводка `describe_pattern_slots`
+# и её отказ целиком) — по нему строка заменяется при дозапросе на кеш-хите.
+_SCHEMA_PROVENANCE_PREFIX = "Схема слотов"
+
+# Часовой для «`schema` не передан»: тогда схему снимает тот же
+# мультимодальный провайдер, что и вид раскладки (`vision`). Так её
+# получают все, кто уже передаёт `vision` (веб-сервис в том числе), а
+# `cli.py` может отдать роли `pattern_schema` свою модель из конфига.
+_SCHEMA_FROM_VISION = object()
 
 
 class TemplateProfile(BaseModel):
@@ -788,6 +884,12 @@ class TemplateProfile(BaseModel):
     # попытка повторяется), потому что именование палитры не требует
     # рендера и стоит одного текстового вызова.
     pattern_kinds_source: str = "geometry"
+    # Снималась ли схема слотов моделью (`PatternSlotModel.purpose` и
+    # соседние): "model" — да, "none" — нет (ключа не было или рендер не
+    # удался). Зачем, см. `pattern_kinds_source`: ключ кеша не знает, был ли
+    # у записавшего прогона ключ модели, и без признака профиль без схемы
+    # навсегда отдавался бы и прогонам, способным её снять.
+    pattern_schema_source: str = "none"
     # Task 10: словарь автофигур шаблона (`ShapeVocabEntry`, по убыванию
     # частоты) — `compose/diagrams.py` рисует карточки схем ТОЛЬКО формами
     # из этого списка (см. докстроку `template/shapes.py`), никогда не
@@ -807,6 +909,7 @@ class TemplateProfile(BaseModel):
     def from_file(
         cls, path: Path, *, namer: LLMProvider | None = None, vision: VisionProvider | None = None,
         cache_dir: Path | None = _CACHE_DIR_UNSET,  # type: ignore[assignment]
+        schema: VisionProvider | None = _SCHEMA_FROM_VISION,  # type: ignore[assignment]
     ) -> "TemplateProfile":
         """Разбирает `.pptx`-шаблон целиком, ровно один проход по пакету.
 
@@ -877,6 +980,10 @@ class TemplateProfile(BaseModel):
         # основную защиту даёт именно ключ: код новой версии просто не
         # видит чужих записей, в том числе в общем хранилище, которое
         # переживает выкатку (см. докстроку `template/store.py`).
+        # `schema` (задача F) — провайдер схемы слотов, см. `_SCHEMA_FROM_
+        # VISION`: не передан — тот же, что `vision`; `None` явно — схема не
+        # снимается.
+        schema_llm = vision if schema is _SCHEMA_FROM_VISION else schema
         fingerprint = profile_key(path.read_bytes(), PROFILE_SCHEMA_VERSION)
 
         # Найдено этой задачей: `cache_dir` объявлен типом `Path | None`, но
@@ -933,6 +1040,11 @@ class TemplateProfile(BaseModel):
                     # половина шаблона остаётся в корзине по умолчанию
                     # навсегда (см. докстроку `pattern_kinds_source`).
                     cached = cls._reclassify_pattern_kinds(cached, path, vision, effective_cache_dir)
+                    refreshed = True
+                if schema_llm is not None and cached.pattern_schema_source != "model":
+                    # После видов: тот дозапрос перемайнивает паттерны и
+                    # кладёт свежие превью, которые здесь читаются с диска.
+                    cached = cls._describe_cached_slots(cached, path, schema_llm, effective_cache_dir)
                     refreshed = True
                 if refreshed and cache_file is not None:
                     # Запись одна на оба дозапроса — иначе профиль, которому
@@ -1058,10 +1170,14 @@ class TemplateProfile(BaseModel):
         with ThreadPoolExecutor(max_workers=3) as pool:
             vision_future = pool.submit(classify_patterns_by_vision, patterns, path, vision)
             palette_future = pool.submit(name_palette_roles_report, usage, theme, namer)
-            preview_future = pool.submit(_save_pattern_previews, patterns, path, preview_dir)
+            # Задача F: превью и схема слотов одним рендером; схема идёт
+            # параллельно с видом раскладки, а не после него, — у неё свой
+            # пул потоков (`llm.pattern_schema_max_workers`), и разбор
+            # шаблона не должен ждать их по очереди.
+            preview_future = pool.submit(_previews_and_slot_schema, patterns, path, preview_dir, schema_llm)
             patterns, vision_notes = vision_future.result()
             palette_report = palette_future.result()
-            preview_paths = preview_future.result()
+            preview_paths, slot_schema, schema_notes, schema_done = preview_future.result()
 
         chart_series = build_chart_series(usage, dict(palette_report.roles))
 
@@ -1084,6 +1200,8 @@ class TemplateProfile(BaseModel):
         # `PaletteNote.severity` — vision_notes уже сама решает, что писать
         # только в сводку, а что как отдельную строку отказа, см. её докстроку).
         warnings.extend(vision_notes[1:])
+        provenance.extend(schema_notes[:1])
+        warnings.extend(schema_notes[1:])
 
         profile = cls(
             source_name=path.name, source_path=str(path.resolve()),
@@ -1094,7 +1212,10 @@ class TemplateProfile(BaseModel):
             type_scale=_type_scale_model(type_scale), grid=_grid_model(grid),
             layouts=[_layout_entry_model(entry) for entry in layouts],
             assets=_asset_catalog_model(assets),
-            patterns=[_pattern_model(p, preview_paths.get(p.pattern_id)) for p in patterns],
+            patterns=_apply_slot_schema(
+                [_pattern_model(p, preview_paths.get(p.pattern_id)) for p in patterns], slot_schema,
+            ),
+            pattern_schema_source="model" if schema_done else "none",
             # "model" значит «модель спрашивали», а не «модель ответила» —
             # см. комментарий у самого поля. Ответила она или отказала, видно
             # по `provenance`/`warnings` (заметки `classify_patterns_by_vision`).
@@ -1246,13 +1367,48 @@ class TemplateProfile(BaseModel):
         provenance.append(vision_notes[0] if vision_notes else _NO_VISION_PROVENANCE_LINE)
 
         return cached.model_copy(update={
-            "patterns": [
+            # Схема слотов, уже снятая моделью, переживает перемайнинг:
+            # `pattern_id` и порядок слотов детерминированы и от вида
+            # раскладки не зависят.
+            "patterns": _apply_slot_schema([
                 _pattern_model(p, fresh_previews.get(p.pattern_id) or old_previews.get(p.pattern_id))
                 for p in patterns
-            ],
+            ], _slot_schema_of(cached.patterns)),
             "pattern_kinds_source": "model",
             "provenance": provenance,
             "warnings": list(cached.warnings) + list(vision_notes[1:]),
+        })
+
+    @classmethod
+    def _describe_cached_slots(
+        cls, cached: "TemplateProfile", path: Path, llm: VisionProvider, cache_dir: Path | None,
+    ) -> "TemplateProfile":
+        """Дозапрос схемы слотов поверх кеш-хита без неё — зеркало
+        `_reclassify_pattern_kinds`. Перемайнивать не нужно: схеме хватает
+        зеркал из кеша (роли, коробки, текст-образец, повтор). Картинки
+        берутся из превью в кеше, недостающие рендерятся."""
+        pngs: dict[str, bytes] = {}
+        for model in cached.patterns:
+            on_disk = cached.pattern_preview_path(model, cache_dir=cache_dir)
+            if on_disk is not None and on_disk.exists():
+                try:
+                    pngs[model.pattern_id] = on_disk.read_bytes()
+                except OSError:
+                    pass
+        missing = [m for m in cached.patterns if m.pattern_id not in pngs]
+        if missing:
+            pngs.update(_render_pattern_pngs(missing, path))
+        if not pngs:
+            return cached
+        schema, notes = describe_pattern_slots(cached.patterns, pngs, llm)
+        provenance = [
+            line for line in cached.provenance if not line.startswith(_SCHEMA_PROVENANCE_PREFIX)
+        ]
+        return cached.model_copy(update={
+            "patterns": _apply_slot_schema(cached.patterns, schema),
+            "pattern_schema_source": "model",
+            "provenance": provenance + notes[:1],
+            "warnings": list(cached.warnings) + notes[1:],
         })
 
     def to_json(self) -> str:
