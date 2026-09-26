@@ -574,3 +574,61 @@ def test_airy_dividers_always_carry_a_visible_headline():
     dividers = [s for s in airy.slides if s.kind == "section" and not s.blocks and s is not airy.slides[0]]
     assert dividers
     assert all(s.headline and s.headline.strip() for s in dividers)
+
+def _many_cards_deck(n: int) -> DeckSpec:
+    cards = [Card(title=f"Шаг {i}", body="Короткое описание шага") for i in range(n)]
+    return DeckSpec(title="Т", language="ru", slides=[
+        SlideSpec(index=0, kind="cards", headline="Много шагов", blocks=[CardBlock(items=cards)]),
+    ])
+
+
+def test_no_structurally_fitting_layout_is_named_in_findings():
+    """Карточек больше, чем в самой большой сетке шаблона: выбор тот же,
+    что и раньше, но причина видна в находках, с числами."""
+    from deckforge.plan.variants import structural_gap
+
+    most = max(
+        max(p.capacity.max_items, p.repeat.count) for p in PROFILE.patterns
+        if p.repeat is not None and {"card_title", "card_body"} & set(p.repeat.slot_roles)
+    )
+    deck = _many_cards_deck(most + 2)
+
+    assert structural_gap(deck.slides[0], PROFILE) == f"нужно {most + 2} единиц, максимум в шаблоне {most}"
+    for variant in Variant:
+        slides = [s for s in apply_variant(deck, PROFILE, variant).slides if s.blocks]
+        assert sum("раскладка под содержание не найдена" in f for f in slides[0].findings) == 1
+    assert deck.slides[0].findings == [], "находка варианта не должна протекать в исходную колоду"
+
+
+def test_fitting_content_gets_no_layout_gap_finding():
+    deck = _many_cards_deck(2)
+    slide = apply_variant(deck, PROFILE, Variant.dense).slides[0]
+    assert not any("раскладка под содержание не найдена" in f for f in slide.findings)
+
+
+def test_kpis_without_kpi_layouts_are_named():
+    """Живой прогон 26 сентября 2026, VK Education: показатель без единой
+    kpi-раскладки в шаблоне сел на раскладку-картинку молча."""
+    from types import SimpleNamespace
+
+    from deckforge.plan.spec import Kpi, KpiBlock
+    from deckforge.plan.variants import structural_gap
+
+    profile = SimpleNamespace(patterns=[SimpleNamespace(kind="image", repeat=None)])
+    slide = SlideSpec(index=7, kind="kpi_caption", headline="Х", blocks=[KpiBlock(items=[Kpi(value="80%", label="а")])])
+
+    assert structural_gap(slide, profile) == "показателей на слайде: 1, раскладок под показатели в шаблоне нет"
+
+
+def test_table_without_table_layout_is_named():
+    from deckforge.plan.spec import TableVisual
+    from deckforge.plan.variants import structural_gap
+
+    if any(p.kind == "table" for p in PROFILE.patterns):
+        pytest.skip("в этом шаблоне таблица есть")
+    slide = SlideSpec(
+        index=1, kind="table", headline="Замер",
+        visual=Visual(kind="table", table=TableVisual(rows=[["а", "б"], ["1", "2"]])),
+    )
+    assert structural_gap(slide, PROFILE) == "нужен слот под таблицу, в шаблоне его нет"
+

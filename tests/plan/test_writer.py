@@ -773,3 +773,73 @@ def test_short_decks_are_left_alone():
     slides = _deck_with_repeated_fact()[:4]
     assert _drop_thin_duplicates(slides) is slides
 
+
+# ---------------------------------------------------------------------------
+# Ремонт недобора: крупнейшее текстовое место заполнено меньше чем на
+# половину цели, и писателя один раз просят дописать до объёма.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingQueueLLM(_QueueLLM):
+    def __init__(self, responses):
+        super().__init__(responses)
+        self.requests: list[dict] = []
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        self.requests.append(json.loads(messages[-1]["content"]))
+        return super().complete(messages, schema=schema, max_tokens=max_tokens, temperature=temperature)
+
+
+def _bullets_json(items: list[str]) -> str:
+    return json.dumps({"kind": "bullets", "headline": "Вывод", "blocks": [{"type": "bullets", "items": items}]},
+                      ensure_ascii=False)
+
+
+def _filling_items(PROFILE) -> list[str]:
+    """Пункты, которые заполняют крупнейшее место bullets-раскладки около цели."""
+    from deckforge.compose.fit_check import main_slot_fill
+
+    probe = SlideSpec(index=0, kind="bullets", headline="В", blocks=[BulletBlock(items=["А"])])
+    target = main_slot_fill(probe, PROFILE)["target_chars"]
+    item = "Заявка проходит согласование в трёх отделах подряд"
+    return [item] * max(1, target // (len(item) + 1))
+
+
+def test_underfilled_slide_gets_one_repair_call(PROFILE):
+    llm = _RecordingQueueLLM([_bullets_json(["Коротко", "Ещё"]), _bullets_json(_filling_items(PROFILE))])
+
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=0)
+
+    assert len(llm.requests) == 2
+    request = llm.requests[1]
+    assert request["previous_answer"]["blocks"][0]["items"] == ["Коротко", "Ещё"]
+    assert request["fill_request"]["target_chars"] > request["fill_request"]["chars"]
+    assert deck.slides[0].blocks[0].items == _filling_items(PROFILE)
+    assert deck.meta["fill_repairs"] == "1" and deck.meta["fill_repairs_accepted"] == "1"
+
+
+def test_failed_repair_keeps_the_original_slide(PROFILE):
+    llm = _QueueLLM([_bullets_json(["Коротко", "Ещё"]), RuntimeError("сеть недоступна")])
+
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=0)
+
+    assert deck.slides[0].blocks[0].items == ["Коротко", "Ещё"]
+    assert deck.meta["fill_repairs"] == "1" and deck.meta["fill_repairs_accepted"] == "0"
+
+
+def test_well_filled_slide_is_not_repaired(PROFILE):
+    llm = _QueueLLM([_bullets_json(_filling_items(PROFILE))])
+
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=0)
+
+    assert not llm._responses
+    assert "fill_repairs" not in deck.meta
+
+
+def test_repair_limited_by_item_count_skips_richer_slides(PROFILE):
+    llm = _QueueLLM([_bullets_json(["А", "Б", "В"])])
+
+    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=2)
+
+    assert "fill_repairs" not in deck.meta
+

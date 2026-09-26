@@ -63,3 +63,42 @@ def test_measure_fit_on_a_profile_free_kind_degrades_without_raising():
     result = measure_fit("текст", "headline", None, "bullets")
     assert result["fits"] is True
     assert "note" in result
+
+
+def test_measure_fit_reports_how_full_the_slot_is(PROFILE):
+    """«Влезает» — половина ответа: короткий текст в большой рамке влезает,
+    но оставляет её пустой. `fill` растёт с длиной текста и не выходит за 1."""
+    short = measure_fit("Коротко", "card_body", PROFILE, "cards")
+    longer = measure_fit("Коротко и по делу, с цифрой и сроком. " * 3, "card_body", PROFILE, "cards")
+    huge = measure_fit("Очень длинный текст. " * 200, "card_body", PROFILE, "cards")
+
+    assert 0.0 < short["fill"] < longer["fill"] <= 1.0
+    assert huge["fill"] == 1.0
+    assert measure_fit("", "card_body", PROFILE, "cards")["fill"] == 0.0
+
+
+def test_main_slot_fill_measures_the_biggest_text_place_of_the_chosen_layout(PROFILE):
+    from deckforge.compose.fit_check import main_slot_fill
+    from deckforge.plan.spec import Card, CardBlock, SlideSpec
+
+    layout = next(p for p in PROFILE.patterns if p.kind == "cards")
+    spec = SlideSpec(
+        index=1, kind="cards", headline="Итог",
+        blocks=[CardBlock(items=[Card(title="А", body="Коротко"), Card(title="Б", body="Чуть длиннее тело")])],
+    )
+
+    result = main_slot_fill(spec, PROFILE, layout_id=layout.pattern_id)
+
+    assert result is not None
+    assert result["layout_id"] == layout.pattern_id
+    assert result["role"] == "card_body"
+    assert result["chars"] == len("Чуть длиннее тело")
+    assert result["target_chars"] == round(result["max_chars"] * 0.8)
+    assert 0.0 < result["fill"] < result["target_fill"]
+
+
+def test_main_slot_fill_is_silent_without_main_text(PROFILE):
+    from deckforge.compose.fit_check import main_slot_fill
+    from deckforge.plan.spec import SlideSpec
+
+    assert main_slot_fill(SlideSpec(index=0, kind="section", headline="Обложка"), PROFILE) is None
