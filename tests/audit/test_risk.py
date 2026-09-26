@@ -70,3 +70,18 @@ def test_pick_risky_slides_uses_autofixed_positions():
     assert pick_risky_slides(spec, [], max_slides=4, min_score=0.5) == []
     picked = pick_risky_slides(spec, [], max_slides=4, min_score=0.5, autofixed_slides={1})
     assert [pos for pos, _ in picked] == [1]
+
+
+def test_hero_slides_are_never_picked_for_visual_audit():
+    """Обложка и разделители по замыслу несут один заголовок: модель
+    отвечала на них «нет содержания» (C05) в каждом прогоне."""
+    from deckforge.plan.spec import DeckSpec, SlideSpec
+    from deckforge.audit.risk import pick_risky_slides
+
+    spec = DeckSpec(title="t", language="ru", slides=[
+        SlideSpec(index=0, kind="section", headline="Обложка", findings=["с нуля"] * 5),
+        SlideSpec(index=1, kind="bullets", headline="Факт", findings=["с нуля"]),
+    ])
+    picked = pick_risky_slides(spec, [], max_slides=4, min_score=0.0)
+    assert [pos for pos, _ in picked] == [1]
+

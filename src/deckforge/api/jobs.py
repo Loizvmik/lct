@@ -388,8 +388,11 @@ async def _run_job(
         # случайные номера, и найти «тот самый, который только что собрали»
         # иначе можно только по времени изменения. Ярлык переставляется на
         # каждом прогоне, старые каталоги не трогаются.
+        # `job.dir.parent`, а не `self.root`: это функция, не метод, и
+        # `self` тут нет. Ошибка глушилась исключением ниже, ярлык не
+        # появлялся ни разу (найдено 27 сентября 2026 при задаче H).
         try:
-            latest = self.root / "decks" / "latest"
+            latest = job.dir.parent / "latest"
             if latest.is_symlink() or latest.exists():
                 latest.unlink()
             latest.symlink_to(job.dir.name)

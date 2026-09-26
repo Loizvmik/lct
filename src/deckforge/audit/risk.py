@@ -74,6 +74,9 @@ def risk_score(slide_spec: SlideSpec, findings: Iterable[Finding], *, autofixed:
     return score
 
 
+_HERO_KINDS = frozenset({"section", "image", "closing"})
+
+
 def pick_risky_slides(
     spec: DeckSpec, findings: Iterable[Finding], *, max_slides: int, min_score: float,
     autofixed_slides: Iterable[int] = (),
@@ -88,9 +91,13 @@ def pick_risky_slides(
         if f.slide_index is not None:
             by_slide.setdefault(f.slide_index, []).append(f)
     fixed = set(autofixed_slides)
+    # Героические слайды (обложка, разделитель, финал) не отправляются:
+    # у них по замыслу один заголовок, и модель отвечает «нет содержания»
+    # (C05) на каждый такой слайд (живой прогон задачи H, 27 сентября 2026).
     scored = [
         (pos, risk_score(slide, by_slide.get(pos, []), autofixed=pos in fixed))
         for pos, slide in enumerate(spec.slides)
+        if slide.kind not in _HERO_KINDS
     ]
     risky = [(pos, score) for pos, score in scored if score >= min_score]
     risky.sort(key=lambda item: (-item[1], item[0]))
