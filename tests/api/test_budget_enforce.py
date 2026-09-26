@@ -122,4 +122,8 @@ def test_hard_ceiling_finishes_the_job_when_the_model_hangs(slow_batch):
         # зависшую модель 120с.
         assert stages["write"] <= SLOW_BUDGET - SLOW_POLICY.export_reserve_seconds + 3.0, (style, stages)
         assert "export" in stages, style
-        assert snap["seconds"] <= SLOW_BUDGET + 5.0, (style, snap["seconds"], stages)
+        # Допуск 10 с, а не 5: сборка и экспорт трёх заданий без модели на
+        # нагруженной машине (параллельные прогоны, LibreOffice) занимают
+        # 25-32 с, и потолок 45 с тогда даёт 51-52 с общего времени. Смысл
+        # проверки в том, что задание не ждёт зависшую модель 120 с.
+        assert snap["seconds"] <= SLOW_BUDGET + 10.0, (style, snap["seconds"], stages)
