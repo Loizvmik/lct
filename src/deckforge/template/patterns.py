@@ -200,6 +200,21 @@ class PatternSlot:
 
 
 @dataclass(frozen=True)
+class RepeatUnit:
+    """Одна единица повтора как она стоит на слайде-примере (задача V2):
+    её место в сетке и id фигур примера, из которых она состоит. Обрезка
+    незаполненных единиц и привязка текста к единице идут по этим id, а
+    не по координате вдоль оси: у двумерной сетки (таймлайн VK Education
+    2 ряда × 4 точки) колонка одна на две единицы, и удаление «по колонке»
+    оставляло точки пустого ряда (7 точек при трёх текстах)."""
+    id: str
+    row: int
+    col: int
+    slot_ids: list[str] = field(default_factory=list)
+    decor_shape_ids: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class RepeatSpec:
     axis: str  # "x" | "y"
     count: int
@@ -216,6 +231,19 @@ class RepeatSpec:
     # кеглем — `slot_roles` был бы {"card_body"}, притом что элементов в
     # группе два и больше).
     group_size: int = 1
+    # Топология повтора (задача V2): `rows` × `cols` мест, порядок обхода
+    # (`row`: по строкам) и реальные единицы с id фигур. Одномерный
+    # повтор: один ряд (ось x) или одна колонка (ось y). Пустой `units`:
+    # старый кэш или синтетика, тогда всё решает координата вдоль оси.
+    rows: int = 1
+    cols: int = 0
+    traversal: str = "row"
+    units: list[RepeatUnit] = field(default_factory=list)
+
+    @property
+    def is_grid(self) -> bool:
+        """Двумерная сетка: больше одного ряда и больше одной колонки."""
+        return self.rows > 1 and self.cols > 1 and bool(self.units)
 
 
 @dataclass(frozen=True)
@@ -317,6 +345,10 @@ class DecorShape:
     # `PatternSlot.source_shape_id`: по нему клон убирает декор
     # незаполненных единиц повтора, не сравнивая коробки.
     source_shape_id: str | None = None
+    # Фото-образец примера (`_is_sample_photo`): крупная фотография или
+    # скриншот, а не фирменная графика. На чужой слайд не переносится ни
+    # клоном, ни сборкой с нуля (задача V2).
+    sample_photo: bool = False
 
 
 @dataclass(frozen=True)
@@ -359,6 +391,17 @@ class Pattern:
     # этого примера вместо глобального коридора 25-75%: обложка по замыслу
     # пустая, таблица плотная. `None`: не снята (тестовые фикстуры).
     source_density: float | None = None
+    # Фото-образцы примера (задача V2, `_sample_photo_frames`): сколько их,
+    # какую долю холста они занимают всего и какую из неё место под
+    # картинку (`image`, туда ляжет фото пользователя). Клон удаляет
+    # фото-образец, на место которого не легло наше фото, и планировщик
+    # по этим числам знает, сколько холста опустеет. `layout_photo_ids`:
+    # фото-образцы, нарисованные не на слайде, а на его лейауте («Паттерн +
+    # фото» VK Education): клон и сборка с нуля их скрывают.
+    photo_frames: int = 0
+    photo_area: float = 0.0
+    photo_slot_area: float = 0.0
+    layout_photo_ids: list[str] = field(default_factory=list)
 
 
 # --- геометрические допуски (бриф, Step 2, п.4 — оба числа литералом) ------
@@ -466,12 +509,13 @@ def mine_patterns(
     # обычно разные медиа-файлы, но даже при совпадении имени части смысл
     # закэшированного значения разный (яркость vs хекс среднего цвета).
     decor_image_cache: dict[str, str | None] = {}
+    photo_cache: dict[str, bool] = {}
 
     candidates: list[Pattern] = []
     for slide_part in _slide_parts(pkg):
         pattern = _mine_slide(
             pkg, canvas, grid, scale, theme, slide_part, logo_target, bg_targets,
-            bg_image_cache, decor_image_cache,
+            bg_image_cache, decor_image_cache, photo_cache,
         )
         if pattern is not None:
             candidates.append(pattern)
@@ -524,7 +568,9 @@ def _mine_slide(
     pkg: PptxPackage, canvas: Canvas, grid: Grid, scale: TypeScale, theme: ThemeInfo,
     slide_part: str, logo_target: str | None, bg_targets: set[str],
     bg_image_cache: dict[str, float | None], decor_image_cache: dict[str, str | None],
+    photo_cache: dict[str, bool] | None = None,
 ) -> Pattern | None:
+    photo_cache = {} if photo_cache is None else photo_cache
     root = pkg.xml(slide_part)
     layout_part = _slide_layout_part(pkg, slide_part)
 
@@ -557,6 +603,12 @@ def _mine_slide(
     tiers = [_tier_info(ref, canvas, scale, theme) for ref in content]
 
     repeat, repeat_roles_by_index = _find_repeat(content, tiers)
+    grid_cells: dict[int, tuple[int, int]] = {}
+    if repeat is None:
+        # Роли фигур сетки решаются как без повтора: год над событием
+        # остаётся `kpi_value`, подпись показателя `kpi_label`. Сетка только
+        # собирает их в единицы.
+        repeat, _grid_roles, grid_cells = _find_grid(content, tiers)
     slots = _finalize_roles(content, tiers, repeat_roles_by_index, canvas, scale)
     slots = _promote_photo_placeholders(slots, decor, canvas)
 
@@ -565,10 +617,15 @@ def _mine_slide(
         # `_prelim_repeat_role`) до классификации kind — `_classify_kind`
         # ("cards") смотрит именно на `repeat.slot_roles`, поэтому порядок
         # здесь важен: сначала роли, потом kind.
-        repeat = replace(repeat, slot_roles=sorted({slots[i].role for i in repeat_roles_by_index}))
+        members = repeat_roles_by_index or grid_cells
+        repeat = replace(repeat, slot_roles=sorted({slots[i].role for i in members}))
 
     roles_present = {s.role for s in slots}
     kind, kind_confidence = _classify_kind(content, slots, repeat, roles_present, canvas)
+    if repeat is not None and repeat.rows > 1 and "kpi_label" in repeat.slot_roles:
+        # Сетка показателей (число с подписью в каждой ячейке) остаётся
+        # показателями, а не карточками: так её видел разбор и до сеток.
+        kind, kind_confidence = "kpi", 0.45
 
     if "headline" not in roles_present and kind not in _HEADLINE_EXEMPT_KINDS:
         # Раскладка без заголовка (и не героического типа section/image) —
@@ -592,10 +649,20 @@ def _mine_slide(
 
     source_density = _source_density(refs, slots, theme, canvas)
 
-    decor_membership = _decor_repeat_membership(decor, repeat)
+    if repeat is not None and repeat.rows > 1:
+        decor_membership = _decor_grid_membership(decor, repeat, content, grid_cells)
+    else:
+        decor_membership = _decor_repeat_membership(decor, repeat)
+    if repeat is not None:
+        repeat = _with_units(repeat, content, repeat_roles_by_index, grid_cells, decor, decor_membership)
     decor_shapes = [
         _to_decor(pkg, rels, ref, theme, decor_image_cache, decor_membership.get(i), canvas, scale)
         for i, ref in enumerate(decor)
+    ]
+    photos = _sample_photo_frames(pkg, rels, content, decor, layout_part, canvas, photo_cache)
+    photo_ids = {sid for where, sid, _area in photos if where == "decor"}
+    decor_shapes = [
+        replace(d, sample_photo=True) if d.source_shape_id in photo_ids else d for d in decor_shapes
     ]
 
     return Pattern(
@@ -611,6 +678,10 @@ def _mine_slide(
         is_dark=is_dark,
         kind_confidence=kind_confidence,
         source_density=source_density,
+        photo_frames=len(photos),
+        photo_area=round(min(1.0, sum(area for _w, _sid, area in photos)), 4),
+        photo_slot_area=round(min(1.0, sum(area for where, _sid, area in photos if where == "slot")), 4),
+        layout_photo_ids=[sid for where, sid, _area in photos if where == "layout"],
     )
 
 
@@ -652,6 +723,78 @@ def _source_density(
         for ref in refs
     ]
     return round(ink_ratio(items, canvas), 4)
+
+
+# Фото-образец примера (задача V2): растровая картинка крупнее 4% холста,
+# непрозрачная, не на чёрном фоне и пёстрая: в уменьшенной до 64×64
+# копии не меньше 1200 разных цветов. Пороги сняты с четырёх шаблонов
+# (27 сентября 2026): фотографии и скриншоты VK Education дают 1500-3600
+# цветов при непрозрачности 1.0; фирменная графика тех же размеров либо
+# вырезана по контуру (VK Tech, кубы и спирали: непрозрачно 18-64%),
+# либо нарисована на чёрном (VK WorkSpace: 78-81% тёмных точек), либо
+# бедна цветами (полукруги VK Education 180-560, графики 300-450).
+# Иконки мельче 4% и остаются оформлением.
+_SAMPLE_PHOTO_MIN_AREA = 0.04
+_SAMPLE_PHOTO_MIN_COLORS = 1200
+_SAMPLE_PHOTO_MIN_OPAQUE = 0.9
+_SAMPLE_PHOTO_MAX_DARK = 0.5
+_SAMPLE_PHOTO_PROBE = (64, 64)
+
+
+def _is_sample_photo(pkg: PptxPackage, target: str | None, cache: dict[str, bool]) -> bool:
+    if not target:
+        return False
+    if target in cache:
+        return cache[target]
+    try:
+        with Image.open(io.BytesIO(pkg.part(target))) as img:
+            data = img.convert("RGBA").resize(_SAMPLE_PHOTO_PROBE).tobytes()
+    except Exception:  # noqa: BLE001: нечитаемая картинка: не фото, оформление остаётся как было
+        cache[target] = False
+        return False
+    pixels = [data[i:i + 4] for i in range(0, len(data), 4)]
+    opaque = [p for p in pixels if p[3] >= 128]
+    colors = len({p[:3] for p in pixels})
+    dark = sum(1 for p in opaque if max(p[0], p[1], p[2]) < 40)
+    cache[target] = (
+        colors >= _SAMPLE_PHOTO_MIN_COLORS
+        and len(opaque) >= _SAMPLE_PHOTO_MIN_OPAQUE * len(pixels)
+        and dark < _SAMPLE_PHOTO_MAX_DARK * max(len(opaque), 1)
+    )
+    return cache[target]
+
+
+def _canvas_area(box: Box | None) -> float:
+    if box is None:
+        return 0.0
+    inside = Box(0.0, 0.0, 1.0, 1.0).intersect(box)
+    return inside.area if inside is not None else 0.0
+
+
+def _sample_photo_frames(
+    pkg: PptxPackage, rels: dict[str, str], content: list[ShapeRef], decor: list[ShapeRef],
+    layout_part: str | None, canvas: Canvas, cache: dict[str, bool],
+) -> list[tuple[str, str, float]]:
+    """Фото-образцы примера: (где, id фигуры, доля холста). `где`:
+    `slot` (картинка стала местом `image`), `decor` (картинка в декоре),
+    `layout` (не-плейсхолдер картинка лейаута: её видно на каждом слайде
+    этого лейаута, и майнинг слайда её раньше не видел вовсе, отчего
+    девушка в кресле уезжала в чужую колоду, 27 сентября 2026)."""
+    frames: list[tuple[str, str, float]] = []
+    for where, refs in (("slot", content), ("decor", decor)):
+        for ref in refs:
+            if ref.kind != "picture" or _canvas_area(ref.box) <= _SAMPLE_PHOTO_MIN_AREA:
+                continue
+            if _is_sample_photo(pkg, _picture_target(ref.element, rels), cache):
+                frames.append((where, ref.shape_id, _canvas_area(ref.box)))
+    if layout_part:
+        layout_rels = pkg.rels(layout_part)
+        for ref in walk_shapes(pkg.xml(layout_part), canvas, include_groups=False):
+            if ref.kind != "picture" or ref.is_placeholder or _canvas_area(ref.box) <= _SAMPLE_PHOTO_MIN_AREA:
+                continue
+            if _is_sample_photo(pkg, _picture_target(ref.element, layout_rels), cache):
+                frames.append(("layout", ref.shape_id, _canvas_area(ref.box)))
+    return frames
 
 
 def _slide_layout_part(pkg: PptxPackage, slide_part: str) -> str | None:
@@ -1307,6 +1450,195 @@ def _decor_repeat_membership(decor: list[ShapeRef], repeat: RepeatSpec | None) -
         ordered = sorted(group, key=lambda i: coord(boxes[i]))
         membership.update({idx: pos for pos, idx in enumerate(ordered)})
     return membership
+
+
+# --- двумерная сетка повтора (задача V2) -------------------------------------
+
+# Допуск совпадения строки и колонки сетки, доли холста: как у совпадения
+# размера (`_SIZE_TOLERANCE`).
+_GRID_TOLERANCE = 0.02
+# Меньше четырёх единиц двумерной сеткой не бывает (2 × 2).
+_MIN_GRID_UNITS = 4
+# Фигура шире колонки в столько раз единице сетки не принадлежит (линия
+# таймлайна через весь ряд, заголовок): тот же допуск, что у
+# `compose.blocks._UNIT_WIDTH_SLACK`.
+_UNIT_WIDTH_SLACK = 1.25
+# Декор дальше этого по вертикали от фигур единицы ей не принадлежит,
+# доли холста: точка таймлайна стоит в 2% над годом.
+_GRID_DECOR_GAP = 0.1
+
+
+def _find_grid(
+    content: list[ShapeRef], tiers: list[_TierInfo | None],
+) -> tuple[RepeatSpec | None, dict[int, str], dict[int, tuple[int, int]]]:
+    """Двумерная сетка повтора, когда одномерной нет: одинаковые фигуры
+    стоят в нескольких рядах с одним шагом по x и в одних колонках.
+    Таймлайн VK Education (`slide42`): четыре года в верхнем ряду, три в
+    нижнем, под каждым подпись. `_spaced` такую сетку не видит: левые края
+    повторяются в двух рядах, и шаг по x не постоянен.
+
+    Опорная группа (самая многочисленная из подходящих) задаёт ячейки;
+    остальные фигуры содержания, чей центр попал в занятую ячейку и кто не
+    шире колонки, входят в ту же единицу (подпись под годом). Возвращает
+    повтор, роли вошедших фигур и ячейку каждой: индекс в `content` ->
+    (ряд, колонка)."""
+    groups: dict[tuple, list[int]] = defaultdict(list)
+    for i, (ref, tier) in enumerate(zip(content, tiers)):
+        if ref.box is None:
+            continue
+        if ref.kind == "picture":
+            groups[("picture",)].append(i)
+        elif tier is not None:
+            groups[(tier.step, tier.numeric, tier.bulleted)].append(i)
+    best: tuple[int, list[int], list[float], list[float], float] | None = None
+    for idxs in groups.values():
+        if len(idxs) < _MIN_GRID_UNITS:
+            continue
+        for members in _group_by_size(idxs, [content[i].box for i in idxs]):
+            if len(members) < _MIN_GRID_UNITS:
+                continue
+            layout = _grid_layout([content[i].box for i in members])
+            if layout is None:
+                continue
+            rows, cols, step = layout
+            if best is None or len(members) > best[0]:
+                best = (len(members), members, rows, cols, step)
+    if best is None:
+        return None, {}, {}
+    _n, anchor, rows, cols, step = best
+    pitch = min(b - a for a, b in zip(rows, rows[1:]))
+
+    def cell_of(box: Box) -> tuple[int, int] | None:
+        if box.width > step * _UNIT_WIDTH_SLACK:
+            return None
+        cy = box.top + box.height / 2
+        r = min(range(len(rows)), key=lambda k: abs(rows[k] - cy))
+        c = next(
+            (k for k, x in enumerate(cols) if x - _GRID_TOLERANCE <= box.left < x + step - _GRID_TOLERANCE), None,
+        )
+        if abs(rows[r] - cy) > pitch / 2 or c is None:
+            return None
+        return r, c
+
+    cells = {i: cell_of(content[i].box) for i in anchor}
+    taken = set(cells.values())
+    if None in taken or len(taken) != len(anchor):
+        return None, {}, {}
+    # Фигура входит в единицу, только если она сама повторяется по сетке:
+    # фигуры её рода стоят в двух ячейках и больше, по одной в ячейке.
+    # Одиночный заголовок в центре ромба из четырёх абзацев (`slide17`)
+    # попадал бы в ячейку просто по координатам.
+    for idxs in groups.values():
+        found = {i: cell_of(content[i].box) for i in idxs if i not in cells}
+        found = {i: c for i, c in found.items() if c in taken}
+        if len(found) >= 2 and len(set(found.values())) == len(found):
+            cells.update(found)
+    per_cell: dict[tuple[int, int], int] = defaultdict(int)
+    for cell in cells.values():
+        per_cell[cell] += 1
+    roles = {i: _prelim_repeat_role(tiers[i], content[i]) for i in cells}
+    repeat = RepeatSpec(
+        axis="x", count=len(taken), step=step, slot_roles=[], group_size=max(per_cell.values()),
+        rows=len(rows), cols=len(cols), traversal="row",
+    )
+    return repeat, roles, cells
+
+
+def _grid_layout(boxes: list[Box]) -> tuple[list[float], list[float], float] | None:
+    """(центры рядов по y, левые края колонок, шаг колонок) или `None`,
+    если фигуры не стоят сеткой: два ряда и больше, две колонки и больше,
+    колонки с постоянным шагом, ряды с постоянным шагом, в ячейке не
+    больше одной фигуры."""
+    rows = sorted(c.center for c in cluster([b.top + b.height / 2 for b in boxes], _GRID_TOLERANCE))
+    cols = sorted(c.center for c in cluster([b.left for b in boxes], _GRID_TOLERANCE))
+    if len(rows) < 2 or len(cols) < 2:
+        return None
+    step = _constant_step(cols)
+    if step is None or (len(rows) > 2 and _constant_step(rows) is None):
+        return None
+    seen: set[tuple[int, int]] = set()
+    for b in boxes:
+        r = min(range(len(rows)), key=lambda k: abs(rows[k] - (b.top + b.height / 2)))
+        c = min(range(len(cols)), key=lambda k: abs(cols[k] - b.left))
+        if (r, c) in seen or abs(cols[c] - b.left) > _GRID_TOLERANCE:
+            return None
+        seen.add((r, c))
+    return rows, cols, step
+
+
+def _decor_grid_membership(
+    decor: list[ShapeRef], repeat: RepeatSpec, content: list[ShapeRef], cells: dict[int, tuple[int, int]],
+) -> dict[int, int]:
+    """Декор двумерной сетки: фигура входит в единицу, если стоит в её
+    колонке (левый край в пределах колонки), не шире колонки и ближе всего
+    по вертикали к фигурам этой единицы. Точка таймлайна над годом, а не
+    «где-то в той же колонке»."""
+    order = _unit_order(cells)
+    boxes_by_unit: dict[int, list[Box]] = defaultdict(list)
+    for i, cell in cells.items():
+        boxes_by_unit[order[cell]].append(content[i].box)
+    def unit_of(box: Box | None) -> int | None:
+        if box is None or box.width > repeat.step * _UNIT_WIDTH_SLACK:
+            return None
+        best: tuple[float, int] | None = None
+        for unit, unit_boxes in boxes_by_unit.items():
+            left = min(b.left for b in unit_boxes)
+            if not (left - _GRID_TOLERANCE <= box.left < left + repeat.step - _GRID_TOLERANCE):
+                continue
+            top = min(b.top for b in unit_boxes)
+            bottom = max(b.bottom for b in unit_boxes)
+            gap = max(0.0, top - box.bottom, box.top - bottom)
+            if best is None or gap < best[0]:
+                best = (gap, unit)
+        return best[1] if best is not None and best[0] <= _GRID_DECOR_GAP else None
+
+    # Как и у фигур содержания, декор входит в единицы только группой
+    # одинаковых фигур, по одной на единицу: крупный фон-эллипс за всей
+    # композицией единицей не становится.
+    membership: dict[int, int] = {}
+    boxes = [ref.box for ref in decor]
+    for group in _group_by_size([i for i, b in enumerate(boxes) if b is not None], [b for b in boxes if b is not None]):
+        found = {i: unit_of(boxes[i]) for i in group}
+        found = {i: u for i, u in found.items() if u is not None}
+        if len(found) >= 2 and len(set(found.values())) == len(found):
+            membership.update(found)
+    return membership
+
+
+def _unit_order(cells: dict[int, tuple[int, int]]) -> dict[tuple[int, int], int]:
+    """Номер единицы по ячейке: обход по строкам, слева направо."""
+    return {cell: n for n, cell in enumerate(sorted(set(cells.values())))}
+
+
+def _with_units(
+    repeat: RepeatSpec, content: list[ShapeRef], roles_by_index: dict[int, str],
+    cells: dict[int, tuple[int, int]], decor: list[ShapeRef], membership: dict[int, int],
+) -> RepeatSpec:
+    """Реальные единицы повтора с id фигур примера. У одномерного повтора
+    единица: фигуры с одной координатой вдоль оси (та же нумерация, что у
+    `DecorShape.repeat_index` и `compose.blocks._repeat_unit_coords`)."""
+    if repeat.rows > 1:
+        order = _unit_order(cells)
+        by_unit = {n: cell for cell, n in order.items()}
+        unit_of = {i: order[cell] for i, cell in cells.items()}
+        rows, cols = repeat.rows, repeat.cols
+    else:
+        coord = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
+        keys = sorted({round(coord(content[i].box), 3) for i in roles_by_index})
+        unit_of = {i: keys.index(round(coord(content[i].box), 3)) for i in roles_by_index}
+        by_unit = {n: ((0, n) if repeat.axis == "x" else (n, 0)) for n in range(len(keys))}
+        rows, cols = (1, len(keys)) if repeat.axis == "x" else (len(keys), 1)
+    units = []
+    for n in sorted(by_unit):
+        r, c = by_unit[n]
+        units.append(RepeatUnit(
+            id=f"u{n}", row=r, col=c,
+            slot_ids=[content[i].shape_id for i, u in sorted(unit_of.items()) if u == n and content[i].shape_id],
+            decor_shape_ids=[
+                decor[d].shape_id for d, u in sorted(membership.items()) if u == n and decor[d].shape_id
+            ],
+        ))
+    return replace(repeat, rows=rows, cols=cols, traversal="row", units=units)
 
 
 # --- назначение финальных ролей ---------------------------------------------

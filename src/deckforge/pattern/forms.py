@@ -206,3 +206,179 @@ def list_item_limit(part: FormPart, count: int) -> Limit:
 
 def forms_of(profile) -> dict[str, PatternForm]:
     return {p.pattern_id: pattern_form(p) for p in profile.patterns}
+
+
+# ---------------------------------------------------------------------------
+# Возможности раскладки и требования слайда (задача V2)
+# ---------------------------------------------------------------------------
+
+# Пустота на месте удалённого фото примера, доля холста, выше которой
+# раскладка без своего фото не годится: половина слайда белым листом.
+MAX_PHOTO_VOID = 0.30
+
+_TEXT_PLACE_ROLES = ("body", "bullet", "card_body", "quote")
+
+
+@dataclass(frozen=True)
+class PatternCapabilities:
+    """Что раскладка умеет держать, явными полями, а не видом `kind`.
+
+    Вид снят геометрией и моделью и остаётся предпочтением стиля, но
+    решать допуск по нему нельзя: у VK Education вид `image` у диаграммы
+    Ганта (пять карточек) и у «Паттерн + фото» (один абзац и фото
+    лейаута), и карточки, написанные под первую, уезжали во вторую.
+    Допуск раскладки к слайду: требования слайда входят в возможности
+    (`unmet_requirements`)."""
+    headline: bool
+    text_blocks_min: int
+    text_blocks_max: int
+    card_count_min: int
+    card_count_max: int
+    card_has_title: bool
+    card_has_body: bool
+    card_has_icon: bool
+    card_has_image: bool
+    supports_table: bool
+    supports_chart: bool
+    supports_photo: bool
+    supports_quote: bool
+    supports_kpi: bool
+    kpi_count_min: int
+    kpi_count_max: int
+    repeat_topology: str
+    sequence_semantics: bool
+    max_total_words: int
+    # Фото-образцы примера (`Pattern.photo_*`): сколько их, доля холста
+    # всех и доля тех, что стоят в месте `image` (туда ляжет наше фото).
+    photo_frames: int = 0
+    photo_area: float = 0.0
+    photo_slot_area: float = 0.0
+
+    def photo_void(self, has_photo: bool) -> float:
+        """Доля холста, которая опустеет, когда клон удалит фото примера."""
+        area = self.photo_area - (self.photo_slot_area if has_photo else 0.0)
+        return max(0.0, area)
+
+
+def capabilities_of(pattern, form: PatternForm | None = None) -> PatternCapabilities:
+    form = form or pattern_form(pattern)
+    repeat = pattern.repeat if (pattern.repeat is not None and pattern.repeat.count >= 2) else None
+    repeat_roles = set(repeat.slot_roles) if repeat is not None else set()
+    cards = next((p for p in form.parts if p.block == "cards"), None)
+    kpi = next((p for p in form.parts if p.block == "kpi"), None)
+    quote = next((p for p in form.parts if p.block == "quote"), None)
+    text_places = [
+        s for s in pattern.slots
+        if s.role in _TEXT_PLACE_ROLES and not keeps_sample_text(s) and getattr(s, "max_chars", 0) > 0
+    ]
+    required_text = sum(1 for p in form.parts if p.required and p.block in ("text", "bullets"))
+    if repeat is None:
+        topology = "none"
+    elif getattr(repeat, "rows", 1) > 1 and getattr(repeat, "cols", 0) > 1:
+        topology = "grid"
+    else:
+        topology = "row" if getattr(repeat, "axis", "x") == "x" else "column"
+    decor = getattr(pattern, "decor", None) or []
+    unit_decor = any(getattr(d, "repeat_group", False) for d in decor) if repeat is not None else False
+    words = sum(p.units * p.unit.max_words for p in form.parts)
+    return PatternCapabilities(
+        headline=form.headline is not None,
+        text_blocks_min=required_text,
+        text_blocks_max=len(text_places),
+        card_count_min=2 if cards is not None else 0,
+        card_count_max=cards.units if cards is not None else 0,
+        card_has_title=bool(cards is not None and cards.title_slot),
+        card_has_body=cards is not None,
+        card_has_icon=bool(cards is not None and (unit_decor or "icon" in repeat_roles)),
+        card_has_image=bool(cards is not None and "image" in repeat_roles),
+        supports_table=form.has_table,
+        supports_chart=form.has_chart or form.has_table or form.has_image,
+        supports_photo=form.has_image,
+        supports_quote=quote is not None,
+        supports_kpi=kpi is not None,
+        kpi_count_min=1 if kpi is not None else 0,
+        kpi_count_max=kpi.units if kpi is not None else 0,
+        repeat_topology=topology,
+        sequence_semantics=bool(repeat is not None and (unit_decor or "kpi_value" in repeat_roles)),
+        max_total_words=int(words),
+        photo_frames=int(getattr(pattern, "photo_frames", 0) or 0),
+        photo_area=float(getattr(pattern, "photo_area", 0.0) or 0.0),
+        photo_slot_area=float(getattr(pattern, "photo_slot_area", 0.0) or 0.0),
+    )
+
+
+@dataclass(frozen=True)
+class SlideRequirements:
+    """Что слайду нужно от раскладки. До письма (`from_intent`) известны
+    заказанная форма и фото; после письма (`from_slide`) блоки, которые
+    написал писатель. `allow_split`: карточек больше мест, но лестница
+    сборки может разделить слайд на два."""
+    headline: bool = True
+    cards: int = 0
+    bullets: int = 0
+    text_blocks: int = 0
+    kpis: int = 0
+    table: bool = False
+    chart: bool = False
+    photo: bool = False
+    quote: bool = False
+    allow_split: bool = True
+    max_photo_void: float = MAX_PHOTO_VOID
+
+    @classmethod
+    def from_intent(cls, intent) -> "SlideRequirements":
+        form = getattr(intent, "form", None)
+        return cls(
+            headline=True,
+            kpis=int(getattr(intent, "items", 0) or 0) if form == "kpi" else 0,
+            table=form == "table", chart=form == "chart", quote=form == "quote",
+            photo=bool(getattr(intent, "photo", None)),
+        )
+
+    @classmethod
+    def from_slide(cls, slide) -> "SlideRequirements":
+        from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, TextBlock
+
+        blocks = list(slide.blocks)
+        visual = slide.visual
+        return cls(
+            headline=bool((slide.headline or "").strip()),
+            cards=sum(len(b.items) for b in blocks if isinstance(b, CardBlock)),
+            bullets=sum(len(b.items) for b in blocks if isinstance(b, BulletBlock)),
+            text_blocks=sum(1 for b in blocks if isinstance(b, TextBlock) and b.text.strip()),
+            kpis=sum(len(b.items) for b in blocks if isinstance(b, KpiBlock)),
+            quote=any(isinstance(b, QuoteBlock) and b.text.strip() for b in blocks),
+            table=visual is not None and visual.kind == "table",
+            chart=visual is not None and visual.kind == "chart",
+            photo=visual is not None and visual.kind == "photo",
+        )
+
+
+def unmet_requirements(req: SlideRequirements, caps: PatternCapabilities) -> list[str]:
+    """Требования, которых раскладка не держит, словами. Пустой список:
+    требования входят в возможности."""
+    missing: list[str] = []
+    if req.headline and not caps.headline:
+        missing.append("нет места под заголовок")
+    if req.cards:
+        need = 2 if req.allow_split else req.cards
+        if caps.card_count_max < need:
+            missing.append(f"карточек {req.cards}, мест под карточки {caps.card_count_max}")
+    if req.bullets and not (caps.text_blocks_max or caps.card_count_max):
+        missing.append("нет места под список")
+    if req.text_blocks and not (caps.text_blocks_max or caps.card_count_max or caps.supports_quote):
+        missing.append("нет места под абзац")
+    if req.kpis and not caps.supports_kpi:
+        missing.append("нет места под показатели")
+    if req.table and not caps.supports_table:
+        missing.append("нет места под таблицу")
+    if req.chart and not caps.supports_chart:
+        missing.append("нет места под график")
+    if req.photo and not caps.supports_photo:
+        missing.append("нет места под фото")
+    if req.quote and not (caps.supports_quote or caps.text_blocks_max):
+        missing.append("нет места под цитату")
+    void = caps.photo_void(req.photo)
+    if void > req.max_photo_void:
+        missing.append(f"после удаления фото примера пустеет {void:.0%} холста")
+    return missing

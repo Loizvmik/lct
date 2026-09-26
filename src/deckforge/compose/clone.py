@@ -1188,3 +1188,103 @@ def fix_duplicate_partnames(prs) -> int:
         seen.add(new_name)
         renamed += 1
     return renamed
+
+
+# ---------------------------------------------------------------------------
+# Фото-образцы лейаута (задача V2)
+# ---------------------------------------------------------------------------
+
+_SP_TREE_HEAD = (qn("p:nvGrpSpPr"), qn("p:grpSpPr"))
+
+
+def hide_layout_photos(slide, photo_ids: Iterable[str], canvas: Canvas) -> int:
+    """Скрывает на слайде фото-образцы его лейаута (`Pattern.layout_photo_
+    ids`): «Паттерн + фото» VK Education рисует фотографию девушки в кресле
+    не на слайде-примере, а на лейауте, и она выходила на каждом слайде
+    этого лейаута в чужой колоде (27 сентября 2026).
+
+    Фигуру лейаута со слайда не удалить, поэтому у слайда выключается
+    графика лейаута (`showMasterSp="0"`, в PowerPoint «Скрыть фоновые
+    рисунки»), а всё остальное видимое оформление лейаута и мастера, кроме
+    фото-образцов, копируется на слайд под его фигуры вместе со связями
+    картинок: фирменная графика должна остаться. Фон слайда этим не
+    трогается. Возвращает, сколько фото скрыто (0: у лейаута их нет, слайд
+    не менялся)."""
+    ids = {str(i) for i in photo_ids if i}
+    if not ids:
+        return 0
+    layout = slide.slide_layout
+    layout_tree = layout.shapes._spTree  # noqa: SLF001
+    hidden = [
+        el for el in layout_tree.iter(qn("p:pic"))
+        if el.find(qn("p:nvPicPr") + "/" + qn("p:cNvPr")) is not None
+        and el.find(qn("p:nvPicPr") + "/" + qn("p:cNvPr")).get("id") in ids
+    ]
+    if not hidden:
+        return 0
+    owners = [(layout, layout_tree)]
+    if layout._element.get("showMasterSp") != "0":  # noqa: SLF001
+        master = layout.slide_master
+        owners.append((master, master.shapes._spTree))  # noqa: SLF001
+    sp_tree = slide.shapes._spTree  # noqa: SLF001
+    anchor = None
+    for el in sp_tree:
+        if el.tag in _SP_TREE_HEAD:
+            anchor = el
+    copies = []
+    # Мастер рисуется под лейаутом: его фигуры идут первыми.
+    for owner, tree in reversed(owners):
+        for el in tree:
+            if el.tag in _SP_TREE_HEAD or _is_placeholder_el(el):
+                continue
+            dup = copy.deepcopy(el)
+            for pic in list(dup.iter(qn("p:pic"))):
+                c_nv = pic.find(qn("p:nvPicPr") + "/" + qn("p:cNvPr"))
+                if owner is layout and c_nv is not None and c_nv.get("id") in ids:
+                    if pic is dup:
+                        dup = None
+                        break
+                    remove_shape(pic)
+            if dup is None or not _visible_on_canvas(dup, canvas):
+                continue
+            _relink(dup, owner.part, slide.part)
+            copies.append(dup)
+    for dup in copies:
+        if anchor is not None:
+            anchor.addnext(dup)
+        else:
+            sp_tree.insert(0, dup)
+        anchor = dup
+    slide._element.set("showMasterSp", "0")  # noqa: SLF001
+    return len(hidden)
+
+
+def _is_placeholder_el(el) -> bool:
+    return el.find(".//" + qn("p:nvPr") + "/" + qn("p:ph")) is not None
+
+
+def _visible_on_canvas(el, canvas: Canvas) -> bool:
+    """Фигура хоть краем на холсте: направляющие мастера VK Education стоят
+    за верхним и нижним краем, копировать их на слайд незачем (аудит
+    посчитал бы их выходом за границы)."""
+    wrapper = etree.Element(qn("p:spTree"))
+    wrapper.append(copy.deepcopy(el))
+    refs = [r for r in walk_shapes(wrapper, canvas) if r.box is not None]
+    whole = Box(0.0, 0.0, 1.0, 1.0)
+    return any(r.box.area > 0 and whole.intersect(r.box) is not None for r in refs)
+
+
+def _relink(root, source_part, target_part) -> None:
+    """Связи, на которые ссылается скопированная фигура (картинки,
+    гиперссылки), переносятся из части-владельца в слайд с новыми rId."""
+    mapping: dict[str, str] = {}
+    for el in root.iter():
+        for name, value in el.attrib.items():
+            if not name.startswith(_R_NS) or value in mapping or value not in source_part.rels:
+                continue
+            rel = source_part.rels[value]
+            if rel.is_external:
+                mapping[value] = target_part.relate_to(rel.target_ref, rel.reltype, is_external=True)
+            else:
+                mapping[value] = target_part.relate_to(rel.target_part, rel.reltype)
+    _remap_rids(root, mapping)

@@ -81,7 +81,9 @@ def test_main_slot_fill_measures_the_biggest_text_place_of_the_chosen_layout(PRO
     from deckforge.compose.fit_check import main_slot_fill
     from deckforge.plan.spec import Card, CardBlock, SlideSpec
 
-    layout = next(p for p in PROFILE.patterns if p.kind == "cards")
+    # Карточная раскладка с местом `card_body`: у двумерных сеток VK Tech
+    # (задача V2) текст карточки снят ролью `body`.
+    layout = next(p for p in PROFILE.patterns if p.kind == "cards" and any(s.role == "card_body" for s in p.slots))
     spec = SlideSpec(
         index=1, kind="cards", headline="Итог",
         blocks=[CardBlock(items=[Card(title="А", body="Коротко"), Card(title="Б", body="Чуть длиннее тело")])],

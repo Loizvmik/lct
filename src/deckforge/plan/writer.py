@@ -37,6 +37,7 @@ from deckforge.compose.fit_check import measure_fit
 from deckforge.pattern.planner import repick_pattern
 from deckforge.plan.contracts import SlideContract, contract_fill, contract_problems
 from deckforge.plan.factcheck import check_number_in_sources
+from deckforge.plan.invariants import invariant_for, invariant_problems
 from deckforge.plan.normalize import normalize_deck
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
@@ -466,7 +467,9 @@ def _write_one_slide(
             entry["timed_out"] = True
         if slide is not None:
             schema_problems = slide_spec_problems(slide)
-            problems = schema_problems + contract_problems(slide, contract)
+            problems = schema_problems + contract_problems(slide, contract) + invariant_problems(
+                slide, invariant_for(contract),
+            )
             if problems and clock is not None and not clock.can_start():
                 # Ремонт не успеет до отметки писателя: слайд остаётся
                 # как есть (с находкой ниже), невалидный идёт запасным.
@@ -584,7 +587,7 @@ def write_slides(
     if clock is not None:
         deck.meta["time_fallbacks"] = str(timed_out + abandoned)
     compliant = frozenset(e["index"] for e in log if e.get("compliant"))
-    deck = normalize_deck(deck, profile, keep=compliant)
+    deck = normalize_deck(deck, profile, keep=compliant, invariants=[invariant_for(c) for c in contracts])
     if style_value and profile is not None:
         deck = _repick_changed(deck, profile, style_value)
     return replace(deck, slides=_dedupe_content(deck.slides, contracts))

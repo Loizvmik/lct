@@ -19,7 +19,9 @@ from __future__ import annotations
 import math
 
 from deckforge.pattern.candidates import capacity_units
-from deckforge.pattern.forms import MIN_HEADLINE_CHARS, PatternForm, list_item_limit
+from deckforge.pattern.forms import (
+    MAX_PHOTO_VOID, MIN_HEADLINE_CHARS, PatternForm, capabilities_of, list_item_limit,
+)
 from deckforge.pattern.intent import SlideIntent
 from deckforge.pattern.style import StylePolicy
 
@@ -123,6 +125,7 @@ def static_cost(
         and pattern.kind not in _HERO_IMAGE_KINDS and not intent.is_hero
     ):
         cost += w("orphan_image")
+    cost += photo_void_cost(pattern, intent, style)
     if position == 0 and cover_id is not None and pattern.pattern_id != cover_id:
         cost += w("cover_miss")
     if (
@@ -138,3 +141,51 @@ def repeat_cost(pattern_id: str, previous: str | None, uses: int, style: StylePo
     повторов, а не включается один раз."""
     cost = style.weight("consecutive_repeat") if pattern_id == previous else 0.0
     return cost + style.weight("repeated_pattern") * uses
+
+
+def growing_repeat_cost(look: str, previous: str | None, uses: int, style: StylePolicy) -> float:
+    """Повтор одного облика раскладки в колоде: цена каждого следующего
+    повтора вдвое выше предыдущего (30, 60, 120...), а не линейна, как у
+    `repeat_cost`. Линейной цены не хватало: живой прогон dense 27 сентября
+    2026 посадил на четыре кружка шесть слайдов из двенадцати, потому что
+    предпочтение стиля к карточкам на каждом слайде перевешивало очередные
+    30. С удвоением третий повтор стоит 120 и дороже любого несовпадения
+    со стилем.
+
+    Подряд один и тот же облик запрещён, пока есть альтернатива: вес
+    `consecutive_repeat` в конфиге порядка переполнения. `look`: ключ
+    облика (`look_key`), не `pattern_id`: два примера шаблона с одной
+    геометрией читаются глазом как одна раскладка."""
+    cost = style.weight("consecutive_repeat") if look == previous else 0.0
+    if uses > 0:
+        cost += style.weight("repeated_pattern") * (2 ** (uses - 1))
+    return cost
+
+
+def look_key(pattern) -> str:
+    """Облик раскладки: вид, лейаут, роли мест, повтор и число декора. У
+    VK Education `slide21` и `slide44` разные примеры с одной и той же
+    геометрией (четыре кружка с подписями), и повтор по `pattern_id` их
+    не различал бы с разными: колода выходила монотонной при «разных»
+    раскладках."""
+    repeat = getattr(pattern, "repeat", None)
+    rep = (
+        (getattr(repeat, "axis", None), repeat.count, tuple(sorted(repeat.slot_roles)))
+        if repeat is not None else None
+    )
+    roles = tuple(sorted(s.role for s in pattern.slots))
+    decor = getattr(pattern, "decor", None) or ()
+    return repr((pattern.kind, getattr(pattern, "layout_id", None), roles, rep, len(decor)))
+
+
+def photo_void(pattern, intent: SlideIntent) -> float:
+    """Доля холста, которая опустеет, когда клон удалит фото примера
+    (`forms.PatternCapabilities.photo_void`)."""
+    return capabilities_of(pattern).photo_void(bool(intent.photo))
+
+
+def photo_void_cost(pattern, intent: SlideIntent, style: StylePolicy) -> float:
+    """Штраф за пустоту на месте фото примера, если жёсткое ограничение
+    пришлось ослабить: выше любого несовпадения стиля."""
+    void = photo_void(pattern, intent)
+    return style.weight("sample_photo_void") if void > MAX_PHOTO_VOID else 0.0

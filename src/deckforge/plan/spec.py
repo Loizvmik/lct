@@ -193,6 +193,10 @@ class SlideSpec:
     # стоимости (`pattern.planner.PatternAssignment.alternatives`). Сборка
     # берёт их второй ступенью лестницы, если клон `pattern_id` отклонён.
     alternatives: tuple[str, ...] = ()
+    # Смысловой инвариант пункта нарушен (`plan.invariants`, задача V2):
+    # содержательный пункт остался без содержания. Сборка зовёт ремонт по
+    # контракту, а не собирает слайд разделителем. `None`: всё в порядке.
+    semantic_gap: str | None = None
 
 
 @dataclass
