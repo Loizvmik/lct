@@ -23,6 +23,7 @@ from deckforge.plan.outline import SourceDoc
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, SlideSpec
 from deckforge.plan.writer import shorten_to_contract
 from deckforge.provider.base import LLMProvider
+from deckforge.workflow.budget import RunMode
 
 # Вызовов починки на колоду одного стиля. Каждый вызов идёт посреди
 # сборки, последовательно по слайдам, и стоит 5-15 секунд модели: четыре
@@ -112,3 +113,27 @@ class SlideRepairer:
                 f"{'получено' if result is not None else 'не удалось'} за {time.monotonic() - started:.1f}с."
             )
         return result
+
+
+# Секунд на все сокращения одной колоды: четыре вызова по 10-15 секунд.
+REPAIR_WANTED_SECONDS = 60.0
+# Сколько оставить после сборки на обязательные стадии (аудит, экспорт).
+REPAIR_RESERVE_SECONDS = 20.0
+
+
+def repairer_for(
+    budget, profile, llm: LLMProvider | None, sources: list[SourceDoc], style, *, total: int = 0,
+) -> SlideRepairer:
+    """Починка для колоды одного стиля в его бюджете. В аварийном режиме и
+    когда времени не осталось модель не зовётся: лестница идёт к
+    разбиению и сборке с нуля, это секунды, а не десятки секунд. Бюджет
+    только читается (`mode`, `allowance`), решений о режиме здесь нет."""
+    seconds = REPAIR_WANTED_SECONDS
+    if budget is not None:
+        seconds = budget.allowance(REPAIR_WANTED_SECONDS, reserve=REPAIR_RESERVE_SECONDS)
+        if budget.mode is RunMode.EMERGENCY:
+            seconds = 0.0
+    return SlideRepairer(
+        profile=profile, llm=llm if seconds > 0 else None, sources=sources, style=style,
+        deadline=time.monotonic() + seconds, total=total,
+    )

@@ -48,6 +48,16 @@ def test_generation_reports_progress_by_stage(job_result: dict) -> None:
     assert job_result["stages"] == STAGES_IN_ORDER
 
 
+def test_snapshot_counts_slides_per_build_ladder_rung(job_result: dict) -> None:
+    """Задача U: в снимке задания по каждому стилю сколько слайдов какой
+    ступенью лестницы собрано; каждый слайд ровно на одной ступени."""
+    ladder = job_result["ladder"]
+    assert set(ladder) == {"dense", "airy", "visual"}
+    for counts in ladder.values():
+        assert list(counts) == ["clone", "adapt", "shorten", "split", "scratch"]
+        assert sum(counts.values()) >= 10
+
+
 def test_three_variants_are_returned(client: TestClient, deck_id: str) -> None:
     response = client.get(f"/api/decks/{deck_id}/variants")
     assert response.status_code == 200, response.text

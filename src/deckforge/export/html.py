@@ -1060,6 +1060,25 @@ def _fidelity_html(fidelity: "FidelityReport | None") -> str:
     return f'<div id="template-fidelity" title="{_esc(fidelity.summary)}">{_esc(fidelity.summary)}</div>'
 
 
+# Ступени лестницы сборки (`compose.builder.LADDER_RUNGS`) в порядке
+# лестницы, подписи для отчёта. Своя копия: экспорту незачем тянуть сборщик.
+_LADDER_LABELS = (
+    ("clone", "клон"), ("adapt", "запасная раскладка"), ("shorten", "сокращение текста"),
+    ("split", "разбиение"), ("scratch", "с нуля"),
+)
+
+
+def _ladder_html(deck_spec: DeckSpec) -> str:
+    """Задача U: сколько слайдов какой ступенью лестницы сборки собрано
+    (`DeckSpec.meta["ladder_*"]`, пишет `build_deck`). Пусто, если колоду
+    собирали без лестницы (старый план, тесты экспорта)."""
+    counts = [(label, deck_spec.meta.get(f"ladder_{key}")) for key, label in _LADDER_LABELS]
+    if all(value is None for _label, value in counts):
+        return ""
+    text = "Лестница сборки: " + ", ".join(f"{label} {value or 0}" for label, value in counts)
+    return f'<div id="build-ladder">{_esc(text)}</div>'
+
+
 def _wrap_document(
     deck_spec: DeckSpec, profile: TemplateProfile, canvas: Canvas, slides_html: list[str], fonts_css: str,
     *, deck_score: dict | None = None, content_avg: float | None = None, design_avg: float | None = None,
@@ -1075,6 +1094,7 @@ def _wrap_document(
     deck_score_html = _deck_score_html(deck_score, content_avg, design_avg)
     run_budget_html = _run_budget_html(budget, risky_slides)
     fidelity_html = _fidelity_html(fidelity)
+    ladder_html = _ladder_html(deck_spec)
 
     return f"""<!DOCTYPE html>
 <html lang="{_esc(lang)}">
@@ -1158,6 +1178,14 @@ body.overview #run-budget {{ display: block; }}
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }}
 body.overview #template-fidelity {{ display: block; }}
+/* Задача U: счётчик ступеней лестницы сборки, под «Верностью шаблону». */
+#build-ladder {{
+  display: none; position: fixed; left: 16px; top: 108px; z-index: 10;
+  max-width: min(70vw, 640px);
+  font: 12px var(--font-fallback); color: #fff; background: rgba(0,0,0,.55);
+  padding: 4px 10px; border-radius: 12px;
+}}
+body.overview #build-ladder {{ display: block; }}
 .block {{ position: absolute; }}
 .text-frame {{ position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-start; }}
 .text-frame p, .text-frame li {{ margin: 0 0 .25em 0; padding: 0; }}
@@ -1229,6 +1257,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 {deck_score_html}
 {run_budget_html}
 {fidelity_html}
+{ladder_html}
 <div id="grid"></div>
 <div class="print-pages" aria-hidden="true">
 {slides_joined}

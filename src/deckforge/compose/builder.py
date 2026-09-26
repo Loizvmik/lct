@@ -1610,7 +1610,7 @@ def _place_with_ladder(
                 pattern = cloned[0]
                 notes.append(
                     f"Слайд {slide_spec.index}: нужно {found[1]} единиц, у лучшей раскладки максимум "
-                    f"{capacity} — слайд разделён на два ({len(head.blocks[found[0]].items)} + "
+                    f"{capacity}, слайд разделён на два ({len(head.blocks[found[0]].items)} + "
                     f"{len(tail.blocks[0].items)}), продолжение следующим слайдом."
                 )
                 return LadderOutcome(
@@ -1626,7 +1626,7 @@ def _place_with_ladder(
 
 def _rung_note(slide_spec: SlideSpec, rung: str, pattern: Pattern) -> str:
     return (
-        f"Слайд {slide_spec.index}: лестница сборки — сработала ступень «{LADDER_TITLES[rung]}» "
+        f"Слайд {slide_spec.index}: лестница сборки: сработала ступень «{LADDER_TITLES[rung]}» "
         f"(раскладка {pattern.pattern_id!r})."
     )
 

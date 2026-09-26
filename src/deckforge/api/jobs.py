@@ -38,7 +38,7 @@ from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.findings import Finding
-from deckforge.compose.builder import build_deck
+from deckforge.compose.builder import build_deck, ladder_counts
 from deckforge.export.bundle import export_bundle
 from deckforge.pattern.intent import intents_from_outline
 from deckforge.plan.contracts import plan_contracts
@@ -46,6 +46,7 @@ from deckforge.plan.outline import Outline, SourceDoc, build_outline, outline_to
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import Variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.workflow.repair import repairer_for
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
@@ -230,6 +231,8 @@ class JobRecord:
                 ]
                 for name, state in self.variants.items()
             },
+            # Задача U: сколько слайдов какой ступенью лестницы собрано.
+            "ladder": {name: ladder_counts(state.deck_spec) for name, state in self.variants.items()},
         }
 
     def subscribe(self) -> asyncio.Queue:
@@ -456,7 +459,12 @@ async def _run_variant(
     job.reach_stage("compose")
 
     started = budget.clock()
-    built_path = await asyncio.to_thread(build_deck, variant_deck, profile, template_path, variant)
+    # Лестница сборки (задача U): слайд, чей клон отклонён, сперва чинится
+    # текстом под контракт раскладки; модель зовёт починка, не сборка.
+    repairer = repairer_for(budget, profile, _build_writer(), sources, variant, total=len(variant_deck.slides))
+    built_path = await asyncio.to_thread(
+        build_deck, variant_deck, profile, template_path, variant, repair=repairer,
+    )
     dest_dir = job.dir / variant.value
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "deck.pptx"

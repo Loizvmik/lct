@@ -132,3 +132,18 @@ def test_html_shows_fidelity_summary_when_passed(DECK, PROFILE, PPTX, tmp_path):
     text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html", fidelity=report).read_text(encoding="utf-8")
     assert 'id="template-fidelity"' in text
     assert report.summary in text
+
+
+def test_html_shows_build_ladder_counts_from_the_deck_meta(DECK, PROFILE, PPTX, tmp_path):
+    """Задача U: счётчик ступеней лестницы сборки из `DeckSpec.meta`
+    (`build_deck` пишет его всегда); без счётчика блока нет."""
+    from dataclasses import replace
+
+    assert DECK.meta.get("ladder_clone") is not None, "build_deck обязан записать счётчик лестницы"
+    text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html").read_text(encoding="utf-8")
+    assert 'id="build-ladder"' in text
+    assert f"клон {DECK.meta['ladder_clone']}" in text
+
+    bare = replace(DECK, meta={k: v for k, v in DECK.meta.items() if not k.startswith("ladder_")})
+    text = to_html(bare, PROFILE, PPTX, tmp_path / "bare.html").read_text(encoding="utf-8")
+    assert 'id="build-ladder"' not in text

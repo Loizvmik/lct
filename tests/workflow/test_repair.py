@@ -262,3 +262,19 @@ def test_planner_backups_come_right_after_the_chosen_layout(profile):
     order = [p.pattern_id for p in builder._resolve_pattern(slide, patterns, profile, Variant.dense)]
 
     assert order[:3] == [bullets[0], bullets[2], bullets[1]]
+
+
+def test_no_model_calls_in_emergency_mode_or_without_time(profile):
+    from deckforge.workflow.budget import BudgetPolicy, RunBudget, RunMode
+    from deckforge.workflow.repair import repairer_for
+
+    llm = _ShortenLLM()
+    roomy = RunBudget.from_policy(BudgetPolicy(budget_seconds=300.0))
+    assert repairer_for(roomy, profile, llm, [], "dense").llm is llm
+
+    emergency = RunBudget.from_policy(BudgetPolicy(budget_seconds=300.0))
+    emergency.mode = RunMode.EMERGENCY
+    assert repairer_for(emergency, profile, llm, [], "dense").llm is None
+
+    late = RunBudget.from_policy(BudgetPolicy(budget_seconds=10.0))
+    assert repairer_for(late, profile, llm, [], "dense").llm is None
