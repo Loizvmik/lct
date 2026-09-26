@@ -45,12 +45,20 @@ from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[2] / "config" / "app.yaml"
 
+# Задача V4: прогон-эталон с `--offline` идёт тем же путём, что `generate`,
+# но без модели, даже если ключ в `.env` есть: все роли получают `None` и
+# уходят в запасные пути. Флаг на процесс, а не аргумент: провайдеры
+# строятся в десятке мест, включая потоки стилей.
+_OFFLINE = {"on": False}
+
 
 def _build_role_provider(role: str, *, deadline_seconds: float | None = None) -> LLMProvider | None:
     """Провайдер для роли `role` (`outline`/`writer`/`pattern_picker`/
     `palette_namer`), либо `None`, если секретов нет или их не хватает для
     клиента — весь пайплайн (`parse`/`generate`) обязан продолжить работу
     запасным вариантом, не падать без сети/ключа."""
+    if _OFFLINE["on"]:
+        return None
     try:
         settings = Settings.load(APP_YAML_PATH)
     except Exception:
@@ -259,7 +267,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     ctx = dict(
         outline=outline, intents=intents, profile=profile, args=args, config=config, user_photos=user_photos,
         photos=photos, photo_report=photo_report, sources=sources,
-        writer_max_workers=writer_max_workers,
+        writer_max_workers=writer_max_workers, metrics=getattr(args, "metrics", None),
     )
     with ThreadPoolExecutor(max_workers=len(styles)) as pool:
         futures = [pool.submit(_generate_variant, style, budgets[style], ctx) for style in styles]
@@ -278,6 +286,8 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     print(f"\nВсего: {time.monotonic() - started:.1f}с на {len(styles)} стил(я/ей) параллельно")
     for style, style_budget in budgets.items():
         part = style_budget.summary()
+        if ctx["metrics"] is not None and style.value in ctx["metrics"]:
+            ctx["metrics"][style.value]["budget"] = part
         verdict = "уложился" if part["elapsed_seconds"] <= part["budget_seconds"] else "НЕ уложился"
         reused = f", переиспользовано: {', '.join(part['shared_stages'])}" if part.get("shared_stages") else ""
         print(
@@ -301,7 +311,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _visual_stage(budget: RunBudget, target, variant, sources, out: list[str]) -> None:
+def _visual_stage(budget: RunBudget, target, variant, sources, out: list[str]):
     """Аудит по картинке рискованных слайдов одного варианта в рамках
     его бюджета (задача H, `workflow.visual_stage`). Превью рендерятся,
     только если стадия реально пойдёт. Печать копится в `out`."""
@@ -313,7 +323,7 @@ def _visual_stage(budget: RunBudget, target, variant, sources, out: list[str]) -
     )
     if outcome.result is None:
         out.append(f"\nАудит по картинке рискованных слайдов не выполнялся: {outcome.skipped_reason}")
-        return
+        return outcome
     slides = ", ".join(
         f"{pos + 1} (техн. {tech:.1f}, смысл. {sem:.1f})" for pos, tech, sem in outcome.picked
     )
@@ -326,6 +336,7 @@ def _visual_stage(budget: RunBudget, target, variant, sources, out: list[str]) -
     for f in outcome.findings:
         where = f"слайд {f.slide_index + 1}" if f.slide_index is not None else "колода"
         out.append(f"  [{f.severity}] {f.check_id} ({where}): {f.message}")
+    return outcome
 
 
 def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[str]:
@@ -414,8 +425,10 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
     )
     # Сводка верности шаблону на вариант; печать, не решение пайплайна, и
     # она не должна ронять генерацию.
+    fidelity = None
     try:
-        out.append(f"  {template_fidelity(path, deck, profile).summary}")
+        fidelity = template_fidelity(path, deck, profile)
+        out.append(f"  {fidelity.summary}")
     except Exception as exc:  # noqa: BLE001 — сводка необязательна
         out.append(f"  ! Верность шаблону не посчитана: {exc}")
     out.append(f"  находки по серьёзности: {by_severity or '(нет)'}")
@@ -457,9 +470,45 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
     )
     # Аудит по картинке идёт у каждого стиля: это отдельный прогон со
     # своим бюджетом, как задание API.
-    _visual_stage(budget, (path, deck, findings), variant, ctx["sources"], out)
+    outcome = _visual_stage(budget, (path, deck, findings), variant, ctx["sources"], out)
     budget.stop()
+    metrics = ctx.get("metrics")
+    if metrics is not None:
+        # Прогон-эталон (задача V4) читает те же числа, что печатаются выше.
+        metrics[variant.value] = variant_metrics(
+            deck, path, findings, rungs, fidelity, outcome.result if outcome is not None else None,
+        )
     return out
+
+
+def variant_metrics(deck, path: Path, findings, rungs: dict[str, int], fidelity, visual) -> dict:
+    """Числа одного стиля для прогона-эталона: без бюджета, его добавляет
+    `_cmd_generate`, когда все стили доделаны."""
+    from dataclasses import asdict
+
+    from deckforge.bench import count_repeated_facts
+
+    by_severity: dict[str, int] = {}
+    for f in findings:
+        by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
+    fid = asdict(fidelity) if fidelity is not None else {}
+    return {
+        "pptx": str(path),
+        "slides": len(deck.slides),
+        "clones": rungs.get("clone", 0),
+        "fallback_rungs": sum(n for r, n in rungs.items() if r != "clone"),
+        "ladder": dict(rungs),
+        "findings_by_severity": dict(sorted(by_severity.items())),
+        "findings_total": len(findings),
+        "visual_content_avg": getattr(visual, "content_avg", None),
+        "visual_design_avg": getattr(visual, "design_avg", None),
+        "native_clone_rate": fid.get("native_clone_rate"),
+        "typography_palette_compliance": fid.get("typography_palette_compliance"),
+        "pattern_entropy": fid.get("pattern_entropy"),
+        "editable_content_coverage": fid.get("editable_content_coverage"),
+        "editable_counts": fid.get("editable_counts") or {},
+        "repeated_facts": count_repeated_facts(deck_spec_to_dict(deck)),
+    }
 
 
 def _cmd_audit_visual(args: argparse.Namespace) -> int:
@@ -589,6 +638,25 @@ def _cmd_fidelity(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bench(args: argparse.Namespace) -> int:
+    """Задача V4: прогон-эталон (`deckforge.bench`)."""
+    from deckforge import bench
+
+    if args.compare:
+        a, b = (json.loads(p.read_text(encoding="utf-8")) for p in args.compare)
+        print(bench.compare(a, b), end="")
+        return 0
+    root = APP_YAML_PATH.parents[1]
+    templates = args.templates or sorted((root / "dataset" / "templates").glob("*.pptx"))
+    packs = args.packs or sorted(p for p in (root / "fixtures" / "content-packs").iterdir() if p.is_dir())
+    styles = args.styles or [s.value for s in GenerationStyle]
+    rows = bench.run_bench(templates, packs, styles, args.output_dir, offline=args.offline)
+    md_path, json_path = bench.write_report(rows, args.output_dir, offline=args.offline)
+    print(bench.to_markdown(rows), end="")
+    print(f"\nОтчёт: {md_path}, {json_path}")
+    return 1 if any("error" in r for r in rows) else 0
+
+
 def _fmt_metric(value: float | None) -> str:
     return f"{value:.0%}" if value is not None else "н/д"
 
@@ -655,6 +723,30 @@ def build_parser() -> argparse.ArgumentParser:
         help="DeckSpec в JSON, сохранённый deckforge generate (<шаблон>__<пакет>__deck-t13.json)",
     )
     fidelity_cmd.set_defaults(func=_cmd_fidelity)
+
+    bench_cmd = sub.add_parser(
+        "bench",
+        help="Прогон-эталон: шаблоны × наборы содержания × стили, таблица чисел в markdown и JSON",
+    )
+    bench_cmd.add_argument(
+        "templates", type=Path, nargs="*",
+        help="Шаблоны .pptx (по умолчанию все из dataset/templates)",
+    )
+    bench_cmd.add_argument(
+        "--pack", dest="packs", type=Path, action="append",
+        help="Каталог набора содержания, можно повторять (по умолчанию все из fixtures/content-packs)",
+    )
+    bench_cmd.add_argument(
+        "--style", dest="styles", action="append", choices=[s.value for s in GenerationStyle],
+        help="Стиль, можно повторять (по умолчанию все три)",
+    )
+    bench_cmd.add_argument("-o", "--output-dir", type=Path, default=Path("out/bench"), help="Куда писать колоды и отчёт")
+    bench_cmd.add_argument("--offline", action="store_true", help="Без модели: все роли запасными путями")
+    bench_cmd.add_argument(
+        "--compare", nargs=2, type=Path, metavar=("A.json", "B.json"),
+        help="Не генерировать, а сравнить два отчёта: дельты B - A по колонкам",
+    )
+    bench_cmd.set_defaults(func=_cmd_bench)
 
     return parser
 
