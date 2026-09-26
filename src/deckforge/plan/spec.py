@@ -189,6 +189,10 @@ class SlideSpec:
     # совместимость сохранена буквально: старый код, не знающий про
     # `pattern_id`, продолжает работать без единой правки.
     pattern_id: str | None = None
+    # Запасные раскладки того же вида от планировщика, в порядке его
+    # стоимости (`pattern.planner.PatternAssignment.alternatives`). Сборка
+    # берёт их второй ступенью лестницы, если клон `pattern_id` отклонён.
+    alternatives: tuple[str, ...] = ()
 
 
 @dataclass
@@ -591,6 +595,7 @@ def slide_spec_to_dict(slide: SlideSpec) -> dict:
         "visual": _visual_to_dict(slide.visual),
         "source_note": slide.source_note, "speaker_notes": slide.speaker_notes,
         "findings": list(slide.findings), "pattern_id": slide.pattern_id,
+        "alternatives": list(slide.alternatives),
     }
 
 
@@ -601,6 +606,7 @@ def slide_spec_from_debug_dict(data: dict) -> SlideSpec:
         visual=_visual_from_debug_dict(data.get("visual")),
         source_note=data.get("source_note"), speaker_notes=data.get("speaker_notes"),
         findings=list(data.get("findings") or []), pattern_id=data.get("pattern_id"),
+        alternatives=tuple(data.get("alternatives") or ()),
     )
 
 

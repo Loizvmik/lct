@@ -116,6 +116,9 @@ class SlideContract:
     photo: str | None = None
     photo_caption: str | None = None
     gap_note: str | None = None
+    # Запасные раскладки планировщика (`PatternAssignment.alternatives`):
+    # писатель их не видит, они едут со слайдом до сборки.
+    alternatives: tuple[str, ...] = ()
 
     @property
     def is_divider(self) -> bool:
@@ -232,6 +235,7 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
         photo=intent.photo,
         photo_caption=intent.photo_caption,
         gap_note=assignment.gap_note(),
+        alternatives=tuple(getattr(assignment, "alternatives", ()) or ()),
     )
 
 

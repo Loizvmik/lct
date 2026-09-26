@@ -23,6 +23,11 @@ from deckforge.pattern.style import StylePolicy, load_style
 
 DEFAULT_BEAM_WIDTH = 20
 
+# Запасных раскладок на слайд. Сборка пробует клон каждой (миллисекунды),
+# но дальше третьей-четвёртой по стоимости идут раскладки, которые
+# планировщик и так счёл плохими для этого содержания.
+MAX_ALTERNATIVES = 3
+
 # Вид слайда, когда раскладок нет вовсе (пустой профиль): первое
 # приближение по смыслу пункта структуры, как раньше у писателя.
 _OUTLINE_KIND_TO_SLIDE_KIND: dict[str, str] = {
@@ -46,6 +51,11 @@ class PatternAssignment:
     kind: str
     cost: float = 0.0
     relaxed: tuple[str, ...] = ()
+    # Запасные раскладки того же вида в порядке стоимости, без выбранной:
+    # вторая ступень лестницы сборки (`compose.builder`), если клон
+    # выбранной отклонён. Порядок тот же, каким планировщик их оценивал,
+    # чтобы сборка не подбирала замену своим, иным расчётом.
+    alternatives: tuple[str, ...] = ()
 
     def gap_note(self) -> str | None:
         if not self.relaxed:
@@ -153,6 +163,10 @@ def plan_patterns(
         PatternAssignment(
             position=i, intent=intent, pattern_id=pid, kind=patterns[pid].kind,
             cost=round(static[i][pid], 3), relaxed=relaxed[i],
+            alternatives=tuple(
+                other for other, _cost in per_slide[i]
+                if other != pid and patterns[other].kind == patterns[pid].kind
+            )[:MAX_ALTERNATIVES],
         )
         for i, (intent, pid) in enumerate(zip(intents, best.ids))
     ]

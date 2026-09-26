@@ -174,7 +174,10 @@ def _parse_slide(data: dict, contract: SlideContract) -> SlideSpec:
     data = {k: v for k, v in data.items() if k != "layout_id"}
     data["kind"] = contract.kind
     slide = slide_spec_from_dict(data, contract.slide_id)
-    return replace(slide, pattern_id=contract.pattern_id, blocks=[_clean_block(b) for b in slide.blocks])
+    return replace(
+        slide, pattern_id=contract.pattern_id, alternatives=contract.alternatives,
+        blocks=[_clean_block(b) for b in slide.blocks],
+    )
 
 
 _MARKUP_RE = re.compile(r"\*\*|__")
@@ -322,6 +325,7 @@ def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> Sl
     return SlideSpec(
         index=contract.slide_id, kind=contract.kind, headline=headline, blocks=blocks,
         source_note=source_note, findings=[finding], pattern_id=contract.pattern_id,
+        alternatives=contract.alternatives,
         speaker_notes="Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
     )
 
@@ -329,7 +333,7 @@ def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> Sl
 def _divider_slide(contract: SlideContract) -> SlideSpec:
     return SlideSpec(
         index=contract.slide_id, kind=contract.kind, headline=contract.divider_label or "",
-        pattern_id=contract.pattern_id,
+        pattern_id=contract.pattern_id, alternatives=contract.alternatives,
     )
 
 
@@ -489,7 +493,8 @@ def _repick_changed(deck: DeckSpec, profile, style: str) -> DeckSpec:
         if pid is None:
             continue
         kind = next(p.kind for p in profile.patterns if p.pattern_id == pid)
-        slides[i] = replace(slide, pattern_id=pid, kind=kind)
+        # Запасные планировщика были того вида, который слайд потерял.
+        slides[i] = replace(slide, pattern_id=pid, kind=kind, alternatives=())
         ids[i] = pid
     return replace(deck, slides=slides)
 
