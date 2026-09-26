@@ -456,13 +456,18 @@ def test_decor_outside_the_repeat_group_survives_when_empty_plaques_go():
     assert result == [background]
 
 
-def test_plaques_are_kept_as_mined_when_units_cannot_be_matched_one_to_one():
-    """Единиц декора шесть, единиц текстовых слотов одна — номера
-    сопоставить нечем, выдумывать соответствие нельзя: раз содержание
-    куда-то легло, весь декор остаётся как намайнен."""
-    pattern = _six_card_pattern()
+def test_plaques_of_empty_columns_go_when_units_cannot_be_matched_by_number():
+    """Единиц декора шесть, единиц текстовых слотов одна — по номерам
+    сопоставить нечем, но по геометрии видно: плашки со второй по шестую
+    стоят в колонках, куда ничего не легло (задача J, наблюдение 8.4:
+    иконка третьего тезиса `slide26` оставалась без текста). Остаётся
+    плашка заполненной колонки и декор вне повтора."""
+    lone = DecorShape(kind="shape", box=Box(0.05, 0.85, 0.9, 0.05), rotation=0.0, flip_h=False, flip_v=False,
+                      fill_hex="#EEEEEE", has_fill=True, repeat_group=False, repeat_index=0)
+    pattern = _six_card_pattern(extra_decor=(lone,))
     result = expand_decor(pattern, None, _grid(), {0})
-    assert len(result) == len(pattern.decor)
+    assert [d.repeat_index for d in result if d.repeat_group] == [0]
+    assert lone in result
 
 
 def test_plaques_all_go_when_units_cannot_be_matched_and_nothing_landed():
