@@ -1,8 +1,5 @@
-// Черновик брифа в localStorage, по одному на шаблон (Task 16, п.1 —
-// «вернуться к брифу и перегенерировать с другим текстом, не загружая
-// шаблон заново»). Шаблон уже разобран и лежит в кеше API по `template_id`
-// — здесь хранится только то, что человек напечатал в форме, чтобы при
-// возврате с экрана вариантов/аудита форма не была пустой.
+import { getAppSettings } from "@/lib/appSettings";
+
 export interface BriefDraft {
   title: string;
   brief: string;
@@ -11,24 +8,47 @@ export interface BriefDraft {
   autofix: boolean;
 }
 
-function key(templateId: string): string {
-  return `deckforge:brief-draft:${templateId}`;
+const key = (templateId: string) => `slides:task-draft:v2:${templateId}`;
+const legacyKey = (templateId: string) => `deckforge:brief-draft:${templateId}`;
+
+function looksLikeBundledExample(draft: BriefDraft): boolean {
+  return draft.title.includes("Сокращение времени согласования заявок")
+    || draft.brief.includes("автоматической маршрутизации заявок");
 }
 
 export function loadBriefDraft(templateId: string): BriefDraft | null {
+  if (typeof window === "undefined") return null;
+  if (!getAppSettings().rememberDrafts) return null;
+  const current = localStorage.getItem(key(templateId));
+  if (current) {
+    try { return JSON.parse(current) as BriefDraft; } catch { localStorage.removeItem(key(templateId)); }
+  }
+  const legacy = localStorage.getItem(legacyKey(templateId));
+  if (!legacy) return null;
   try {
-    const raw = window.localStorage.getItem(key(templateId));
-    if (!raw) return null;
-    return JSON.parse(raw) as BriefDraft;
+    const draft = JSON.parse(legacy) as BriefDraft;
+    localStorage.removeItem(legacyKey(templateId));
+    if (looksLikeBundledExample(draft)) return null;
+    saveBriefDraft(templateId, draft);
+    return draft;
   } catch {
+    localStorage.removeItem(legacyKey(templateId));
     return null;
   }
 }
 
 export function saveBriefDraft(templateId: string, draft: BriefDraft): void {
-  try {
-    window.localStorage.setItem(key(templateId), JSON.stringify(draft));
-  } catch {
-    // приватный режим/квота — черновик просто не переживёт переход, это не критично
+  if (typeof window === "undefined") return;
+  if (!getAppSettings().rememberDrafts) {
+    clearBriefDraft(templateId);
+    return;
+  }
+  localStorage.setItem(key(templateId), JSON.stringify(draft));
+}
+
+export function clearBriefDraft(templateId: string): void {
+  if (typeof window !== "undefined") {
+    localStorage.removeItem(key(templateId));
+    localStorage.removeItem(legacyKey(templateId));
   }
 }

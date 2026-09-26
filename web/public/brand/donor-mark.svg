@@ -1,0 +1,3 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title desc">
+<title id="title">Знак «Донор»</title><desc id="desc">Визуальный модуль переходит между двумя рамками презентаций.</desc><path d="M3 7H22V13H9V35H22V41H3Z" fill="#4938E8"/><path d="M26 7H45V41H26V35H39V13H26Z" fill="#17171D" class="donor-frame-secondary"/><path d="M18 17H30V31H18Z" fill="#FF6846"/>
+</svg>

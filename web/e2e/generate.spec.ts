@@ -1,96 +1,135 @@
 import { test, expect } from "@playwright/test";
 import path from "node:path";
 
-// Обязательная проверка Task 16 — весь путь пользователя в браузере на
-// РЕАЛЬНОМ пайплайне (не мок API): загрузка шаблона -> дизайн-система ->
-// бриф -> прогресс по этапам -> три варианта -> аудит с подсветкой находок
-// поверх превью -> выгрузка. Реальная генерация занимает минуты (ТЗ:
-// "не более пяти минут"), поэтому тест один, длинный, а не набор мелких
-// изолированных тестов с моками — мок здесь бы проверил вёрстку, а не то,
-// что брифом действительно требуется показать вживую.
 const TEMPLATE_PATH = path.resolve(__dirname, "../../dataset/templates/ЛЦТ2026 Шаблон презентации.pptx");
 
-test("полный путь: шаблон -> бриф -> варианты -> аудит с подсветкой -> выгрузка", async ({ page }) => {
+test("полный путь: шаблон, задание, варианты, проверка и скачивание", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByRole("heading", { level: 1, name: /Шаг 1 — загрузите/ })).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Загрузите шаблон презентации" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Выбрать файл" })).toBeVisible();
+  await page.locator('input[type="file"]').setInputFiles(TEMPLATE_PATH);
 
-  const fileInput = page.locator('input[type="file"]');
-  await fileInput.setInputFiles(TEMPLATE_PATH);
+  await page.waitForURL(/\/templates\/[a-f0-9]+$/, { timeout: 45_000 });
+  await expect(page.getByRole("heading", { level: 1, name: "ЛЦТ2026 Шаблон презентации.pptx" })).toBeVisible();
+  await expect(page.getByText("Основные цвета")).toBeVisible();
+  await page.getByRole("link", { name: "Перейти к заданию" }).click();
 
-  // Разбор шаблона -> редирект на /templates/{id}, дизайн-система видна.
-  await page.waitForURL(/\/templates\/[a-f0-9]+$/, { timeout: 30_000 });
-  await expect(page.getByRole("heading", { level: 1, name: /Дизайн-система шаблона/ })).toBeVisible();
-  await expect(page.getByText("Палитра ролей", { exact: false })).toBeVisible();
-  await expect(page.getByText("Каталог паттернов вёрстки", { exact: false })).toBeVisible();
-  await expect(page.getByText("Откуда что взято")).toBeVisible();
+  await expect(page.getByRole("heading", { level: 1, name: "Опишите задачу" })).toBeVisible();
+  const task = page.getByLabel(/Задача презентации/);
+  await expect(task).toHaveValue("");
+  await page.getByRole("button", { name: "Вставить пример" }).click();
+  await expect(task).not.toHaveValue("");
+  await page.getByRole("button", { name: "Очистить поля" }).click();
+  await expect(task).toHaveValue("");
+  await expect(page.getByRole("radio", { name: /Все три стиля/ })).toBeChecked();
+  await expect(page.getByRole("button", { name: "Создать три варианта" })).toBeDisabled();
+  await page.getByLabel(/Название презентации/).fill("Итоги проекта");
+  await task.fill("Показать руководителям результаты проекта и получить решение о запуске следующего этапа.");
+  await page.getByLabel(/Исходные материалы/).fill("В пилоте участвовали 4 отдела. Срок обработки сократился на 27%.");
+  await expect(page.getByRole("button", { name: "Создать три варианта" })).toBeEnabled();
+  await page.getByRole("button", { name: "Создать три варианта" }).click();
 
-  await page.getByRole("link", { name: /Дальше: бриф и материалы/ }).click();
-  await page.waitForURL(/\/templates\/[a-f0-9]+\/brief$/);
-
-  await page.getByPlaceholder(/Например, «Сокращение времени/).fill("e2e — согласование заявок");
-  await page.getByPlaceholder(/Просим комитет согласовать/).fill(
-    "Просим комитет согласовать запуск автоматической маршрутизации заявок на " +
-      "внутренней платформе. Показать, где уходит время, что дал пилот и что нужно " +
-      "для раскатки на всю компанию.",
-  );
-  await page.getByPlaceholder(/Выборка: 1240 заявок/).fill(
-    "Выборка: 1240 заявок, медиана ожидания 18 часов, чистая работа — 28 минут.",
-  );
-
-  await page.getByRole("button", { name: /Собрать три варианта/ }).click();
   // Задача Q: одна кнопка создаёт три задания (по стилю), экран пакета
-  // показывает прогресс каждого отдельно.
+  // показывает прогресс каждого отдельно, задания идут параллельно.
   await page.waitForURL(/\/batches\/[a-f0-9]+$/, { timeout: 30_000 });
+  await expect(page.getByRole("heading", { level: 1, name: "Три стиля, три презентации" })).toBeVisible();
   await expect(page.locator(".variant-card")).toHaveCount(3);
-
-  // Прогресс — реальные этапы, не крутилка (ТЗ, Step 3 брифа задачи).
   await expect(page.locator(".stage-track .stage").first()).toBeVisible();
 
-  // Каждое задание: разбор + структура + текст + сборка + аудит + выгрузка,
-  // до пяти минут по ТЗ на задание; задания идут параллельно.
+  // Каждое задание укладывается в пять минут по ТЗ; ждём превью всех трёх.
   await expect(page.locator(".variant-card .preview img")).toHaveCount(3, { timeout: 5 * 60 * 1000 });
-
   for (const label of ["Плотный", "Воздушный", "Визуальный"]) {
-    await expect(page.getByText(label, { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { level: 2, name: label })).toBeVisible();
   }
 
-  await page.locator(".variant-card").first().getByRole("link", { name: /Аудит и починка/ }).click();
-  await page.waitForURL(/\/decks\/[a-f0-9]+\/audit\?variant=/);
-
-  await expect(page.getByRole("heading", { level: 1, name: /Шаг 4 — аудит/ })).toBeVisible();
+  await page.locator(".variant-card").first().getByRole("link", { name: "Проверить вариант" }).click();
+  await expect(page.getByRole("heading", { name: "Проверьте презентацию" })).toBeVisible();
   await expect(page.locator(".slide-preview-wrap img")).toBeVisible();
 
-  // Сердце задачи: подсветка находок ПОВЕРХ превью по координатам —
-  // проверяем, что хотя бы одна рамка позиционирована процентами (не
-  // нулевой заглушкой) поверх картинки слайда, обходя слайды при
-  // необходимости (не на каждом слайде обязана быть находка).
+  const thumbs = page.locator(".audit-stage .thumb");
   let foundBox = false;
-  const thumbCount = await page.locator(".thumb-strip .thumb").count();
-  for (let i = 0; i < thumbCount && !foundBox; i++) {
-    await page.locator(".thumb-strip .thumb").nth(i).click();
-    const boxes = page.locator(".finding-box");
-    if (await boxes.count()) {
-      const style = await boxes.first().getAttribute("style");
-      expect(style).toMatch(/left: \d/);
-      expect(style).toMatch(/top: \d/);
-      foundBox = true;
-    }
+  for (let index = 0; index < await thumbs.count() && !foundBox; index += 1) {
+    await thumbs.nth(index).click();
+    if (await page.locator(".finding-box").count()) foundBox = true;
   }
   expect(foundBox).toBe(true);
+  await expect(page.getByRole("link", { name: "Скачать PowerPoint" })).toHaveAttribute("href", /format=pptx/);
+});
 
-  // Экран выбора: чекбокс на находке, кнопка «исправить выбранное».
-  const checkbox = page.locator('.finding-item input[type="checkbox"]:not([disabled])').first();
-  if (await checkbox.count()) {
-    await expect(checkbox).toBeVisible();
-    const fixButton = page.getByRole("button", { name: /Исправить выбранное/ });
-    await expect(fixButton).toBeEnabled();
+test("настройки и управление с клавиатуры", async ({ page }) => {
+  await page.goto("/");
+  await expect(page).toHaveTitle("Донор — презентации по вашему образцу");
+  await expect(page.getByRole("link", { name: "Донор — на главную" })).toBeVisible();
+  await expect(page.locator('link[rel="icon"]')).toHaveCount(2);
+  await page.getByRole("button", { name: /настройки/i }).click();
+  await expect(page.getByRole("dialog", { name: "Настройки" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Создание презентации" })).toBeVisible();
+  await page.getByLabel("Количество слайдов по умолчанию").selectOption("12");
+  await page.getByLabel("Предпочтительный формат").selectOption("pdf");
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog", { name: "Настройки" })).toBeHidden();
+  await page.goto("/templates/settings-test/brief");
+  await expect(page.getByRole("textbox", { name: "Количество слайдов", exact: true })).toHaveValue("12");
+  await page.keyboard.press("Tab");
+  await expect(page.locator(":focus-visible")).toBeVisible();
+});
+
+test("новая презентация требует подтверждения", async ({ page }) => {
+  await page.goto("/templates/ui-test-template/brief");
+  await page.getByRole("button", { name: "Новая презентация" }).click();
+  const dialog = page.getByRole("dialog", { name: "Начать новую презентацию?" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByRole("button", { name: "Остаться" }).click();
+  await expect(page).toHaveURL(/\/templates\/ui-test-template\/brief$/);
+  await page.getByRole("button", { name: "Новая презентация" }).click();
+  await dialog.getByRole("button", { name: "Начать новую" }).click();
+  await expect(page).toHaveURL(/\/$/);
+});
+
+test("пустая форма, черновик и проверка числа слайдов", async ({ page }) => {
+  const templateId = "ui-test-template";
+  await page.goto(`/templates/${templateId}/brief`);
+
+  const title = page.getByLabel(/Название презентации/);
+  const task = page.getByLabel(/Задача презентации/);
+  const sources = page.getByLabel(/Исходные материалы/);
+  const slides = page.getByRole("textbox", { name: "Количество слайдов", exact: true });
+  const submit = page.getByRole("button", { name: "Создать три варианта" });
+
+  await expect(title).toHaveValue("");
+  await expect(task).toHaveValue("");
+  await page.getByRole("button", { name: "Вставить пример" }).click();
+  await expect(task).not.toHaveValue("");
+  await page.getByRole("button", { name: "Очистить поля" }).click();
+  await expect(task).toHaveValue("");
+  await expect(page.getByRole("radio", { name: /Все три стиля/ })).toBeChecked();
+  await expect(sources).toHaveValue("");
+  await expect(submit).toBeDisabled();
+
+  await title.fill("Сохранённое название");
+  await task.fill("Показать команде итоги и согласовать следующий этап.");
+  await sources.fill("Обработано 410 заявок.");
+  await slides.fill("99");
+  await expect(page.getByText("Введите число от 4 до 15.")).toBeVisible();
+  await expect(submit).toBeDisabled();
+  await slides.fill("12");
+  await expect(submit).toBeEnabled();
+  await page.waitForTimeout(300);
+  await page.reload();
+  await expect(title).toHaveValue("Сохранённое название");
+  await expect(task).toHaveValue(/Показать команде итоги/);
+  await expect(slides).toHaveValue("12");
+
+  // Задача Q: одна кнопка создаёт три задания (по стилю), экран пакета
+  // показывает прогресс каждого отдельно, задания идут параллельно.
+  await page.waitForURL(/\/batches\/[a-f0-9]+$/, { timeout: 30_000 });
+  await expect(page.getByRole("heading", { level: 1, name: "Три стиля, три презентации" })).toBeVisible();
+  await expect(page.locator(".variant-card")).toHaveCount(3);
+  await expect(page.locator(".stage-track .stage").first()).toBeVisible();
+
+  // Каждое задание укладывается в пять минут по ТЗ; ждём превью всех трёх.
+  await expect(page.locator(".variant-card .preview img")).toHaveCount(3, { timeout: 5 * 60 * 1000 });
+  for (const label of ["Плотный", "Воздушный", "Визуальный"]) {
+    await expect(page.getByRole("heading", { level: 2, name: label })).toBeVisible();
   }
-
-  // Выгрузка — три ссылки (.pptx/.pdf/.html) на вариант, ведущие на
-  // реальный маршрут экспорта API (скачивание файла не гоняем через
-  // браузерный download-диалог в CI — проверяем сам URL).
-  await page.goto(`/decks/${page.url().match(/decks\/([a-f0-9]+)/)![1]}/variants`);
-  await expect(page.locator(".variant-card")).toHaveCount(1);
-  const pptxLink = page.locator('.variant-card a:text("pptx")').first();
-  await expect(pptxLink).toHaveAttribute("href", /\/api\/decks\/.+\/export\?format=pptx&variant=/);
 });

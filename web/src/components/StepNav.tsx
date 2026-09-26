@@ -9,22 +9,22 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getJob, listJobs, VariantName } from "@/lib/api";
+import { getJob, isJobDone, listJobs, VariantName } from "@/lib/api";
 
 type StepKey = "template" | "brief" | "variants" | "audit";
 
 const STEPS: { key: StepKey; label: string }[] = [
   { key: "template", label: "1. Шаблон" },
-  { key: "brief", label: "2. Бриф" },
+  { key: "brief", label: "2. Задание" },
   { key: "variants", label: "3. Варианты" },
-  { key: "audit", label: "4. Аудит" },
+  { key: "audit", label: "4. Проверка" },
 ];
 
 export default function StepNav() {
   const pathname = usePathname();
   const templateMatch = pathname.match(/^\/templates\/([^/]+)/);
   const deckMatch = pathname.match(/^\/decks\/([^/]+)/);
-  // Задача Q: экран пакета стилей (`/batches/{id}`) — тот же шаг 3.
+  // Задача Q: экран пакета стилей (`/batches/{id}`) это тот же шаг 3.
   const batchMatch = pathname.match(/^\/batches\/([^/]+)/);
   const batchIdFromUrl = batchMatch ? decodeURIComponent(batchMatch[1]) : null;
   const templateIdFromUrl = templateMatch ? decodeURIComponent(templateMatch[1]) : null;
@@ -50,17 +50,13 @@ export default function StepNav() {
   }, [batchIdFromUrl]);
 
   useEffect(() => {
-    if (!jobId) {
-      setJobTemplateId(null);
-      setDeckReady(false);
-      return;
-    }
+    if (!jobId) return;
     let cancelled = false;
     getJob(jobId)
       .then((job) => {
         if (cancelled) return;
         setJobTemplateId(job.template_id);
-        setDeckReady(job.status === "done");
+        setDeckReady(isJobDone(job.status));
         setJobStyle(job.style);
         setJobBatchId(job.batch_id);
       })
@@ -70,9 +66,10 @@ export default function StepNav() {
     };
   }, [jobId]);
 
-  // Шаблон пакета берётся, только пока мы на экране пакета: старое значение
-  // не сбрасывается в эффекте, а просто не читается на других экранах.
-  const templateId = templateIdFromUrl ?? jobTemplateId ?? (batchIdFromUrl ? batchTemplateId : null);
+  // Значения прошлого задания или пакета в эффектах не сбрасываются, а
+  // просто не читаются, когда в адресе их нет.
+  const templateId = templateIdFromUrl ?? (jobId ? jobTemplateId : null) ?? (batchIdFromUrl ? batchTemplateId : null);
+  const currentDeckReady = jobId ? deckReady : false;
 
   let current: StepKey = "template";
   if (templateMatch && pathname.endsWith("/brief")) current = "brief";
@@ -95,14 +92,14 @@ export default function StepNav() {
         return templateId ? `/templates/${templateId}/brief` : null;
       case "variants":
         if (jobId && jobBatchId) return `/batches/${jobBatchId}`;
-        return jobId && deckReady ? `/decks/${jobId}/variants` : null;
+        return jobId && currentDeckReady ? `/decks/${jobId}/variants` : null;
       case "audit":
-        return jobId && deckReady ? `/decks/${jobId}/audit?variant=${jobStyle}` : null;
+        return jobId && currentDeckReady ? `/decks/${jobId}/audit?variant=${jobStyle}` : null;
     }
   }
 
   return (
-    <div className="steps">
+    <nav className="steps" aria-label="Этапы создания презентации">
       {STEPS.map((step) => {
         const isActive = step.key === current;
         const href = hrefFor(step.key);
@@ -120,6 +117,6 @@ export default function StepNav() {
           </span>
         );
       })}
-    </div>
+    </nav>
   );
 }

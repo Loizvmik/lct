@@ -1,6 +1,7 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
+  devIndicators: false,
   // Next 16 по умолчанию отдаёт свои dev-ресурсы (в том числе горячую
   // перезагрузку) только хосту, под которым сам запущен, — страница,
   // открытая по 127.0.0.1, получает `Blocked cross-origin request to

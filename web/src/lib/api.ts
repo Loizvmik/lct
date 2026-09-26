@@ -1,11 +1,13 @@
-// Клиент DeckForge API (Task 16) — тонкая обёртка над `fetch`, без
+// Клиент API — тонкая обёртка над `fetch`, без
 // дополнительных библиотек: эндпоинтов немного, и типы здесь — прямое
 // зеркало `deckforge.api.schemas` (см. комментарии у каждого типа).
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
 export type Stage = "parse" | "outline" | "write" | "compose" | "audit" | "export";
-export type JobStatus = "running" | "done" | "error";
+// `done_with_warnings` сервер пока не отдаёт (появится с задачей надёжности):
+// интерфейс заранее считает его готовым результатом, «готово с замечаниями».
+export type JobStatus = "running" | "done" | "done_with_warnings" | "error";
 export type VariantName = "dense" | "airy" | "visual";
 
 export interface TemplateUploadResponse {
@@ -76,6 +78,12 @@ export interface JobResponse {
       seconds?: number;
     }
   > | null;
+  // Задача R: по вариантам находки, которые автопочинка не трогает, потому
+  // что нужен другой текст или другая раскладка.
+  structural?: Record<string, { slide_index: number | null; check_id: string; message: string }[]> | null;
+  // Задача U: по вариантам сколько слайдов какой ступенью лестницы сборки
+  // собрано (ключи: `LADDER_TITLES`).
+  ladder?: Record<string, Record<string, number>> | null;
 }
 
 export interface FindingBox {
@@ -95,6 +103,7 @@ export interface Finding {
   box: FindingBox | null;
   fixable: boolean;
   fix_hint: string;
+  repair?: "local" | "structural" | "none";
 }
 
 export interface VariantSummary {
@@ -143,6 +152,11 @@ export async function uploadTemplate(file: File): Promise<TemplateUploadResponse
   const form = new FormData();
   form.append("file", file);
   const response = await fetch(`${API_BASE}/api/templates`, { method: "POST", body: form });
+  return asJson(response);
+}
+
+export async function healthcheck(): Promise<{ status: string; stages: Stage[] }> {
+  const response = await fetch(`${API_BASE}/api/health`);
   return asJson(response);
 }
 
@@ -210,7 +224,7 @@ export function subscribeJobEvents(
   source.onmessage = (event) => {
     const job = JSON.parse(event.data) as JobResponse;
     onUpdate(job);
-    if (job.status === "done" || job.status === "error") {
+    if (isJobFinished(job.status)) {
       source.close();
     }
   };
@@ -244,12 +258,39 @@ export function exportUrl(deckId: string, variant: VariantName, format: "pptx" |
 }
 
 export const STAGE_LABELS: Record<Stage, string> = {
-  parse: "Разбор шаблона",
-  outline: "Структура презентации",
-  write: "Текст слайдов",
-  compose: "Вёрстка",
-  audit: "Детерминированный аудит",
-  export: "Выгрузка (PDF/HTML/превью)",
+  parse: "Читаем шаблон",
+  outline: "Составляем план",
+  write: "Готовим тексты",
+  compose: "Оформляем слайды",
+  audit: "Проверяем результат",
+  export: "Подготавливаем файлы",
+};
+
+// Задание закончилось результатом, с замечаниями или без: и переход к
+// вариантам, и шаги навигации ведут себя одинаково.
+export function isJobDone(status: JobStatus | undefined | null): boolean {
+  return status === "done" || status === "done_with_warnings";
+}
+
+export function isJobFinished(status: JobStatus | undefined | null): boolean {
+  return isJobDone(status) || status === "error";
+}
+
+export const JOB_STATUS_LABELS: Record<JobStatus, string> = {
+  running: "Идёт",
+  done: "Готово",
+  done_with_warnings: "Готово с замечаниями",
+  error: "Ошибка",
+};
+
+// Ступени лестницы сборки (`compose.builder.LADDER_RUNGS`) в порядке от
+// самой бережной к самой дальней от шаблона.
+export const LADDER_TITLES: Record<string, string> = {
+  clone: "по раскладке шаблона",
+  adapt: "по запасной раскладке",
+  shorten: "с сокращённым текстом",
+  split: "разделено на два",
+  scratch: "собрано с нуля",
 };
 
 export const STAGE_ORDER: Stage[] = ["parse", "outline", "write", "compose", "audit", "export"];
@@ -257,15 +298,21 @@ export const STAGE_ORDER: Stage[] = ["parse", "outline", "write", "compose", "au
 export const VARIANT_ORDER: VariantName[] = ["dense", "airy", "visual"];
 
 export const MODE_LABELS: Record<string, string> = {
-  full: "полный режим",
-  fast: "быстрый режим",
-  emergency: "аварийный режим",
+  full: "Полный",
+  fast: "Быстрый",
+  emergency: "Аварийный",
 };
 
 export const VARIANT_LABELS: Record<VariantName, string> = {
   dense: "Плотный",
   airy: "Воздушный",
   visual: "Визуальный",
+};
+
+export const VARIANT_DESCRIPTIONS: Record<VariantName, string> = {
+  dense: "Больше фактов и деталей на каждом слайде.",
+  airy: "Крупнее текст, больше свободного пространства.",
+  visual: "Больше визуальных акцентов и короче формулировки.",
 };
 
 export const SEVERITY_LABELS: Record<string, string> = {

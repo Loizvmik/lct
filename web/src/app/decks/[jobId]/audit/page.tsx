@@ -2,13 +2,16 @@
 
 import Link from "next/link";
 import { useParams, useRouter, useSearchParams } from "next/navigation";
-import { Suspense, useEffect, useMemo, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { PreviewImage } from "@/components/PreviewImage";
 import {
   applyFix,
   assetUrl,
+  exportUrl,
   Finding,
   getJob,
   getVariants,
+  isJobDone,
   JobResponse,
   listJobs,
   SEVERITY_LABELS,
@@ -17,245 +20,192 @@ import {
   VARIANT_LABELS,
   VARIANT_ORDER,
 } from "@/lib/api";
+import { EXPORT_FORMATS, ExportFormat, getAppSettings, subscribeToAppSettings } from "@/lib/appSettings";
 
 function AuditScreen() {
   const params = useParams<{ jobId: string }>();
   const search = useSearchParams();
   const router = useRouter();
-  const variantName = (search.get("variant") ?? "dense") as VariantName;
-
+  const requestedVariant = search.get("variant");
+  const variantName: VariantName = requestedVariant === "airy" || requestedVariant === "visual" ? requestedVariant : "dense";
   const [all, setAll] = useState<VariantSummary[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [slideIndex, setSlideIndex] = useState(0);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [applying, setApplying] = useState(false);
-  const [lastResult, setLastResult] = useState<{ applied: number; skipped: number } | null>(null);
+  const [result, setResult] = useState<string | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
-  // Задача Q: стили одного запуска — отдельные задания пакета; переключатель
-  // ведёт на аудит соседнего задания, а не на вариант внутри этого.
+  const [preferredFormat, setPreferredFormat] = useState<ExportFormat>("pptx");
+  // Задача Q: стили одного запуска это отдельные задания пакета; переключатель
+  // ведёт на проверку соседнего задания, а не на вариант внутри этого.
   const [siblings, setSiblings] = useState<JobResponse[]>([]);
 
+  const load = useCallback(() => {
+    getVariants(params.jobId)
+      .then((variants) => {
+        setAll(variants);
+        const current = variants.find((item) => item.variant === variantName) ?? variants[0];
+        setSelected(new Set(current?.findings.filter((item) => item.fixable).map((item) => item.id) ?? []));
+      })
+      .catch((err: Error) => setError(err.message));
+  }, [params.jobId, variantName]);
+
+  useEffect(() => { load(); }, [load]);
   useEffect(() => {
     getJob(params.jobId)
       .then((job) => {
         setTemplateId(job.template_id);
-        if (job.batch_id) {
-          listJobs(job.batch_id)
-            .then((jobs) =>
-              setSiblings(
-                jobs
-                  .filter((j) => j.status === "done")
-                  .sort((a, b) => VARIANT_ORDER.indexOf(a.style) - VARIANT_ORDER.indexOf(b.style)),
-              ),
-            )
-            .catch(() => undefined);
-        }
+        if (!job.batch_id) return;
+        listJobs(job.batch_id)
+          .then((jobs) => setSiblings(
+            jobs
+              .filter((item) => isJobDone(item.status))
+              .sort((a, b) => VARIANT_ORDER.indexOf(a.style) - VARIANT_ORDER.indexOf(b.style)),
+          ))
+          .catch(() => undefined);
       })
       .catch(() => undefined);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.jobId]);
-
-  function load() {
-    getVariants(params.jobId)
-      .then((variants) => {
-        setAll(variants);
-        const current = variants.find((v) => v.variant === variantName) ?? variants[0];
-        if (current) {
-          setSelected(new Set(current.findings.filter((f) => f.fixable).map((f) => f.id)));
-        }
-      })
-      .catch((err) => setError(err.message));
-  }
-
   useEffect(() => {
-    load();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [params.jobId, variantName]);
-
+    const timer = window.setTimeout(() => setPreferredFormat(getAppSettings().preferredExportFormat), 0);
+    const unsubscribe = subscribeToAppSettings((settings) => setPreferredFormat(settings.preferredExportFormat));
+    return () => { window.clearTimeout(timer); unsubscribe(); };
+  }, []);
   // С задачи Q в задании одна презентация: без совпадения по имени берётся она.
-  const variant = all?.find((v) => v.variant === variantName) ?? all?.[0] ?? null;
-
-  const slideFindings = useMemo(
-    () => (variant ? variant.findings.filter((f) => f.slide_index === slideIndex) : []),
-    [variant, slideIndex],
+  const variant = all?.find((item) => item.variant === variantName) ?? all?.[0] ?? null;
+  const slideFindings = useMemo(() => variant?.findings.filter((item) => item.slide_index === slideIndex) ?? [], [variant, slideIndex]);
+  const commonFindings = useMemo(() => variant?.findings.filter((item) => item.slide_index === null) ?? [], [variant]);
+  const downloadFormats = [...EXPORT_FORMATS].sort((a, b) =>
+    Number(b.value === preferredFormat) - Number(a.value === preferredFormat)
   );
 
-  const deckWideFindings = useMemo(
-    () => (variant ? variant.findings.filter((f) => f.slide_index === null) : []),
-    [variant],
-  );
-
-  if (error) return <div className="error-banner">{error}</div>;
-  if (!all || !variant) return <p className="muted">Загружаем аудит…</p>;
-
-  const previewSrc = variant.preview_pngs[slideIndex];
+  if (error) return <div className="error-banner" role="alert">{error}</div>;
+  if (!variant) return <p className="muted"><span className="spinner" /> Загружаем проверку…</p>;
+  // Имя варианта берётся из загруженного результата, а не из адреса: в
+  // задании одного стиля адрес может называть другой вариант.
+  const shownVariant = variant.variant;
 
   function toggle(id: string) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+    setSelected((before) => {
+      const next = new Set(before);
+      if (next.has(id)) next.delete(id); else next.add(id);
       return next;
     });
   }
 
   async function fixSelected() {
-    if (selected.size === 0 || !variant) return;
-    setApplying(true);
-    setLastResult(null);
+    if (!selected.size) return;
+    setApplying(true); setResult(null); setError(null);
     try {
-      const result = await applyFix(params.jobId, variant.variant, Array.from(selected));
-      setLastResult({ applied: result.applied.length, skipped: result.skipped.length });
+      const response = await applyFix(params.jobId, shownVariant, Array.from(selected));
+      setResult(`Исправлено: ${response.applied.length}. Не удалось исправить автоматически: ${response.skipped.length}.`);
       load();
     } catch (err) {
-      setError(err instanceof Error ? err.message : "Не удалось применить исправления");
+      setError(err instanceof Error ? err.message : "Не удалось применить исправления.");
     } finally {
       setApplying(false);
     }
   }
 
-  function renderFindingRow(finding: Finding) {
+  function FindingRow({ finding }: { finding: Finding }) {
+    const checkboxId = `finding-${finding.id}`;
     return (
-      <div className={`finding-item${!finding.fixable ? " disabled" : ""}`} key={finding.id}>
-        <input
-          type="checkbox"
-          disabled={!finding.fixable}
-          checked={selected.has(finding.id)}
-          onChange={() => toggle(finding.id)}
-        />
-        <div>
-          <div className="finding-meta">
-            <span className={`pill ${finding.severity}`}>{SEVERITY_LABELS[finding.severity]}</span>
-            <span className="pill">{finding.check_id}</span>
-            {!finding.fixable && <span className="muted" style={{ fontSize: 11 }}>нет автопочинки</span>}
-          </div>
-          <div>{finding.message}</div>
-          {finding.fixable && <div className="muted" style={{ fontSize: 12, marginTop: 2 }}>{finding.fix_hint}</div>}
-        </div>
+      <div className={`finding-item${finding.fixable ? "" : " disabled"}`}>
+        <input id={checkboxId} type="checkbox" disabled={!finding.fixable} checked={selected.has(finding.id)} onChange={() => toggle(finding.id)} />
+        <label htmlFor={checkboxId}>
+          <span className="finding-meta">
+            <span className={`count ${finding.severity}`}>{SEVERITY_LABELS[finding.severity]}</span>
+            {finding.repair === "structural"
+              ? <span className="pill">Нужен другой текст или раскладка</span>
+              : !finding.fixable && <span className="pill">Требуется ручная правка</span>}
+          </span>
+          <span>{finding.message}</span>
+          {finding.fixable && finding.fix_hint && <span className="field-hint">{finding.fix_hint}</span>}
+        </label>
       </div>
     );
   }
 
   return (
     <div>
-      <h1>Шаг 4 — аудит: {VARIANT_LABELS[variant.variant]} вариант</h1>
-      <p className="muted">
-        Рамки поверх превью — находки детерминированного аудита по координатам
-        (доли холста). Отметьте, что чинить, и нажмите «Исправить выбранное» — презентация
-        пересоберётся и аудит пройдёт заново.
-      </p>
+      <header className="page-header">
+        <p className="eyebrow">Шаг 4 из 4</p>
+        <h1>Проверьте презентацию</h1>
+        <p className="lead">Выберите слайд, изучите замечания и примените доступные исправления перед скачиванием.</p>
+      </header>
 
-      <div className="row-actions" style={{ marginBottom: 16 }}>
-        {siblings.length > 1 &&
-          siblings.map((job) => (
+      {siblings.length > 1 && (
+        <div className="row-actions" aria-label="Стили этого запуска">
+          {siblings.map((job) => (
             <button
+              type="button"
               key={job.job_id}
               className={job.job_id === params.jobId ? "" : "secondary"}
-              onClick={() => router.push(`/decks/${job.job_id}/audit?variant=${job.style}`)}
+              aria-pressed={job.job_id === params.jobId}
+              onClick={() => { setSlideIndex(0); setResult(null); router.push(`/decks/${job.job_id}/audit?variant=${job.style}`); }}
             >
               {VARIANT_LABELS[job.style]}
             </button>
           ))}
-        {templateId && (
-          <Link className="button secondary" href={`/templates/${templateId}/brief`}>
-            ← Изменить бриф и сгенерировать заново
-          </Link>
-        )}
-      </div>
-
-      {lastResult && (
-        <div className="card" style={{ borderColor: "var(--ok)" }}>
-          Применено исправлений: {lastResult.applied}
-          {lastResult.skipped > 0 && `, пропущено (нет автопочинки для этого типа): ${lastResult.skipped}`}
         </div>
       )}
+
+      {error && <div className="error-banner" role="alert">{error}</div>}
+      {result && <div className="success-banner" role="status">{result}</div>}
 
       <div className="audit-stage">
         <div>
           <div className="slide-preview-wrap">
-            {previewSrc && (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src={assetUrl(previewSrc)} alt={`слайд ${slideIndex + 1}`} />
-            )}
-            {slideFindings
-              .filter((f) => f.box)
-              .map((f) => (
-                <div
-                  key={f.id}
-                  className={`finding-box ${f.severity}${selected.has(f.id) ? " selected" : ""}`}
-                  style={{
-                    left: `${(f.box!.left * 100).toFixed(3)}%`,
-                    top: `${(f.box!.top * 100).toFixed(3)}%`,
-                    width: `${(f.box!.width * 100).toFixed(3)}%`,
-                    height: `${(f.box!.height * 100).toFixed(3)}%`,
-                  }}
-                  title={f.message}
-                />
-              ))}
+            {variant.preview_pngs[slideIndex]
+              ? <PreviewImage src={assetUrl(variant.preview_pngs[slideIndex])} alt={`Слайд ${slideIndex + 1}`} />
+              : <div className="preview-fallback">Предпросмотр пока недоступен</div>}
+            {slideFindings.filter((item) => item.box).map((item) => (
+              <span
+                key={item.id}
+                className={`finding-box ${item.severity}${selected.has(item.id) ? " selected" : ""}`}
+                style={{ left: `${item.box!.left * 100}%`, top: `${item.box!.top * 100}%`, width: `${item.box!.width * 100}%`, height: `${item.box!.height * 100}%` }}
+                aria-hidden="true"
+              />
+            ))}
           </div>
-          <div className="thumb-strip" style={{ marginTop: 10 }}>
-            {variant.preview_pngs.map((png, idx) => {
-              const count = variant.findings.filter((f) => f.slide_index === idx).length;
+          <div className="thumb-strip" aria-label="Слайды">
+            {variant.preview_pngs.map((png, index) => {
+              const count = variant.findings.filter((item) => item.slide_index === index).length;
               return (
-                <div
-                  className={`thumb${idx === slideIndex ? " active" : ""}`}
-                  key={png}
-                  onClick={() => setSlideIndex(idx)}
-                  style={{ position: "relative" }}
-                >
-                  {/* eslint-disable-next-line @next/next/no-img-element */}
-                  <img src={assetUrl(png)} alt={`слайд ${idx + 1}`} />
-                  {count > 0 && (
-                    <span
-                      style={{
-                        position: "absolute",
-                        top: 2,
-                        right: 2,
-                        background: "var(--critical)",
-                        color: "#fff",
-                        borderRadius: 8,
-                        fontSize: 10,
-                        padding: "1px 5px",
-                      }}
-                    >
-                      {count}
-                    </span>
-                  )}
-                </div>
+                <button type="button" className={`thumb${index === slideIndex ? " active" : ""}`} key={png} onClick={() => setSlideIndex(index)} aria-label={`Слайд ${index + 1}, замечаний: ${count}`} aria-pressed={index === slideIndex}>
+                  <PreviewImage src={assetUrl(png)} alt="" />
+                  <span className="slide-number">{index + 1}{count ? ` · ${count}` : ""}</span>
+                </button>
               );
             })}
           </div>
         </div>
 
-        <div>
-          <div className="card">
-            <h2>
-              Находки на слайде {slideIndex + 1} ({slideFindings.length})
-            </h2>
-            {slideFindings.length === 0 && <p className="muted">На этом слайде находок нет.</p>}
-            {slideFindings.map(renderFindingRow)}
-          </div>
-
-          {deckWideFindings.length > 0 && (
-            <div className="card">
-              <h2>Находки презентации целиком ({deckWideFindings.length})</h2>
-              {deckWideFindings.map(renderFindingRow)}
-            </div>
-          )}
-
-          <button onClick={fixSelected} disabled={applying || selected.size === 0} style={{ width: "100%" }}>
-            {applying ? "Применяем…" : `Исправить выбранное (${selected.size})`}
+        <aside>
+          <section className="card">
+            <h2>Замечания на слайде {slideIndex + 1}</h2>
+            {slideFindings.length ? slideFindings.map((finding) => <FindingRow finding={finding} key={finding.id} />) : <p className="muted">На этом слайде замечаний нет.</p>}
+          </section>
+          {commonFindings.length > 0 && <section className="card"><h2>Для всей презентации</h2>{commonFindings.map((finding) => <FindingRow finding={finding} key={finding.id} />)}</section>}
+          <button type="button" onClick={fixSelected} disabled={applying || selected.size === 0} style={{ width: "100%" }}>
+            {applying ? "Исправляем…" : `Исправить выбранное (${selected.size})`}
           </button>
-        </div>
+        </aside>
+      </div>
+
+      <div className="row-actions">
+        {downloadFormats.map((format) => (
+          <a className={`button${format.value === preferredFormat ? "" : " secondary"}`} href={exportUrl(params.jobId, variant.variant, format.value)} key={format.value}>
+            {format.value === "html" ? "Открыть веб-версию" : `Скачать ${format.label}`}
+          </a>
+        ))}
+        <Link className="button ghost" href={`/decks/${params.jobId}/variants`}>Вернуться к презентации</Link>
+        {templateId && <Link className="button ghost" href={`/templates/${templateId}/brief`}>Изменить задание</Link>}
       </div>
     </div>
   );
 }
 
 export default function AuditPage() {
-  return (
-    <Suspense fallback={<p className="muted">Загружаем аудит…</p>}>
-      <AuditScreen />
-    </Suspense>
-  );
+  return <Suspense fallback={<p className="muted">Загружаем проверку…</p>}><AuditScreen /></Suspense>;
 }

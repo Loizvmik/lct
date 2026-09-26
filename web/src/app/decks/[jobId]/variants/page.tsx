@@ -6,8 +6,8 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getJob, getVariants, JobResponse, VariantSummary, VARIANT_LABELS } from "@/lib/api";
 import VariantCard from "@/components/VariantCard";
+import { getJob, getVariants, JobResponse, VariantSummary, VARIANT_LABELS } from "@/lib/api";
 
 export default function VariantsPage() {
   const params = useParams<{ jobId: string }>();
@@ -16,36 +16,29 @@ export default function VariantsPage() {
   const [job, setJob] = useState<JobResponse | null>(null);
 
   useEffect(() => {
-    getVariants(params.jobId).then(setVariants).catch((err) => setError(err.message));
+    getVariants(params.jobId).then(setVariants).catch((err: Error) => setError(err.message));
     getJob(params.jobId).then(setJob).catch(() => undefined);
   }, [params.jobId]);
 
-  if (error) return <div className="error-banner">{error}</div>;
-  if (!variants) return <p className="muted">Загружаем презентацию…</p>;
+  if (error) return <div className="error-banner" role="alert">{error}</div>;
+  if (!variants) return <p className="muted"><span className="spinner" /> Загружаем презентацию…</p>;
 
   return (
     <div>
-      <h1>Шаг 3 — готовая презентация{job ? `: ${VARIANT_LABELS[job.style]}` : ""}</h1>
-      <p className="muted">
-        Одна презентация одного стиля, собранная своим заданием в своём бюджете пяти минут.
-      </p>
+      <header className="page-header">
+        <p className="eyebrow">Шаг 3 из 4</p>
+        <h1>{job ? `Презентация: ${VARIANT_LABELS[job.style].toLowerCase()} стиль` : "Готовая презентация"}</h1>
+        <p className="lead">Одна презентация одного стиля, собранная своим заданием в бюджете пяти минут. Откройте её для подробной проверки или скачайте.</p>
+      </header>
 
-      <div className="row-actions" style={{ marginBottom: 16 }}>
-        {job && (
-          <Link className="button secondary" href={`/templates/${job.template_id}/brief`}>
-            ← Изменить бриф и сгенерировать заново
-          </Link>
-        )}
-        {job?.batch_id && (
-          <Link className="button secondary" href={`/batches/${job.batch_id}`}>
-            Все стили этого запуска
-          </Link>
-        )}
+      <div className="row-actions">
+        {job && <Link className="button secondary" href={`/templates/${job.template_id}/brief`}>← Изменить задание и создать заново</Link>}
+        {job?.batch_id && <Link className="button secondary" href={`/batches/${job.batch_id}`}>Все стили этого запуска</Link>}
       </div>
 
-      <div className="grid-3">
+      <div className={variants.length > 1 ? "grid-3" : "grid-single"}>
         {variants.map((variant) => (
-          <VariantCard jobId={params.jobId} variant={variant} key={variant.variant} />
+          <VariantCard jobId={params.jobId} variant={variant} job={job} key={variant.variant} />
         ))}
       </div>
     </div>
