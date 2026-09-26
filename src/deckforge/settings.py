@@ -182,6 +182,18 @@ class PlanConfig(BaseModel):
     rerank_variants: bool = True
 
 
+class RunConfig(BaseModel):
+    # Бюджет времени одного прогона и пороги деградации
+    # (`workflow.budget.RunBudget`). Происхождение чисел см. в app.yaml. Со
+    # значениями по умолчанию по той же причине, что и поля `LLMConfig`.
+    budget_seconds: float = 300.0
+    rerank_min_remaining: float = 120.0
+    visual_audit_min_remaining: float = 75.0
+    visual_audit_max_slides: int = 4
+    visual_audit_min_risk: float = 1.0
+    visual_audit_batch: bool = False
+
+
 class Settings(BaseModel):
     llm: LLMConfig
     paths: PathsConfig
@@ -190,6 +202,7 @@ class Settings(BaseModel):
     # вручную в тестах) не должны переставать парситься.
     compose: ComposeConfig = ComposeConfig()
     plan: PlanConfig = PlanConfig()
+    run: RunConfig = RunConfig()
     yandex_api_key: str | None = None
     yandex_folder_id: str | None = None
 
