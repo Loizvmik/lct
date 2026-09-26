@@ -25,16 +25,11 @@ def test_generate_passes_writer_max_workers_override_to_write_slides(monkeypatch
     captured = {}
     real_write_slides = cli_module.write_slides
 
-    def _spy(outline, sources, profile, llm, *, max_workers, agent_max_steps=None, **rest):
-        # `**rest` — чтобы шпион не ломался от НОВЫХ именованных аргументов
-        # `write_slides` (Task 23 добавила `template_path`): тест проверяет
-        # проброс ОДНОГО параметра, а не полную сигнатуру, и падать на
-        # расширении контракта ему незачем.
+    def _spy(outline, contracts, sources, profile, llm, *, max_workers, **rest):
+        # `**rest` — чтобы шпион не ломался от новых именованных аргументов
+        # `write_slides`: тест проверяет проброс одного параметра.
         captured["max_workers"] = max_workers
-        kwargs = {"max_workers": max_workers, **rest}
-        if agent_max_steps is not None:
-            kwargs["agent_max_steps"] = agent_max_steps
-        return real_write_slides(outline, sources, profile, llm, **kwargs)
+        return real_write_slides(outline, contracts, sources, profile, llm, max_workers=max_workers, **rest)
 
     monkeypatch.setattr(cli_module, "write_slides", _spy)
     out_dir = tmp_path / "decks"
@@ -93,55 +88,44 @@ def test_audit_visual_runs_on_a_finished_pptx_without_regenerating_it(monkeypatc
     assert "Сводный отчёт" in out
 
 
-def test_generate_passes_the_model_layout_choice_to_apply_variant(monkeypatch, capsys, tmp_path):
-    """Задача D: шаг переранжирования стоит между текстом и вариантами, и
-    выбор модели доходит до `apply_variant`. Модель подменена: сети нет."""
-    from deckforge.provider.base import LLMProvider
-
+def test_generate_plans_layouts_per_style_before_the_text(monkeypatch, capsys, tmp_path):
+    """Задача P: у каждого стиля свои раскладки, назначенные до текста;
+    писатель получает контракты, и раскладка из контракта доходит до
+    плана собранной колоды."""
     monkeypatch.delenv("YANDEX_API_KEY", raising=False)
     monkeypatch.delenv("YANDEX_FOLDER_ID", raising=False)
+    captured: dict = {}
+    real_write_slides = cli_module.write_slides
 
-    class _LastCandidate(LLMProvider):
-        calls = 0
+    def _spy(outline, contracts, sources, profile, llm, **kw):
+        captured[kw["style"]] = [c.pattern_id for c in contracts]
+        return real_write_slides(outline, contracts, sources, profile, llm, **kw)
 
-        def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-            _LastCandidate.calls += 1
-            payload = json.loads(messages[1]["content"])
-            return json.dumps({"pattern_id": payload["candidates"][-1]["pattern_id"], "reason": "тест"})
+    monkeypatch.setattr(cli_module, "write_slides", _spy)
+    # Писатель подменён моделью, которая отвечает ровно по контракту: без
+    # ключа запасной текст пуст, и слайды ушли бы в разделители.
+    from tests.plan.test_writer import _ContractLLM
 
     real_build = cli_module._build_role_provider
     monkeypatch.setattr(
         cli_module, "_build_role_provider",
-        lambda role, **kw: _LastCandidate() if role == "pattern_picker" else real_build(role, **kw),
+        lambda role, **kw: _ContractLLM() if role == "writer" else real_build(role, **kw),
     )
-    captured: dict = {}
-    real_apply = cli_module.apply_variant
-
-    def _spy(deck, profile, variant, preferred=None, **kw):
-        captured[variant] = preferred
-        return real_apply(deck, profile, variant, preferred=preferred, **kw)
-
-    monkeypatch.setattr(cli_module, "apply_variant", _spy)
-    # Без ключа запасной текст слайдов пуст, и модели не из чего выбирать:
-    # подставляем текст, как будто его написал писатель.
-    from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec
-
-    written = DeckSpec(title="T", language="ru", slides=[
-        SlideSpec(index=0, kind="section", headline="Обложка"),
-        *[
-            SlideSpec(index=i, kind="bullets", headline=f"Тезис {i}", blocks=[BulletBlock(items=[
-                "Ожидание первого согласующего — медиана 18 часов", "Чистая работа людей — 28 минут",
-            ])])
-            for i in range(1, 4)
-        ],
-    ])
-    monkeypatch.setattr(cli_module, "write_slides", lambda *a, **kw: written)
+    out_dir = tmp_path / "decks"
 
     exit_code = main([
-        "generate", str(TEMPLATE), str(CONTENT_PACK), "-o", str(tmp_path / "decks"), "--variant", "visual",
+        "generate", str(TEMPLATE), str(CONTENT_PACK), "-o", str(out_dir), "--variant", "dense", "--variant", "visual",
     ])
     assert exit_code == 0
-    assert _LastCandidate.calls > 0
-    preferred = captured[cli_module.Variant.visual]
-    assert preferred and len(preferred) == _LastCandidate.calls
-    assert "уточнены моделью" in capsys.readouterr().out
+
+    assert set(captured) == {cli_module.Variant.dense, cli_module.Variant.visual}
+    assert captured[cli_module.Variant.dense] != captured[cli_module.Variant.visual]
+    for style, planned in captured.items():
+        written = json.loads(next(out_dir.glob(f"*__{style.value}-deck.json")).read_text(encoding="utf-8"))
+        same = sum(a == b["pattern_id"] for a, b in zip(planned, written["slides"]))
+        assert same >= len(planned) - 2, (planned, [s["pattern_id"] for s in written["slides"]])
+    out = capsys.readouterr().out
+    assert "раскладки назначены" in out and "мест в пределах контракта" in out
+    assert list(out_dir.glob("*__outline.json"))
+
+

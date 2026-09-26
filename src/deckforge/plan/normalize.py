@@ -1,12 +1,13 @@
-"""Вырождение содержания под раскладки шаблона: после письма текста, до
-вариантов.
+"""Вырождение содержания под раскладки шаблона: после письма текста.
 
-Зачем. Писатель выбирает форму по смыслу пункта структуры, а не по тому,
-сколько материала у него набралось. Отсюда слайды, которые форма делает
-хуже, чем текст сам по себе: ряд «карточек» из одной карточки (сетка на
-три места с двумя пустыми), список из двух пунктов «Медиана — 6,2 ч» и
-«Пилот — 4 подразделения», который просится в крупные цифры. Код видит
-это по структуре, без модели и без координат, поэтому правит сам.
+Зачем. Писатель пишет под контракт раскладки, но модель его нарушает, а
+запасной слайд пишется без модели вовсе. Отсюда слайды, которые форма
+делает хуже, чем текст сам по себе: ряд «карточек» из одной карточки
+(сетка на три места с двумя пустыми), список из двух пунктов «Медиана —
+6,2 ч» и «Пилот — 4 подразделения», который просится в крупные цифры. Код
+видит это по структуре, без модели и без координат, поэтому правит сам.
+Правило «с третьего карточного слайда карточки идут списком» убрано с
+задачей P: повторы теперь разводит глобальный планировщик паттернов.
 
 Правила детерминированные и узкие, каждое со своей находкой в `findings`:
 - `CardBlock` из одной карточки -> `KpiBlock`, если заголовок карточки
@@ -21,7 +22,8 @@
 
 Слайд, чья форма поменялась, теряет выбранную писателем раскладку
 (`pattern_id`): она подбиралась под карточки или список, а не под то, во
-что они превратились. Раскладку подберёт `variants.apply_variant`.
+что они превратились. Раскладку подберёт заново `pattern.repick_pattern`
+(через `writer.write_slides`), соседей не трогая.
 
 Граница слоёв: модуль в `plan/`, координат и python-pptx не знает,
 профиль читает только как список видов и повторов."""
@@ -47,15 +49,23 @@ _KPI_KINDS = ("kpi", "kpi_caption")
 _CARD_ROLES = frozenset({"card_title", "card_body"})
 
 
-def normalize_deck(deck: DeckSpec, profile) -> DeckSpec:
+def normalize_deck(deck: DeckSpec, profile, *, keep: frozenset[int] = frozenset()) -> DeckSpec:
     """Прогоняет каждый слайд через правила модуля. Без профиля ничего не
-    делает: какие формы есть в шаблоне, тогда неизвестно."""
+    делает: какие формы есть в шаблоне, тогда неизвестно.
+
+    `keep`: номера слайдов, чей текст уложился в контракт раскладки. Их
+    форму выбрал планировщик, и два коротких пункта с числами на раскладке
+    списка остаются списком: правило вырождения нужно там, где модель
+    нарушила контракт или слайд собран без неё. Слайд без содержания
+    становится разделителем всегда."""
     if profile is None:
         return deck
     kinds = {p.kind for p in profile.patterns}
     two_unit_cards = _has_two_unit_card_layout(profile)
-    slides = [_normalize_slide(slide, kinds, two_unit_cards) for slide in deck.slides]
-    slides = _diversify_cards(slides, kinds)
+    slides = [
+        (_blockless_as_section(slide, kinds) or slide) if i in keep else _normalize_slide(slide, kinds, two_unit_cards)
+        for i, slide in enumerate(deck.slides)
+    ]
     changed = sum(1 for before, after in zip(deck.slides, slides) if before is not after)
     meta = dict(deck.meta)
     if changed:
@@ -78,43 +88,10 @@ def _blockless_as_section(slide: SlideSpec, kinds: set[str]) -> SlideSpec | None
     разделителем, если в шаблоне такие есть."""
     if slide.kind in _HERO_KINDS or slide.blocks or slide.visual is not None or "section" not in kinds:
         return None
-    return replace(slide, kind="section", findings=[
+    return replace(slide, kind="section", pattern_id=None, findings=[
         *slide.findings,
         f"Слайд {slide.index}: содержания нет, только заголовок; собран как разделитель.",
     ])
-
-
-# Сколько карточных слайдов подряд по колоде допустимо до того, как
-# следующий уходит в список по колонкам: у VK Education под четыре
-# карточки с длинным текстом подходит одна раскладка (slide21), и пять
-# карточных слайдов из одиннадцати выходили одинаковыми (27 сентября 2026).
-_MAX_CARD_SLIDES = 2
-
-
-def _diversify_cards(slides: list[SlideSpec], kinds: set[str]) -> list[SlideSpec]:
-    """Третий и дальше карточный слайд колоды становится списком по
-    колонкам (`two_col`, иначе `bullets`): «заголовок карточки: тело» на
-    пункт. Смысл тот же, форма другая, и ранжир получает другие кандидаты."""
-    target = "two_col" if "two_col" in kinds else ("bullets" if "bullets" in kinds else None)
-    if target is None:
-        return slides
-    out: list[SlideSpec] = []
-    seen = 0
-    for slide in slides:
-        cards = [b for b in slide.blocks if isinstance(b, CardBlock)]
-        if slide.kind != "cards" or len(cards) != 1 or len(slide.blocks) != 1:
-            out.append(slide)
-            continue
-        seen += 1
-        if seen <= _MAX_CARD_SLIDES:
-            out.append(slide)
-            continue
-        items = [f"{c.title}: {c.body}" if c.title else c.body for c in cards[0].items]
-        out.append(replace(slide, kind=target, blocks=[BulletBlock(items=items)], findings=[
-            *slide.findings,
-            f"Слайд {slide.index}: карточки заменены списком, в колоде уже {_MAX_CARD_SLIDES} карточных слайда.",
-        ]))
-    return out
 
 
 def _normalize_slide(slide: SlideSpec, kinds: set[str], two_unit_cards: bool) -> SlideSpec:

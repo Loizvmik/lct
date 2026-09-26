@@ -1,8 +1,9 @@
 """Структура колоды: сколько слайдов, о чём каждый, в каком порядке —
-первый шаг планирования содержания (Task 13). Текст слайдов пишет
-следующий шаг (`writer.write_slides`), конкретную раскладку — шаг за ним
-(`writer.pick_patterns`/`variants.apply_variant`); этот модуль не знает ни
-о том, ни о другом.
+первый шаг планирования содержания (Task 13). Раскладку каждого слайда
+выбирает следующий шаг (`pattern.plan_patterns`, сразу для всей колоды),
+текст пишется последним, под контракт раскладки (`writer.write_slides`);
+этот модуль не знает ни о том, ни о другом, но называет, сколько единиц
+содержания у пункта и нужна ли ему особая форма (`items`, `form`).
 
 Промпт — файл `agents/outline-writer/AGENT.md`, не строка в коде (ТЗ требует
 промпты файлами с версией во фронтматтере — тот же приём, что уже применён
@@ -29,6 +30,10 @@ OUTLINE_KINDS = (
     "title", "agenda", "context", "problem", "solution", "how_it_works",
     "data", "comparison", "case", "roadmap", "team", "risks", "ask", "closing",
 )
+
+# Особая форма пункта, которую планировщик раскладок сам не назначает:
+# цитата и показатель только там, где материал их действительно несёт.
+OUTLINE_FORMS = ("quote", "kpi", "table", "chart")
 
 # Объём колоды — ТЗ дословно ("10-15 слайдов или заданное пользователем").
 MIN_SLIDES = 10
@@ -62,6 +67,12 @@ class OutlineSlide:
     kind: str
     intent: str
     needs: list[str] = field(default_factory=list)
+    # Задача P: раскладку выбирают до текста, и планировщику нужно знать,
+    # сколько единиц содержания (пунктов, карточек, показателей) слайд
+    # покажет и нужна ли особая форма (цитата, показатель, таблица,
+    # график). Оба поля необязательны: без них число берётся из `needs`.
+    items: int | None = None
+    form: str | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +102,8 @@ _SCHEMA = {
                     "kind": {"type": "string", "enum": list(OUTLINE_KINDS)},
                     "intent": {"type": "string"},
                     "needs": {"type": "array", "items": {"type": "string"}},
+                    "items": {"type": "integer"},
+                    "form": {"type": "string", "enum": list(OUTLINE_FORMS)},
                 },
                 "required": ["kind", "intent"],
                 "additionalProperties": False,
@@ -252,7 +265,10 @@ def build_outline(
                 continue
             needs = [str(x) for x in item.get("needs", []) if isinstance(item.get("needs"), list)] \
                 if isinstance(item.get("needs"), list) else []
-            slides.append(OutlineSlide(kind=kind, intent=intent, needs=needs))
+            items = item.get("items")
+            items = items if isinstance(items, int) and not isinstance(items, bool) and items > 0 else None
+            form = item.get("form") if item.get("form") in OUTLINE_FORMS else None
+            slides.append(OutlineSlide(kind=kind, intent=intent, needs=needs, items=items, form=form))
         if not slides:
             raise ValueError("модель не вернула ни одного валидного слайда структуры")
     except Exception:
@@ -290,3 +306,15 @@ def load_content_pack(pack_dir: Path) -> tuple[str, list[SourceDoc], dict]:
 
     sources = [SourceDoc(name="sources.md", text=sources_path.read_text(encoding="utf-8"))]
     return body, sources, meta
+
+
+def outline_to_dict(outline: Outline) -> dict:
+    """Структура для отладочного файла рядом с колодой: общая для всех
+    стилей, раскладки и текст у каждого стиля свои (`<стиль>/deck.json`)."""
+    return {
+        "title": outline.title, "language": outline.language,
+        "slides": [
+            {"kind": s.kind, "intent": s.intent, "needs": list(s.needs), "items": s.items, "form": s.form}
+            for s in outline.slides
+        ],
+    }

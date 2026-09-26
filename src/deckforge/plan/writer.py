@@ -1,172 +1,68 @@
-"""Пишет текст слайдов по структуре (`outline.Outline`) и подбирает КОНКРЕТНУЮ
-раскладку шаблона под уже написанное содержание — вторая и третья ступени
-планирования Task 13 (первая — `outline.build_outline`).
+"""Пишет текст слайдов под контракт уже выбранной раскладки (раздел 10).
 
-Два публичных интерфейса брифа:
+Порядок решений с задачи P: структура (`outline.build_outline`) ->
+раскладка на каждый слайд сразу для всей колоды (`pattern.plan_patterns`,
+по стилю) -> контракт слайда (`plan.contracts`) -> текст. Писатель больше
+не выбирает раскладку и не видит каталог раскладок: он получает контракт
+(заголовок до N слов, K карточек по M слов, таблица до R строк) и пишет
+под него. Раньше было наоборот: текст писался под «самую вместительную
+раскладку вида», раскладка подбиралась после, и нарядные раскладки с
+местами на 36-84 знака отклонялись, потому что текст был на 140-200.
 
-- `write_slides(outline, sources, profile, llm) -> DeckSpec` — по одному
-  вызову модели (`agents/slide-writer/AGENT.md`) на пункт структуры;
-  лимиты длины содержания приходят из ЗАМЕРЕННОЙ вместимости раскладки
-  шаблона (`Capacity`, `template/patterns.py`), не из головы (брифом,
-  "Требования к работе"). Каждый написанный слайд проверяется `plan.spec.
-  slide_spec_problems` немедленно — невалидный слайд (опечатка поля, пустой
-  текст, цифра без источника) не портит всю колоду молча: код просит модель
-  исправить один раз, а если и это не помогло — берёт детерминированный
-  запасной вариант с честной пометкой в `SlideSpec.findings` (тот же
-  принцип "модель предлагает, код проверяет и не падает", что и
-  `template/naming.py`).
-- `pick_patterns(deck_spec, profile, llm) -> DeckSpec` — по одному вызову
-  модели (`agents/pattern-picker/AGENT.md`) на слайд, ТОЛЬКО среди
-  паттернов, УЖЕ отобранных кодом по `SlideSpec.kind` (модель физически не
-  может предложить раскладку вне шаблона — её ей не показывают); ответ вне
-  списка кандидатов код отвергает и берёт раскладку по вместимости сам
-  (`_best_by_capacity`, тот же критерий, что и `compose.builder._pick_
-  pattern` использует геометрически точнее — здесь, в `plan/`, доступны
-  только числа `Capacity`, не координаты `Box`, тем самым план по-прежнему
-  не знает ни одной координаты).
+Один вызов модели на слайд, слайды параллельно (до `max_workers`),
+агентный цикл до `agent_max_steps` кругов с двумя инструментами:
+`measure_fit` (влезет ли текст в место раскладки, реальные метрики шрифта)
+и `check_number` (есть ли число в исходниках). Ответ проверяется кодом
+дважды: по схеме слайда (`spec.slide_spec_problems`) и по контракту
+(`contracts.contract_problems`: число единиц, пределы слов и знаков). При
+нарушении один ремонтный вызов «сократи/дополни под контракт»; из двух
+ответов берётся тот, что ближе к контракту. Модель недоступна или дважды
+не справилась: запасной слайд из пунктов плана, с честной находкой.
 
-Задача D: `rerank_patterns(deck, profile, variants, llm)` — для вариантов
-`airy` и `visual` код отбирает три лучшие раскладки слайда (`variants.
-rank_patterns`), модель выбирает одну по смыслу; результат уходит в
-`variants.apply_variant(..., preferred=...)`. В реальном пайплайне стоит
-между `write_slides` и `apply_variant` (`cli.py`, `api/jobs.py`).
-
-Task 19: `write_slides` — теперь настоящий агентный цикл, не одиночный
-вызов. Модель пишет текст вслепую, не зная, влезет ли он в слот выбранной
-раскладки, — самая частая находка аудита ("текст не помещается в свою
-рамку", 13 из 33 находок на контрольном прогоне брифа). `_write_with_agent_
-loop` даёт модели два инструмента (`_run_tool_call`, диспетчер): `measure_
-fit` — реальный замер текста в слоте раскладки (ОБЯЗАТЕЛЬНО через `compose.
-textfit.measure` внутри `compose.fit_check.measure_fit` — единственный
-замер текста в проекте, см. её докстроку, план по-прежнему не трогает
-`Box`/координаты сам, только пересылает текст+роль и получает обратно
-плоские числа) и `check_number` — водится ли число/факт в исходных
-материалах слайда (`plan.factcheck.check_number_in_sources`, чистые строки,
-без сети). Модель может вызвать инструменты (JSON-конверт `{"tool_calls":
-[...]}`), увидеть результат и переписать текст короче — цикл, где модель
-видит последствия своего действия и поправляется, а не просто "отправили,
-получили ответ, код проверил". Ограничен `AGENT_MAX_STEPS_DEFAULT`
-(`config/app.yaml`, `llm.slide_writer_agent_max_steps`) сетевыми кругами:
-на последнем разрешённом шаге код требует финальный ответ и, если текст
-всё равно не уложился, принимает его как есть — находка остаётся аудиту
-(та же честная деградация "модель предлагает, код не блокирует колоду",
-что и везде в проекте), а не бесконечный цикл дожимания.
-"""
+Вид слайда и раскладку ответ модели не меняет: `kind` и `pattern_id`
+приходят из контракта."""
 from __future__ import annotations
 import os
 import json
 import re
 import time
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
 import yaml
 
-from deckforge.compose.fit_check import main_slot_fill, measure_fit, target_of
-from deckforge.compose.slide_tools import list_layouts, try_slide
+from deckforge.compose.fit_check import measure_fit
+from deckforge.pattern.planner import repick_pattern
+from deckforge.plan.contracts import SlideContract, contract_fill, contract_problems
 from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.normalize import normalize_deck
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
-    SLIDE_KINDS, BulletBlock, CardBlock, DeckSpec, QuoteBlock, SlideSpec, TextBlock,
+    SLIDE_KINDS, BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock, Visual,
     slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
 )
-from deckforge.plan.variants import Variant, rerank_candidates
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.yandex import WRITER_BUDGET_CAP
-from deckforge.template.patterns import keeps_sample_text, slot_char_capacity
 
 AGENT_PATH_WRITER = Path(__file__).resolve().parents[3] / "agents" / "slide-writer" / "AGENT.md"
-AGENT_PATH_PICKER = Path(__file__).resolve().parents[3] / "agents" / "pattern-picker" / "AGENT.md"
-AGENT_PATH_REALIZER = Path(__file__).resolve().parents[3] / "agents" / "slide-realizer" / "AGENT.md"
 
-# Живой прогон обязательной проверки задачи (девять презентаций, отчёт
-# задачи): на старте 3072 эскалация до потолка `MAX_TOKENS_BUDGET_CAP`=6144
-# (`provider/yandex.py`) срабатывала практически на каждом вызове
-# slide-writer — та же находка и то же решение, что и у `outline.
-# OUTLINE_MAX_TOKENS` (см. её комментарий): начинать ниже гарантированно
-# нужного бюджета только теряет время на лишний HTTP-круг.
+# Живой прогон: на старте 3072 эскалация до потолка бюджета токенов
+# срабатывала почти на каждом вызове писателя; начинать ниже нужного
+# значит терять HTTP-круг.
 WRITER_MAX_TOKENS = 6144
-PICKER_MAX_TOKENS = 2048
 
-# Слайды пишутся моделью ПАРАЛЛЕЛЬНО, не по очереди — живой замер задачи
-# (task-12-report.md): 23с на слайд, 12 слайдов подряд дали 273.7с из
-# 302.8с всей генерации (90% времени), при том что содержание одного
-# слайда не зависит от другого (свой пункт структуры, свои исходные
-# материалы) — последовательный порядок был архитектурной случайностью
-# первой версии `write_slides`, не требованием.
-#
-# Число — из `config/app.yaml` (`llm.slide_writer_max_workers`), это здесь
-# только запасной дефолт, если вызывающий код не передал `max_workers` явно
-# (прямые вызовы `write_slides` из тестов и т.п.) — тот же приём, что и
-# `audit.visual.run_visual(..., max_workers=4)`. Значение подобрано тем же
-# рассуждением, что и там: не "чем больше, тем быстрее" — провайдер (Yandex
-# Cloud) не любит слишком много одновременных запросов, и в колоде и так
-# уже есть запас на сетевые ретраи (`deadline_seconds`) на КАЖДЫЙ вызов;
-# 4 — тот же порядок, что уже проверен живьём в визуальном аудите
-# (`_PER_SLIDE_MAX_TOKENS`/`ThreadPoolExecutor(max_workers=4)`, тот же
-# провайдер, тот же класс нагрузки), не гадание с нуля.
+# Слайды пишутся параллельно: содержание одного не зависит от другого.
+# Число из `config/app.yaml` (`llm.slide_writer_max_workers`), здесь только
+# запасной дефолт для прямых вызовов.
 DEFAULT_WRITER_MAX_WORKERS = 4
 
-# Task 19: сколько сетевых кругов агентного цикла разрешено ОДНОМУ слайду
-# (см. докстроку модуля) — число из `config/app.yaml` (`llm.slide_writer_
-# agent_max_steps`), это здесь только запасной дефолт, тот же приём, что и
-# у `DEFAULT_WRITER_MAX_WORKERS` выше. 2 — буквально то, что просит бриф
-# задачи ("Цикл ограничен двумя шагами. Написала, проверила, при
-# необходимости переписала короче."): шаг 1 — модель пишет и, если хочет,
-# зовёт инструменты (`measure_fit`/`check_number`) в том же шаге; шаг 2 —
-# последний, код требует финальный ответ независимо от того, влез текст или
-# нет ("не уложилась — отдаёт что есть, находка остаётся аудиту"). Слайд,
-# который модель написала уверенно с первого раза (без вызова инструмента),
-# по-прежнему стоит ОДИН сетевой вызов — цикл не удорожает уже хороший
-# случай, только даёт модели путь исправиться в плохом.
+# Сетевых кругов агентного цикла на слайд (`llm.slide_writer_agent_max_steps`):
+# шаг 1 пишет и, если хочет, зовёт инструменты; шаг 2 последний, код
+# требует финальный ответ.
 AGENT_MAX_STEPS_DEFAULT = 2
 
-# Запасная вместимость для `kind`, которого нет вовсе ни в одном паттерне
-# профиля (шаблон бедный, или тестовая синтетика) — round-number, того же
-# порядка, что и типичные измеренные значения на трёх учебных шаблонах
-# (`tests/template/test_patterns.py`), не подгонка под конкретный файл.
 _DIGIT_RE = re.compile(r"\d")
-
-_FALLBACK_CAPACITY = {
-    "max_items": 4, "max_chars_per_item": 140, "max_bullets": 6,
-    "max_series": 4, "max_rows": 6, "max_cols": 4,
-}
-
-# Запасной лимит длины заголовка, когда ни один паттерн `kind` не несёт
-# слота роли "headline" с измеренной `max_chars` (не должно случаться на
-# `SLIDE_KINDS`, где headline обязателен всем, кроме "section"/"image" —
-# `_HEADLINE_EXEMPT_KINDS`, `template/patterns.py`; честный запасной вариант
-# на случай вырожденного профиля). Округлая величина того же порядка, что
-# типичный заголовок-вывод на одну-две строки, не подгонка под файл.
-_FALLBACK_HEADLINE_CHARS = 70
-
-# Виды слайда, где заголовок без содержания — законная вёрстка: обложка,
-# разделитель раздела, героическая картинка. Тот же смысл, что у
-# `patterns._HEADLINE_EXEMPT_KINDS`, но с другой стороны: там решают, нужен
-# ли заголовок, здесь — нужно ли содержание под ним.
-_HEADLINE_ONLY_KINDS = frozenset({"section", "image"})
-
-# Пункт структуры (`OutlineSlide.kind`, словарь outline-writer) -> желаемый
-# `SlideSpec.kind` (закрытый список `plan.spec.SLIDE_KINDS`, десять значений
-# с Task 18) — грубое, но детерминированное первое приближение вёрстки,
-# нужное ДО того, как известна конкретная раскладка (`pick_patterns`/
-# `variants.apply_variant` идут следующими шагами): slide-writer обязан
-# знать примерный лимит длины текста уже сейчас, а лимит приходит из
-# вместимости раскладки ИМЕННО этого `kind` (см. `_kind_capacity`). Сам
-# `kind` в ответе модели может отличаться от этой подсказки (AGENT.md
-# разрешает это явно), если контент содержательно не ложится в
-# предложенный тип — с Task 18 у модели для этого есть не только право, но
-# и данные: `_all_kind_capacities` показывает ей вместимость ВСЕХ видов
-# шаблона, не только подсказанного здесь.
-_OUTLINE_KIND_TO_SLIDE_KIND: dict[str, str] = {
-    "title": "section", "closing": "section", "ask": "section",
-    "agenda": "bullets", "context": "bullets", "problem": "bullets", "risks": "bullets",
-    "solution": "two_col", "comparison": "two_col",
-    "how_it_works": "cards", "case": "cards", "team": "cards", "roadmap": "cards",
-    "data": "kpi",
-}
 
 
 def _load_agent_prompt(path: Path) -> tuple[dict, str]:
@@ -178,149 +74,12 @@ def _load_agent_prompt(path: Path) -> tuple[dict, str]:
     return meta, parts[2].strip()
 
 
-def _kind_capacity(kind: str, profile) -> dict:
-    """Вместимость раскладки `kind` в ЭТОМ шаблоне — ориентир длины текста
-    для slide-writer.
-
-    Раньше здесь был МИНИМУМ по всем намайненным паттернам `kind`
-    (консервативная оценка "валидна для любого паттерна этого kind") — живой
-    прогон обязательной проверки задачи вскрыл, что это не работает: разброс
-    `max_chars_per_item` у раскладок ОДНОГО `kind` в реальном шаблоне велик
-    (VK Tech, `cards`: от 14 до 252 знаков на элемент), и минимум по всем
-    четырём (14) делает лимит практически бесполезным — контент такой длины
-    не несёт ни одного факта из источников. Число нужно не для того, чтобы
-    ГАРАНТИРОВАННО подойти под любую раскладку `kind` (эту работу теперь
-    делает `plan.variants._pick_pattern_id`, сверяясь с ФАКТИЧЕСКОЙ длиной
-    написанного текста, не только с числом элементов — см. её докстроку), а
-    чтобы дать модели разумный ПОТОЛОК: МАКСИМУМ среди паттернов `kind`
-    — content, вписавшийся в самую вместительную раскладку этого `kind`,
-    подбор паттерна дальше сам найдёт (или, если ни одна не хватит, сборка
-    честно ужмёт/усечёт и оставит finding — тот же путь, каким `compose.
-    builder` уже обрабатывает любое расхождение содержания с раскладкой)."""
-    candidates = [p.capacity for p in profile.patterns if p.kind == kind]
-    if not candidates:
-        return {
-            **_FALLBACK_CAPACITY,
-            "target_chars_per_item": target_of(_FALLBACK_CAPACITY["max_chars_per_item"]),
-        }
-
-    def _max_positive(values: list[int], default: int) -> int:
-        positive = [v for v in values if v > 0]
-        return max(positive) if positive else default
-
-    max_chars = _max_positive([c.max_chars_per_item for c in candidates], _FALLBACK_CAPACITY["max_chars_per_item"])
-    return {
-        "max_items": _max_positive([c.max_items for c in candidates], _FALLBACK_CAPACITY["max_items"]),
-        "max_chars_per_item": max_chars,
-        # Цель рядом с пределом: см. `compose.slide_tools._slot_guide`.
-        "target_chars_per_item": target_of(max_chars),
-        "max_bullets": _max_positive([c.max_bullets for c in candidates], _FALLBACK_CAPACITY["max_bullets"]),
-        "max_series": _max_positive([c.max_series for c in candidates], _FALLBACK_CAPACITY["max_series"]),
-        "max_rows": _max_positive([c.max_rows for c in candidates], _FALLBACK_CAPACITY["max_rows"]),
-        "max_cols": _max_positive([c.max_cols for c in candidates], _FALLBACK_CAPACITY["max_cols"]),
-    }
-
-
-def _headline_capacity(kind: str, profile) -> int:
-    """Лимит длины ЗАГОЛОВКА — живой прогон обязательной проверки задачи
-    (девять презентаций, отчёт задачи) вскрыл, что `_kind_capacity` выше
-    ограничивает длину body/bullet/card-содержания, но НЕ headline —
-    slide-writer писал заголовок-вывод ПОЛНЫМ предложением (60-100+ знаков),
-    который на живом рендере переносился на 2-3 строки и наезжал на
-    содержание ниже (находки L02/L03 аудита). Тот же принцип, что и у
-    `_kind_capacity` (МАКСИМУМ среди раскладок `kind`, не минимум — см. её
-    докстроку), взятый по слоту роли `"headline"` вместо `body`/`card_body`/
-    `bullet`."""
-    lengths = [
-        s.max_chars
-        for p in profile.patterns if p.kind == kind
-        for s in p.slots if s.role == "headline" and s.max_chars > 0
-    ]
-    return max(lengths) if lengths else _FALLBACK_HEADLINE_CHARS
-
-
-def _all_kind_capacities(profile) -> list[dict]:
-    """Вместимость ВСЕХ видов раскладки, которые реально есть в этом
-    шаблоне — не только подсказанного `desired_kind` (`_kind_capacity`
-    выше, та же арифметика на один вид за раз). Task 18, находка №2 брифа:
-    "модель пишет прозу, потому что ей никто не сказал, что этот шаблон
-    умеет показать ряд из трёх карточек... крупное число с подписью, фото
-    с подписью, цитату" — до этой правки slide-writer видел вместимость
-    ТОЛЬКО того вида, который код заранее выбрал `_OUTLINE_KIND_TO_SLIDE_
-    KIND` (грубая эвристика по семантике пункта структуры, не по
-    содержанию, которое модель ещё не написала) — увидеть, что шаблон,
-    скажем, умеет цитату, было решительно неоткуда, даже когда AGENT.md уже
-    прямо разрешает `kind` ответа отличаться от подсказки `layout_kind`.
-
-    `profile is None` (синтетика/ручной вызов без шаблона) -> пустой список,
-    та же честная деградация, что и `outline._summarize_available_forms`."""
-    if profile is None:
-        return []
-    kinds_present = sorted({p.kind for p in profile.patterns})
-    return [
-        {
-            "kind": kind,
-            "count": sum(1 for p in profile.patterns if p.kind == kind),
-            **_kind_capacity(kind, profile),
-            "max_headline_chars": _headline_capacity(kind, profile),
-        }
-        for kind in kinds_present
-    ]
-
-
-def _fallback_slide(kind: str, index: int, intent: str, needs: list[str], *, reason: str | None = None) -> SlideSpec:
-    """Детерминированный запасной слайд — используется без модели и когда
-    модель дважды не смогла вернуть валидный слайд. Заведомо проходит
-    `slide_spec_problems` — колода собирается целиком, с честной пометкой в
-    `findings`, а не падает на одном плохом слайде.
-
-    `intent` (структура от `outline.build_outline`) — свободный текст и
-    МОЖЕТ нести цифру (например, "Обучение 340 согласующих") — тогда
-    `slide_spec_problems`/`validate_deck_spec` потребуют `source_note`
-    (правило "цифра без источника" не делает исключения для запасного
-    варианта). Настоящего источника у запасного варианта нет по
-    определению (модель не писала текст) — `source_note` честно говорит об
-    этом словами, а не выдумывает ссылку на данные."""
-    headline = intent.strip() or "Слайд требует содержания"
-    finding = "Слайд собран запасным вариантом — модель недоступна или не вернула валидный ответ."
-    if reason:
-        finding += f" Причина: {reason}."
-    if needs:
-        finding += f" Нужны данные: {', '.join(needs)}."
-    source_note = "Источник не подтверждён — текст запасного варианта, требует проверки перед показом." \
-        if _DIGIT_RE.search(headline) else None
-
-    # Слайд с ОДНИМ заголовком — брак по ТЗ (Приложение 1, «Целостность»:
-    # «пустой слайд или слайд с одним заголовком»). Раньше запасной вариант
-    # выдавал ровно его: на живом прогоне 25 сентября 2026 три слайда из
-    # двенадцати вышли пустыми, и по слайду было не понять, что случилось.
-    #
-    # Пункты структуры (`OutlineSlide.needs`) — это то, что планировщик
-    # просил найти в источниках для ЭТОГО слайда. Показать их честнее, чем
-    # пустоту: видно, чего не хватило, и слайд можно дописать руками, не
-    # разбираясь в отчёте.
-    # На обложке и разделителе слайд с одним заголовком — норма вёрстки, а
-    # не брак: ТЗ имеет в виду содержательный слайд, на котором кроме
-    # заголовка ничего нет. Живой прогон 25 сентября 2026 на VK Tech:
-    # титульный слайд получил строку «Нужны данные: Название инициативы» —
-    # для обложки это мусор, а не честность.
-    # Пункты идут на слайд как есть, без приставки «Нужны данные»: в
-    # готовой колоде она читалась как брак (живой прогон 27 сентября 2026),
-    # а что слайд запасной, говорят находка выше и заметка докладчика.
-    needs_fit_this_slide = needs and kind not in _HEADLINE_ONLY_KINDS
-    blocks = [BulletBlock(items=list(needs))] if needs_fit_this_slide else []
-    return SlideSpec(
-        index=index, kind=kind, headline=headline, blocks=blocks,
-        source_note=source_note, findings=[finding],
-        speaker_notes="Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
-    )
-
-
+# Поля ответа модели. `kind` и `layout_id` больше не её решение, но старый
+# ответ с ними не должен падать: код их перезаписывает из контракта.
 _SLIDE_SCHEMA = {
     "type": "object",
     "properties": {
         "kind": {"type": "string", "enum": list(SLIDE_KINDS)},
-        "layout_id": {"type": "string"},
         "headline": {"type": "string"},
         "subhead": {"type": "string"},
         "blocks": {"type": "array"},
@@ -328,19 +87,12 @@ _SLIDE_SCHEMA = {
         "source_note": {"type": "string"},
         "speaker_notes": {"type": "string"},
     },
-    "required": ["kind", "headline"],
+    "required": ["headline"],
     "additionalProperties": False,
 }
 
+_TOOL_NAMES = ("measure_fit", "check_number")
 
-# Task 19 — конверт вызова инструмента, которым модель может ответить
-# ВМЕСТО финального слайда на любом шаге, кроме последнего (см. `_AGENT_
-# TURN_SCHEMA`/`_write_with_agent_loop`). Список, не одиночный вызов —
-# модель может захотеть проверить и заголовок, и цифру в одном шаге, а
-# бюджет сетевых кругов (`AGENT_MAX_STEPS_DEFAULT`) считает именно КРУГИ,
-# не отдельные вызовы инструментов внутри круга (оба инструмента —
-# локальные вычисления, не сеть, батч из нескольких вызовов в одном шаге
-# ничего не стоит по времени сверх самого шага).
 _TOOL_CALL_SCHEMA = {
     "type": "object",
     "properties": {
@@ -349,7 +101,7 @@ _TOOL_CALL_SCHEMA = {
             "items": {
                 "type": "object",
                 "properties": {
-                    "tool": {"type": "string", "enum": ["measure_fit", "check_number", "list_layouts", "try_slide"]},
+                    "tool": {"type": "string", "enum": list(_TOOL_NAMES)},
                     "args": {"type": "object"},
                 },
                 "required": ["tool", "args"],
@@ -361,86 +113,33 @@ _TOOL_CALL_SCHEMA = {
     "additionalProperties": False,
 }
 
-# Схема НЕ последнего шага цикла: модель вправе ответить либо вызовом
-# инструмента, либо сразу финальным слайдом (если уверена без проверки) —
-# `oneOf`, не приоритет одного варианта над другим (докстрока `provider.
-# yandex.YandexProvider.complete`: `schema` здесь — только текстовая
-# подсказка модели в system-сообщении, не строгий JSON Schema-режим API,
-# так что `oneOf` читает модель, не валидатор).
 _AGENT_TURN_SCHEMA = {"oneOf": [_TOOL_CALL_SCHEMA, _SLIDE_SCHEMA]}
 
 
-def _run_tool_call(
-    call: dict, profile, desired_kind: str, source_text: str, index: int = 0,
-    template_path: Path | None = None,
-) -> dict:
-    """Диспетчер инструментов агентного цикла (см. докстроку модуля).
-    Никогда не бросает исключение наружу — невалидный/неизвестный вызов
-    (модель перепутала имя инструмента или прислала не те аргументы)
-    возвращает объект с `error`, который уходит обратно модели тем же
-    путём, что и настоящий результат: она видит свою ошибку и может
-    попробовать снова на следующем шаге, вместо того чтобы уронить весь
-    цикл написания этого слайда."""
+def _run_tool_call(call: dict, profile, contract: SlideContract, source_text: str) -> dict:
+    """Диспетчер инструментов. Не бросает: невалидный вызов возвращает
+    `error`, модель видит его и может исправиться на следующем шаге."""
     if not isinstance(call, dict):
         return {"error": "вызов инструмента должен быть объектом {tool, args}"}
     name = call.get("tool")
     args = call.get("args") if isinstance(call.get("args"), dict) else {}
     try:
         if name == "measure_fit":
-            layout_id = args.get("layout_id")
+            # Место меряется в раскладке этого слайда: она уже выбрана.
             return measure_fit(
-                str(args.get("text", "")), str(args.get("role", "")), profile, desired_kind,
-                layout_id=str(layout_id) if layout_id else None,
+                str(args.get("text", "")), str(args.get("role", "")), profile, contract.kind,
+                layout_id=contract.pattern_id,
             )
         if name == "check_number":
             return check_number_in_sources(str(args.get("query", "")), source_text)
-        # Оба инструмента ниже (Task 23) требуют файла шаблона: черновик
-        # рисуется от него же, что и настоящая колода. Без пути они просто
-        # недоступны — так работает вызов `write_slides` из тестов и из
-        # старого кода, который путь не передаёт: цикл продолжается на
-        # прежних двух инструментах, а не падает.
-        if name == "list_layouts":
-            if template_path is None:
-                return {"error": "инструмент недоступен в этом прогоне (шаблон не передан)"}
-            kind = args.get("kind")
-            return {"layouts": list_layouts(profile, kind=str(kind) if kind else None)}
-        if name == "try_slide":
-            if template_path is None:
-                return {"error": "инструмент недоступен в этом прогоне (шаблон не передан)"}
-            return _try_slide_tool(args, profile, index, template_path)
-    except Exception as exc:  # инструмент не должен ронять весь цикл написания слайда
+    except Exception as exc:  # инструмент не должен ронять цикл написания слайда
         return {"error": f"инструмент {name!r} упал: {exc}"}
-    return {
-        "error": f"неизвестный инструмент {name!r}, доступны: "
-                 "measure_fit, check_number, list_layouts, try_slide"
-    }
-
-
-def _try_slide_tool(args: dict, profile, index: int, template_path: Path) -> dict:
-    """Черновая сборка слайда по ответу модели — обёртка над `compose.
-    slide_tools.try_slide`, разбирающая аргументы так же снисходительно, как
-    и остальные инструменты: модель прислала слайд не по схеме или забыла
-    номер раскладки — это ответ ей текстом, а не исключение."""
-    layout_id = args.get("layout_id")
-    if not layout_id:
-        return {"error": "нужен layout_id — возьми его из list_layouts"}
-    draft = args.get("slide")
-    if not isinstance(draft, dict):
-        return {"error": "нужен объект slide — тот же JSON слайда, что ты собираешься прислать финальным"}
-    try:
-        spec = slide_spec_from_dict(draft, index)
-    except Exception as exc:
-        return {"error": f"слайд не лёг в схему: {exc}"}
-    return try_slide(spec, str(layout_id), profile, template_path)
+    return {"error": f"неизвестный инструмент {name!r}, доступны: {', '.join(_TOOL_NAMES)}"}
 
 
 def _complete(llm: LLMProvider, messages: list[dict], schema: dict, max_tokens: int) -> str:
-    """Вызов модели с потолком бюджета, поднятым для писателя слайдов.
-
-    `budget_cap` понимает не всякий провайдер (у базового интерфейса его
-    нет, тесты подсовывают свои заглушки) — поэтому сначала пробуем с ним,
-    а на `TypeError` зовём по-старому. Это не проглатывание ошибки: любая
-    другая беда провайдера летит наверх и попадает в причину отказа."""
+    """Вызов модели с поднятым потолком бюджета; провайдер без `budget_cap`
+    (тестовые заглушки) зовётся по-старому."""
     try:
         return llm.complete(messages, schema=schema, max_tokens=max_tokens, budget_cap=WRITER_BUDGET_CAP)
     except TypeError:
@@ -448,13 +147,8 @@ def _complete(llm: LLMProvider, messages: list[dict], schema: dict, max_tokens: 
 
 
 def _why(exc: BaseException) -> str:
-    """Короткая причина отказа для отчёта — класс исключения плюс начало
-    сообщения.
-
-    Ключ провайдера вырезается: он уходит в заголовок запроса, а не в текст
-    исключения, но причина попадает в `SlideSpec.findings`, оттуда в отчёт
-    прогона и в веб-интерфейс, и цена ошибки тут несимметрична — лучше
-    вырезать лишнее, чем однажды показать секрет на экране."""
+    """Короткая причина отказа для отчёта, с вырезанными секретами:
+    причина уходит в находки, отчёт и веб-интерфейс."""
     text = f"{type(exc).__name__}: {str(exc)[:200]}"
     for name in ("YANDEX_API_KEY", "YANDEX_FOLDER_ID"):
         secret = os.environ.get(name)
@@ -463,41 +157,22 @@ def _why(exc: BaseException) -> str:
     return text
 
 
+def _parse_slide(data: dict, contract: SlideContract) -> SlideSpec:
+    """Ответ модели как слайд: вид и раскладка из контракта, лишние поля
+    выбора раскладки отброшены."""
+    data = {k: v for k, v in data.items() if k != "layout_id"}
+    data["kind"] = contract.kind
+    slide = slide_spec_from_dict(data, contract.slide_id)
+    return replace(slide, pattern_id=contract.pattern_id)
+
+
 def _write_with_agent_loop(
-    prompt_body: str, payload: dict, index: int, llm: LLMProvider, profile, desired_kind: str,
-    source_text: str, *, max_steps: int, template_path: Path | None = None,
+    prompt_body: str, payload: dict, contract: SlideContract, llm: LLMProvider, profile, source_text: str,
+    *, max_steps: int,
 ) -> tuple[SlideSpec | None, str | None]:
-    """Task 19: агентный цикл письма ОДНОГО слайда, бюджет `max_steps`
-    сетевых кругов (см. `AGENT_MAX_STEPS_DEFAULT`). Заменяет первый вызов
-    `_ask_slide_writer` в `_write_one_slide` — последующий один шанс
-    исправить СТРУКТУРНО невалидный ответ (`slide_spec_problems`) остаётся
-    снаружи, в `_write_one_slide`, без изменений: это разные заботы (там —
-    "ответ вообще разбирается по схеме", здесь — "текст физически влезает и
-    цифры не выдуманы").
-
-    На каждом шаге, кроме последнего, модель вольна ответить вызовом
-    инструмента (`{"tool_calls": [...]}`) вместо финального слайда — код
-    выполняет все вызовы этого шага, добавляет их результаты отдельным
-    user-сообщением и переходит к следующему шагу. Любой другой валидный
-    JSON-объект (без `tool_calls`) трактуется как попытка финального
-    ответа — цикл завершается ЭТИМ шагом, даже если `max_steps` ещё не
-    исчерпан: слайд, написанный уверенно с первого раза, не должен стоить
-    больше одного сетевого вызова.
-
-    На последнем разрешённом шаге инструменты уже недоступны (`is_final_
-    step`) — код прямо просит модель ответить финальным слайдом, и ЛЮБОЙ
-    ответ на этом шаге, включая случайный `tool_calls`, парсится как
-    попытка слайда (и, скорее всего, провалится валидацией схемы —
-    `slide_spec_from_dict` подберёт это как обычную ошибку разбора, тот же
-    путь, что и раньше у любого невалидного ответа).
-
-    Возвращает `(слайд, причина_отказа)`. Раньше возвращала только слайд, а
-    причину глотала (`except Exception: return None`) — и запасной слайд
-    получал одну и ту же строку «модель недоступна или не вернула валидный
-    ответ» независимо от того, отвалилась сеть, кончился бюджет токенов или
-    ответ не разобрался по схеме. На живом прогоне 23 сентября 2026 четыре
-    слайда из двенадцати ушли в запасной вариант, и понять почему было
-    нечем."""
+    """Агентный цикл одного слайда: на каждом шаге, кроме последнего,
+    модель вправе ответить вызовом инструментов; любой другой объект
+    трактуется как финальный слайд. Возвращает `(слайд, причина_отказа)`."""
     conversation: list[dict] = []
     for step in range(1, max(1, max_steps) + 1):
         is_final_step = step >= max_steps
@@ -526,286 +201,245 @@ def _write_with_agent_loop(
             results = [
                 {"tool": call.get("tool") if isinstance(call, dict) else None,
                  "args": call.get("args") if isinstance(call, dict) else None,
-                 "result": _run_tool_call(
-                     call, profile, desired_kind, source_text, index, template_path)}
+                 "result": _run_tool_call(call, profile, contract, source_text)}
                 for call in tool_calls
             ]
             conversation.append({"role": "assistant", "content": raw})
-            conversation.append(
-                {"role": "user", "content": json.dumps({"tool_results": results}, ensure_ascii=False)}
-            )
+            conversation.append({"role": "user", "content": json.dumps({"tool_results": results}, ensure_ascii=False)})
             continue
-
         try:
-            slide = slide_spec_from_dict(data, index)
+            return _parse_slide(data, contract), None
         except Exception as exc:
             return None, f"шаг {step}/{max_steps}: ответ не лёг в схему слайда — {_why(exc)}"
-
-        return slide, None
     return None, f"бюджет шагов исчерпан ({max_steps}), финального слайда модель так и не прислала"
 
 
-def _ask_slide_writer(
-    prompt_body: str, payload: dict, index: int, llm: LLMProvider, *, repair: list[str] | None = None,
+def _ask_repair(
+    prompt_body: str, payload: dict, contract: SlideContract, llm: LLMProvider, previous: dict | None,
+    problems: list[str],
 ) -> tuple[SlideSpec | None, str | None]:
-    """Один вызов модели за слайдом. Возвращает `(слайд, причина_отказа)` —
-    тем же контрактом, что и `_write_with_agent_loop` выше и по той же
-    причине."""
-    user_payload = dict(payload)
-    if repair:
-        user_payload["previous_answer_problems"] = repair
+    """Один ремонтный вызов: модель видит свой ответ и нарушения, списком,
+    и переписывает слайд под контракт. Инструменты недоступны."""
+    request = dict(payload)
+    request["contract_problems"] = problems
+    if previous is not None:
+        request["previous_answer"] = previous
     messages = [
         {"role": "system", "content": prompt_body},
-        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+        {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
     ]
     try:
         raw = _complete(llm, messages, _SLIDE_SCHEMA, WRITER_MAX_TOKENS)
     except Exception as exc:
         return None, f"модель не ответила — {_why(exc)}"
     try:
-        slide = slide_spec_from_dict(json.loads(raw), index)
+        return _parse_slide(json.loads(raw), contract), None
     except Exception as exc:
         return None, f"ответ не лёг в схему слайда — {_why(exc)}"
-    return slide, None
 
 
-def _write_one_slide(
-    index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
-    *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, template_path: Path | None = None,
-    fill_repair_max_items: int | None = None, repair_log: list[dict] | None = None,
-) -> SlideSpec:
-    """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
-    чтобы её можно было независимо запускать в пуле потоков (слайды друг от
-    друга не зависят: свой пункт структуры, свои исходные материалы — тот
-    же аргумент, что уже обосновал параллельность `audit.visual.run_visual`
-    по слайдам). Не трогает ничего снаружи себя (не пишет в общий список,
-    не читает состояние других слайдов) — единственное, что нужно для
-    безопасного вызова из нескольких потоков одновременно."""
-    desired_kind = _OUTLINE_KIND_TO_SLIDE_KIND.get(item.kind, "bullets")
-    capacity = _kind_capacity(desired_kind, profile)
-    payload = {
-        "slide_kind_hint": item.kind,
-        "intent": item.intent,
-        "needs": item.needs,
-        "layout_kind": desired_kind,
-        "capacity": capacity,
-        "max_headline_chars": _headline_capacity(desired_kind, profile),
-        # Task 18: ВСЕ виды раскладки, которые реально есть в шаблоне, с их
-        # вместимостью — не только подсказанный `layout_kind` (см.
-        # `_all_kind_capacities`) — модель решает, что из материала ложится
-        # в цитату/крупный фактоид/карточки/фото, а не только в прозу.
-        "available_kinds": _all_kind_capacities(profile),
-        "sources": source_text,
-        "position": {"index": index, "total": total},
-    }
-
-    slide: SlideSpec | None = None
-    reason: str | None = None
-    if llm is not None:
-        # Task 19: первый шанс — агентный цикл (пишет, при необходимости
-        # меряет текст/сверяет цифры инструментами, переписывает), не
-        # одиночный вызов. Репарация СТРУКТУРНОЙ невалидности ниже — та же,
-        # что была всегда, отдельная забота (см. докстроку `_write_with_
-        # agent_loop`).
-        slide, reason = _write_with_agent_loop(
-            prompt_body, payload, index, llm, profile, desired_kind, source_text,
-            max_steps=agent_max_steps, template_path=template_path,
-        )
-        if slide is not None:
-            problems = slide_spec_problems(slide)
-            if problems:
-                # Один шанс на исправление — код показывает модели её
-                # собственные ошибки (брифом: "валидатор ловит то, что
-                # иначе всплывёт при сборке" — здесь оно ловится ДО
-                # сборки и ДО того, как испортит остальную колоду).
-                repaired, repair_reason = _ask_slide_writer(prompt_body, payload, index, llm, repair=problems)
-                still_broken = slide_spec_problems(repaired) if repaired is not None else []
-                if repaired is not None and not still_broken:
-                    slide = repaired
-                else:
-                    slide = None
-                    reason = (
-                        f"ответ не прошёл проверку ({'; '.join(problems)}), "
-                        + (
-                            f"попытка исправить тоже: {'; '.join(still_broken)}"
-                            if still_broken else f"попытка исправить: {repair_reason}"
-                        )
-                    )
-    elif llm is None:
-        reason = "модель не подключена (нет ключа) — текст слайдов не писался вовсе"
-
-    if slide is None:
-        return _validate_chosen_layout(
-            _fallback_slide(desired_kind, index, item.intent, item.needs, reason=reason), profile,
-        )
-
-    slide = _validate_chosen_layout(slide, profile)
-    if fill_repair_max_items is not None and llm is not None:
-        slide = _repair_underfill(
-            prompt_body, payload, slide, profile, llm, max_items=fill_repair_max_items, log=repair_log,
-        )
-    return slide
+def _answer_view(slide: SlideSpec) -> dict:
+    return {k: v for k, v in slide_spec_to_dict(slide).items() if k not in ("index", "findings", "pattern_id", "kind")}
 
 
-# Виды, где крупное текстовое место и не должно быть заполнено: обложка,
-# картинка, показатели, цитата, таблица. Длину их текста задаёт смысл.
-_NO_FILL_REPAIR_KINDS = frozenset({"section", "image", "kpi", "kpi_caption", "quote", "table"})
+def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> SlideSpec:
+    """Детерминированный запасной слайд под контракт: пункты плана
+    (`needs`) ложатся в главное место раскладки той формой, какой оно
+    ждёт. Заведомо проходит `slide_spec_problems`: цифра в заголовке
+    получает честную строку источника, а не выдуманную ссылку."""
+    headline = contract.intent.strip() or "Слайд требует содержания"
+    finding = "Слайд собран запасным вариантом — модель недоступна или не вернула валидный ответ."
+    if reason:
+        finding += f" Причина: {reason}."
+    needs = [n for n in contract.evidence if n.strip()]
+    if needs:
+        finding += f" Нужны данные: {', '.join(needs)}."
+    source_note = "Источник не подтверждён — текст запасного варианта, требует проверки перед показом." \
+        if _DIGIT_RE.search(headline) else None
+    main = next((s for s in contract.slots if s.required), None)
+    blocks: list = []
+    # На обложке и разделителе слайд с одним заголовком норма вёрстки.
+    # На содержательном слайде пункты плана честнее пустоты.
+    if needs and main is not None and contract.outline_kind not in ("title", "closing"):
+        if main.block == "cards" and len(needs) >= 2:
+            blocks = [CardBlock(items=[Card(body=n) for n in needs[:main.count]])]
+        elif main.block == "text":
+            blocks = [TextBlock(text="; ".join(needs))]
+        else:
+            blocks = [BulletBlock(items=list(needs))]
+    return SlideSpec(
+        index=contract.slide_id, kind=contract.kind, headline=headline, blocks=blocks,
+        source_note=source_note, findings=[finding], pattern_id=contract.pattern_id,
+        speaker_notes="Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
+    )
 
-# Ремонт идёт, когда место заполнено меньше этой доли цели.
-FILL_REPAIR_SHARE_OF_TARGET = 0.5
+
+def _divider_slide(contract: SlideContract) -> SlideSpec:
+    return SlideSpec(
+        index=contract.slide_id, kind=contract.kind, headline=contract.divider_label or "",
+        pattern_id=contract.pattern_id,
+    )
 
 
-def _repair_underfill(
-    prompt_body: str, payload: dict, slide: SlideSpec, profile, llm: LLMProvider,
-    *, max_items: int = 0, log: list[dict] | None = None,
-) -> SlideSpec:
-    """Один добавочный вызов «допиши до объёма», если крупнейшее текстовое
-    место слайда заполнено меньше чем на половину цели.
-
-    Правило объёма стоит в задании писателя, но модель его нарушает молча:
-    прогоны 23–26 сентября 2026 давали пункты по 20 знаков в блоках на 250.
-    Тот же приём, что ремонт невалидного JSON: код меряет, показывает
-    модели число и просит один раз. Не больше одного круга; ответ хуже
-    исходного (невалиден, длиннее предела, не прибавил заполнения)
-    отбрасывается, и остаётся исходный слайд. Отказ модели здесь не
-    превращает слайд в запасной: у нас уже есть хороший ответ.
-
-    `max_items` > 0 ограничивает ремонт слайдами с малым числом элементов
-    (`_content_units`), если на колоде он окажется дорог по времени."""
-    if slide.kind in _NO_FILL_REPAIR_KINDS:
+def _with_photo(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
+    """Фото контент-пакета, назначенное слайду до планирования: раскладка
+    уже выбрана с местом под картинку, модель фото не выбирает."""
+    if not contract.photo:
         return slide
     if slide.visual is not None and slide.visual.kind in ("table", "chart"):
         return slide
-    if max_items and _content_units(slide) > max_items:
-        return slide
-    before = main_slot_fill(slide, profile, layout_id=slide.pattern_id)
-    if before is None or before["fill"] >= FILL_REPAIR_SHARE_OF_TARGET * before["target_fill"]:
-        return slide
+    caption = (slide.visual.caption if slide.visual is not None else None) or contract.photo_caption
+    return replace(slide, visual=Visual(kind="photo", caption=caption, photo_name=contract.photo))
 
-    started = time.monotonic()
-    answer = {k: v for k, v in slide_spec_to_dict(slide).items() if k not in ("index", "findings", "pattern_id")}
-    if slide.pattern_id:
-        answer["layout_id"] = slide.pattern_id
-    request = dict(payload)
-    request["previous_answer"] = answer
-    request["fill_request"] = {
-        "role": before["role"], "chars": before["chars"],
-        "target_chars": before["target_chars"], "max_chars": before["max_chars"],
+
+def _write_one_slide(
+    contract: SlideContract, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
+    *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, style: str | None = None, log: list[dict] | None = None,
+) -> SlideSpec:
+    """Пишет один слайд. Ничего не трогает снаружи, кроме `log` (append из
+    нескольких потоков под GIL безопасен), поэтому зовётся из пула."""
+    if contract.is_divider:
+        return _divider_slide(contract)
+    payload = {
+        "contract": contract.to_prompt(),
+        "sources": source_text,
+        "position": {"index": contract.slide_id, "total": total},
     }
-    messages = [
-        {"role": "system", "content": prompt_body},
-        {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
-    ]
-    outcome = "отброшен"
-    result = slide
-    after = None
-    try:
-        repaired = slide_spec_from_dict(json.loads(_complete(llm, messages, _SLIDE_SCHEMA, WRITER_MAX_TOKENS)), slide.index)
-    except Exception as exc:  # отказ ремонта не портит уже хороший слайд
-        repaired, outcome = None, f"не удался: {_why(exc)}"
-    if repaired is not None and not slide_spec_problems(repaired):
-        repaired = _validate_chosen_layout(repaired, profile)
-        after = main_slot_fill(repaired, profile, layout_id=repaired.pattern_id)
-        if after is not None and before["fill"] < after["fill"] and after["chars"] <= after["max_chars"]:
-            result = replace(repaired, findings=[*slide.findings, *repaired.findings])
-            outcome = "принят"
+    if style:
+        payload["style"] = style
+
+    slide: SlideSpec | None = None
+    reason: str | None = None
+    entry = {"index": contract.slide_id, "repair": None}
+    if llm is None:
+        reason = "модель не подключена (нет ключа) — текст слайдов не писался вовсе"
+    else:
+        slide, reason = _write_with_agent_loop(
+            prompt_body, payload, contract, llm, profile, source_text, max_steps=agent_max_steps,
+        )
+        if slide is not None:
+            schema_problems = slide_spec_problems(slide)
+            problems = schema_problems + contract_problems(slide, contract)
+            if problems:
+                repaired, repair_reason = _ask_repair(
+                    prompt_body, payload, contract, llm, _answer_view(slide), problems,
+                )
+                repaired_problems = None
+                if repaired is not None and not slide_spec_problems(repaired):
+                    repaired_problems = contract_problems(repaired, contract)
+                accepted = repaired_problems is not None and (
+                    schema_problems or len(repaired_problems) < len(problems)
+                )
+                entry["repair"] = "принят" if accepted else "отброшен"
+                if accepted:
+                    slide = repaired
+                elif schema_problems:
+                    slide = None
+                    reason = (
+                        f"ответ не прошёл проверку ({'; '.join(schema_problems)}), "
+                        f"попытка исправить: {repair_reason or 'не помогла'}"
+                    )
+    if slide is None:
+        slide = _fallback_slide(contract, reason=reason)
+    else:
+        left = contract_problems(slide, contract)
+        entry["compliant"] = not left
+        if left:
+            slide.findings.append(
+                f"Слайд {contract.slide_id}: текст не уложился в контракт раскладки "
+                f"{contract.pattern_id}: {'; '.join(left[:3])}."
+            )
+    if contract.gap_note:
+        slide.findings.append(contract.gap_note)
+    slide = _with_photo(slide, contract)
+    ok, places = contract_fill(slide, contract)
+    entry.update(ok=ok, places=places)
     if log is not None:
-        log.append({
-            "index": slide.index, "seconds": round(time.monotonic() - started, 1), "outcome": outcome,
-            "fill_before": before["fill"], "fill_after": after["fill"] if outcome == "принят" else before["fill"],
-        })
-    return result
-
-
-def _validate_chosen_layout(slide: SlideSpec, profile) -> SlideSpec:
-    """Номер раскладки, выбранный агентом, обязан существовать в ЭТОМ
-    шаблоне — тот же принцип «модель предлагает, код проверяет», что и у
-    именования палитры и выбора вида раскладки.
-
-    Живой прогон 23 сентября 2026: модель прислала `layout_id: "bullets_1"`,
-    хотя раскладки этого шаблона называются `slide16`/`slide18` — то есть
-    выдумала номер, не посмотрев каталог. `compose.builder._resolve_pattern`
-    такой номер и так не примет (он ищет паттерн по id и не находит), но
-    молча: со стороны это неотличимо от «агент не выбирал». Выдуманный
-    номер стирается здесь и остаётся честной находкой."""
-    if not slide.pattern_id:
-        return slide
-    known = {p.pattern_id for p in profile.patterns}
-    if slide.pattern_id in known:
-        return slide
-    slide.findings.append(
-        f"Слайд {slide.index}: раскладки {slide.pattern_id!r} в шаблоне нет — "
-        "выбор модели отброшен, раскладку подобрал код. Номер надо брать из list_layouts."
-    )
-    return replace(slide, pattern_id=None)
+        log.append(entry)
+    return slide
 
 
 def write_slides(
-    outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None,
+    outline: Outline, contracts: list[SlideContract], sources: list[SourceDoc], profile, llm: LLMProvider | None,
     *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
-    template_path: Path | None = None, fill_repair_max_items: int | None = None,
+    style=None,
 ) -> DeckSpec:
-    """Пишет текст всех слайдов ПАРАЛЛЕЛЬНО (см. `DEFAULT_WRITER_MAX_
-    WORKERS` — до `max_workers` одновременных вызовов модели), не по
-    очереди — слайды друг от друга не зависят. Два инварианта, за которые
-    отвечает именно эта функция (а не `_write_one_slide`, который ничего не
-    знает про порядок и про соседей):
+    """Текст всех слайдов колоды под их контракты, параллельно.
 
-    1. Порядок слайдов в готовой колоде не зависит от того, кто ответил
-       первым — результаты собираются в массив по ИНДЕКСУ (`slides[index]
-       = ...`), не в порядке `as_completed`, и уже упорядоченный список
-       уходит дальше (`_flag_repeated_headlines`, `DeckSpec.slides`).
-    2. Отказ одного слайда (исключение/невалидный ответ внутри
-       `_write_one_slide`) не роняет всю колоду — `_write_one_slide` сама
-       никогда не бросает исключение по вине модели (та же деградация, что
-       и раньше, до параллельности: `_ask_slide_writer` ловит любую ошибку
-       вызова и возвращает `None`, дальше в ход идёт `_fallback_slide`);
-       здесь это свойство только ПЕРЕЖИВАЕТ переезд в пул потоков, не
-       создаётся заново.
+    Порядок слайдов в колоде не зависит от того, кто ответил первым:
+    результат собирается по номеру. Отказ одного слайда не роняет колоду.
+    После письма: тонкий повтор факта выбрасывается, похожие заголовки
+    помечаются, содержание вырождается под шаблон (`plan.normalize`: одна
+    карточка в абзац, два пункта с числами в показатели); слайду, чья
+    форма от этого поменялась, раскладка подбирается заново тем же
+    расчётом стоимости, что у планировщика (`pattern.repick_pattern`).
 
-    `fill_repair_max_items` включает ремонт недобора (`_repair_underfill`):
-    `None` — выключен (тесты с очередью заготовленных ответов считают
-    вызовы), 0 — для всех слайдов, N — для слайдов не больше чем с N
-    элементами. Сколько слайдов ремонтировалось и сколько секунд это
-    стоило, пишется в `DeckSpec.meta`.
-
-    После письма содержание вырождается под раскладки шаблона (`plan.
-    normalize.normalize_deck`): одна карточка становится абзацем, пара
-    коротких пунктов с числами — показателями."""
+    В `DeckSpec.meta`: сколько мест контракта заполнено в его пределах
+    (`contract_places_ok`/`contract_places`), сколько было ремонтов."""
     _meta, prompt_body = _load_agent_prompt(AGENT_PATH_WRITER)
     source_text = "\n\n".join(f"### {s.name}\n{s.text}" for s in sources)
-    total = len(outline.slides)
+    total = len(contracts)
+    style_value = getattr(style, "value", style)
 
     slides: list[SlideSpec | None] = [None] * total
-    repair_log: list[dict] = []
+    log: list[dict] = []
+    started = time.monotonic()
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures = {
             pool.submit(
-                _write_one_slide, index, item, profile, prompt_body, source_text, total, llm,
-                agent_max_steps=agent_max_steps, template_path=template_path,
-                fill_repair_max_items=fill_repair_max_items, repair_log=repair_log,
-            ): index
-            for index, item in enumerate(outline.slides)
+                _write_one_slide, contract, profile, prompt_body, source_text, total, llm,
+                agent_max_steps=agent_max_steps, style=style_value, log=log,
+            ): i
+            for i, contract in enumerate(contracts)
         }
         for future in as_completed(futures):
-            index = futures[future]
-            slides[index] = future.result()
+            slides[futures[future]] = future.result()
 
-    ordered_slides: list[SlideSpec] = slides  # type: ignore[assignment] — каждый индекс заполнен ровно один раз выше
-    ordered_slides = _drop_thin_duplicates(ordered_slides)
-    _flag_repeated_headlines(ordered_slides)
-    deck = DeckSpec(title=outline.title, language=outline.language, slides=ordered_slides)
-    if repair_log:
-        deck.meta["fill_repairs"] = str(len(repair_log))
-        deck.meta["fill_repairs_accepted"] = str(sum(1 for r in repair_log if r["outcome"] == "принят"))
-        deck.meta["fill_repair_seconds"] = f"{sum(r['seconds'] for r in repair_log):.1f}"
-        # По слайду: заполнение до и после, секунды, исход. Нужно для разбора
-        # прогона по deck.json без повторного вызова модели.
-        deck.meta["fill_repair_log"] = "; ".join(
-            f"{r['index']}: {r['fill_before']}->{r['fill_after']}, {r['seconds']}с, {r['outcome']}"
-            for r in sorted(repair_log, key=lambda r: r["index"])
-        )
-    return normalize_deck(deck, profile)
+    deck = DeckSpec(title=outline.title, language=outline.language, slides=list(slides))  # type: ignore[arg-type]
+    deck.meta["contract_places"] = str(sum(e.get("places", 0) for e in log))
+    deck.meta["contract_places_ok"] = str(sum(e.get("ok", 0) for e in log))
+    repairs = [e for e in log if e.get("repair")]
+    deck.meta["contract_repairs"] = str(len(repairs))
+    deck.meta["contract_repairs_accepted"] = str(sum(1 for e in repairs if e["repair"] == "принят"))
+    deck.meta["write_seconds"] = f"{time.monotonic() - started:.1f}"
+    compliant = frozenset(e["index"] for e in log if e.get("compliant"))
+    deck = normalize_deck(deck, profile, keep=compliant)
+    if style_value and profile is not None:
+        deck = _repick_changed(deck, profile, style_value)
+    return replace(deck, slides=_dedupe_content(deck.slides, contracts))
+
+
+def _dedupe_content(slides: list[SlideSpec], contracts: list[SlideContract]) -> list[SlideSpec]:
+    """Повторы фактов ищутся только среди содержательных слайдов:
+    разделители airy («Дальше — цифры», «Дальше — план») делят слово
+    «Дальше» и без этого выбрасывались бы как тонкие повторы друг друга."""
+    dividers = {id(slides[i]) for i, c in enumerate(contracts) if c.is_divider and i < len(slides)}
+    kept = _drop_thin_duplicates(slides, frozenset(i for i, s in enumerate(slides) if id(s) in dividers))
+    # `_drop_thin_duplicates` перенумеровывает выжившие копиями; разделитель
+    # узнаётся по тому же заголовку без содержания.
+    labels = {s.headline for s in slides if id(s) in dividers}
+    skip = frozenset(i for i, s in enumerate(kept) if s.headline in labels and not s.blocks)
+    _flag_repeated_headlines(kept, skip)
+    return kept
+
+
+def _repick_changed(deck: DeckSpec, profile, style: str) -> DeckSpec:
+    """Слайды, у которых нормализация сбросила раскладку, получают новую:
+    соседи уже назначены и остаются как есть."""
+    ids = [s.pattern_id for s in deck.slides]
+    if all(ids):
+        return deck
+    slides = list(deck.slides)
+    for i, slide in enumerate(slides):
+        if slide.pattern_id:
+            continue
+        pid = repick_pattern(slide, i, ids, profile, style)
+        if pid is None:
+            continue
+        kind = next(p.kind for p in profile.patterns if p.pattern_id == pid)
+        slides[i] = replace(slide, pattern_id=pid, kind=kind)
+        ids[i] = pid
+    return replace(deck, slides=slides)
 
 
 # Слово короче этой длины (предлоги, союзы, частицы — «и», «на», «за») не
@@ -880,7 +514,7 @@ def _same_fact(a: SlideSpec, b: SlideSpec) -> bool:
     return overlap >= _HEADLINE_OVERLAP_THRESHOLD or bool(_notable_numbers(a.headline) & _notable_numbers(b.headline))
 
 
-def _drop_thin_duplicates(slides: list[SlideSpec]) -> list[SlideSpec]:
+def _drop_thin_duplicates(slides: list[SlideSpec], skip: frozenset[int] = frozenset()) -> list[SlideSpec]:
     """Убирает слайд, который повторяет факт другого слайда (тот же признак,
     что у `_flag_repeated_headlines`) и при этом тонкий (`_content_units`
     не больше `_THIN_SLIDE_MAX_UNITS`). Прогон 26 сентября 2026 на VK
@@ -897,6 +531,8 @@ def _drop_thin_duplicates(slides: list[SlideSpec]) -> list[SlideSpec]:
     dropped: set[int] = set()
     for i in range(len(slides)):
         for j in range(i + 1, len(slides)):
+            if i in skip or j in skip:
+                continue
             if i in dropped or j in dropped or not _same_fact(slides[i], slides[j]):
                 continue
             protected = {0, len(slides) - 1}
@@ -908,11 +544,14 @@ def _drop_thin_duplicates(slides: list[SlideSpec]) -> list[SlideSpec]:
                 dropped.add(i)
     if not dropped:
         return slides
+    # Выброшенный слайд забирает с собой разделитель airy перед ним: иначе
+    # два разделителя встали бы подряд.
+    dropped |= {k - 1 for k in dropped if k - 1 in skip}
     kept = [s for k, s in enumerate(slides) if k not in dropped]
     return [replace(s, index=k) for k, s in enumerate(kept)]
 
 
-def _flag_repeated_headlines(slides: list[SlideSpec]) -> None:
+def _flag_repeated_headlines(slides: list[SlideSpec], skip: frozenset[int] = frozenset()) -> None:
     """Помечает finding'ом пары слайдов КОЛОДЫ ЦЕЛИКОМ (не только соседних —
     двойной цикл `i < j` ниже сравнивает КАЖДУЮ пару, брифом задачи прямо
     требуется не ограничиваться соседями), чьи заголовки, вероятно, несут
@@ -940,6 +579,8 @@ def _flag_repeated_headlines(slides: list[SlideSpec]) -> None:
     number_sets = [_notable_numbers(s.headline) for s in slides]
     for i in range(len(slides)):
         for j in range(i + 1, len(slides)):
+            if i in skip or j in skip:
+                continue
             a, b = word_sets[i], word_sets[j]
             word_overlap = len(a & b) / min(len(a), len(b)) if a and b else 0.0
             shared_numbers = number_sets[i] & number_sets[j]
@@ -949,592 +590,3 @@ def _flag_repeated_headlines(slides: list[SlideSpec]) -> None:
                     f"({slides[j].headline!r}) — возможно, один и тот же факт другими словами."
                 )
 
-
-# ---------------------------------------------------------------------------
-# pick_patterns — подбор КОНКРЕТНОЙ раскладки моделью, поверх уже
-# написанного содержания.
-# ---------------------------------------------------------------------------
-
-_PICKER_SCHEMA = {
-    "type": "object",
-    "properties": {"pattern_id": {"type": "string"}, "reason": {"type": "string"}},
-    "required": ["pattern_id"],
-    "additionalProperties": False,
-}
-
-
-def _content_item_count(slide: SlideSpec) -> int | None:
-    """Фактический объём содержания слайда — то же число, что `compose.
-    builder._repeat_item_count` использует для геометрически точного
-    подбора, здесь взято проще (без повторов раскладки, `plan/` их не
-    знает): число буллетов/карточек/KPI/строк таблицы/рядов графика, в
-    зависимости от того, что на слайде есть. `None` — на слайде нет
-    контента, объём которого имеет смысл сравнивать с `Capacity.max_items`
-    (например, чистый текстовый абзац)."""
-    from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock
-
-    for block in slide.blocks:
-        if isinstance(block, CardBlock) and block.items:
-            return len(block.items)
-        if isinstance(block, BulletBlock) and block.items:
-            return len(block.items)
-        if isinstance(block, KpiBlock) and block.items:
-            return len(block.items)
-    if slide.visual is not None and slide.visual.table is not None and slide.visual.table.rows:
-        return len(slide.visual.table.rows) - 1  # без шапки
-    return None
-
-
-def _best_by_capacity(candidates: list, item_count: int | None):
-    """Раскладка того же `kind`, чья `Capacity.max_items` ближе всего к
-    фактическому объёму содержания — код-фолбэк `pick_patterns`, когда
-    модель недоступна или предложила `pattern_id` вне списка кандидатов;
-    тот же критерий, что первым делом ранжирует `compose.builder._pick_
-    pattern` (`_capacity_badness`), выраженный только через `Capacity`
-    (без `Box`/`fits()` — `plan/` не знает координат и не меряет текст,
-    это работа `compose/`, которая при сборке ВСЁ РАВНО перепроверит
-    итоговый выбор через `fits()` и при необходимости ужмёт/подвинет)."""
-    if not candidates:
-        return None
-    if item_count is None:
-        return max(candidates, key=lambda p: p.score)
-
-    def badness(p):
-        max_items = p.capacity.max_items or 1
-        return (abs(max_items - item_count) / max_items, -p.score)
-
-    return min(candidates, key=badness)
-
-
-def pick_patterns(deck_spec: DeckSpec, profile, llm: LLMProvider | None) -> DeckSpec:
-    """Проставляет `SlideSpec.pattern_id` — по одному вызову модели на
-    слайд, среди паттернов ТОЛЬКО того `kind`, что уже несёт слайд (модель
-    не может предложить раскладку вне шаблона — ей показывают только
-    список кандидатов этого `kind`); без модели, при сбое вызова или на
-    ответе вне списка кандидатов — код сам берёт раскладку по вместимости
-    (`_best_by_capacity`), а не оставляет `pattern_id` пустым."""
-    _meta, prompt_body = _load_agent_prompt(AGENT_PATH_PICKER) if llm is not None else ({}, "")
-
-    new_slides: list[SlideSpec] = []
-    for slide in deck_spec.slides:
-        candidates = [p for p in profile.patterns if p.kind == slide.kind]
-        if not candidates:
-            new_slides.append(slide)
-            continue
-
-        item_count = _content_item_count(slide)
-        fallback = _best_by_capacity(candidates, item_count)
-        chosen_id = fallback.pattern_id if fallback is not None else None
-
-        if llm is not None:
-            payload = {
-                "slide": {
-                    "kind": slide.kind, "headline": slide.headline,
-                    "item_count": item_count,
-                },
-                "candidates": [
-                    {
-                        "pattern_id": p.pattern_id,
-                        "capacity": {
-                            "max_items": p.capacity.max_items,
-                            "max_chars_per_item": p.capacity.max_chars_per_item,
-                            "max_bullets": p.capacity.max_bullets,
-                            "max_series": p.capacity.max_series,
-                            "max_rows": p.capacity.max_rows,
-                            "max_cols": p.capacity.max_cols,
-                        },
-                        "decor_count": len(p.decor),
-                        "score": p.score,
-                    }
-                    for p in candidates
-                ],
-            }
-            messages = [
-                {"role": "system", "content": prompt_body},
-                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-            ]
-            try:
-                raw = llm.complete(messages, schema=_PICKER_SCHEMA, max_tokens=PICKER_MAX_TOKENS)
-                data = json.loads(raw)
-                proposed = data.get("pattern_id")
-                valid_ids = {p.pattern_id for p in candidates}
-                if isinstance(proposed, str) and proposed in valid_ids:
-                    chosen_id = proposed
-                # иначе — модель предложила раскладку вне списка (или сбой
-                # разбора) — код отвергает и оставляет уже посчитанный fallback
-            except Exception:
-                pass
-
-        new_slides.append(
-            SlideSpec(
-                index=slide.index, kind=slide.kind, headline=slide.headline, subhead=slide.subhead,
-                blocks=slide.blocks, visual=slide.visual, source_note=slide.source_note,
-                speaker_notes=slide.speaker_notes, findings=list(slide.findings), pattern_id=chosen_id,
-            )
-        )
-
-    return DeckSpec(title=deck_spec.title, language=deck_spec.language, slides=new_slides, meta=dict(deck_spec.meta))
-
-
-# ---------------------------------------------------------------------------
-# rerank_patterns — модель выбирает раскладку из трёх, отобранных кодом,
-# для вариантов airy и visual.
-# ---------------------------------------------------------------------------
-
-# Варианты, которым раскладку уточняет модель. `dense` сюда не входит: его
-# раскладку уже выбирал писатель текста инструментами (`list_layouts`/
-# `try_slide`), и `apply_variant` её наследует.
-RERANK_VARIANTS = (Variant.visual, Variant.airy)
-
-# Запасные дефолты, если вызывающий код не передал своих: те же числа, что
-# в `config/app.yaml` (`llm.pattern_picker_*`), см. обоснование там.
-DEFAULT_RERANK_MAX_WORKERS = 8
-DEFAULT_RERANK_BUDGET_SECONDS = 40.0
-
-# Стартовый бюджет ответа одного вызова. Живой прогон 26 сентября 2026 на
-# VK Education: с прежних 2048 (`PICKER_MAX_TOKENS`) провайдер эскалировал до
-# 4096 в 11 вызовах из 14 — модель рассуждает, прежде чем выбрать, и почти
-# каждый вызов платил лишний сетевой круг. Начинать сразу с 4096 дешевле.
-RERANK_MAX_TOKENS = 4096
-
-# Поля слайда, которые модели не нужны для выбора раскладки: находки и
-# заметки докладчика её только отвлекают, а `pattern_id` — это выбор
-# писателя для плотного варианта, не подсказка для этих двух.
-_RERANK_HIDDEN_SLIDE_FIELDS = ("findings", "speaker_notes", "pattern_id", "index")
-
-
-def _rerank_candidate_card(pattern, rank: int) -> dict:
-    """Что модель знает о раскладке: роли и вместимость мест, сетка, декор.
-    Без координат: план их не знает (см. `tests/plan/test_no_pptx_import.
-    py`), а смысл выбора координатами и не выражается."""
-    return {
-        "pattern_id": pattern.pattern_id,
-        "rank": rank,
-        "kind": pattern.kind,
-        "slots": [{"role": slot.role, "max_chars": slot.max_chars} for slot in pattern.slots],
-        "repeat_count": pattern.repeat.count if pattern.repeat is not None else 0,
-        "decor_count": len(pattern.decor),
-        "has_image_slot": any(slot.role in ("image", "icon") for slot in pattern.slots),
-        "is_dark": pattern.is_dark,
-    }
-
-
-def _rerank_one(
-    variant: Variant, slide: SlideSpec, candidate_ids: list[str], profile, prompt_body: str, llm: LLMProvider,
-    text_will_be_rewritten: bool = False,
-) -> tuple[str, str | None]:
-    """Один вызов модели на слайд. Возвращает `(pattern_id, причина сбоя)`:
-    при любом сбое — первого кандидата кода и причину, иначе `None`. Не
-    бросает: отказ модели на одном слайде не должен ронять шаг. Пояснение
-    модели (`reason`) нужно ей самой, чтобы выбирать осмысленно, коду оно
-    ни к чему."""
-    by_id = {p.pattern_id: p for p in profile.patterns}
-    slide_view = {k: v for k, v in slide_spec_to_dict(slide).items() if k not in _RERANK_HIDDEN_SLIDE_FIELDS}
-    payload = {
-        "variant": variant.value,
-        "slide": slide_view,
-        "candidates": [_rerank_candidate_card(by_id[pid], rank) for rank, pid in enumerate(candidate_ids, 1)],
-        # Задача N: при `prefer_decor` кандидаты отобраны без оглядки на
-        # длину текста, и модели надо знать, что его перепишут.
-        "text_will_be_rewritten": text_will_be_rewritten,
-    }
-    messages = [
-        {"role": "system", "content": prompt_body},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-    ]
-    fallback = candidate_ids[0]
-    try:
-        raw = llm.complete(messages, schema=_PICKER_SCHEMA, max_tokens=RERANK_MAX_TOKENS)
-        data = json.loads(raw)
-    except Exception as exc:
-        return fallback, f"модель не ответила — {_why(exc)}"
-    proposed = data.get("pattern_id") if isinstance(data, dict) else None
-    if not isinstance(proposed, str) or proposed not in candidate_ids:
-        # Тот же принцип, что `_validate_chosen_layout`: номер вне списка
-        # кандидатов код не принимает.
-        return fallback, f"модель назвала раскладку вне списка кандидатов ({proposed!r})"
-    return proposed, None
-
-
-def rerank_patterns(
-    deck: DeckSpec, profile, variants, llm: LLMProvider | None,
-    *, max_workers: int = DEFAULT_RERANK_MAX_WORKERS, budget_seconds: float = DEFAULT_RERANK_BUDGET_SECONDS,
-    notes: list[str] | None = None, prefer_decor: bool = False,
-) -> dict[tuple[Variant, int], str]:
-    """Раскладки, выбранные моделью: `(вариант, номер слайда в варианте) ->
-    pattern_id`, готово к передаче в `apply_variant(..., preferred=...)`.
-
-    Зачем: для `airy` и `visual` выбор раньше был чисто числовым (`variants.
-    _pattern_rank_key`), без единого взгляда на смысл слайда, и два варианта
-    из трёх выглядели однообразно. Код по-прежнему решает, что вообще
-    допустимо (`variants.rank_patterns`: три лучших, все без переполнения),
-    модель выбирает одну по смыслу. `apply_variant` остаётся чистой и ещё
-    раз проверяет совместимость.
-
-    Время: вызовы параллельны (`max_workers`), а весь шаг ограничен
-    `budget_seconds`. Слайды, по которым модель не успела, просто остаются
-    на выборе кода: колода и так близка к 300с ТЗ, и ждать отстающих ради
-    вкуса дороже, чем их потерять. Без модели шаг ничего не делает.
-
-    `notes` (если передан) получает по строке на каждый слайд, где модель
-    не ответила или ответила не по правилам, — для отчёта командной строки.
-
-    `prefer_decor` — тот же флаг, с которым потом позовут `apply_variant`
-    (задача N): кандидаты обязаны совпасть с теми, из которых выбирает
-    сборка, иначе выбор модели там не найдётся и молча пропадёт."""
-    if llm is None:
-        return {}
-    wanted = [v for v in RERANK_VARIANTS if v in set(variants)]
-    jobs = [
-        (variant, index, slide, ids)
-        for variant in wanted
-        for index, slide, ids in rerank_candidates(deck, profile, variant, prefer_decor=prefer_decor)
-    ]
-    if not jobs:
-        return {}
-    _meta, prompt_body = _load_agent_prompt(AGENT_PATH_PICKER)
-
-    result: dict[tuple[Variant, int], str] = {}
-    pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
-    try:
-        futures = {
-            pool.submit(_rerank_one, variant, slide, ids, profile, prompt_body, llm, prefer_decor): (variant, index, ids)
-            for variant, index, slide, ids in jobs
-        }
-        deadline = time.monotonic() + budget_seconds
-        pending = set(futures)
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-            for future in done:
-                variant, index, _ids = futures[future]
-                chosen, failure = future.result()
-                result[(variant, index)] = chosen
-                if notes is not None and failure:
-                    notes.append(f"[{variant.value}] слайд {index}: {failure}, взят первый кандидат кода")
-        for future in pending:
-            variant, index, ids = futures[future]
-            result[(variant, index)] = ids[0]
-            if notes is not None:
-                notes.append(
-                    f"[{variant.value}] слайд {index}: модель не уложилась в бюджет шага "
-                    f"({budget_seconds:.0f}с), взят первый кандидат кода"
-                )
-    finally:
-        # Не ждать отстающих: их вызовы сами оборвутся по дедлайну провайдера,
-        # а ответ уже никому не нужен.
-        pool.shutdown(wait=False, cancel_futures=True)
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Задача N: текст под вариант (`realize_for_variant`)
-# ---------------------------------------------------------------------------
-
-# Варианты, чей текст переписывается под выбранную раскладку. `dense`
-# остаётся с полным текстом на вместительной раскладке: он эталон
-# содержания, два других его подают.
-REALIZE_VARIANTS = (Variant.visual, Variant.airy)
-
-# Запасные дефолты, если вызывающий код не передал своих (`config/app.yaml`,
-# `plan.realize_*`, обоснование там).
-DEFAULT_REALIZE_MAX_WORKERS = 4
-DEFAULT_REALIZE_BUDGET_SECONDS = 60.0
-
-# Сколько секунд варианта оставить после переписывания на обязательное:
-# сборка (~3с), аудит (<1с), экспорт с рендером soffice (15-30с в API).
-# Живой прогон 27 сентября 2026: после текста вариантам осталось 98с, и
-# шаг в 60с поместился с запасом в 35с.
-REALIZE_RESERVE_SECONDS = 40.0
-
-# Места раскладки, куда ложится основной текст слайда. Заголовок, подписи и
-# показатели не в счёт: заголовок-вывод реализация сохраняет дословно, а у
-# показателей длину задаёт число, не рамка.
-_REALIZE_TEXT_ROLES = ("body", "bullet", "card_body", "quote")
-
-# Виды слайда без основного текста под рамку: обложка, картинка, показатели,
-# таблица. Переписывать там нечего, и вызов модели был бы пустой тратой.
-_NO_REALIZE_KINDS = frozenset({"section", "image", "kpi", "kpi_caption", "table"})
-
-# Число в тексте: целое или дробное, с запятой или точкой. Разряды через
-# пробел («1 200») склеиваются заранее (`_numbers_of`), знак процента не
-# различается: «4%» и «4 %» один и тот же факт.
-_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
-_THOUSANDS_RE = re.compile(r"(?<=\d)[   ](?=\d{3}(?!\d))")
-
-
-def _numbers_of(text: str) -> set[str]:
-    """Числа текста в одном написании (запятая как точка, без разрядных
-    пробелов). Нужен ровно один ответ на вопрос «все ли числа исходника
-    дошли до переписанного текста», а не разбор единиц измерения."""
-    text = _THOUSANDS_RE.sub("", text or "")
-    return {m.group(0).replace(",", ".") for m in _NUMBER_RE.finditer(text)}
-
-
-def _slide_body_text(slide: SlideSpec) -> str:
-    """Весь текст слайда, в котором живут факты: блоки, подзаголовок,
-    подпись визуала, строка источника. Заголовок не входит: он сохраняется
-    дословно и так."""
-    parts = [slide.subhead or "", slide.source_note or ""]
-    if slide.visual is not None and slide.visual.caption:
-        parts.append(slide.visual.caption)
-    for block in slide.blocks:
-        if isinstance(block, TextBlock):
-            parts.append(block.text)
-        elif isinstance(block, BulletBlock):
-            parts.extend(block.items)
-        elif isinstance(block, CardBlock):
-            for card in block.items:
-                parts.extend((card.title, card.body))
-        elif isinstance(block, QuoteBlock):
-            parts.extend((block.text, block.author or ""))
-        else:  # показатели: значение и подпись несут факт так же, как текст
-            for item in getattr(block, "items", []) or []:
-                parts.extend((getattr(item, "value", ""), getattr(item, "label", "")))
-    return "\n".join(p for p in parts if p)
-
-
-def _pattern_of(slide: SlideSpec, profile):
-    return next((p for p in profile.patterns if p.pattern_id == slide.pattern_id), None)
-
-
-def _layout_places(pattern) -> list[dict]:
-    """Текстовые места раскладки, куда реально ляжет содержание: без мест
-    с текстом примера (номера шагов, постоянные подписи шаблона), с
-    вместимостью по схеме слотов (`slot_char_capacity`: меньшее из рамки и
-    числа слов, которое для места назвала модель разбора)."""
-    places: list[dict] = []
-    for slot in pattern.slots:
-        if slot.role not in _REALIZE_TEXT_ROLES or slot.max_chars <= 0 or keeps_sample_text(slot):
-            continue
-        capacity = slot_char_capacity(slot)
-        places.append({
-            "role": slot.role, "max_chars": capacity, "target_chars": target_of(capacity),
-            "max_words": slot.max_words, "purpose": slot.purpose, "content_hint": slot.content_hint,
-        })
-    return places
-
-
-def _is_repeated(pattern) -> bool:
-    return pattern.repeat is not None and pattern.repeat.count >= 2
-
-
-def _content_pieces(slide: SlideSpec, pattern) -> list[str]:
-    """Куски текста так, как их разложит сборка (`compose.blocks.
-    _assign_block`): карточка в свою ячейку, абзац в своё место, список —
-    по пункту в ячейку, если раскладка построена на повторе, иначе одним
-    куском в одно место. Цитата — одним куском."""
-    repeated = _is_repeated(pattern)
-    pieces: list[str] = []
-    for block in slide.blocks:
-        if isinstance(block, TextBlock) and block.text.strip():
-            pieces.append(block.text)
-        elif isinstance(block, BulletBlock):
-            items = [i for i in block.items if i.strip()]
-            if repeated and len(items) >= 2:
-                pieces.extend(items)
-            elif items:
-                pieces.append("\n".join(items))
-        elif isinstance(block, CardBlock):
-            pieces.extend(card.body for card in block.items if card.body.strip())
-        elif isinstance(block, QuoteBlock) and block.text.strip():
-            pieces.append(block.text)
-    return pieces
-
-
-def layout_overflow(slide: SlideSpec, profile) -> list[dict]:
-    """Где текст слайда не влезает в контракт выбранной раскладки
-    (`slide.pattern_id`). Пустой список: влезает, или мерить нечего (нет
-    раскладки, вид без основного текста).
-
-    Две проверки, обе без сборки: доля заполнения места по знакам больше
-    единицы, и замер высоты текста в рамке (`measure_fit`, та же
-    единственная мерка текста в проекте, что у писателя). Куски и места
-    сопоставляются от длинного к ёмкому: сборка тоже кладёт содержание в
-    самое ёмкое свободное место. Кусков больше, чем мест у раскладки без
-    повтора, — тоже переполнение: лишний кусок сборка потеряет."""
-    if not slide.pattern_id or slide.kind in _NO_REALIZE_KINDS:
-        return []
-    pattern = _pattern_of(slide, profile)
-    if pattern is None:
-        return []
-    places = sorted(_layout_places(pattern), key=lambda pl: -pl["max_chars"])
-    pieces = sorted(_content_pieces(slide, pattern), key=len, reverse=True)
-    if not places or not pieces:
-        return []
-    if _is_repeated(pattern):
-        # Повтор разворачивается под число кусков: мест столько, сколько
-        # единиц держит раскладка (`Capacity.max_items`), каждое с ячейку.
-        places = [places[0]] * max(pattern.capacity.max_items, 1)
-    problems: list[dict] = []
-    for i, piece in enumerate(pieces):
-        if i >= len(places):
-            problems.append({"text": piece[:60], "chars": len(piece), "problem": "лишний кусок: места под него нет"})
-            continue
-        place = places[i]
-        if len(piece) > place["max_chars"]:
-            problems.append({
-                "text": piece[:60], "chars": len(piece), "max_chars": place["max_chars"], "role": place["role"],
-                "problem": "длиннее места",
-            })
-            continue
-        fit = measure_fit(piece, place["role"], profile, pattern.kind, layout_id=pattern.pattern_id)
-        # Одна строка, не влезшая по высоте, — рамка ниже строки кегля
-        # (подпись на VK Tech: 12 знаков «не влезают» в место на 16).
-        # Короче её не перепишешь, и вызов модели ушёл бы впустую.
-        if not fit.get("fits", True) and fit.get("lines", 0) > 1:
-            problems.append({
-                "text": piece[:60], "chars": len(piece), "max_chars": place["max_chars"], "role": place["role"],
-                "problem": f"не влезает по высоте рамки на {fit.get('overflow_in', 0)} дюйма",
-            })
-    return problems
-
-
-def _overflow_chars(slide: SlideSpec, profile) -> int:
-    """Сколько знаков не влезает в сумме: мера «стало ли лучше» после
-    переписывания. Лишний кусок считается целиком."""
-    return sum(max(p["chars"] - p.get("max_chars", 0), 1) for p in layout_overflow(slide, profile))
-
-
-def _realize_contract(pattern) -> dict:
-    return {
-        "layout_id": pattern.pattern_id,
-        "kind": pattern.kind,
-        "places": _layout_places(pattern),
-        "repeat_count": pattern.repeat.count if _is_repeated(pattern) else 0,
-        "max_items": pattern.capacity.max_items,
-        "max_chars_per_item": pattern.capacity.max_chars_per_item,
-        "target_chars_per_item": target_of(pattern.capacity.max_chars_per_item),
-    }
-
-
-def _realize_one(
-    slide: SlideSpec, variant: Variant, profile, prompt_body: str, llm: LLMProvider,
-) -> tuple[SlideSpec, str]:
-    """Один вызов модели на слайд. Возвращает `(слайд, исход)`: при любом
-    отказе исходный слайд и причину. Не бросает.
-
-    Инвариант смысла проверяет код, не модель: каждое число исходного
-    текста обязано найтись в новом (`_numbers_of`). Нет хотя бы одного —
-    ответ отброшен целиком, остаётся старый текст на новой раскладке
-    (переполнение тогда увидят сборка и аудит, как раньше). Заголовок,
-    строка источника, визуал, вид слайда и раскладка остаются прежними:
-    модель переписывает только текст мест. Число, которое уже стоит в
-    заголовке, на слайде есть и так, в `must_keep` оно не идёт.
-
-    Второе условие приёма: у ответа не больше кусков, чем мест у раскладки.
-    Лишний кусок сборка молча выбросит (`compose.blocks._drop`), и это была
-    бы та же потеря факта, только мимо проверки чисел: живой прогон 27
-    сентября 2026 принял шесть абзацев на раскладку с тремя местами."""
-    pattern = _pattern_of(slide, profile)
-    in_headline = _numbers_of(slide.headline)
-    must_keep = sorted(_numbers_of(_slide_body_text(slide)) - in_headline)
-    slide_view = {
-        k: v for k, v in slide_spec_to_dict(slide).items()
-        if k not in ("findings", "pattern_id", "index", "speaker_notes", "visual")
-    }
-    payload = {
-        "variant": variant.value,
-        "slide": slide_view,
-        "layout": _realize_contract(pattern),
-        "overflow": layout_overflow(slide, profile),
-        "must_keep": must_keep,
-    }
-    messages = [
-        {"role": "system", "content": prompt_body},
-        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-    ]
-    try:
-        data = json.loads(_complete(llm, messages, _SLIDE_SCHEMA, WRITER_MAX_TOKENS))
-        if not isinstance(data, dict):
-            return slide, "отброшен: ответ не объект"
-        data = {k: v for k, v in data.items() if k not in ("layout_id", "visual", "speaker_notes")}
-        data["kind"], data["headline"] = slide.kind, slide.headline
-        realized = slide_spec_from_dict(data, slide.index)
-    except Exception as exc:  # отказ модели не портит слайд: остаётся старый текст
-        return slide, f"не удался: {_why(exc)}"
-    realized = replace(
-        realized, pattern_id=slide.pattern_id, visual=slide.visual,
-        # Строка источника — не текст места, её не сокращают: живой прогон
-        # 27 сентября 2026 терял в ней числа выборки при переписывании.
-        source_note=slide.source_note,
-        # Полный текст плотного варианта уходит докладчику: на слайде его
-        # сократили, а сказать вслух его всё ещё можно.
-        speaker_notes=slide.speaker_notes or "\n".join(_content_pieces(slide, pattern)),
-    )
-    if slide_spec_problems(realized):
-        return slide, "отброшен: слайд не прошёл проверку схемы"
-    lost = sorted(set(must_keep) - _numbers_of(_slide_body_text(realized)))
-    if lost:
-        return slide, f"отброшен: потеряны числа {', '.join(lost)}"
-    if any("лишний кусок" in p["problem"] for p in layout_overflow(realized, profile)):
-        return slide, "отброшен: кусков больше, чем мест у раскладки"
-    if _overflow_chars(realized, profile) >= _overflow_chars(slide, profile):
-        return slide, "отброшен: переполнение не уменьшилось"
-    realized.findings = [
-        *slide.findings,
-        f"Слайд {slide.index}: текст переписан под раскладку {slide.pattern_id} варианта {variant.value}.",
-    ]
-    return realized, "принят"
-
-
-def realize_for_variant(
-    deck: DeckSpec, variant: Variant, profile, llm: LLMProvider | None,
-    *, max_workers: int = DEFAULT_REALIZE_MAX_WORKERS, budget_seconds: float = DEFAULT_REALIZE_BUDGET_SECONDS,
-) -> DeckSpec:
-    """Переписывает текст слайдов варианта под контракт раскладки, которую
-    ему уже выбрал `apply_variant` (задача N). `deck` — колода ВАРИАНТА, не
-    общая: у каждого слайда проставлен `pattern_id`.
-
-    Зачем: текст пишется один раз под плотный вариант, 140-200 знаков на
-    пункт, а нарядные раскладки VK Education держат 36-84. Клон такой
-    раскладки отклонялся по переполнению, и visual выходил белыми листами.
-    Модель зовётся только на слайдах, где текст не влезает
-    (`layout_overflow`), по вызову на слайд, параллельно; весь шаг ограничен
-    `budget_seconds`, что не успело, остаётся со старым текстом.
-
-    Числа исходного текста — инвариант смысла: ответ, где хоть одного нет,
-    отбрасывается (`_realize_one`). Итог шага пишется в `DeckSpec.meta`
-    (`realize_*`) для отчёта. `dense` и колода без модели возвращаются как
-    есть."""
-    if variant not in REALIZE_VARIANTS or llm is None:
-        return deck
-    jobs = [(i, slide) for i, slide in enumerate(deck.slides) if layout_overflow(slide, profile)]
-    meta = dict(deck.meta)
-    meta["realize_overflowing"] = str(len(jobs))
-    meta["realize_accepted"] = "0"
-    if not jobs:
-        return replace(deck, meta=meta)
-    _meta, prompt_body = _load_agent_prompt(AGENT_PATH_REALIZER)
-
-    slides = list(deck.slides)
-    log: list[tuple[int, str]] = []
-    accepted = 0
-    started = time.monotonic()
-    pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
-    try:
-        futures = {pool.submit(_realize_one, slide, variant, profile, prompt_body, llm): i for i, slide in jobs}
-        deadline = started + budget_seconds
-        pending = set(futures)
-        while pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
-            for future in done:
-                i = futures[future]
-                realized, outcome = future.result()
-                slides[i] = realized
-                accepted += outcome == "принят"
-                log.append((i, outcome))
-        for future in pending:
-            log.append((futures[future], f"не уложился в бюджет шага ({budget_seconds:.0f}с)"))
-    finally:
-        # Тот же приём, что у `rerank_patterns`: отстающих не ждать.
-        pool.shutdown(wait=False, cancel_futures=True)
-    meta["realize_accepted"] = str(accepted)
-    meta["realize_seconds"] = f"{time.monotonic() - started:.1f}"
-    meta["realize_log"] = "; ".join(f"{i}: {outcome}" for i, outcome in sorted(log))
-    return replace(deck, slides=slides, meta=meta)

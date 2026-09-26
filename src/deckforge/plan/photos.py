@@ -311,3 +311,26 @@ def assign_photos(
     unused = [name for name in photos_by_name if name not in assignments.values()]
     new_deck = replace(deck, slides=new_slides)
     return new_deck, PhotoAssignmentReport(assigned=dict(assignments), unused_photos=unused, notes=notes)
+
+
+def assign_photos_to_outline(
+    outline, photos: list[ContentPhoto], llm: LLMProvider | None,
+) -> tuple[dict[int, tuple[str, str | None]], PhotoAssignmentReport]:
+    """Распределение фотографий по пунктам СТРУКТУРЫ, до планирования
+    раскладок (задача P). Раньше фото ставились на уже написанные слайды,
+    а раскладку подбирали после; теперь раскладка выбирается до текста, и
+    слайду с фото она обязана дать место под картинку. Модели показывается
+    скелет колоды: мысль пункта вместо заголовка. Тот же один вызов на
+    колоду и те же проверки ответа, что у `assign_photos`.
+
+    Возвращает `номер пункта -> (имя файла, подпись)` и отчёт."""
+    skeleton = DeckSpec(title=getattr(outline, "title", ""), language=getattr(outline, "language", "ru"), slides=[
+        SlideSpec(index=i, kind=slide.kind, headline=slide.intent)
+        for i, slide in enumerate(outline.slides)
+    ])
+    placed, report = assign_photos(skeleton, photos, llm)
+    by_index: dict[int, tuple[str, str | None]] = {}
+    for slide in placed.slides:
+        if slide.visual is not None and slide.visual.photo_name:
+            by_index[slide.index] = (slide.visual.photo_name, slide.visual.caption)
+    return by_index, report

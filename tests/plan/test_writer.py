@@ -1,725 +1,353 @@
-"""Тесты `plan.writer.write_slides`/`pick_patterns` (Task 13, Step 3 брифа)."""
+"""Тесты `plan.writer.write_slides`: текст пишется под контракт уже
+выбранной раскладки (задача P). Модель везде фейковая, сети нет."""
 from __future__ import annotations
 from dataclasses import replace
 import json
 import threading
 import time
 
-from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
-from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock, validate_deck_spec
-from deckforge.compose.slide_tools import list_layouts
-from deckforge.plan.variants import Variant, apply_variant, rerank_candidates
-from deckforge.plan.writer import _drop_thin_duplicates, _flag_repeated_headlines, pick_patterns, rerank_patterns, write_slides
+import pytest
+
+from deckforge.plan.contracts import plan_contracts
+from deckforge.plan.outline import Outline, OutlineSlide
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, SlideSpec, validate_deck_spec
+from deckforge.plan.writer import _drop_thin_duplicates, _flag_repeated_headlines, write_slides
 from deckforge.provider.base import LLMProvider
+
+import deckforge.plan.writer as writer_module
+
+
+def _outline(n: int = 4) -> Outline:
+    slides = [OutlineSlide(kind="title", intent="Тема")]
+    kinds = ["problem", "how_it_works", "risks", "solution", "case"]
+    for i in range(n - 2):
+        slides.append(OutlineSlide(kind=kinds[i % len(kinds)], intent=f"Пункт {i}", needs=["а", "б", "в"]))
+    slides.append(OutlineSlide(kind="closing", intent="Итог"))
+    return Outline(slides=slides, title="Колода", language="ru")
+
+
+def _contracts(profile, outline: Outline, style: str = "dense"):
+    return plan_contracts(outline, profile, style)[1]
+
+
+def _limit_words(spec: dict) -> int:
+    return max(1, min(2, spec["max_words"]))
+
+
+def _compliant_answer(contract: dict, headline: str = "Вывод") -> dict:
+    """Ответ, который укладывается в контракт: ровно `count` единиц,
+    каждая не длиннее предела."""
+    blocks = []
+    for block in contract["blocks"]:
+        if not block["required"]:
+            continue
+        n, kind = block["count"], block["type"]
+        if kind == "cards":
+            body = " ".join(["шаг"] * _limit_words(block["body"]))
+            blocks.append({"type": "cards", "items": [{"title": "Шаг", "body": body} for _ in range(n)]})
+        elif kind == "bullets":
+            blocks.append({"type": "bullets", "items": [" ".join(["пункт"] * _limit_words(block["item"]))] * n})
+        elif kind == "kpi":
+            blocks.append({"type": "kpi", "items": [{"value": "80%", "label": "доля"} for _ in range(n)]})
+        elif kind == "quote":
+            blocks.append({"type": "quote", "text": "цитата"})
+        else:
+            blocks.append({"type": "text", "text": " ".join(["текст"] * _limit_words(block["text"]))})
+    return {"headline": headline, "blocks": blocks, "source_note": "Источник: тест"}
+
+
+class _ContractLLM(LLMProvider):
+    """Отвечает по контракту из запроса. `overrun`: номера слайдов, на
+    которых первый ответ нарушает контракт (лишняя единица и длинный
+    заголовок); `repair_ok`: исправляет ли модель на ремонте."""
+
+    def __init__(self, *, overrun: set[int] = frozenset(), repair_ok: bool = True, delay=None, fail=frozenset()):
+        self.overrun, self.repair_ok = set(overrun), repair_ok
+        self.delay, self.fail = delay or (lambda i: 0.0), set(fail)
+        self.requests: list[dict] = []
+        self.schemas: list[dict] = []
+        self.concurrent = self.max_concurrent = 0
+        self._lock = threading.Lock()
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        payload = json.loads(messages[1]["content"])
+        index = payload["position"]["index"]
+        with self._lock:
+            self.requests.append(payload)
+            self.schemas.append(schema)
+            self.concurrent += 1
+            self.max_concurrent = max(self.max_concurrent, self.concurrent)
+        try:
+            time.sleep(self.delay(index))
+            if index in self.fail:
+                raise RuntimeError(f"слайд {index}: модель недоступна (тест)")
+            answer = _compliant_answer(payload["contract"], headline=f"Вывод {index}")
+            repairing = "contract_problems" in payload
+            if index in self.overrun and (not repairing or not self.repair_ok):
+                answer["headline"] = " ".join(["очень"] * 30)
+            answer["kind"] = "quote"  # модель не выбирает вид: код обязан его перезаписать
+            return json.dumps(answer, ensure_ascii=False)
+        finally:
+            with self._lock:
+                self.concurrent -= 1
+
+
+def test_without_a_model_every_slide_is_a_valid_fallback_on_its_planned_layout(PROFILE):
+    outline = _outline(4)
+    contracts = _contracts(PROFILE, outline)
+    deck = write_slides(outline, contracts, [], PROFILE, llm=None)
+
+    assert len(deck.slides) == len(outline.slides)
+    assert validate_deck_spec(deck) == []
+    assert [s.pattern_id for s in deck.slides] == [c.pattern_id for c in contracts]
+    assert all(any("запасным вариантом" in f for f in s.findings) for s in deck.slides)
+
+
+def test_a_compliant_answer_costs_one_call_and_keeps_the_planned_kind_and_layout(PROFILE):
+    outline = _outline(4)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM()
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=1, style="dense")
+
+    assert len(llm.requests) == len(contracts)
+    for slide, contract in zip(deck.slides, contracts):
+        assert slide.pattern_id == contract.pattern_id
+        assert slide.kind == contract.kind
+        assert not any("не уложился" in f for f in slide.findings)
+    assert deck.meta["contract_places_ok"] == deck.meta["contract_places"]
+    assert deck.meta["contract_repairs"] == "0"
+
+
+def test_the_writer_sees_the_contract_not_a_layout_catalogue(PROFILE):
+    outline = _outline(3)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM()
+
+    write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=1)
+
+    payload = next(r for r in llm.requests if r["position"]["index"] == 1)
+    assert "available_kinds" not in payload and "capacity" not in payload
+    contract = payload["contract"]
+    assert {"headline", "blocks", "intent", "evidence"} <= set(contract)
+    assert contract["headline"]["max_words"] >= contract["headline"]["target_words"]
+    main = contract["blocks"][0]
+    assert main["count"] >= 1 and "type" in main
+    tools = json.dumps(llm.schemas[0], ensure_ascii=False)
+    assert "list_layouts" not in tools and "try_slide" not in tools
+    assert "measure_fit" in tools and "check_number" in tools
+
+
+def test_a_contract_violation_gets_one_repair_call_that_is_accepted(PROFILE):
+    outline = _outline(3)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM(overrun={1})
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=1)
+
+    calls = [r for r in llm.requests if r["position"]["index"] == 1]
+    assert len(calls) == 2
+    assert any("заголовок" in p for p in calls[1]["contract_problems"])
+    assert calls[1]["previous_answer"]["headline"].startswith("очень")
+    assert deck.slides[1].headline == "Вывод 1"
+    assert deck.meta["contract_repairs"] == "1" and deck.meta["contract_repairs_accepted"] == "1"
+
+
+def test_a_failed_repair_keeps_the_answer_and_names_the_violation(PROFILE):
+    outline = _outline(3)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM(overrun={1}, repair_ok=False)
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=1)
+
+    assert len([r for r in llm.requests if r["position"]["index"] == 1]) == 2
+    assert any("не уложился в контракт" in f for f in deck.slides[1].findings)
+    assert int(deck.meta["contract_places_ok"]) < int(deck.meta["contract_places"])
+
+
+def test_measure_fit_measures_in_the_planned_layout(PROFILE, monkeypatch):
+    outline = _outline(3)
+    contracts = _contracts(PROFILE, outline)
+    seen: list[tuple] = []
+
+    def _spy(text, role, profile, kind, *, layout_id=None):
+        seen.append((kind, layout_id))
+        return {"fits": True, "overflow_in": 0, "lines": 1, "fill": 0.8}
+
+    monkeypatch.setattr(writer_module, "measure_fit", _spy)
+
+    class _ToolThenAnswer(LLMProvider):
+        def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+            payload = json.loads(messages[1]["content"])
+            if len(messages) == 2:
+                return json.dumps({"tool_calls": [{"tool": "measure_fit", "args": {"role": "headline", "text": "Вывод"}}]})
+            return json.dumps(_compliant_answer(payload["contract"]), ensure_ascii=False)
+
+    write_slides(outline, contracts, [], PROFILE, llm=_ToolThenAnswer(), max_workers=1)
+
+    assert (contracts[1].kind, contracts[1].pattern_id) in seen
+
+
+def test_airy_dividers_are_written_without_a_model(PROFILE):
+    outline = _outline(5)
+    contracts = _contracts(PROFILE, outline, "airy")
+    dividers = [c for c in contracts if c.is_divider]
+    if not dividers:
+        pytest.skip("в шаблоне нет раскладки под разделитель")
+    llm = _ContractLLM()
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=1, style="airy")
+
+    assert len(llm.requests) == len(contracts) - len(dividers)
+    for slide, contract in zip(deck.slides, contracts):
+        if contract.is_divider:
+            assert slide.headline == contract.divider_label and not slide.blocks
+
+
+def test_a_photo_planned_for_the_slide_reaches_its_visual(PROFILE):
+    from deckforge.pattern.intent import intents_from_outline
+
+    outline = _outline(3)
+    intents = intents_from_outline(outline, {1: ("team.jpg", "Команда пилота")})
+    contracts = plan_contracts(intents, PROFILE, "visual")[1]
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=_ContractLLM(), max_workers=1)
+
+    assert deck.slides[1].visual is not None and deck.slides[1].visual.photo_name == "team.jpg"
+
+
+def test_slides_are_written_concurrently(PROFILE):
+    outline = _outline(5)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM(delay=lambda i: 0.2)
+
+    started = time.monotonic()
+    write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=5)
+
+    assert time.monotonic() - started < 0.6
+    assert llm.max_concurrent > 1
+
+
+def test_order_does_not_depend_on_who_answers_first(PROFILE):
+    outline = _outline(5)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM(delay=lambda i: (4 - i) * 0.05)
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=5)
+
+    assert [s.headline for s in deck.slides] == [f"Вывод {i}" for i in range(5)]
+    assert [s.index for s in deck.slides] == [0, 1, 2, 3, 4]
+
+
+def test_one_failing_slide_does_not_bring_down_the_rest(PROFILE):
+    outline = _outline(5)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM(delay=lambda i: 0.02, fail={2})
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=5)
+
+    assert len(deck.slides) == 5
+    assert any("запасным вариантом" in f for f in deck.slides[2].findings)
+    assert deck.slides[3].headline == "Вывод 3"
+    assert validate_deck_spec(deck) == []
 
 
 class _QueueLLM(LLMProvider):
-    """Отдаёт заранее заготовленные ответы по очереди (FIFO) — нужен, чтобы
-    проверить путь "первый ответ невалиден -> код просит исправить -> второй
-    ответ валиден", а не только happy path в один вызов."""
-
-    def __init__(self, responses: list[str | Exception]):
+    def __init__(self, responses: list):
         self._responses = list(responses)
 
     def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-        if not self._responses:
-            raise RuntimeError("_QueueLLM: закончились заготовленные ответы")
         response = self._responses.pop(0)
         if isinstance(response, Exception):
             raise response
         return response
 
 
-def _valid_slide_json(headline: str, *, with_number: bool = False) -> str:
-    payload = {
-        "kind": "bullets",
-        "headline": headline,
-        "blocks": [{"type": "bullets", "items": ["Первый пункт", "Второй пункт"]}],
-    }
-    if with_number:
-        payload["blocks"][0]["items"][0] = "Сквозная медиана — 6,2 часа"
-        payload["source_note"] = "Источник: пилот, июнь—август 2026"
-    return json.dumps(payload, ensure_ascii=False)
-
-
-def _outline(n: int = 3) -> Outline:
-    slides = [OutlineSlide(kind="title", intent="Тема")]
-    for i in range(n - 2):
-        slides.append(OutlineSlide(kind="problem", intent=f"Пункт {i}", needs=["число"]))
-    slides.append(OutlineSlide(kind="closing", intent="Итог"))
-    return Outline(slides=slides, title="Колода", language="ru")
-
-
-def test_write_slides_without_llm_produces_valid_fallback_deck(PROFILE):
-    outline = _outline(4)
-    deck = write_slides(outline, [], PROFILE, llm=None)
-    assert isinstance(deck, DeckSpec)
-    assert len(deck.slides) == len(outline.slides)
-    assert validate_deck_spec(deck) == []
-    assert all(s.findings for s in deck.slides)  # запасной вариант честно помечен
-
-
-def test_write_slides_uses_model_response_when_valid(PROFILE):
-    outline = _outline(3)
-    llm = _QueueLLM([_valid_slide_json("Заголовок один"), _valid_slide_json("Заголовок два"), _valid_slide_json("Заголовок три")])
-    sources = [SourceDoc(name="sources.md", text="Сквозная медиана — 6,2 часа")]
-    # max_workers=1: тест проверяет ЛОГИКУ (repair/fallback/happy path), не
-    # параллельность — `_QueueLLM` отдаёт ответы строго по очереди (FIFO),
-    # и с несколькими воркерами порядок обращения к очереди зависит от
-    # планировщика потоков, а не от индекса слайда (реальную параллельность
-    # и то, что порядок ИТОГОВОЙ колоды от неё не зависит, проверяют
-    # отдельные тесты ниже, "параллельность write_slides").
-    deck = write_slides(outline, sources, PROFILE, llm=llm, max_workers=1)
-    assert [s.headline for s in deck.slides] == ["Заголовок один", "Заголовок два", "Заголовок три"]
-    assert validate_deck_spec(deck) == []
-    assert deck.title == "Колода"
-    assert deck.language == "ru"
-
-
-def test_write_slides_repairs_once_then_falls_back_to_valid_answer(PROFILE):
-    outline = _outline(3)
-    # Первый ответ на второй слайд несёт цифру без source_note (невалиден) —
-    # код обязан попросить исправление один раз и принять второй, валидный
-    # ответ, а не сразу деградировать до запасного варианта.
-    bad = json.dumps({"kind": "bullets", "headline": "Заголовок", "blocks": [
-        {"type": "bullets", "items": ["Медиана — 6,2 часа"]},
-    ]}, ensure_ascii=False)  # цифра есть, source_note нет — невалидно
-    good = _valid_slide_json("Заголовок исправлен", with_number=True)
-    llm = _QueueLLM([_valid_slide_json("Первый"), bad, good, _valid_slide_json("Третий")])
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)  # см. комментарий выше — FIFO нужен последовательно
-    assert deck.slides[1].headline == "Заголовок исправлен"
-    assert validate_deck_spec(deck) == []
-
-
-def test_write_slides_falls_back_when_model_keeps_sending_invalid_json(PROFILE):
-    outline = _outline(3)
-    # Оба ответа (первичный и после просьбы исправить) — с неизвестным полем:
-    # код обязан деградировать до запасного варианта, а не пропустить слайд
-    # или упасть.
-    bad = json.dumps({"kind": "bullets", "headline": "X", "unknown_field": 1}, ensure_ascii=False)
-    llm = _QueueLLM([_valid_slide_json("Первый"), bad, bad, _valid_slide_json("Третий")])
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)  # FIFO — см. комментарий выше
-    assert validate_deck_spec(deck) == []
-    assert deck.slides[1].findings  # запасной вариант помечен честно
-
-
-def test_write_slides_falls_back_on_network_error(PROFILE):
-    outline = _outline(2)
-    llm = _QueueLLM([RuntimeError("сеть недоступна"), RuntimeError("сеть недоступна")])
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)  # FIFO — см. комментарий выше
-    assert validate_deck_spec(deck) == []
-    assert all(s.findings for s in deck.slides)
-
-
-# ---------------------------------------------------------------------------
-# Task 19: агентный цикл — модель пишет, при необходимости зовёт инструменты
-# (measure_fit/check_number), видит результат и переписывает, бюджет два
-# сетевых круга на слайд.
-# ---------------------------------------------------------------------------
-
-
-def _one_slide_outline() -> Outline:
-    return Outline(slides=[OutlineSlide(kind="problem", intent="Слайд", needs=[])], title="Т", language="ru")
-
-
-class _ToolThenFinalLLM(LLMProvider):
-    """Первый ответ — вызов `measure_fit` инструмента с заведомо огромным
-    текстом; второй (после результата инструмента) — короткий финальный
-    слайд. Считает вызовы, чтобы тест мог проверить ТОЧНЫЙ бюджет сетевых
-    кругов (бриф Task 19: "Цикл ограничен двумя шагами")."""
-
-    def __init__(self):
-        self.calls = 0
-        self.seen_tool_results: list[dict] = []
-
-    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-        self.calls += 1
-        if self.calls == 1:
-            return json.dumps({
-                "tool_calls": [
-                    {"tool": "measure_fit", "args": {"role": "headline", "text": "Очень длинный текст. " * 60}},
-                ],
-            }, ensure_ascii=False)
-        # Второй шаг: код обязан был прислать результат инструмента отдельным
-        # user-сообщением (см. `_write_with_agent_loop`) — запоминаем его,
-        # чтобы тест ниже мог проверить, что модель РЕАЛЬНО увидела ответ
-        # инструмента, а не просто была вызвана дважды подряд вслепую.
-        self.seen_tool_results.append(json.loads(messages[-1]["content"]))
-        return _valid_slide_json("Короткий заголовок")
-
-
-def test_write_slides_agent_loop_calls_measure_fit_then_rewrites_shorter(PROFILE):
-    llm = _ToolThenFinalLLM()
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1)
-
-    assert llm.calls == 2, "должно было хватить одного вызова инструмента и одного финального шага"
-    assert deck.slides[0].headline == "Короткий заголовок"
-    assert validate_deck_spec(deck) == []
-    tool_results = llm.seen_tool_results[0]["tool_results"]
-    assert tool_results[0]["tool"] == "measure_fit"
-    assert tool_results[0]["result"]["fits"] is False, "инструмент обязан был честно сказать, что текст не влез"
-
-
-class _StubbornToolCallingLLM(LLMProvider):
-    """Каждый ответ — вызов инструмента, даже на последнем разрешённом
-    шаге: код обязан остановиться на бюджете, а не звать модель без конца
-    или бросить исключение."""
-
-    def __init__(self):
-        self.calls = 0
-
-    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-        self.calls += 1
-        return json.dumps({"tool_calls": [{"tool": "check_number", "args": {"query": "1"}}]}, ensure_ascii=False)
-
-
-def test_write_slides_agent_loop_stops_at_the_step_budget_and_falls_back(PROFILE):
-    llm = _StubbornToolCallingLLM()
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, agent_max_steps=2)
-
-    assert llm.calls == 2, "бюджет — ровно два сетевых круга, не больше и не меньше"
-    assert deck.slides[0].findings, "не уложилась — обязан остаться запасной вариант с честной пометкой"
-    assert validate_deck_spec(deck) == []
-
-
-def test_write_slides_agent_loop_costs_one_call_when_the_model_is_confident_upfront(PROFILE):
-    """Слайд, написанный уверенно с первого раза (без вызова инструмента),
-    по-прежнему стоит ОДИН сетевой вызов — цикл не должен удорожать уже
-    хороший случай (бриф Task 19, "агент с двумя шагами может удвоить
-    [время]" — но только там, где инструмент реально понадобился)."""
-    llm = _QueueLLM([_valid_slide_json("Заголовок")])
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1)
-    assert deck.slides[0].headline == "Заголовок"
-    assert not llm._responses, "остался неиспользованный заготовленный ответ — было больше одного вызова"
-
-
-def test_write_slides_agent_loop_respects_a_configured_step_budget_of_one(PROFILE):
-    """`agent_max_steps=1` — тот же путь, что и до Task 19 (цикл выключен
-    конфигом): даже если модель отвечает вызовом инструмента, первый шаг уже
-    последний — код обязан потребовать финальный ответ сразу, не звать
-    модель второй раз."""
-    llm = _StubbornToolCallingLLM()
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, agent_max_steps=1)
-    assert llm.calls == 1
-    assert deck.slides[0].findings
-
-
-# ---------------------------------------------------------------------------
-# Параллельность write_slides (это задача: слайды пишутся по очереди — 23с
-# на слайд, слайды друг от друга не зависят, писать нужно параллельно).
-# ---------------------------------------------------------------------------
-
-
-class _SlowIndexAwareLLM(LLMProvider):
-    """Читает `position.index` из ЗАПРОСА (не угадывает по порядку вызова —
-    у параллельных потоков порядок обращения непредсказуем) и отвечает
-    валидным слайдом, чей заголовок несёт этот индекс. `delay_by_index`
-    позволяет заставить более поздние слайды отвечать РАНЬШЕ более ранних —
-    единственный честный способ проверить, что итоговый порядок колоды не
-    зависит от того, кто ответил первым (не просто "порядок не менялся",
-    что было бы правдой и без всякой сортировки по индексу)."""
-
-    def __init__(self, delay_by_index=None, fail_indices: set[int] = frozenset()):
-        self._delay_by_index = delay_by_index or (lambda i: 0.0)
-        self._fail_indices = fail_indices
-        self.concurrent_calls = 0
-        self.max_concurrent_calls = 0
-        self._lock = threading.Lock()
-
-    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-        payload = json.loads(messages[1]["content"])
-        index = payload["position"]["index"]
-
-        with self._lock:
-            self.concurrent_calls += 1
-            self.max_concurrent_calls = max(self.max_concurrent_calls, self.concurrent_calls)
-        try:
-            time.sleep(self._delay_by_index(index))
-            if index in self._fail_indices:
-                raise RuntimeError(f"слайд {index}: модель недоступна (тест)")
-            # with_number=True: заголовок несёт цифру индекса ("Заголовок 0"
-            # и т.п.) — без source_note такой слайд невалиден
-            # (`slide_spec_problems`, "цифра без источника"), с ним — валиден.
-            return _valid_slide_json(f"Заголовок {index}", with_number=True)
-        finally:
-            with self._lock:
-                self.concurrent_calls -= 1
-
-
-def test_write_slides_calls_the_model_concurrently_not_one_at_a_time(PROFILE):
-    """Ловит именно параллельность, не просто факт вызова: пять слайдов,
-    каждый вызов модели держит поток 0.2с. Последовательно это заняло бы
-    ~1.0с; при реальном распараллеливании (max_workers=5) — ~0.2с. Порог
-    0.6с — с большим запасом от 1.0с (последовательно) и от 0.2с
-    (идеально параллельно), не хрупкий к дрожанию таймингов CI."""
-    outline = _outline(5)
-    llm = _SlowIndexAwareLLM(delay_by_index=lambda i: 0.2)
-
-    started = time.monotonic()
-    write_slides(outline, [], PROFILE, llm=llm, max_workers=5)
-    elapsed = time.monotonic() - started
-
-    assert elapsed < 0.6, f"write_slides заняло {elapsed:.2f}с — похоже, слайды пишутся по очереди, не параллельно"
-    assert llm.max_concurrent_calls > 1, "ни разу не было больше одного активного вызова модели одновременно"
-
-
-def test_write_slides_keeps_outline_order_even_when_later_slides_answer_first(PROFILE):
-    """Порядок слайдов в готовой колоде не должен зависеть от того, кто
-    ответил первым — слайд с БОЛЬШИМ индексом намеренно отвечает БЫСТРЕЕ
-    (задержка обратно пропорциональна индексу), и всё равно должен оказаться
-    на своём месте в конце `deck.slides`, а не в начале."""
-    outline = _outline(5)
-    llm = _SlowIndexAwareLLM(delay_by_index=lambda i: (4 - i) * 0.05)
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=5)
-
-    assert [s.headline for s in deck.slides] == [f"Заголовок {i}" for i in range(5)]
-    assert [s.index for s in deck.slides] == [0, 1, 2, 3, 4]
-
-
-def test_write_slides_one_slide_failing_does_not_bring_down_the_rest_under_concurrency(PROFILE):
-    """Отказ одного слайда не должен ронять всю колоду, даже когда остальные
-    слайды пишутся параллельно с ним — сохраняется честная деградация
-    (заголовок + пометка в findings) на месте, а не пропуск слайда или
-    падение всей колоды."""
-    outline = _outline(5)
-    llm = _SlowIndexAwareLLM(delay_by_index=lambda i: 0.02, fail_indices={2})
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=5)
-
-    assert len(deck.slides) == 5
-    assert [s.index for s in deck.slides] == [0, 1, 2, 3, 4]
-    for i, slide in enumerate(deck.slides):
-        if i == 2:
-            assert slide.findings, "неудачный слайд обязан остаться с честной пометкой, не пропасть"
-        else:
-            assert slide.headline == f"Заголовок {i}"
-    assert validate_deck_spec(deck) == []
-
-
-# ---------------------------------------------------------------------------
-# _flag_repeated_headlines
-# ---------------------------------------------------------------------------
-
-
-def test_flag_repeated_headlines_catches_the_same_number_stated_differently():
-    """Task 13, дефект отчёта задачи №3 (важное, ручная проверка ЛЦТ2026):
-    в реально собранной колоде слайды 2 и 4 несли один и тот же факт
-    другими словами — "98,5% ожидания устранимы: пилот подтвердил
-    эффективность, готов план раскатки" и "98,5% времени заявка находится
-    в ожидании, а не обрабатывается" — разный падеж ("ожидания"/
-    "ожидании"), разный порядок слов, и буквального пересечения ЗНАЧИМЫХ
-    слов нет вовсе (доля 0.0 — "ожидания" != "ожидании" посимвольно) — старый
-    бэкстоп (только пересечение целых слов) эту пару пропускал. Индексы
-    здесь НЕ соседние (0 и 3, между ними два других слайда) — бэкстоп
-    обязан сравнивать ВСЮ колоду, не только соседей (бриф задачи).
-    Общая цифра "98,5%" — сильный сигнал того же факта (бриф: "числа в
-    заголовке — хороший признак, одна и та же цифра в двух заголовках
-    почти всегда означает повтор")."""
-    slides = [
-        SlideSpec(
-            index=0, kind="bullets",
-            headline="98,5% ожидания устранимы: пилот подтвердил эффективность, готов план раскатки",
-        ),
-        SlideSpec(index=1, kind="bullets", headline="Команда и бюджет"),
-        SlideSpec(index=2, kind="bullets", headline="Обучение сотрудников"),
-        SlideSpec(
-            index=3, kind="bullets",
-            headline="98,5% времени заявка находится в ожидании, а не обрабатывается.",
-        ),
-    ]
-    _flag_repeated_headlines(slides)
-    assert any("слайд 3" in f for f in slides[0].findings), slides[0].findings
-
-
-def test_flag_repeated_headlines_does_not_fire_on_unrelated_headlines_with_incidental_numbers():
-    """Общая цифра — сильный, но не единственный сигнал: две головы,
-    делящие короткое случайное число (например, год "2026" в обеих) без
-    единого общего значимого слова, не обязаны считаться повтором — иначе
-    находка станет бесполезным шумом на любой реальной колоде (обе несут
-    "2026" в контексте сроков/дат)."""
-    slides = [
-        SlideSpec(index=0, kind="bullets", headline="Команда — 2 человека на доработку правил закупок"),
-        SlideSpec(index=1, kind="bullets", headline="Раскатка завершится в 2026 году"),
-    ]
-    _flag_repeated_headlines(slides)
-    assert slides[0].findings == []
-
-
-# ---------------------------------------------------------------------------
-# pick_patterns
-# ---------------------------------------------------------------------------
-# Task 18, находка №2 брифа: slide-writer должен видеть вместимость ВСЕХ
-# видов раскладки шаблона, не только подсказанного `layout_kind` — иначе
-# ему физически неоткуда узнать, что шаблон умеет цитату/крупный фактоид с
-# подписью/фото с текстом, и он раз за разом пишет прозу под ту же
-# подсказку.
-# ---------------------------------------------------------------------------
-
-
-class _RecordingLLM(LLMProvider):
-    """Запоминает `messages` каждого вызова, ключом — `position.index` из
-    payload (слайды пишутся параллельно, ThreadPoolExecutor — порядок
-    вызовов не совпадает с порядком слайдов, см. `write_slides`)."""
-
-    def __init__(self, response: str):
-        self._response = response
-        self.messages_by_index: dict[int, list] = {}
-
-    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-        payload = json.loads(messages[1]["content"])
-        self.messages_by_index[payload["position"]["index"]] = messages
-        return self._response
-
-
-def test_write_slides_shows_every_slide_the_capacity_of_all_kinds_the_template_has(PROFILE):
-    outline = _outline(3)
-    llm = _RecordingLLM(_valid_slide_json("Заголовок"))
-    write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
-    assert len(llm.messages_by_index) == 3
-    actual_kinds = {p.kind for p in PROFILE.patterns}
-    for messages in llm.messages_by_index.values():
-        payload = json.loads(messages[1]["content"])
-        available = payload["available_kinds"]
-        assert available, "available_kinds пуст, хотя PROFILE несёт паттерны"
-        assert {a["kind"] for a in available} == actual_kinds
-        # Подсказанный `layout_kind` тоже обязан присутствовать среди
-        # `available_kinds` (он и есть один из видов шаблона) — иначе модель
-        # видела бы противоречивые числа для одного и того же вида.
-        hinted = next(a for a in available if a["kind"] == payload["layout_kind"])
-        assert hinted["max_chars_per_item"] == payload["capacity"]["max_chars_per_item"]
-        assert hinted["max_headline_chars"] == payload["max_headline_chars"]
-
-
-def _cards_deck() -> DeckSpec:
-    return DeckSpec(title="T", language="ru", slides=[
-        SlideSpec(index=0, kind="cards", headline="Заголовок", blocks=[BulletBlock(items=["а", "б"])]),
-    ])
-
-
-def test_pick_patterns_without_llm_assigns_by_capacity(PROFILE):
-    deck = pick_patterns(_cards_deck(), PROFILE, llm=None)
-    assert deck.slides[0].pattern_id is not None
-    assert deck.slides[0].pattern_id in {p.pattern_id for p in PROFILE.patterns if p.kind == "cards"}
-
-
-def test_pick_patterns_uses_model_choice_when_valid(PROFILE):
-    candidate_id = next(p.pattern_id for p in PROFILE.patterns if p.kind == "cards")
-    llm = _QueueLLM([json.dumps({"pattern_id": candidate_id})])
-    deck = pick_patterns(_cards_deck(), PROFILE, llm=llm)
-    assert deck.slides[0].pattern_id == candidate_id
-
-
-def test_pick_patterns_rejects_hallucinated_pattern_id(PROFILE):
-    llm = _QueueLLM([json.dumps({"pattern_id": "not-a-real-pattern-id"})])
-    deck = pick_patterns(_cards_deck(), PROFILE, llm=llm)
-    assert deck.slides[0].pattern_id in {p.pattern_id for p in PROFILE.patterns if p.kind == "cards"}
-
-
-def test_pick_patterns_keeps_slide_untouched_when_kind_has_no_candidates(PROFILE):
-    deck = DeckSpec(title="T", language="ru", slides=[
-        SlideSpec(index=0, kind="cards", headline="H", pattern_id=None),
-    ])
-    # Профиль без единого паттерна вовсе (пустой) — код не должен падать,
-    # просто оставляет слайд как есть (pattern_id=None), решать нечем.
-    class _EmptyPatterns:
-        patterns: list = []
-
-    result = pick_patterns(deck, _EmptyPatterns(), llm=None)
-    assert result.slides[0].pattern_id is None
-
-
-# ---------------------------------------------------------------------------
-# Причина отказа модели: живой прогон 23 сентября 2026 — 4 слайда из 12 ушли
-# в запасной вариант, и понять почему было нечем
-# ---------------------------------------------------------------------------
-
-
 def test_fallback_finding_names_the_network_failure(PROFILE):
-    """Запасной слайд обязан сказать, ЧТО именно случилось, а не только «не
-    вернула валидный ответ»: сеть отвалилась, кончился бюджет токенов и
-    ответ не лёг в схему — три разные болезни с разным лечением."""
     outline = _outline(2)
     llm = _QueueLLM([RuntimeError("The read operation timed out")] * 4)
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+    deck = write_slides(outline, _contracts(PROFILE, outline), [], PROFILE, llm=llm, max_workers=1)
 
     finding = " ".join(deck.slides[0].findings)
-    assert "The read operation timed out" in finding
-    assert "RuntimeError" in finding
+    assert "The read operation timed out" in finding and "RuntimeError" in finding
 
 
 def test_fallback_finding_names_the_schema_failure(PROFILE):
-    """Ответ пришёл, но не лёг в схему — причина обязана отличаться от
-    сетевой, иначе по отчёту не понять, чинить сеть или промпт."""
     outline = _outline(2)
-    bad = json.dumps({"kind": "bullets", "headline": "X", "unknown_field": 1}, ensure_ascii=False)
+    bad = json.dumps({"headline": "X", "unknown_field": 1}, ensure_ascii=False)
     llm = _QueueLLM([bad] * 4)
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+    deck = write_slides(outline, _contracts(PROFILE, outline), [], PROFILE, llm=llm, max_workers=1)
 
     finding = " ".join(deck.slides[0].findings)
     assert "unknown_field" in finding or "схем" in finding
-    assert "The read operation timed out" not in finding
 
 
 def test_fallback_reason_does_not_leak_the_provider_key(PROFILE, monkeypatch):
-    """Причина едет в отчёт прогона и в веб-интерфейс. Ключ уходит в
-    заголовок запроса, а не в текст исключения, но цена ошибки
-    несимметрична — вырезаем."""
     monkeypatch.setenv("YANDEX_API_KEY", "AQVN-секрет-не-для-экрана")
     outline = _outline(2)
     llm = _QueueLLM([RuntimeError("401 Unauthorized: Api-Key AQVN-секрет-не-для-экрана")] * 4)
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+    deck = write_slides(outline, _contracts(PROFILE, outline), [], PROFILE, llm=llm, max_workers=1)
 
     finding = " ".join(deck.slides[0].findings)
-    assert "AQVN-секрет-не-для-экрана" not in finding
-    assert "***" in finding
-
-
-# ---------------------------------------------------------------------------
-# Task 23: агент видит последствия своего решения — каталог раскладок и
-# черновая сборка слайда как инструменты цикла
-# ---------------------------------------------------------------------------
-
-
-def _tool_call(tool: str, args: dict) -> str:
-    return json.dumps({"tool_calls": [{"tool": tool, "args": args}]}, ensure_ascii=False)
-
-
-def test_agent_can_ask_what_layouts_the_template_has(PROFILE, TEMPLATE_PATH):
-    outline = _outline(2)
-    llm = _QueueLLM([
-        _tool_call("list_layouts", {}),
-        _valid_slide_json("После каталога"),
-        _valid_slide_json("Второй"),
-    ])
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
-
-    assert deck.slides[0].headline == "После каталога"
-    assert not deck.slides[0].findings, "слайд написан моделью, запасной вариант не нужен"
-
-
-def test_agent_sees_the_verdict_of_a_draft_slide(PROFILE, TEMPLATE_PATH):
-    """Главное обещание задачи: модель узнаёт, что вышло, ДО того как слайд
-    попал в колоду."""
-    outline = _outline(2)
-    draft = json.loads(_valid_slide_json("Черновик"))
-    layout_id = list_layouts(PROFILE)[0]["layout_id"]
-    llm = _QueueLLM([
-        _tool_call("try_slide", {"layout_id": layout_id, "slide": draft}),
-        _valid_slide_json("Переписано после проверки"),
-        _valid_slide_json("Второй"),
-    ])
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
-
-    assert deck.slides[0].headline == "Переписано после проверки"
-
-
-def test_the_layout_the_agent_chose_reaches_the_slide(PROFILE, TEMPLATE_PATH):
-    """Выбор раскладки агентом бесполезен, если теряется по дороге к
-    сборке."""
-    outline = _outline(2)
-    layout_id = list_layouts(PROFILE)[0]["layout_id"]
-    chosen = json.loads(_valid_slide_json("С выбранной раскладкой"))
-    chosen["layout_id"] = layout_id
-    llm = _QueueLLM([json.dumps(chosen, ensure_ascii=False), _valid_slide_json("Второй")])
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
-
-    assert deck.slides[0].pattern_id == layout_id
-
-
-def test_new_tools_are_unavailable_without_a_template_but_do_not_break_the_loop(PROFILE):
-    """Старые вызовы `write_slides` пути шаблона не передают. Цикл обязан
-    продолжиться на прежних двух инструментах, а не упасть."""
-    outline = _outline(2)
-    llm = _QueueLLM([
-        _tool_call("try_slide", {"layout_id": "что-угодно", "slide": {}}),
-        _valid_slide_json("Всё равно написано"),
-        _valid_slide_json("Второй"),
-    ])
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
-
-    assert deck.slides[0].headline == "Всё равно написано"
-
-
-def test_a_malformed_try_slide_call_is_answered_not_raised(PROFILE, TEMPLATE_PATH):
-    """Модель вправе ошибиться в аргументах — ошибка возвращается ей
-    текстом, тем же принципом, что и у остальных инструментов."""
-    outline = _outline(2)
-    llm = _QueueLLM([
-        _tool_call("try_slide", {"slide": {"kind": "bullets"}}),  # забыт layout_id
-        _valid_slide_json("После ошибки"),
-        _valid_slide_json("Второй"),
-    ])
-
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1, template_path=TEMPLATE_PATH)
-
-    assert deck.slides[0].headline == "После ошибки"
-
-
+    assert "AQVN-секрет-не-для-экрана" not in finding and "***" in finding
 
 
 def test_a_fallback_slide_says_what_data_it_needs(PROFILE):
-    """Слайд с ОДНИМ заголовком — брак по ТЗ (Приложение 1, «пустой слайд
-    или слайд с одним заголовком»), а запасной вариант выдавал ровно его:
-    на живом прогоне 25 сентября 2026 три слайда из двенадцати вышли
-    пустыми, и по слайду было не понять, что случилось."""
-    # Три пункта: у среднего (`_outline`) есть `needs` — именно он и
-    # проверяется; у титульного и финального их нет по построению.
+    """Слайд с одним заголовком — брак по ТЗ; запасной показывает пункты
+    плана в главном месте раскладки, а о запасном варианте говорят находка
+    и заметка докладчика."""
     outline = _outline(3)
     llm = _QueueLLM([RuntimeError("сеть недоступна")] * 9)
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+    deck = write_slides(outline, _contracts(PROFILE, outline), [], PROFILE, llm=llm, max_workers=1)
 
     middle = deck.slides[1]
-    assert middle.blocks, "запасной слайд не должен оставаться с одним заголовком"
-    assert all("Нужны данные" not in i for b in middle.blocks for i in getattr(b, "items", [])), \
-        "приставка ушла из текста слайда: о запасном варианте говорят находка и заметка"
+    assert middle.blocks
     assert any("Нужны данные" in f for f in middle.findings)
     assert middle.speaker_notes
 
 
 def test_a_cover_slide_does_not_ask_for_data(PROFILE):
-    """На обложке и разделителе заголовок без содержания — законная
-    вёрстка, а не брак. Живой прогон 25 сентября 2026 на VK Tech: титульный
-    слайд получил строку «Нужны данные: Название инициативы» — для обложки
-    это мусор, а не честность."""
     outline = Outline(
         slides=[OutlineSlide(kind="title", intent="Тема доклада", needs=["Название инициативы"])],
         title="Колода", language="ru",
     )
     llm = _QueueLLM([RuntimeError("сеть недоступна")] * 4)
 
-    deck = write_slides(outline, [], PROFILE, llm=llm, max_workers=1)
+    deck = write_slides(outline, _contracts(PROFILE, outline), [], PROFILE, llm=llm, max_workers=1)
 
-    assert not deck.slides[0].blocks, "обложка не должна просить данные"
-
-
-# ---------------------------------------------------------------------------
-# rerank_patterns — модель выбирает одну из трёх раскладок для airy/visual
-# ---------------------------------------------------------------------------
-
-
-def _rerank_deck() -> DeckSpec:
-    return DeckSpec(title="T", language="ru", slides=[
-        SlideSpec(index=0, kind="section", headline="Обложка"),
-        SlideSpec(index=1, kind="bullets", headline="Где уходит время", blocks=[BulletBlock(items=[
-            "Ожидание первого согласующего — медиана 18 часов",
-            "Ожидание второго согласующего — медиана 11 часов",
-            "Чистая работа людей — 28 минут",
-        ])]),
-        SlideSpec(index=2, kind="bullets", headline="Что изменилось", blocks=[BulletBlock(items=[
-            "Сквозная медиана сократилась до 6,2 часа", "Переназначений вручную — 4%",
-        ])]),
-    ])
-
-
-class _PayloadLLM(LLMProvider):
-    """Отвечает функцией от payload запроса; вызовы идут из пула потоков."""
-
-    def __init__(self, answer):
-        self._answer = answer
-        self.calls = 0
-        self._lock = threading.Lock()
-
-    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-        with self._lock:
-            self.calls += 1
-        return self._answer(json.loads(messages[1]["content"]))
-
-
-def _jobs(profile) -> dict[tuple[Variant, int], list[str]]:
-    jobs = {
-        (variant, index): ids
-        for variant in (Variant.airy, Variant.visual)
-        for index, _slide, ids in rerank_candidates(_rerank_deck(), profile, variant)
-    }
-    assert jobs, "на контрольном шаблоне модели обязано быть из чего выбирать"
-    return jobs
-
-
-def test_rerank_applies_a_valid_model_choice(PROFILE):
-    jobs = _jobs(PROFILE)
-    llm = _PayloadLLM(lambda payload: json.dumps(
-        {"pattern_id": payload["candidates"][-1]["pattern_id"], "reason": "по смыслу"}, ensure_ascii=False,
-    ))
-    chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), llm)
-    assert llm.calls == len(jobs)
-    assert chosen == {key: ids[-1] for key, ids in jobs.items()}
-    # Выбор доходит до собранного варианта.
-    for variant in (Variant.airy, Variant.visual):
-        preferred = {i: pid for (v, i), pid in chosen.items() if v is variant}
-        spec = apply_variant(_rerank_deck(), PROFILE, variant, preferred=preferred)
-        for index, pid in preferred.items():
-            assert spec.slides[index].pattern_id == pid
-
-
-def test_rerank_model_sees_only_the_code_candidates_without_coordinates(PROFILE):
-    seen = []
-    llm = _PayloadLLM(lambda payload: seen.append(payload) or json.dumps({"pattern_id": "x"}))
-    rerank_patterns(_rerank_deck(), PROFILE, [Variant.visual], llm)
-    assert seen and all(p["variant"] == "visual" for p in seen)
-    for payload in seen:
-        assert 2 <= len(payload["candidates"]) <= 3
-        assert [c["rank"] for c in payload["candidates"]] == list(range(1, len(payload["candidates"]) + 1))
-        assert "box" not in json.dumps(payload)
-
-
-def test_rerank_rejects_a_pattern_outside_the_candidates(PROFILE):
-    jobs = _jobs(PROFILE)
-    llm = _PayloadLLM(lambda payload: json.dumps({"pattern_id": "not-a-real-pattern-id"}))
-    notes: list[str] = []
-    chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), llm, notes=notes)
-    assert chosen == {key: ids[0] for key, ids in jobs.items()}
-    assert len(notes) == len(jobs)
-
-
-def test_rerank_survives_a_model_failure(PROFILE):
-    jobs = _jobs(PROFILE)
-
-    def _boom(_payload):
-        raise RuntimeError("сеть недоступна")
-
-    chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), _PayloadLLM(_boom))
-    assert chosen == {key: ids[0] for key, ids in jobs.items()}
-
-
-def test_rerank_without_a_model_does_nothing(PROFILE):
-    assert rerank_patterns(_rerank_deck(), PROFILE, list(Variant), None) == {}
-
-
-def test_rerank_skips_dense(PROFILE):
-    llm = _PayloadLLM(lambda payload: json.dumps({"pattern_id": "x"}))
-    assert rerank_patterns(_rerank_deck(), PROFILE, [Variant.dense], llm) == {}
-    assert llm.calls == 0
-
-
-def test_rerank_does_not_wait_past_its_time_budget(PROFILE):
-    jobs = _jobs(PROFILE)
-    release = threading.Event()
-
-    def _slow(payload):
-        release.wait(5)
-        return json.dumps({"pattern_id": payload["candidates"][-1]["pattern_id"]})
-
-    started = time.monotonic()
-    try:
-        chosen = rerank_patterns(_rerank_deck(), PROFILE, list(Variant), _PayloadLLM(_slow), budget_seconds=0.2)
-    finally:
-        release.set()
-    assert time.monotonic() - started < 2
-    assert chosen == {key: ids[0] for key, ids in jobs.items()}
+    assert not deck.slides[0].blocks
 
 
 # ---------------------------------------------------------------------------
-# _drop_thin_duplicates
+# _flag_repeated_headlines и _drop_thin_duplicates (без изменений задачи P)
 # ---------------------------------------------------------------------------
+
+
+def test_flag_repeated_headlines_catches_the_same_number_stated_differently():
+    """Общая заметная цифра — сильный признак того же факта, даже когда
+    значимые слова не совпадают падежом (ЛЦТ2026, слайды 0 и 3)."""
+    slides = [
+        SlideSpec(index=0, kind="bullets",
+                  headline="98,5% ожидания устранимы: пилот подтвердил эффективность, готов план раскатки"),
+        SlideSpec(index=1, kind="bullets", headline="Команда и бюджет"),
+        SlideSpec(index=2, kind="bullets", headline="Обучение сотрудников"),
+        SlideSpec(index=3, kind="bullets", headline="98,5% времени заявка находится в ожидании, а не обрабатывается."),
+    ]
+    _flag_repeated_headlines(slides)
+    assert any("слайд 3" in f for f in slides[0].findings), slides[0].findings
+
+
+def test_flag_repeated_headlines_does_not_fire_on_unrelated_headlines_with_incidental_numbers():
+    slides = [
+        SlideSpec(index=0, kind="bullets", headline="Команда — 2 человека на доработку правил закупок"),
+        SlideSpec(index=1, kind="bullets", headline="Раскатка завершится в 2026 году"),
+    ]
+    _flag_repeated_headlines(slides)
+    assert slides[0].findings == []
 
 
 def _deck_with_repeated_fact() -> list[SlideSpec]:
@@ -738,9 +366,6 @@ def _deck_with_repeated_fact() -> list[SlideSpec]:
 
 
 def test_thin_duplicate_of_a_fact_is_dropped_and_indexes_are_renumbered():
-    """Прогон 26 сентября 2026 на VK Education: три слайда про «98,5%
-    времени ожидание», два из них с одним пунктом. Тонкий повтор уходит,
-    полный остаётся, номера идут подряд."""
     slides = _drop_thin_duplicates(_deck_with_repeated_fact())
 
     assert [s.headline for s in slides][:3] == [
@@ -750,9 +375,6 @@ def test_thin_duplicate_of_a_fact_is_dropped_and_indexes_are_renumbered():
 
 
 def test_two_full_slides_on_the_same_fact_are_both_kept():
-    """Полные слайды с общей цифрой не выбрасываются: это может быть
-    «проблема» и «решение» с одним показателем. Их по-прежнему только
-    помечает `_flag_repeated_headlines`."""
     slides = _deck_with_repeated_fact()
     slides[2] = replace(slides[2], blocks=[BulletBlock(items=["а", "б", "в"])])
 
@@ -772,217 +394,3 @@ def test_cover_and_closing_slides_are_never_dropped():
 def test_short_decks_are_left_alone():
     slides = _deck_with_repeated_fact()[:4]
     assert _drop_thin_duplicates(slides) is slides
-
-
-# ---------------------------------------------------------------------------
-# Ремонт недобора: крупнейшее текстовое место заполнено меньше чем на
-# половину цели, и писателя один раз просят дописать до объёма.
-# ---------------------------------------------------------------------------
-
-
-class _RecordingQueueLLM(_QueueLLM):
-    def __init__(self, responses):
-        super().__init__(responses)
-        self.requests: list[dict] = []
-
-    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
-        self.requests.append(json.loads(messages[-1]["content"]))
-        return super().complete(messages, schema=schema, max_tokens=max_tokens, temperature=temperature)
-
-
-def _bullets_json(items: list[str]) -> str:
-    return json.dumps({"kind": "bullets", "headline": "Вывод", "blocks": [{"type": "bullets", "items": items}]},
-                      ensure_ascii=False)
-
-
-def _filling_items(PROFILE) -> list[str]:
-    """Пункты, которые заполняют крупнейшее место bullets-раскладки около цели."""
-    from deckforge.compose.fit_check import main_slot_fill
-
-    probe = SlideSpec(index=0, kind="bullets", headline="В", blocks=[BulletBlock(items=["А"])])
-    target = main_slot_fill(probe, PROFILE)["target_chars"]
-    item = "Заявка проходит согласование в трёх отделах подряд"
-    return [item] * max(1, target // (len(item) + 1))
-
-
-def test_underfilled_slide_gets_one_repair_call(PROFILE):
-    llm = _RecordingQueueLLM([_bullets_json(["Коротко", "Ещё"]), _bullets_json(_filling_items(PROFILE))])
-
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=0)
-
-    assert len(llm.requests) == 2
-    request = llm.requests[1]
-    assert request["previous_answer"]["blocks"][0]["items"] == ["Коротко", "Ещё"]
-    assert request["fill_request"]["target_chars"] > request["fill_request"]["chars"]
-    assert deck.slides[0].blocks[0].items == _filling_items(PROFILE)
-    assert deck.meta["fill_repairs"] == "1" and deck.meta["fill_repairs_accepted"] == "1"
-
-
-def test_failed_repair_keeps_the_original_slide(PROFILE):
-    llm = _QueueLLM([_bullets_json(["Коротко", "Ещё"]), RuntimeError("сеть недоступна")])
-
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=0)
-
-    assert deck.slides[0].blocks[0].items == ["Коротко", "Ещё"]
-    assert deck.meta["fill_repairs"] == "1" and deck.meta["fill_repairs_accepted"] == "0"
-
-
-def test_well_filled_slide_is_not_repaired(PROFILE):
-    llm = _QueueLLM([_bullets_json(_filling_items(PROFILE))])
-
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=0)
-
-    assert not llm._responses
-    assert "fill_repairs" not in deck.meta
-
-
-def test_repair_limited_by_item_count_skips_richer_slides(PROFILE):
-    llm = _QueueLLM([_bullets_json(["А", "Б", "В"])])
-
-    deck = write_slides(_one_slide_outline(), [], PROFILE, llm=llm, max_workers=1, fill_repair_max_items=2)
-
-    assert "fill_repairs" not in deck.meta
-
-
-# ---------------------------------------------------------------------------
-# realize_for_variant — текст под раскладку варианта (задача N)
-# ---------------------------------------------------------------------------
-
-_LONG_FACT = (
-    "Ожидание первого согласующего занимает медиану 18 часов, второго ещё 11 часов, "
-    "а чистая работа людей укладывается в 28 минут; переназначений вручную 4%. "
-)
-
-
-def _overflowing_layout(profile) -> str:
-    """Раскладка списка, куда длинный абзац не влезает, а короткий влезает:
-    ровно тот случай, ради которого переписывание и нужно."""
-    from deckforge.plan.writer import layout_overflow
-
-    for p in profile.patterns:
-        if p.kind != "bullets" or p.repeat is not None:
-            continue
-        long_slide = SlideSpec(index=1, kind="bullets", headline="Где уходит время",
-                               blocks=[TextBlock(text=_LONG_FACT * 3)], pattern_id=p.pattern_id)
-        short_slide = replace(long_slide, blocks=[TextBlock(text="Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%")])
-        if layout_overflow(long_slide, profile) and not layout_overflow(short_slide, profile):
-            return p.pattern_id
-    raise AssertionError("на контрольном шаблоне нет раскладки списка средней вместимости")
-
-
-def _realize_deck(profile) -> DeckSpec:
-    pid = _overflowing_layout(profile)
-    return DeckSpec(title="T", language="ru", slides=[
-        SlideSpec(index=0, kind="section", headline="Обложка"),
-        SlideSpec(index=1, kind="bullets", headline="Где уходит время", pattern_id=pid,
-                  blocks=[TextBlock(text=_LONG_FACT * 3)], source_note="Источник: пилот"),
-        SlideSpec(index=2, kind="bullets", headline="Что изменилось", pattern_id=pid,
-                  blocks=[TextBlock(text="Медиана сократилась до 6,2 часа")]),
-    ])
-
-
-def _realized_json(text: str) -> str:
-    return json.dumps({
-        "kind": "bullets", "headline": "Другой заголовок",
-        "blocks": [{"type": "text", "text": text}], "source_note": "Источник: пилот",
-    }, ensure_ascii=False)
-
-
-def test_realize_accepts_a_shorter_text_that_keeps_every_number(PROFILE):
-    from deckforge.plan.writer import layout_overflow, realize_for_variant
-
-    deck = _realize_deck(PROFILE)
-    llm = _PayloadLLM(lambda payload: _realized_json("Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%"))
-
-    out = realize_for_variant(deck, Variant.visual, PROFILE, llm)
-
-    assert llm.calls == 1  # второй слайд влезает, модель его не видит
-    slide = out.slides[1]
-    assert slide.blocks[0].text == "Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%"
-    assert slide.headline == "Где уходит время"  # заголовок-вывод не меняется
-    assert slide.pattern_id == deck.slides[1].pattern_id
-    assert not layout_overflow(slide, PROFILE)
-    assert "18" in slide.speaker_notes  # полный текст остался докладчику
-    assert out.slides[2] is deck.slides[2]
-    assert out.meta["realize_overflowing"] == "1" and out.meta["realize_accepted"] == "1"
-
-
-def test_realize_rejects_an_answer_that_lost_a_number(PROFILE):
-    from deckforge.plan.writer import realize_for_variant
-
-    deck = _realize_deck(PROFILE)
-    llm = _PayloadLLM(lambda payload: _realized_json("Медиана 18 ч и 11 ч, работа 28 мин"))  # без 4%
-
-    out = realize_for_variant(deck, Variant.visual, PROFILE, llm)
-
-    assert llm.calls == 1
-    assert out.slides[1] is deck.slides[1]
-    assert out.meta["realize_accepted"] == "0"
-    assert "4" in out.meta["realize_log"] and "потеряны числа" in out.meta["realize_log"]
-
-
-def test_realize_rejects_more_pieces_than_the_layout_has_places(PROFILE):
-    """Лишний абзац сборка молча выбросит: такой ответ теряет факт мимо
-    проверки чисел и приниматься не должен."""
-    from deckforge.plan.writer import realize_for_variant
-
-    deck = _realize_deck(PROFILE)
-    pieces = ["18 ч", "11 ч", "28 мин", "4%"] + [f"Пункт {chr(0x0430 + i)}" for i in range(12)]
-    llm = _PayloadLLM(lambda payload: json.dumps({
-        "kind": "bullets", "headline": "x", "blocks": [{"type": "text", "text": t} for t in pieces],
-    }, ensure_ascii=False))
-
-    out = realize_for_variant(deck, Variant.visual, PROFILE, llm)
-
-    assert out.slides[1] is deck.slides[1]
-    assert "кусков больше" in out.meta["realize_log"]
-
-
-def test_realize_does_not_demand_numbers_the_headline_already_carries(PROFILE):
-    from deckforge.plan.writer import realize_for_variant
-
-    deck = _realize_deck(PROFILE)
-    deck.slides[1] = replace(deck.slides[1], headline="Ожидание 18 часов вместо работы")
-    seen: list[dict] = []
-
-    def answer(payload):
-        seen.append(payload)
-        return _realized_json("Второй ждёт 11 ч, работа 28 мин, вручную 4%")
-
-    out = realize_for_variant(deck, Variant.visual, PROFILE, _PayloadLLM(answer))
-
-    assert "18" not in seen[0]["must_keep"]
-    assert out.meta["realize_accepted"] == "1"
-    assert out.slides[1].source_note == "Источник: пилот"
-
-
-def test_realize_payload_names_the_numbers_and_the_layout_places(PROFILE):
-    from deckforge.plan.writer import realize_for_variant
-
-    seen: list[dict] = []
-
-    def answer(payload):
-        seen.append(payload)
-        return _realized_json("Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%")
-
-    deck = _realize_deck(PROFILE)
-    realize_for_variant(deck, Variant.airy, PROFILE, _PayloadLLM(answer))
-
-    assert seen[0]["must_keep"] == sorted({"18", "11", "28", "4"})
-    assert seen[0]["layout"]["layout_id"] == deck.slides[1].pattern_id
-    assert seen[0]["layout"]["places"] and seen[0]["overflow"]
-    assert "box" not in json.dumps(seen[0], ensure_ascii=False)
-
-
-def test_realize_calls_nothing_when_text_fits_or_for_dense(PROFILE):
-    from deckforge.plan.writer import realize_for_variant
-
-    deck = _realize_deck(PROFILE)
-    llm = _PayloadLLM(lambda payload: _realized_json("x"))
-
-    assert realize_for_variant(deck, Variant.dense, PROFILE, llm) is deck
-    fitting = replace(deck, slides=[deck.slides[0], deck.slides[2]])
-    out = realize_for_variant(fitting, Variant.visual, PROFILE, llm)
-    assert llm.calls == 0
-    assert out.slides == fitting.slides
-    assert realize_for_variant(deck, Variant.visual, PROFILE, None) is deck

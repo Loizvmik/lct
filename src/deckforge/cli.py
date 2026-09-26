@@ -25,21 +25,20 @@ from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.report import AuditReport
 from deckforge.audit.visual import run_visual
 from deckforge.compose.builder import build_deck, count_embedded_photos
-from deckforge.plan.outline import build_outline, load_content_pack
-from deckforge.plan.photos import assign_photos, load_content_pack_photos
+from deckforge.pattern.intent import intents_from_outline
+from deckforge.plan.contracts import plan_contracts
+from deckforge.plan.outline import build_outline, load_content_pack, outline_to_dict
+from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
-from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import (
-    AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, REALIZE_RESERVE_SECONDS, RERANK_VARIANTS, REALIZE_VARIANTS,
-    realize_for_variant, rerank_patterns, write_slides,
-)
+from deckforge.plan.variants import Variant
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
 from deckforge.render.soffice import to_pngs
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
-from deckforge.workflow.budget import RunBudget, RunMode, load_policy
+from deckforge.workflow.budget import RunBudget, load_policy
 from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[2] / "config" / "app.yaml"
@@ -65,50 +64,6 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
         )
     except (ValueError, ModelNotAllowed):
         return None
-
-
-def _rerank(
-    deck, profile, variants, budget: RunBudget | None = None, *, prefer_decor: bool = False,
-) -> tuple[dict, list[str]]:
-    """Задача D: модель выбирает раскладку из трёх, отобранных кодом, для
-    airy и visual. Возвращает `(вариант -> {номер слайда -> pattern_id},
-    заметки)`. Выключено в конфиге, нет ключа или конфиг не читается —
-    пустой выбор, варианты собираются чисто детерминированно.
-
-    Задача L: идёт ли rerank вообще, решает режим прогона (`budget.mode_
-    spec().rerank`), зафиксированный на контрольной точке `after_write`
-    (см. `_cmd_generate`) — не отдельный порог этой функции."""
-    try:
-        settings = Settings.load(APP_YAML_PATH)
-    except Exception:
-        return {}, []
-    if not settings.plan.rerank_variants:
-        return {}, []
-    if budget is not None and not budget.mode_spec().rerank:
-        mode_name = budget.mode.value if budget.mode is not None else RunMode.FULL.value
-        return {}, [f"переранжирование пропущено режимом прогона {mode_name}"]
-    llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
-    notes: list[str] = []
-    chosen = rerank_patterns(
-        deck, profile, variants, llm,
-        max_workers=settings.llm.pattern_picker_max_workers,
-        budget_seconds=settings.llm.pattern_picker_step_budget_seconds, notes=notes,
-        prefer_decor=prefer_decor,
-    )
-    by_variant: dict = {}
-    for (variant, index), pattern_id in chosen.items():
-        by_variant.setdefault(variant, {})[index] = pattern_id
-    return by_variant, notes
-
-
-def _realize_settings() -> tuple[bool, int, float]:
-    """Переписывание под вариант (задача N, `plan.realize_*`): `(включено,
-    потоков, бюджет шага)`. Без читаемого конфига выключено."""
-    try:
-        plan = Settings.load(APP_YAML_PATH).plan
-    except Exception:
-        return False, 1, 0.0
-    return plan.realize_variants, plan.realize_max_workers, plan.realize_step_budget_seconds
 
 
 def _build_namer() -> LLMProvider | None:
@@ -163,17 +118,6 @@ def _writer_agent_max_steps() -> int:
         return AGENT_MAX_STEPS_DEFAULT
 
 
-def _writer_fill_repair() -> int | None:
-    """Ремонт недобора (`plan.writer._repair_underfill`): `None` — выключен,
-    иначе предел числа элементов слайда (0 — без предела). Без читаемого
-    конфига включён для всех слайдов, как в `config/app.yaml`."""
-    try:
-        llm = Settings.load(APP_YAML_PATH).llm
-    except Exception:
-        return 0
-    return llm.slide_writer_fill_repair_max_items if llm.slide_writer_fill_repair else None
-
-
 def _cmd_parse(args: argparse.Namespace) -> int:
     namer = _build_namer()
     vision = _build_pattern_kind_vlm()
@@ -212,28 +156,28 @@ def _cmd_parse(args: argparse.Namespace) -> int:
 
 
 def _cmd_generate(args: argparse.Namespace) -> int:
-    """Весь путь от брифа до готовой презентации (Task 13, "эта задача
-    замыкает пайплайн"): разбор шаблона -> структура -> текст слайдов ->
-    три варианта вёрстки -> сборка -> детерминированный аудит каждого
-    варианта. Без ключа модели (`.env`) продолжает работать запасными
-    вариантами на каждом шаге (`build_outline`/`write_slides` без `llm`) —
-    результат хуже по содержанию, но пайплайн не падает.
+    """Весь путь от брифа до готовой презентации: разбор шаблона ->
+    структура -> фото по пунктам структуры -> для каждого стиля свои
+    раскладки (`pattern.plan_patterns`), контракты и текст под них ->
+    сборка -> детерминированный аудит. Без ключа модели (`.env`) продолжает
+    работать запасными вариантами на каждом шаге, результат хуже по
+    содержанию, но пайплайн не падает.
 
-    Полный аудит по картинке всех слайдов (C01-C11) сюда не входит: замер
-    `task-12-report.md` дал 302.8с генерации плюс 152.8с такого аудита,
-    почти вдвое больше пяти минут ТЗ. Задача H вернула в генерацию его
-    часть: вопросы C01-C08, C10 по нескольким самым рискованным слайдам
-    одного варианта (`workflow.visual_stage`), и только если бюджет прогона
-    (`workflow.budget.RunBudget`, `run:` в app.yaml) это позволяет. Не
-    пошла стадия: печатается причина. Полный аудит остаётся отдельной
-    командой `deckforge audit-visual` на готовом файле."""
+    Задача P поменяла порядок решений: раньше текст писался один раз на три
+    стиля, а стиль потом подбирал раскладку под готовый текст. Теперь общие
+    только разбор и структура; раскладки и текст у каждого стиля свои,
+    текст пишется под свою композицию.
+
+    Полный аудит по картинке всех слайдов (C01-C11) сюда не входит, только
+    вопросы по нескольким рискованным слайдам одного варианта, если бюджет
+    позволяет (`workflow.visual_stage`). Полный аудит остаётся командой
+    `deckforge audit-visual` на готовом файле."""
     # Бюджет прогона создаётся первым делом: пять минут ТЗ считаются от
     # начала команды.
     budget = RunBudget.from_policy(load_policy(APP_YAML_PATH))
     namer = _build_namer()
     vision = _build_pattern_kind_vlm()
     outline_llm = _build_role_provider("outline")
-    writer_llm = _build_role_provider("writer")
 
     started = time.monotonic()
     profile = TemplateProfile.from_file(
@@ -253,86 +197,62 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     budget.record("outline", outlined_at - parsed_at)
     print(f"Структура: {len(outline.slides)} слайдов за {outlined_at - parsed_at:.1f}с")
 
-    # Текст слайдов пишется ПАРАЛЛЕЛЬНО (max_workers — config/app.yaml,
-    # `llm.slide_writer_max_workers`) — слайды друг от друга не зависят, а
-    # последовательное написание было девяноста процентами времени всей
-    # генерации (живой замер, docstring `write_slides`/`task-12-report.md`).
-    writer_max_workers = args.writer_max_workers if args.writer_max_workers is not None else _writer_max_workers()
-    deck = write_slides(
-        outline, sources, profile, writer_llm,
-        max_workers=writer_max_workers, agent_max_steps=_writer_agent_max_steps(),
-        template_path=args.template, fill_repair_max_items=_writer_fill_repair(),
-    )
-    written_at = time.monotonic()
-    budget.record("write", written_at - outlined_at)
-    print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
-    if "fill_repairs" in deck.meta:
-        print(
-            f"  дописано до объёма: {deck.meta['fill_repairs_accepted']} из {deck.meta['fill_repairs']} слайдов, "
-            f"вызовы ремонта заняли {deck.meta['fill_repair_seconds']}с суммарно"
-        )
-    if "normalized_slides" in deck.meta:
-        print(f"  содержание приведено к раскладке: {deck.meta['normalized_slides']} слайдов")
-
-    # Task 20: распределение фотографий контент-пакета по слайдам — ПОСЛЕ
-    # текста (нужны уже написанные заголовки/содержание, см. `plan.photos.
-    # assign_photos`) и ДО `apply_variant`/`build_deck` (`_compatible_kinds`
-    # смотрит на `SlideSpec.visual.kind`, проставленный здесь, при выборе
-    # финальной раскладки — см. докстроку `plan.variants._compatible_
-    # kinds`). Один вызов модели на всю колоду, не на слайд (бриф задачи).
+    # Фотографии контент-пакета распределяются по пунктам структуры ДО
+    # планирования раскладок: слайду с фото планировщик обязан дать место
+    # под картинку. Один вызов модели на колоду, общий для всех стилей.
     photos = load_content_pack_photos(args.content_pack)
     photo_llm = _build_role_provider("photo_picker") if photos else None
-    deck, photo_report = assign_photos(deck, photos, photo_llm)
+    photo_by_slide, photo_report = assign_photos_to_outline(outline, photos, photo_llm)
     photos_at = time.monotonic()
     if photos:
-        # Task 22, отчёт задачи, находка "пайплайн рапортует не то, что в
-        # файле": ЭТО число — план планировщика (`assign_photos`, слайд
-        # получил `Visual.photo_name`), не факт вставки. У раскладки,
-        # которую слайду в итоге даст `apply_variant`, может не найтись
-        # слота под картинку — тогда `compose.builder._place_picture_
-        # visual` честно не вставляет фотографию (см. её докстроку), и
-        # факт расходится с планом. Сколько РЕАЛЬНО легло на слайды —
-        # печатается отдельно, ПОСЛЕ сборки каждого варианта ниже (там же,
-        # где известен готовый `.pptx`), не здесь.
+        # Это план планировщика, не факт вставки: сколько реально легло на
+        # слайды, печатается после сборки каждого варианта.
         print(
             f"Фотографии контент-пакета: {len(photos)} пришло, "
             f"{photo_report.placed_count} распределено планировщиком (план, не факт вставки) "
-            f"за {photos_at - written_at:.1f}с"
+            f"за {photos_at - outlined_at:.1f}с"
         )
         for note in photo_report.notes:
             print(f"  ! {note}")
         if photo_report.placed_count == 0:
             print("  ! Ни одна фотография не попала ни на один слайд — см. находки выше.")
     user_photos = {p.name: p.path for p in photos}
+    budget.record("photos", photos_at - outlined_at)
+    intents = intents_from_outline(outline, photo_by_slide)
 
     config = AuditConfig.load()
     args.output_dir.mkdir(parents=True, exist_ok=True)
-
-    debug_path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__deck-t13.json"
-    debug_path.write_text(json.dumps(deck_spec_to_dict(deck), ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"Содержание (для отладки) записано в {debug_path}")
+    outline_path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__outline.json"
+    outline_path.write_text(json.dumps(outline_to_dict(outline), ensure_ascii=False, indent=2), encoding="utf-8")
     variants = [Variant[v] for v in args.variants] if args.variants else list(Variant)
+    writer_max_workers = args.writer_max_workers if args.writer_max_workers is not None else _writer_max_workers()
 
-    # Задача N: фотографии распределены, общие стадии позади. Дальше
-    # варианты идут параллельно, каждый целиком в своём бюджете (300с минус
-    # общие стадии): лимит ТЗ считается на одну презентацию. Бюджеты
-    # заводятся все сразу, чтобы дедлайн у вариантов был один. Печать
-    # каждого варианта копится и выводится целиком, иначе строки трёх
-    # потоков перемешались бы.
-    budget.record("photos", photos_at - written_at)
+    # Общие стадии позади. Дальше стили идут параллельно, каждый целиком
+    # (раскладки, текст, сборка, аудит) в своём бюджете: лимит ТЗ считается
+    # на одну презентацию. Бюджеты заводятся все сразу, чтобы дедлайн был
+    # один. Печать каждого стиля копится и выводится целиком.
     budgets = {variant: budget.for_variant(variant.value) for variant in variants}
     # Вариант, по которому идёт аудит по картинке: dense, если собирается,
     # иначе первый из заказанных.
     visual_variant = Variant.dense if Variant.dense in variants else variants[0]
     ctx = dict(
-        deck=deck, profile=profile, args=args, config=config, user_photos=user_photos,
+        outline=outline, intents=intents, profile=profile, args=args, config=config, user_photos=user_photos,
         photos=photos, photo_report=photo_report, sources=sources, visual_variant=visual_variant,
+        writer_max_workers=writer_max_workers,
     )
     with ThreadPoolExecutor(max_workers=len(variants)) as pool:
         futures = [pool.submit(_generate_variant, variant, budgets[variant], ctx) for variant in variants]
         outputs = [future.result() for future in futures]
     for lines in outputs:
         print("\n".join(lines))
+
+    # Содержание варианта, по которому идёт аудит по картинке, ещё и под
+    # общим именем: `deckforge audit-visual` берёт .pptx и его план.
+    debug_path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__deck-t13.json"
+    variant_debug = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{visual_variant.value}-deck.json"
+    if variant_debug.exists():
+        shutil.copy2(variant_debug, debug_path)
+        print(f"\nСодержание (для отладки) записано в {debug_path}")
 
     summary = budget.summary()
     print(f"\nВсего: {time.monotonic() - started:.1f}с (бюджет {budget.deadline_seconds:.0f}с на презентацию)")
@@ -378,59 +298,48 @@ def _visual_stage(budget: RunBudget, target, variant, sources, out: list[str]) -
 
 
 def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[str]:
-    """Всё после текста для одного варианта, в его бюджете (задача N):
-    rerank, переписывание под раскладку, сборка, аудит, аудит по картинке.
+    """Всё после структуры для одного стиля, в его бюджете: раскладки на
+    всю колоду, контракты, текст под них, сборка, аудит, аудит по картинке.
     Возвращает строки отчёта, печатает их вызывающий код целиком."""
-    deck, profile, args = ctx["deck"], ctx["profile"], ctx["args"]
+    profile, args = ctx["profile"], ctx["args"]
     photos, photo_report = ctx["photos"], ctx["photo_report"]
     out: list[str] = []
-    mode = budget.decide_mode("after_write")
-    out.append(f"\n[{variant.value}] режим: {mode.value} (точка after_write, осталось {budget.remaining():.0f}с)")
-
-    realize_on, realize_workers, realize_budget = _realize_settings()
-    realizer = _build_role_provider("writer") if realize_on and variant in REALIZE_VARIANTS else None
-    # Нарядная раскладка без переписывания даст переполнение: `prefer_decor`
-    # только когда переписывание реально пойдёт и после него останется время
-    # на сборку.
-    prefer_decor = (
-        realizer is not None and mode is not RunMode.EMERGENCY
-        and budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS) > 0
-    )
-
-    preferred = None
-    if variant in RERANK_VARIANTS:
-        step_started = time.monotonic()
-        chosen, notes = _rerank(deck, profile, [variant], budget, prefer_decor=prefer_decor)
-        budget.record("rerank", time.monotonic() - step_started)
-        preferred = chosen.get(variant)
-        if preferred:
-            out.append(f"  раскладки уточнены моделью: {len(preferred)} слайдов за {time.monotonic() - step_started:.1f}с")
-        for note in notes:
-            out.append(f"  ! {note}")
 
     step_started = time.monotonic()
-    variant_deck = apply_variant(deck, profile, variant, preferred=preferred, prefer_decor=prefer_decor)
-    if prefer_decor:
-        variant_deck = realize_for_variant(
-            variant_deck, variant, profile, realizer, max_workers=realize_workers,
-            budget_seconds=budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS),
-        )
-        realized_at = time.monotonic()
-        budget.record("realize", realized_at - step_started)
-        meta = variant_deck.meta
-        out.append(
-            f"  текст под раскладку: переписано {meta.get('realize_accepted', '0')} из "
-            f"{meta.get('realize_overflowing', '0')} переполненных слайдов за {realized_at - step_started:.1f}с"
-        )
-        if meta.get("realize_log"):
-            out.append(f"    {meta['realize_log']}")
-        step_started = realized_at
-    built_path = build_deck(variant_deck, profile, args.template, variant, user_photos=ctx["user_photos"])
+    assignments, contracts = plan_contracts(ctx["intents"], profile, variant)
+    planned_at = time.monotonic()
+    budget.record("plan", planned_at - step_started)
+    unique = len({a.pattern_id for a in assignments if a.pattern_id})
+    out.append(
+        f"\n[{variant.value}] раскладки назначены за {planned_at - step_started:.2f}с: "
+        f"{unique} разных на {len(assignments)} слайдов"
+    )
+
+    deck = write_slides(
+        ctx["outline"], contracts, ctx["sources"], profile, _build_role_provider("writer"),
+        max_workers=ctx["writer_max_workers"], agent_max_steps=_writer_agent_max_steps(), style=variant,
+    )
+    written_at = time.monotonic()
+    budget.record("write", written_at - planned_at)
+    meta = deck.meta
+    out.append(
+        f"  текст под контракт за {written_at - planned_at:.1f}с: мест в пределах контракта "
+        f"{meta.get('contract_places_ok', '0')} из {meta.get('contract_places', '0')}, "
+        f"ремонтов {meta.get('contract_repairs_accepted', '0')} принято из {meta.get('contract_repairs', '0')}"
+    )
+    if "normalized_slides" in meta:
+        out.append(f"  содержание приведено к раскладке: {meta['normalized_slides']} слайдов")
+
+    mode = budget.decide_mode("after_write")
+    out.append(f"  режим: {mode.value} (точка after_write, осталось {budget.remaining():.0f}с)")
+
+    step_started = time.monotonic()
+    built_path = build_deck(deck, profile, args.template, variant, user_photos=ctx["user_photos"])
     built_at = time.monotonic()
     path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-t13.pptx"
     shutil.copy2(built_path, path)
     variant_debug = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-deck.json"
-    variant_debug.write_text(json.dumps(deck_spec_to_dict(variant_deck), ensure_ascii=False, indent=2), encoding="utf-8")
+    variant_debug.write_text(json.dumps(deck_spec_to_dict(deck), ensure_ascii=False, indent=2), encoding="utf-8")
     findings = run_deterministic(path, profile, ctx["config"])
     audited_at = time.monotonic()
     budget.record("compose", built_at - step_started)
@@ -444,31 +353,27 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
         by_check[f.check_id] = by_check.get(f.check_id, 0) + 1
 
     out.append(
-        f"[{variant.value}] {path.name}: {len(variant_deck.slides)} слайдов, "
+        f"[{variant.value}] {path.name}: {len(deck.slides)} слайдов, "
         f"сборка {built_at - step_started:.1f}с, аудит {audited_at - built_at:.1f}с"
     )
-    out.append(f"  раскладки: {', '.join(s.pattern_id or '-' for s in variant_deck.slides)}")
-    # Задача T: сводка верности шаблону на вариант; печать, не решение
-    # пайплайна, и она не должна ронять генерацию (профиль в кэше старше
-    # кода метрики и т.п.).
+    out.append(f"  раскладки: {', '.join(s.pattern_id or '-' for s in deck.slides)}")
+    # Сводка верности шаблону на вариант; печать, не решение пайплайна, и
+    # она не должна ронять генерацию.
     try:
-        out.append(f"  {template_fidelity(path, variant_deck, profile).summary}")
+        out.append(f"  {template_fidelity(path, deck, profile).summary}")
     except Exception as exc:  # noqa: BLE001 — сводка необязательна
         out.append(f"  ! Верность шаблону не посчитана: {exc}")
     out.append(f"  находки по серьёзности: {by_severity or '(нет)'}")
     out.append(f"  находки по видам: {dict(sorted(by_check.items()))}")
-    slide_findings = [s for v in variant_deck.slides for s in v.findings]
+    slide_findings = [s for v in deck.slides for s in v.findings]
     if slide_findings:
         out.append(f"  находки сборки (усечения/переполнения): {len(slide_findings)}")
     for f in slide_findings:
         if "раскладка под содержание не найдена" in f:
             out.append(f"  ! {f}")
 
-    # Task 22: сколько фотографий контент-пакета РЕАЛЬНО легло на
-    # слайды ЭТОГО варианта — считано по байтам уже сохранённого
-    # `.pptx` (`count_embedded_photos`), не взято из плана
-    # `assign_photos`. Число не обязано совпадать с планом: у dense/airy/
-    # visual разные раскладки на один и тот же слайд.
+    # Сколько фотографий контент-пакета РЕАЛЬНО легло на слайды этого
+    # варианта: по байтам сохранённого .pptx, не по плану распределения.
     if photos:
         embedded = count_embedded_photos(path, ctx["user_photos"])
         not_embedded_findings = [
@@ -496,7 +401,7 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
         f"  режим: {mode_after_compose.value} (точка after_compose, осталось {budget.remaining():.0f}с)"
     )
     if variant == ctx["visual_variant"]:
-        _visual_stage(budget, (path, variant_deck, findings), variant, ctx["sources"], out)
+        _visual_stage(budget, (path, deck, findings), variant, ctx["sources"], out)
     budget.stop()
     return out
 
