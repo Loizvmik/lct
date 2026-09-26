@@ -30,7 +30,7 @@ import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from deckforge.ooxml.color import Color, UnresolvedColor
 from deckforge.ooxml.geometry import Canvas
@@ -249,7 +249,10 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # по своему ключу, который тоже перестаёт совпадать).
 # Детерминированная версия 2, а не 1: `source_density` паттерна (задача R)
 # снимается детерминированно и влилась одновременно с разделением кеша.
-DETERMINISTIC_SCHEMA_VERSION = 2
+# Версия 3 (задача V2): фото-образцы примера у паттерна (`photo_frames`,
+# `photo_area`, `photo_slot_area`, `layout_photo_ids`) и у декора
+# (`sample_photo`), двумерная сетка повтора (`RepeatSpec.rows`/`cells`).
+DETERMINISTIC_SCHEMA_VERSION = 3
 MODEL_SCHEMA_VERSION = 1
 PROFILE_SCHEMA_VERSION = DETERMINISTIC_SCHEMA_VERSION * 1000 + MODEL_SCHEMA_VERSION
 
@@ -557,12 +560,27 @@ def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
     )
 
 
+class RepeatUnitModel(BaseModel):
+    """Единица повтора с id фигур примера (`patterns.RepeatUnit`, задача V2)."""
+    id: str
+    row: int
+    col: int
+    slot_ids: list[str] = Field(default_factory=list)
+    decor_shape_ids: list[str] = Field(default_factory=list)
+
+
 class RepeatSpecModel(BaseModel):
     axis: str
     count: int
     step: float
     slot_roles: list[str]
     group_size: int
+    # Топология повтора (задача V2, `patterns.RepeatSpec.units`). Значения
+    # по умолчанию: старый кэш, единицы тогда решает координата.
+    rows: int = 1
+    cols: int = 0
+    traversal: str = "row"
+    units: list[RepeatUnitModel] = Field(default_factory=list)
 
 
 def _repeat_spec_model(repeat: RepeatSpec | None) -> RepeatSpecModel | None:
@@ -571,6 +589,13 @@ def _repeat_spec_model(repeat: RepeatSpec | None) -> RepeatSpecModel | None:
     return RepeatSpecModel(
         axis=repeat.axis, count=repeat.count, step=repeat.step,
         slot_roles=list(repeat.slot_roles), group_size=repeat.group_size,
+        rows=repeat.rows, cols=repeat.cols, traversal=repeat.traversal,
+        units=[
+            RepeatUnitModel(
+                id=u.id, row=u.row, col=u.col, slot_ids=list(u.slot_ids), decor_shape_ids=list(u.decor_shape_ids),
+            )
+            for u in repeat.units
+        ],
     )
 
 
@@ -627,6 +652,8 @@ class DecorShapeModel(BaseModel):
     # Id исходной фигуры на слайде-примере (`patterns.DecorShape.
     # source_shape_id`): по нему клон убирает декор незаполненных единиц.
     source_shape_id: str | None = None
+    # Фото-образец примера (`patterns.DecorShape.sample_photo`, задача V2).
+    sample_photo: bool = False
 
 
 def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
@@ -637,7 +664,7 @@ def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
         repeat_group=decor.repeat_group, repeat_index=decor.repeat_index,
         image_part=decor.image_part, badge_text=decor.badge_text,
         badge_size_pt=decor.badge_size_pt, badge_color_hex=decor.badge_color_hex,
-        prst=decor.prst, source_shape_id=decor.source_shape_id,
+        prst=decor.prst, source_shape_id=decor.source_shape_id, sample_photo=decor.sample_photo,
     )
 
 
@@ -676,6 +703,13 @@ class PatternModel(BaseModel):
     # собранных без майнинга (тестовые фикстуры): D05 тогда судит по
     # глобальному коридору.
     source_density: float | None = None
+    # Задача V2: фото-образцы примера (`patterns.Pattern.photo_frames`),
+    # по ним планировщик знает, сколько холста опустеет без своего фото,
+    # а клон и сборка с нуля скрывают фото лейаута.
+    photo_frames: int = 0
+    photo_area: float = 0.0
+    photo_slot_area: float = 0.0
+    layout_photo_ids: list[str] = Field(default_factory=list)
 
 
 def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> PatternModel:
@@ -688,6 +722,8 @@ def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> Pattern
         capacity=_capacity_model(pattern.capacity), score=pattern.score, is_dark=pattern.is_dark,
         kind_confidence=pattern.kind_confidence, preview_path=preview_path,
         source_density=pattern.source_density,
+        photo_frames=pattern.photo_frames, photo_area=pattern.photo_area,
+        photo_slot_area=pattern.photo_slot_area, layout_photo_ids=list(pattern.layout_photo_ids),
     )
 
 

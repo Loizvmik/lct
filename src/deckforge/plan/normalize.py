@@ -49,23 +49,37 @@ _KPI_KINDS = ("kpi", "kpi_caption")
 _CARD_ROLES = frozenset({"card_title", "card_body"})
 
 
-def normalize_deck(deck: DeckSpec, profile, *, keep: frozenset[int] = frozenset()) -> DeckSpec:
+def normalize_deck(
+    deck: DeckSpec, profile, *, keep: frozenset[int] = frozenset(), invariants=None,
+) -> DeckSpec:
     """Прогоняет каждый слайд через правила модуля. Без профиля ничего не
     делает: какие формы есть в шаблоне, тогда неизвестно.
 
     `keep`: номера слайдов, чей текст уложился в контракт раскладки. Их
     форму выбрал планировщик, и два коротких пункта с числами на раскладке
     списка остаются списком: правило вырождения нужно там, где модель
-    нарушила контракт или слайд собран без неё. Слайд без содержания
-    становится разделителем всегда."""
+    нарушила контракт или слайд собран без неё.
+
+    `invariants`: смысловые инварианты пунктов по номеру слайда
+    (`plan.invariants`, задача V2). Слайд без содержания становится
+    разделителем, только если инвариант это позволяет (титул, финал,
+    разделитель, цитата) или инварианта нет; содержательный пункт без
+    содержания остаётся своим видом и получает `semantic_gap`: сборка
+    зовёт ремонт по контракту."""
     if profile is None:
         return deck
     kinds = {p.kind for p in profile.patterns}
     two_unit_cards = _has_two_unit_card_layout(profile)
-    slides = [
-        (_blockless_as_section(slide, kinds) or slide) if i in keep else _normalize_slide(slide, kinds, two_unit_cards)
-        for i, slide in enumerate(deck.slides)
-    ]
+    invariants = list(invariants or [])
+    slides = []
+    for i, slide in enumerate(deck.slides):
+        held = _held_by_invariant(slide, invariants[i] if i < len(invariants) else None)
+        if held is not None:
+            slides.append(held)
+        elif i in keep:
+            slides.append(_blockless_as_section(slide, kinds) or slide)
+        else:
+            slides.append(_normalize_slide(slide, kinds, two_unit_cards))
     changed = sum(1 for before, after in zip(deck.slides, slides) if before is not after)
     meta = dict(deck.meta)
     if changed:
@@ -91,6 +105,24 @@ def _blockless_as_section(slide: SlideSpec, kinds: set[str]) -> SlideSpec | None
     return replace(slide, kind="section", pattern_id=None, findings=[
         *slide.findings,
         f"Слайд {slide.index}: содержания нет, только заголовок; собран как разделитель.",
+    ])
+
+
+def _held_by_invariant(slide: SlideSpec, invariant) -> SlideSpec | None:
+    """Содержательный пункт без содержания: вид слайда не меняется, слайд
+    помечается `semantic_gap` с причиной для ремонта. `None`: инварианта
+    нет, слайд вправе быть разделителем или содержание есть."""
+    from deckforge.plan.invariants import invariant_problems
+
+    if invariant is None or invariant.may_be_section:
+        return None
+    problems = invariant_problems(slide, invariant)
+    if not problems:
+        return None
+    return replace(slide, semantic_gap=problems[0], findings=[
+        *slide.findings,
+        f"Слайд {slide.index}: содержательный пункт остался без содержания; разделителем не собирается, "
+        "нужен ремонт по контракту.",
     ])
 
 

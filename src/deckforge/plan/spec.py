@@ -199,6 +199,10 @@ class SlideSpec:
     # ступени) и `ladder_rung`
     # (сработавшая). Читает HTML-отчёт: «почему не клон».
     meta: dict[str, str] = field(default_factory=dict)
+    # Смысловой инвариант пункта нарушен (`plan.invariants`, задача V2):
+    # содержательный пункт остался без содержания. Сборка зовёт ремонт по
+    # контракту, а не собирает слайд разделителем. `None`: всё в порядке.
+    semantic_gap: str | None = None
 
 
 @dataclass

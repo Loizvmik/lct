@@ -18,7 +18,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-from deckforge.pattern.forms import PatternForm
+from deckforge.pattern.forms import (
+    MAX_PHOTO_VOID, PatternForm, SlideRequirements, capabilities_of, unmet_requirements,
+)
 from deckforge.pattern.intent import SlideIntent
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 from deckforge.template.patterns import is_fixed_phrase
@@ -164,20 +166,34 @@ def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: i
         # холста пустеет.
         empty_visual = form.has_table or (form.has_image and p.kind in _PICTURE_KINDS)
         checks["visual"] = (block is not None or intent.is_hero) and not empty_visual
+    checks["capabilities"] = not unmet_requirements(
+        SlideRequirements.from_intent(intent), capabilities_of(p, form),
+    )
     return checks
 
 
 # Порядок ослабления: от наименее важного к самому важному. Место
 # финальной и титульной раскладки не ослабляется никогда.
-_RELAX_ORDER = ("units", "form", "visual", "fixed_headline", "headline")
+_RELAX_ORDER = ("units", "capabilities", "form", "visual", "fixed_headline", "headline")
 
 RELAX_TITLES = {
     "units": "единиц содержания больше, чем мест у любой раскладки",
     "form": "в шаблоне нет раскладки нужной формы",
     "visual": "нет места под таблицу, график или фото",
+    "capabilities": "у раскладок нет мест под содержание слайда или остаётся пустота на месте фото примера",
     "fixed_headline": "осталась только раскладка с постоянным заголовком",
     "headline": "осталась только раскладка без заголовка",
 }
+
+
+def sample_photo_fits(intent: SlideIntent, p) -> bool:
+    """Фото примера (`Pattern.photo_area`) клон удаляет, если на его
+    место не ляжет фото слайда. Раскладка годится, только если после
+    удаления пустеет не больше `forms.MAX_PHOTO_VOID` холста (задача V2):
+    «Паттерн + фото» VK Education без своей фотографии это белая половина
+    слайда, а с фотографией примера это чужая девушка в кресле в нашей
+    колоде."""
+    return capabilities_of(p).photo_void(bool(intent.photo)) <= MAX_PHOTO_VOID
 
 
 def candidates_for(

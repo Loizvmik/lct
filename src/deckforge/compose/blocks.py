@@ -558,6 +558,8 @@ def expand_repeat(pattern: Pattern, n: int, grid: Grid) -> list[list[PatternSlot
     repeat = pattern.repeat
     if repeat is None or n <= 0:
         return []
+    if is_grid(pattern):
+        return _grid_units(pattern, n)
     axis = repeat.axis
     members = [s for s in pattern.slots if s.role in repeat.slot_roles]
     if not members:
@@ -638,6 +640,8 @@ def _repeat_unit_coords(pattern: Pattern) -> list[float]:
     repeat = pattern.repeat
     if repeat is None:
         return []
+    if is_grid(pattern):
+        return [float(n) for n in range(len(repeat.units))]
     members = [s for s in pattern.slots if s.role in repeat.slot_roles]
     coord = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
     return sorted({round(coord(s.box), 3) for s in members})
@@ -657,6 +661,12 @@ def filled_repeat_units(pattern: Pattern, contents: list[SlotContent]) -> set[in
     repeat = pattern.repeat
     if repeat is None:
         return set()
+    if is_grid(pattern):
+        return {
+            unit for content in contents
+            if any(p.text.strip() for p in content.paragraphs)
+            for unit in [repeat_unit_index(pattern, content.slot)] if unit is not None
+        }
     coords = _repeat_unit_coords(pattern)
     index_of = {c: i for i, c in enumerate(coords)}
     coord = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
@@ -719,6 +729,13 @@ def expand_decor(
         return _decor_of_filled_units(pattern, grouped, ungrouped, filled)
     if n <= 0:
         return ungrouped
+    if is_grid(pattern):
+        # Сетка ставит единицы на их родные места: первые `n` по обходу.
+        orphan = _grid_unfilled_test(pattern, set(range(n)))
+        return [
+            d for d in pattern.decor
+            if (not d.repeat_group or d.repeat_index < n) and not orphan(d.box)
+        ]
 
     repeat = pattern.repeat
     axis = repeat.axis
@@ -783,6 +800,8 @@ def unfilled_unit_test(
     coords = _repeat_unit_coords(pattern)
     if repeat is None or not coords:
         return lambda box: False
+    if is_grid(pattern):
+        return _grid_unfilled_test(pattern, filled, occupied)
     x_axis = repeat.axis == "x"
 
     def along(b: Box) -> tuple[float, float]:
@@ -822,6 +841,79 @@ def unfilled_unit_test(
             return False
         column = column_of(box)
         return column is not None and column not in taken
+
+    return test
+
+
+def is_grid(pattern: Pattern) -> bool:
+    """Повтор раскладки двумерная сетка с известными единицами (задача V2,
+    `RepeatSpec.units`). У такой сетки колонка одна на несколько единиц, и
+    всё решают id фигур единицы, а не координата вдоль оси."""
+    repeat = pattern.repeat
+    return repeat is not None and bool(getattr(repeat, "is_grid", False))
+
+
+def repeat_unit_index(pattern: Pattern, slot: PatternSlot) -> int | None:
+    """Номер единицы сетки, в которую входит слот (по id фигуры примера),
+    или `None`. Номер совпадает с `DecorShape.repeat_index` декора той же
+    единицы: обход по строкам."""
+    sid = slot.source_shape_id
+    if not sid or pattern.repeat is None:
+        return None
+    return next((n for n, unit in enumerate(pattern.repeat.units) if sid in unit.slot_ids), None)
+
+
+def _grid_units(pattern: Pattern, n: int) -> list[list[PatternSlot]]:
+    """Первые `n` единиц сетки на их родных местах: i-я карточка ложится
+    в i-ю единицу обхода (слева направо, сверху вниз), вместе со своей
+    точкой и подписью. Пересчитывать шаг, как у ряда, нельзя: второй ряд
+    таймлайна сдвинулся бы в первый."""
+    repeat = pattern.repeat
+    by_id = {s.source_shape_id: s for s in pattern.slots if s.source_shape_id and s.role in repeat.slot_roles}
+    return [
+        [by_id[sid] for sid in unit.slot_ids if sid in by_id]
+        for unit in repeat.units[:n]
+    ]
+
+
+def _grid_unfilled_test(
+    pattern: Pattern, filled: set[int], occupied: Iterable[Box] = (),
+) -> Callable[[Box], bool]:
+    """Предикат «коробка принадлежит незаполненной единице сетки»: по
+    id фигур единицы (слоты и декор), не по колонке. Занята единица, если
+    она в `filled` или в её слот лёг текст (`occupied`)."""
+    repeat = pattern.repeat
+    taken = set(filled)
+    occupied = list(occupied)
+    for slot in pattern.slots:
+        if any(slot.box == box for box in occupied):
+            unit = repeat_unit_index(pattern, slot)
+            if unit is not None:
+                taken.add(unit)
+    orphan_boxes: list[Box] = []
+    row_boxes: dict[int, list[Box]] = {}
+    empty_rows = {u.row for u in repeat.units} - {u.row for n, u in enumerate(repeat.units) if n in taken}
+    for n, unit in enumerate(repeat.units):
+        ids = set(unit.slot_ids) | set(unit.decor_shape_ids)
+        boxes = [s.box for s in pattern.slots if s.source_shape_id in ids]
+        boxes += [d.box for d in pattern.decor if d.source_shape_id in ids]
+        row_boxes.setdefault(unit.row, []).extend(boxes)
+        if n not in taken:
+            orphan_boxes += boxes
+    # Ряд сетки, где не заполнено ни одной единицы, уходит целиком, вместе
+    # с оформлением ряда вне единиц: линия таймлайна под пустым вторым
+    # рядом оставалась стрелкой в никуда.
+    bands = [
+        (min(b.top for b in row_boxes[r]) - _UNIT_BAND_TOLERANCE, max(b.bottom for b in row_boxes[r]) + _UNIT_BAND_TOLERANCE)
+        for r in empty_rows if row_boxes.get(r)
+    ]
+    ungrouped = [d.box for d in pattern.decor if not d.repeat_group]
+    for box in ungrouped:
+        if any(lo <= box.top and box.bottom <= hi for lo, hi in bands):
+            orphan_boxes.append(box)
+
+    def test(box: Box) -> bool:
+        return any(box == b for b in orphan_boxes)
 
     return test
 

@@ -18,7 +18,7 @@ from deckforge.pattern.candidates import (
 )
 from deckforge.pattern.forms import PatternForm, forms_of
 from deckforge.pattern.intent import SlideIntent, intents_from_outline, with_dividers
-from deckforge.pattern.scoring import repeat_cost, static_cost
+from deckforge.pattern.scoring import growing_repeat_cost, look_key, static_cost
 from deckforge.pattern.style import StylePolicy, load_style
 
 DEFAULT_BEAM_WIDTH = 20
@@ -72,6 +72,25 @@ class _Beam:
     cost: float
     ids: tuple[str, ...]
     uses: dict[str, int]
+    # Сколько последних слайдов подряд одного облика и одного вида: для
+    # ограничений разнообразия (`StylePolicy.diversity`).
+    look_run: int = 0
+    kind_run: int = 0
+
+
+def _violates(beam: _Beam, look: str, kind: str, previous_look: str | None, previous_kind: str | None,
+              policy: StylePolicy) -> bool:
+    """Нарушит ли раскладка облика `look` и вида `kind` ограничения
+    разнообразия колоды, если поставить её следующей за `beam`."""
+    rules = policy.diversity
+    if beam.uses.get(look, 0) + 1 > rules.same_pattern_max_total:
+        return True
+    run = beam.look_run + 1 if look == previous_look else 1
+    if run > rules.same_pattern_max_consecutive:
+        return True
+    limit = rules.kind_limit(kind)
+    kind_run = beam.kind_run + 1 if kind == previous_kind else 1
+    return limit is not None and kind_run > limit
 
 
 def _has_divider_layout(profile, cover_id: str | None, closing_ids: frozenset[str]) -> bool:
@@ -136,25 +155,40 @@ def plan_patterns(
         per_slide.append(scored)
         relaxed.append(found.relaxed)
 
+    # Повтор считается по облику раскладки, а не по `pattern_id` (задача
+    # V2, `scoring.look_key`): два примера с одной геометрией для глаза одна
+    # раскладка.
+    looks = {pid: look_key(p) for pid, p in patterns.items()}
     beams = [_Beam(cost=0.0, ids=(), uses={})]
     width = max(1, beam_width)
     for scored in per_slide:
         expanded: dict[tuple, _Beam] = {}
         for beam in beams:
-            previous = beam.ids[-1] if beam.ids else None
-            for pid, cost in scored:
-                total = beam.cost + cost + repeat_cost(pid, previous, beam.uses.get(pid, 0), policy)
+            previous = looks[beam.ids[-1]] if beam.ids else None
+            previous_kind = patterns[beam.ids[-1]].kind if beam.ids else None
+            # Ограничения разнообразия: запрет, но только если у этого
+            # слайда есть альтернатива, которая их не нарушает.
+            allowed = [
+                (pid, cost) for pid, cost in scored
+                if not _violates(beam, looks[pid], patterns[pid].kind, previous, previous_kind, policy)
+            ] or scored
+            for pid, cost in allowed:
+                look = looks[pid]
+                kind = patterns[pid].kind
+                total = beam.cost + cost + growing_repeat_cost(look, previous, beam.uses.get(look, 0), policy)
                 uses = dict(beam.uses)
-                uses[pid] = uses.get(pid, 0) + 1
+                uses[look] = uses.get(look, 0) + 1
+                look_run = beam.look_run + 1 if look == previous else 1
+                kind_run = beam.kind_run + 1 if kind == previous_kind else 1
                 ids = (*beam.ids, pid)
                 # Две частичные колоды с одним последним слайдом и одним
                 # набором использованных раскладок дальше неразличимы для
                 # стоимости: оставляется дешёвая, и луч не забивается
                 # перестановками одного и того же.
-                key = (pid, tuple(sorted(uses.items())))
+                key = (look, kind_run, tuple(sorted(uses.items())))
                 kept = expanded.get(key)
                 if kept is None or (total, ids) < (kept.cost, kept.ids):
-                    expanded[key] = _Beam(cost=total, ids=ids, uses=uses)
+                    expanded[key] = _Beam(cost=total, ids=ids, uses=uses, look_run=look_run, kind_run=kind_run)
         beams = sorted(expanded.values(), key=lambda b: (round(b.cost, 9), b.ids))[:width]
 
     best = beams[0]
@@ -163,10 +197,7 @@ def plan_patterns(
         PatternAssignment(
             position=i, intent=intent, pattern_id=pid, kind=patterns[pid].kind,
             cost=round(static[i][pid], 3), relaxed=relaxed[i],
-            alternatives=tuple(
-                other for other, _cost in per_slide[i]
-                if other != pid and patterns[other].kind == patterns[pid].kind
-            )[:MAX_ALTERNATIVES],
+            alternatives=_same_form_alternatives(per_slide[i], pid, patterns, forms),
         )
         for i, (intent, pid) in enumerate(zip(intents, best.ids))
     ]
@@ -192,6 +223,8 @@ def repick_pattern(
     intent = SlideIntent(index=position, outline_kind="context", intent=slide.headline, items=units)
     others = [pid for i, pid in enumerate(ids) if i != position and pid]
     neighbours = {ids[i] for i in (position - 1, position + 1) if 0 <= i <= last and ids[i]}
+    other_looks = {q.pattern_id: look_key(q) for q in profile.patterns}
+    neighbour_looks = {other_looks[pid] for pid in neighbours if pid in other_looks}
     best: tuple[float, str] | None = None
     for p in profile.patterns:
         if p.kind not in kinds:
@@ -204,8 +237,30 @@ def repick_pattern(
             intent, p, forms[p.pattern_id], policy, position=position, last=last,
             cover_id=cover_id, closing_ids=closing_ids,
         )
-        cost += policy.weight("consecutive_repeat") * (p.pattern_id in neighbours)
-        cost += policy.weight("repeated_pattern") * others.count(p.pattern_id)
+        look = look_key(p)
+        cost += policy.weight("consecutive_repeat") * (look in neighbour_looks)
+        uses = sum(1 for other in others if other_looks.get(other) == look)
+        cost += growing_repeat_cost(look, None, uses, policy)
         if best is None or (cost, p.pattern_id) < best:
             best = (cost, p.pattern_id)
     return best[1] if best is not None else None
+
+
+def _same_form_alternatives(
+    scored: list[tuple[str, float]], chosen: str, patterns: dict, forms: dict[str, PatternForm],
+) -> tuple[str, ...]:
+    """Запасные раскладки выбранной: того же вида И той же главной формы
+    (карточки, список, показатели). Одного вида мало: у VK Education вид
+    `image` у диаграммы Ганта (пять карточек) и у «Паттерн + фото» (один
+    абзац). Карточки, написанные под Гант, клон запасной раскладки терял
+    целиком, а в тело ложилась подпись месяца «Май» (задача V2, 27
+    сентября 2026)."""
+    def block(pid: str) -> str | None:
+        main = forms[pid].main
+        return main.block if main is not None else None
+
+    want_kind, want_block = patterns[chosen].kind, block(chosen)
+    return tuple(
+        other for other, _cost in scored
+        if other != chosen and patterns[other].kind == want_kind and block(other) == want_block
+    )[:MAX_ALTERNATIVES]

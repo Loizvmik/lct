@@ -32,13 +32,14 @@ from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import audit_slide_layout, slide_fill_ratio
 from deckforge.compose.blocks import (
     DROPPED_ROLE_TITLES, Paragraph, SlotContent, assign_content, assign_content_with_drops,
-    expand_decor, filled_repeat_units, find_bullet_char, unfilled_unit_test,
+    expand_decor, filled_repeat_units, find_bullet_char, is_grid, repeat_unit_index, unfilled_unit_test,
 )
 from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
     CLONE_MARK_PREFIX, allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
-    inherited_text_color, inherited_text_size, mark_slide, match_slots, native_table, prune_unfilled, remove_in_box,
+    hide_layout_photos, inherited_text_color, inherited_text_size, mark_slide, match_slots, native_table,
+    prune_unfilled, remove_in_box,
     remove_sample_frames, remove_stray_text, replace_picture, sample_slides_by_number,
     set_native_table_geometry, set_shape_box, set_table_text_size, set_text_size, shape_text, slide_refs,
     table_cell_styles, template_row_heights_emu, text_style,
@@ -65,7 +66,7 @@ from deckforge.plan.variants import Variant
 from deckforge.settings import Settings
 from deckforge.template.grid import ColumnAxis, Grid
 from deckforge.template.naming import MIN_CONTRAST
-from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
+from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec, RepeatUnit
 from deckforge.template.typography import fill_scale_gaps
 from deckforge.template.profile import LayoutEntryModel, TemplateProfile
 from deckforge.workflow.versions import manifest as workflow_manifest
@@ -241,7 +242,9 @@ def build_deck(
     while position < len(spec.slides):
         slide_spec = spec.slides[position]
         position += 1
-        candidates = _resolve_pattern(slide_spec, patterns, profile, variant, history)
+        if slide_spec.semantic_gap:
+            _refill_semantic_gap(slide_spec, repair, spec.meta, patterns, profile)
+        candidates = _capable_first(slide_spec, _resolve_pattern(slide_spec, patterns, profile, variant, history), forms)
         if not candidates:
             slide_spec.findings.append(
                 f"Слайд {slide_spec.index}: для kind={slide_spec.kind!r} не нашлось ни одного "
@@ -334,6 +337,10 @@ def place_slide(
         contents, plaques = _align_scattered_units(contents, pattern, grid)
         if plaques:
             decor = [*decor, *plaques]
+    # Фото-образцы примера сборка с нуля не рисует, а фото лейаута
+    # скрывает (задача V2): на чужом слайде это чужое содержание.
+    decor = [d for d in decor if not d.sample_photo]
+    hide_layout_photos(slide, pattern.layout_photo_ids, Canvas(width_emu=canvas_width_emu, height_emu=canvas_height_emu))
     apply_decor(slide, decor, canvas_width_emu, canvas_height_emu, image_bytes)
     # `_local_background_is_dark` ищет охватывающую плашку декора ПОД
     # слотом (см. её докстроку) — обязана видеть УЖЕ развёрнутые позиции
@@ -1303,6 +1310,91 @@ _MAX_LAYOUT_ATTEMPTS = 3
 _MAX_CLONE_ATTEMPTS = 1 + MAX_ALTERNATIVES
 
 
+def _refill_semantic_gap(
+    slide_spec: SlideSpec, repair: "SlideRepair | None", meta: dict, patterns: list[Pattern] = (),
+    profile=None,
+) -> None:
+    """Содержательный пункт остался без содержания (`SlideSpec.semantic_
+    gap`, задача V2): один ремонт по контракту его раскладки, и слайд
+    собирается со своим содержанием. Разделителем он становится только
+    если ремонт невозможен (нет модели, вышло время) или не удался, и это
+    громкая находка, а не тихая смена вида: пустая сетка карточек с одним
+    заголовком читалась бы хуже."""
+    reason = slide_spec.semantic_gap
+    refilled = None
+    if repair is not None and slide_spec.pattern_id:
+        try:
+            refilled = repair.shorten(slide_spec, slide_spec.pattern_id, [reason])
+        except Exception as exc:  # noqa: BLE001: ремонт необязателен, сборка слайда важнее
+            slide_spec.findings.append(f"Слайд {slide_spec.index}: ремонт пустого пункта упал ({type(exc).__name__}).")
+    if refilled is not None and refilled.blocks:
+        _adopt(slide_spec, refilled)
+        slide_spec.semantic_gap = None
+        slide_spec.findings.append(f"Слайд {slide_spec.index}: пустой пункт плана дописан ремонтом по контракту.")
+        meta["semantic_repairs"] = str(int(meta.get("semantic_repairs", "0") or 0) + 1)
+        return
+    meta["semantic_gaps"] = str(int(meta.get("semantic_gaps", "0") or 0) + 1)
+    if not any(p.kind == "section" for p in patterns):
+        # Героических раскладок в шаблоне нет (ЛЦТ2026): слайд остаётся на
+        # своей раскладке с одним заголовком, как и до инварианта.
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: содержательный пункт без содержания, ремонт не удался; "
+            "собран одним заголовком, это брак плана."
+        )
+        return
+    slide_spec.findings.append(
+        f"Слайд {slide_spec.index}: содержательный пункт без содержания, ремонт не удался; "
+        "собран разделителем вынужденно, это брак плана."
+    )
+    slide_spec.kind = "section"
+    # Разделитель посреди колоды не встаёт на обложку и финал «Спасибо за
+    # внимание!»: живой прогон 27 сентября 2026 (visual) собрал три таких
+    # слайда финальной раскладкой. Берутся героические раскладки без
+    # постоянного заголовка, по очереди, чтобы не повторяться.
+    dividers = _divider_layouts(patterns, profile)
+    if dividers:
+        start = slide_spec.index % len(dividers)
+        ordered = dividers[start:] + dividers[:start]
+        slide_spec.pattern_id = ordered[0]
+        slide_spec.alternatives = tuple(ordered[1:])
+    else:
+        slide_spec.pattern_id = None
+        slide_spec.alternatives = ()
+
+
+def _divider_layouts(patterns: list[Pattern], profile) -> list[str]:
+    """Героические раскладки, годные под разделитель посреди колоды: не
+    обложка, не финальная и без постоянного заголовка."""
+    from deckforge.pattern.candidates import cover_pattern_id, has_fixed_headline, is_closing_pattern
+
+    if profile is None:
+        return []
+    cover = cover_pattern_id(profile)
+    return [
+        p.pattern_id for p in patterns
+        if p.kind == "section" and p.pattern_id != cover and not is_closing_pattern(p, profile)
+        and not has_fixed_headline(p)
+    ]
+
+
+def _capable_first(slide_spec: SlideSpec, candidates: list[Pattern], forms: dict) -> list[Pattern]:
+    """Кандидаты, чьи возможности держат написанное содержание, идут
+    первыми, порядок внутри сохраняется (задача V2). Раскладка планировщика
+    обычно и так держит его, но запасные того же вида бывают другой формы:
+    карточки, написанные под диаграмму Ганта, уезжали в «Паттерн + фото» с
+    одним абзацем. Остальные кандидаты не выбрасываются: лучше собрать
+    слайд с находкой, чем не собрать вовсе."""
+    from deckforge.pattern.forms import SlideRequirements, capabilities_of, unmet_requirements
+
+    need = SlideRequirements.from_slide(slide_spec)
+    fits, rest = [], []
+    for pattern in candidates:
+        form = forms.get(pattern.pattern_id)
+        ok = form is None or not unmet_requirements(need, capabilities_of(pattern, form))
+        (fits if ok else rest).append(pattern)
+    return fits + rest
+
+
 def _remove_last_slide(prs) -> None:
     """Убирает ПОСЛЕДНИЙ добавленный слайд из колоды — используется ТОЛЬКО
     `_place_best_candidate`, чтобы откатить отклонённого кандидата раскладки
@@ -1951,6 +2043,10 @@ _AUDIT_DEFAULT_LINE_SPACING = 1.2
 
 _CLONE_PICTURE_ROLES = frozenset({"image", "icon"})
 
+# Роли потерь, при которых клон отклоняется: главный блок слайда не лёг
+# целиком (`blocks._drop`).
+_MAIN_BLOCK_DROPS = frozenset({"cards", "bullets", "kpi"})
+
 # Роли «рамки» слайда: заголовок, подзаголовок, сноска. Слайд, на который
 # легли только они, содержания не несёт.
 _CLONE_FRAME_ROLES = frozenset({"headline", "subhead", "source"})
@@ -2087,6 +2183,12 @@ def place_slide_by_clone(
     grid = _grid_from_model(profile.grid)
 
     contents, drops = assign_content_with_drops(slide_spec, pattern, grid)
+    lost = sorted({d.role for d in drops if d.role in _MAIN_BLOCK_DROPS})
+    if lost:
+        # Главный блок целиком не лёг (карточки на раскладку без повтора):
+        # клон с одной подписью вместо карточек хуже, чем следующий
+        # кандидат (задача V2, airy слайд 3: вместо двух карточек «Май»).
+        return CloneOutcome(f"блоки без места в раскладке: {', '.join(lost)}")
     clean: list[SlotContent] = []
     for content in contents:
         hit = _placeholder_text_hit(content, audit_config)
@@ -2175,9 +2277,12 @@ def place_slide_by_clone(
         {id(_visual_slot(pattern, "image")), id(_visual_slot(pattern, "icon"))}
         if slide_spec.visual is not None and slide_spec.visual.kind in ("photo", "icon") else set()
     )
+    hide_layout_photos(slide, pattern.layout_photo_ids, canvas)
     prune_unfilled(
         slide,
-        [d for d in pattern.decor if id(d) not in kept_ids],
+        # Фото-образец в декоре уходит всегда: фото пользователя ложится
+        # только в место `image` (задача V2).
+        [d for d in pattern.decor if id(d) not in kept_ids or d.sample_photo],
         [
             s for s in pattern.slots
             if id(s) not in bound_slots
@@ -2296,7 +2401,8 @@ def _sample_text_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
         marked = slot.keeps_sample_text or bool(
             slot.sample_text and _ORDINAL_RE.fullmatch(slot.sample_text.strip())
         )
-        if marked and units.index(round(along(slot.box), 3)) in filled:
+        unit = repeat_unit_index(pattern, slot) if is_grid(pattern) else units.index(round(along(slot.box), 3))
+        if marked and unit in filled:
             kept.append(slot)
     return kept
 
@@ -2668,6 +2774,15 @@ def _pattern_from_model(model) -> Pattern:
         repeat = RepeatSpec(
             axis=model.repeat.axis, count=model.repeat.count, step=model.repeat.step,
             slot_roles=list(model.repeat.slot_roles), group_size=model.repeat.group_size,
+            rows=getattr(model.repeat, "rows", 1), cols=getattr(model.repeat, "cols", 0),
+            traversal=getattr(model.repeat, "traversal", "row"),
+            units=[
+                RepeatUnit(
+                    id=u.id, row=u.row, col=u.col, slot_ids=list(u.slot_ids),
+                    decor_shape_ids=list(u.decor_shape_ids),
+                )
+                for u in getattr(model.repeat, "units", None) or []
+            ],
         )
     decor = [
         DecorShape(
@@ -2676,7 +2791,7 @@ def _pattern_from_model(model) -> Pattern:
             repeat_group=d.repeat_group, repeat_index=d.repeat_index,
             image_part=d.image_part, badge_text=d.badge_text,
             badge_size_pt=d.badge_size_pt, badge_color_hex=d.badge_color_hex, prst=d.prst,
-            source_shape_id=d.source_shape_id,
+            source_shape_id=d.source_shape_id, sample_photo=getattr(d, "sample_photo", False),
         )
         for d in model.decor
     ]
@@ -2690,6 +2805,9 @@ def _pattern_from_model(model) -> Pattern:
         layout_id=model.layout_id, kind=model.kind, slots=slots, repeat=repeat, decor=decor,
         capacity=capacity, score=model.score, is_dark=model.is_dark,
         kind_confidence=model.kind_confidence, source_density=model.source_density,
+        photo_frames=getattr(model, "photo_frames", 0), photo_area=getattr(model, "photo_area", 0.0),
+        photo_slot_area=getattr(model, "photo_slot_area", 0.0),
+        layout_photo_ids=list(getattr(model, "layout_photo_ids", []) or []),
     )
 
 
