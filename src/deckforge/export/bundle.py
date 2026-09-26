@@ -14,7 +14,11 @@ profile, out_dir)`) не несёт его вовсе, а `to_html` без со�
 по-прежнему честно строит страницу из самого `.pptx` (см. докстроку
 `export.html`) — просто без мягкой привязки `data-kind` к `SlideSpec.kind`.
 Когда `deck_spec` под рукой (обычный путь вызова из `cli.generate`, где
-план уже есть) — передаётся явно, разметка получается точнее."""
+план уже есть) — передаётся явно, разметка получается точнее.
+
+`budget`/`risky_slides` (задача L) — необязательный снимок бюджета прогона
+и слайдов, ушедших на аудит по картинке; прокидываются буквально в
+`to_html_report` (см. её докстроку), сам экспорт их не читает."""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -49,6 +53,7 @@ class Bundle:
 def export_bundle(
     pptx_path: Path, profile: TemplateProfile, out_dir: Path, *,
     deck_spec: DeckSpec | None = None, preview_dpi: int = DEFAULT_PREVIEW_DPI,
+    budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
 ) -> Bundle:
     pptx_path = Path(pptx_path)
     out_dir = Path(out_dir)
@@ -62,7 +67,10 @@ def export_bundle(
     pngs = to_pngs(pptx_path, out_dir / "preview", dpi=preview_dpi, pdf_path=pdf_path)
 
     spec = deck_spec if deck_spec is not None else DeckSpec(title=pptx_path.stem, language="ru", slides=[])
-    html_result = to_html_report(spec, profile, pptx_path, out_dir / f"{pptx_path.stem}.html")
+    html_result = to_html_report(
+        spec, profile, pptx_path, out_dir / f"{pptx_path.stem}.html",
+        budget=budget, risky_slides=risky_slides,
+    )
 
     return Bundle(
         pptx=pptx_path, pdf=pdf_path, html=html_result.path, pngs=pngs,

@@ -86,6 +86,7 @@ class _Ctx:
 def to_html(
     deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
     *, visual: "VisualAuditResult | AuditReport | None" = None,
+    budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
 ) -> Path:
     """Собирает `out` — единый `.html` без внешних запросов. Возвращает `out`
     (интерфейс брифа); подробности деградаций — `to_html_report` ниже, для
@@ -96,13 +97,22 @@ def to_html(
     VisualAuditResult` или уже сведённый `audit.report.AuditReport`);
     `None` (по умолчанию) держит старое поведение буквально — экспорт не
     обязан знать про аудит, чтобы работать (интерфейс брифа Task 14 старше
-    самих оценок, см. докстроку `_extract_visual_scores`)."""
-    return to_html_report(deck_spec, profile, pptx_path, out, visual=visual).path
+    самих оценок, см. докстроку `_extract_visual_scores`).
+
+    `budget`/`risky_slides` — задача L: снимок `workflow.budget.RunBudget.
+    summary()` и `workflow.visual_stage.VisualStageOutcome.summary()["risk"]`
+    (позиция слайда -> {technical, semantic, total}), тоже необязательные —
+    отчёт без бюджета (например, вызов из старого кода/теста) остаётся
+    рабочим, просто без блока режима."""
+    return to_html_report(
+        deck_spec, profile, pptx_path, out, visual=visual, budget=budget, risky_slides=risky_slides,
+    ).path
 
 
 def to_html_report(
     deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
     *, visual: "VisualAuditResult | AuditReport | None" = None,
+    budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
 ) -> HtmlExportResult:
     pptx_path = Path(pptx_path)
     out = Path(out)
@@ -138,6 +148,7 @@ def to_html_report(
     document = _wrap_document(
         deck_spec, profile, canvas, slides_html, fonts_css,
         deck_score=deck_score, content_avg=content_avg, design_avg=design_avg,
+        budget=budget, risky_slides=risky_slides,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(document, encoding="utf-8")
@@ -1003,9 +1014,37 @@ def _deck_score_html(deck_score: dict | None, content_avg: float | None, design_
     return f'<div id="deck-score"{title_attr}>PPTEval: {_esc(", ".join(parts))}</div>'
 
 
+def _run_budget_html(budget: dict | None, risky_slides: dict[int, dict] | None) -> str:
+    """Задача L: режим прогона, секунды по стадиям и слайды, ушедшие на
+    аудит по картинке (с обоими рисками) — тот же принцип честной
+    видимости, что и у `_deck_score_html` (пустая строка, если бюджета нет,
+    не только CSS прячет отсутствующее)."""
+    if not budget:
+        return ""
+    mode = budget.get("mode")
+    if not mode:
+        return ""
+    checkpoint = budget.get("mode_checkpoint")
+    stage_seconds = budget.get("stage_seconds") or {}
+    stages_txt = ", ".join(f"{name} {seconds:.0f}с" for name, seconds in stage_seconds.items())
+    mode_txt = f"режим {mode}" + (f" (точка «{checkpoint}»)" if checkpoint else "")
+
+    risky_txt = ""
+    if risky_slides:
+        items = sorted(risky_slides.items(), key=lambda kv: int(kv[0]))
+        risky_txt = "; аудит по картинке: " + ", ".join(
+            f"слайд {pos} (техн. {risk['technical']:.1f}, смысл. {risk['semantic']:.1f})"
+            for pos, risk in items
+        )
+
+    text = mode_txt + ((" · " + stages_txt) if stages_txt else "") + risky_txt
+    return f'<div id="run-budget">{_esc(text)}</div>'
+
+
 def _wrap_document(
     deck_spec: DeckSpec, profile: TemplateProfile, canvas: Canvas, slides_html: list[str], fonts_css: str,
     *, deck_score: dict | None = None, content_avg: float | None = None, design_avg: float | None = None,
+    budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
 ) -> str:
     width_px = round(canvas.width_in * 96)
     height_px = round(canvas.height_in * 96)
@@ -1014,6 +1053,7 @@ def _wrap_document(
     n_slides = len(slides_html)
     lang = (deck_spec.language or "ru")[:2]
     deck_score_html = _deck_score_html(deck_score, content_avg, design_avg)
+    run_budget_html = _run_budget_html(budget, risky_slides)
 
     return f"""<!DOCTYPE html>
 <html lang="{_esc(lang)}">
@@ -1077,6 +1117,16 @@ body.overview .slide-notes {{ display: none !important; }}
   padding: 4px 10px; border-radius: 999px;
 }}
 body.overview #deck-score {{ display: block; }}
+/* Задача L: режим прогона/секунды по стадиям/слайды на аудите по картинке
+   — под бейджем PPTEval, тем же приёмом (видим только в обзоре, пуст, если
+   бюджет не передан). */
+#run-budget {{
+  display: none; position: fixed; left: 16px; top: 44px; z-index: 10;
+  max-width: min(70vw, 640px);
+  font: 12px var(--font-fallback); color: #fff; background: rgba(0,0,0,.55);
+  padding: 4px 10px; border-radius: 12px;
+}}
+body.overview #run-budget {{ display: block; }}
 .block {{ position: absolute; }}
 .text-frame {{ position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-start; }}
 .text-frame p, .text-frame li {{ margin: 0 0 .25em 0; padding: 0; }}
@@ -1128,7 +1178,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 }}
 @media print {{
   html, body {{ background: #fff; }}
-  #hud, #help, #deck-score {{ display: none !important; }}
+  #hud, #help, #deck-score, #run-budget {{ display: none !important; }}
   body.overview #grid {{ display: none !important; }}
   #viewport {{ position: static; display: block; }}
   #stage {{ display: none; }}
@@ -1146,6 +1196,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 {slides_joined}
 </div></div>
 {deck_score_html}
+{run_budget_html}
 <div id="grid"></div>
 <div class="print-pages" aria-hidden="true">
 {slides_joined}
