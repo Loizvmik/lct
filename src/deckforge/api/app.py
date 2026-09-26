@@ -66,6 +66,7 @@ def _variant_summary(store: JobStore, state: VariantState) -> schemas.VariantSum
         preview_pngs=[_png_url(store, p) for p in state.preview_pngs],
         findings=findings, by_severity=by_severity, by_check=by_check,
         autofixed_count=state.autofixed_count,
+        content_avg=state.content_avg, design_avg=state.design_avg,
     )
 
 

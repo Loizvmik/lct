@@ -156,16 +156,32 @@ def test_stage_runs_on_top_risky_slides_within_budget(tmp_path: Path):
     budget, outcome, rendered = _stage(tmp_path, _Clock(), vlm)
     assert outcome.result is not None
     assert [pos for pos, _tech, _sem in outcome.picked] == [5, 1]  # с нуля + critical, затем с нуля
+    # Задача M: коллаж C09/C11 всей колоды едет ВМЕСТЕ с рискованными
+    # слайдами (`deck_level=True`) — на `_FakeVision` он не даёт находок
+    # (её C01-ответ "нет" не входит в DECK_LEVEL_CHECK_IDS), но слайд-индекс
+    # `None` (коллаж) должен быть среди позиций, по которым модель отвечала.
     assert {f.slide_index for f in outcome.findings} == {1, 5}
     assert rendered == [1]
     assert "visual_audit" in budget.stage_seconds
     assert outcome.summary()["ran"] is True
 
 
-def test_stage_batch_mode_uses_single_call(tmp_path: Path):
+def test_stage_asks_deck_level_questions_once_per_variant(tmp_path: Path):
+    """Задача M: вопросы уровня колоды (C09/C11) идут одним отдельным
+    вызовом сверх рискованных слайдов — 2 рискованных слайда + 1 коллаж =
+    3 вызова модели, не 2."""
+    vlm = _FakeVision()
+    _budget, outcome, _ = _stage(tmp_path, _Clock(), vlm)
+    assert outcome.result is not None
+    assert outcome.result.model_calls == 3
+
+
+def test_stage_batch_mode_asks_deck_level_too(tmp_path: Path):
     vlm = _FakeVision()
     _budget, outcome, _ = _stage(tmp_path, _Clock(), vlm, batch=True)
-    assert outcome.result is not None and outcome.result.model_calls == 1
+    # Пачка: один вызов на ВСЕ рискованные слайды разом + один на коллаж
+    # C09/C11 (задача M) = 2, не 1.
+    assert outcome.result is not None and outcome.result.model_calls == 2
     assert outcome.batch is True
 
 
@@ -184,3 +200,40 @@ def test_stage_without_model_reports_reason(tmp_path: Path):
     assert outcome.result is None
     assert "модель" in outcome.skipped_reason
     assert rendered == []
+
+
+def test_stage_lock_prevents_lost_updates_on_shared_budget(tmp_path: Path):
+    """Задача M: три варианта зовут `run_visual_stage` параллельно на ОБЩИЙ
+    `budget` (`api.jobs._visual_audit_variants`) — без общего `lock`
+    `budget.record`/`budget.skipped` внутри `_done` теряют обновления
+    (read-modify-write из нескольких потоков разом). Здесь это же
+    воспроизведено напрямую: N потоков, один и тот же `budget`, общий лок —
+    сумма секунд стадии обязана сойтись, а не оказаться меньше."""
+    modes = {
+        RunMode.FULL: ModeSpec(min_remaining=0, rerank=True, visual_audit_max_slides=2),
+        RunMode.FAST: ModeSpec(min_remaining=0, rerank=False, visual_audit_max_slides=1),
+        RunMode.EMERGENCY: ModeSpec(min_remaining=0, rerank=False, visual_audit_max_slides=0),
+    }
+    budget = RunBudget.from_policy(BudgetPolicy(budget_seconds=300, modes=modes, visual_audit_min_risk=1.0))
+    budget.decide_mode("after_compose")
+    lock = threading.Lock()
+    n = 8
+
+    def run_one(i: int) -> None:
+        vlm = _FakeVision()
+        run_visual_stage(
+            budget, _spec(3, from_scratch=set()),
+            [Finding(check_id="L03", severity="critical", slide_index=0, shape_ref=None, message="m",
+                     box=None, fixable=True, fix_hint="h")],
+            vlm, lambda: _pngs(tmp_path, 3), lock=lock,
+        )
+
+    threads = [threading.Thread(target=run_one, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # `record()` копит секунды (не перезаписывает) — при N успешных прогонах
+    # без потерянных обновлений `stage_seconds["visual_audit"]` есть и не
+    # ушёл в отрицательное/нулевое значение молчаливой потерей записи.
+    assert budget.stage_seconds.get("visual_audit", 0.0) > 0.0

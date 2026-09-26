@@ -33,7 +33,13 @@
 # 1.7.0 -> 1.8.0: задача L (режимы прогона вместо решений «на лету») —
 # `run.rerank_min_remaining`/`run.visual_audit_min_remaining`/`run.visual_
 # audit_max_slides` заменены таблицей `run.modes` (FULL/FAST/EMERGENCY).
-version: 1.8.0
+# 1.8.0 -> 1.9.0: задача M (аудит по картинке для каждого варианта, не
+# только dense) — `run.modes.full.visual_audit_max_slides` 4 -> 8,
+# `run.modes.fast.visual_audit_max_slides` 2 -> 4: раз аудит теперь идёт по
+# трём вариантам параллельно, а не последовательно по одному, бюджет на
+# вариант можно расширить (см. `workflow.visual_stage`/`api.jobs.
+# _visual_audit_variants`).
+version: 1.9.0
 
 llm:
   provider: yandex
@@ -203,20 +209,24 @@ run:
     # Хватает на весь rerank-шаг (сам ограничен 40с, `llm.pattern_picker_
     # step_budget_seconds`) плюс сборка трёх вариантов, аудит и экспорт
     # (~40-60с по замерам) — те же 120, что раньше были порогом `rerank_
-    # min_remaining`. Аудит по картинке — до 4 самых рискованных слайдов.
+    # min_remaining`. Аудит по картинке — до 8 самых рискованных слайдов
+    # (задача M: три варианта проверяются ПАРАЛЛЕЛЬНО, не по очереди, так
+    # что бюджет на один вариант можно расширить вдвое против прежних 4 —
+    # см. живой замер задачи M, `docs/ARCHITECTURE.md`).
     full:
       min_remaining: 120
       rerank: true
-      visual_audit_max_slides: 4
+      visual_audit_max_slides: 8
     # Времени в обрез: rerank раскладок не идёт (см. докстроку `ModeSpec.
     # rerank` — почему не «частичный», а пропуск). Аудит по картинке
-    # (17-46с звонок, замер `audit/visual.py`) — до 2 слайдов, тот же
+    # (17-46с звонок, замер `audit/visual.py`) — до 4 слайдов (задача M:
+    # вдвое больше прежних 2, той же логикой, что и FULL выше), тот же
     # порог 75, что раньше был `visual_audit_min_remaining` (один вызов с
     # запасом на обязательные стадии после).
     fast:
       min_remaining: 75
       rerank: false
-      visual_audit_max_slides: 2
+      visual_audit_max_slides: 4
     # Меньше 75с осталось — только обязательные стадии, лишь бы получить
     # файл. `min_remaining: 0` — запасной вариант, если остаток уже
     # отрицательный (бюджет превышен).

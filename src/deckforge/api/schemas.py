@@ -77,6 +77,12 @@ class VariantSummary(BaseModel):
     by_severity: dict[str, int]
     by_check: dict[str, int]
     autofixed_count: int
+    # Задача M: средние оценки PPTEval (content/design) этого варианта,
+    # если аудит по картинке прошёл и прислал хоть одну валидную оценку
+    # (`audit.visual._axis_average`) — `None`, если нет (аудит не пошёл,
+    # или модель не оценила ни один слайд).
+    content_avg: float | None = None
+    design_avg: float | None = None
 
 
 class FixRequest(BaseModel):

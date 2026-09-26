@@ -87,6 +87,17 @@ export default function VariantsPage() {
                     Автопочинка уже применила {variant.autofixed_count} исправлений.
                   </p>
                 )}
+                {(variant.content_avg != null || variant.design_avg != null) && (
+                  <p className="muted" style={{ fontSize: 12 }}>
+                    Оценка модели:{" "}
+                    {[
+                      variant.content_avg != null && `содержание ${variant.content_avg.toFixed(1).replace(".", ",")}`,
+                      variant.design_avg != null && `дизайн ${variant.design_avg.toFixed(1).replace(".", ",")}`,
+                    ]
+                      .filter(Boolean)
+                      .join(" / ")}
+                  </p>
+                )}
                 <div className="row-actions" style={{ marginTop: "auto" }}>
                   <Link className="button" href={`/decks/${params.jobId}/audit?variant=${variant.variant}`}>
                     Аудит и починка ({totalFindings})

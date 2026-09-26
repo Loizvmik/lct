@@ -53,13 +53,19 @@ export interface JobResponse {
     stage_seconds: Record<string, number>;
     skipped: Record<string, string>;
   } | null;
-  visual_audit?: {
-    ran: boolean;
-    skipped_reason: string | null;
-    slides?: number[];
-    findings?: number;
-    seconds?: number;
-  } | null;
+  // Задача M: сводка аудита по картинке — по КАЖДОМУ варианту (ключ —
+  // имя варианта), не одна на всю колоду, как было, пока аудитом
+  // накрывали только dense.
+  visual_audit?: Record<
+    string,
+    {
+      ran: boolean;
+      skipped_reason: string | null;
+      slides?: number[];
+      findings?: number;
+      seconds?: number;
+    }
+  > | null;
 }
 
 export interface FindingBox {
@@ -89,6 +95,10 @@ export interface VariantSummary {
   by_severity: Record<string, number>;
   by_check: Record<string, number>;
   autofixed_count: number;
+  // Задача M: средние оценки PPTEval (content/design) этого варианта —
+  // отсутствуют, пока аудит по картинке не прошёл или ничего не оценил.
+  content_avg?: number | null;
+  design_avg?: number | null;
 }
 
 export interface FixResponse {

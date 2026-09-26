@@ -66,12 +66,22 @@ def budget_job(client: TestClient, template_id: str, store, fake_vlm: _FakeVisio
 
 
 def test_pipeline_with_fake_model_runs_visual_audit(budget_job, fake_vlm: _FakeVision, client: TestClient):
+    """Задача M: аудит по картинке идёт по КАЖДОМУ варианту, не только
+    dense — `visual_audit` в снимке задания теперь словарь `{вариант:
+    сводка}`, и находки модели должны найтись в отчёте каждого из трёх."""
     snapshot, job = budget_job
     assert snapshot["status"] == "done", snapshot
     visual = snapshot["visual_audit"]
-    assert visual["ran"] is True, visual
-    assert 1 <= len(visual["slides"]) <= 3
-    assert fake_vlm.calls == len(visual["slides"])  # без коллажа C09/C11 и без повторов
+    assert set(visual) == {"dense", "airy", "visual"}, visual
+
+    expected_calls = 0
+    for name, summary in visual.items():
+        assert summary["ran"] is True, summary
+        assert 1 <= len(summary["slides"]) <= 3
+        # Один вызов на рискованный слайд плюс один на коллаж C09/C11
+        # колоды (задача M: вопросы уровня колоды теперь идут и здесь).
+        expected_calls += len(summary["slides"]) + 1
+    assert fake_vlm.calls == expected_calls
 
     budget = snapshot["budget"]
     for stage in ("parse", "outline", "write", "compose", "audit", "export", "visual_audit"):
@@ -83,19 +93,22 @@ def test_pipeline_with_fake_model_runs_visual_audit(budget_job, fake_vlm: _FakeV
     assert budget["mode_checkpoint"] == "after_compose", budget
     assert [entry["mode"] for entry in budget["mode_history"]] == ["full", "full"]
 
-    # Находки модели лежат в том же отчёте варианта dense, что и детерминированные.
+    # Находки модели лежат в отчёте КАЖДОГО варианта — не только dense.
     variants = client.get(f"/api/decks/{snapshot['deck_id']}/variants").json()
-    dense = next(v for v in variants if v["variant"] == "dense")
-    c08 = [f for f in dense["findings"] if f["check_id"] == "C08"]
-    assert {f["slide_index"] for f in c08} == set(visual["slides"])
-    assert len(job.variants["dense"].visual_findings) == len(c08)
-    # Находки модели есть только у варианта, по которому шёл аудит.
-    for other in variants:
-        if other["variant"] != "dense":
-            assert not any(f["check_id"] == "C08" for f in other["findings"])
+    for entry in variants:
+        name = entry["variant"]
+        c08 = [f for f in entry["findings"] if f["check_id"] == "C08"]
+        assert {f["slide_index"] for f in c08} == set(visual[name]["slides"]), (name, entry["findings"])
+        assert len(job.variants[name].visual_findings) == len(c08)
+        # Задача G/M: оценки PPTEval сводки этого варианта тоже посчитаны.
+        assert entry["content_avg"] == pytest.approx(3.0)
+        assert entry["design_avg"] == pytest.approx(3.0)
 
 
 def test_visual_audit_skipped_when_budget_exhausted(budget_job, fake_vlm: _FakeVision):
+    """Задача M: `_visual_audit_variants` пропускает КАЖДЫЙ вариант с одной
+    и той же причиной (режим), не только dense — и не роняет общий
+    `budget.skipped` гонкой между тремя параллельными вызовами."""
     _snapshot, job = budget_job
     calls_before = fake_vlm.calls
 
@@ -111,8 +124,10 @@ def test_visual_audit_skipped_when_budget_exhausted(budget_job, fake_vlm: _FakeV
     job.budget.decide_mode("after_compose")
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(jobs, "_build_visual_auditor", lambda: fake_vlm)
-        asyncio.run(jobs._visual_audit_dense(job, job.profile, []))
+        asyncio.run(jobs._visual_audit_variants(job, job.profile, []))
     assert fake_vlm.calls == calls_before
-    assert job.visual_audit["ran"] is False
-    assert "осталось" in job.visual_audit["skipped_reason"]
+    assert set(job.visual_audit) == {"dense", "airy", "visual"}
+    for summary in job.visual_audit.values():
+        assert summary["ran"] is False
+        assert "осталось" in summary["skipped_reason"]
     assert "visual_audit" in job.budget.skipped

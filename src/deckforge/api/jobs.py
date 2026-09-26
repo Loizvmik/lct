@@ -22,6 +22,7 @@ import asyncio
 import json
 import hashlib
 import shutil
+import threading
 import zipfile
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -183,6 +184,12 @@ class VariantState:
     # ручной починки (`fix_deck`) детерминированный аудит пересчитывается, а
     # модель заново не спрашивают, и её находки иначе бы пропали.
     visual_findings: list[Finding] = field(default_factory=list)
+    # Задача M: средние оценки PPTEval (content/design) ЭТОГО варианта —
+    # `None`, пока аудит по картинке не прошёл или не прислал ни одной
+    # валидной оценки (см. `audit.visual._axis_average`). Нужны сводке
+    # вариантов (`VariantSummary`), не только HTML-отчёту.
+    content_avg: float | None = None
+    design_avg: float | None = None
 
     def set_findings(self, findings: list[Finding]) -> None:
         self.findings = findings + self.visual_findings
@@ -202,9 +209,11 @@ class JobRecord:
     variants: dict[str, VariantState] = field(default_factory=dict)
     # Бюджет прогона (`workflow.budget.RunBudget`): его же часы меряют
     # секунды каждой стадии для интерфейса и лога. `visual_audit`:
-    # сводка стадии аудита по картинке (`VisualStageOutcome.summary`).
+    # сводка стадии аудита по картинке (`VisualStageOutcome.summary`) ПО
+    # КАЖДОМУ варианту (задача M) — `{вариант: сводка}`, не одна сводка на
+    # всю колоду, как было, пока аудитом накрывали только dense.
     budget: RunBudget | None = None
-    visual_audit: dict | None = None
+    visual_audit: dict[str, dict] | None = None
     _subscribers: list[asyncio.Queue] = field(default_factory=list)
     _stage_started: float | None = None
 
@@ -462,7 +471,7 @@ async def _run_job(
                     tg.create_task(_audit_then_export(variant.value))
 
         job.close_stage()
-        await _visual_audit_dense(job, profile, source_docs)
+        await _visual_audit_variants(job, profile, source_docs)
         job.finish()
     except* Exception as eg:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
         # не остаться молчаливым "running" навсегда
@@ -499,14 +508,40 @@ async def _audit_variant(job: JobRecord, variant_name: str, profile: TemplatePro
     state.set_findings(findings)
 
 
-async def _visual_audit_dense(job: JobRecord, profile: TemplateProfile, sources: list[SourceDoc]) -> None:
-    """Аудит по картинке рискованных слайдов варианта dense, если бюджет
-    прогона позволяет (`workflow.visual_stage`). Превью уже отрисованы
-    экспортом. Находки ложатся в тот же список, что и детерминированные;
-    HTML-отчёт dense перерисовывается с оценками модели. Любой сбой здесь
-    не роняет готовую колоду: стадия необязательная."""
-    state = job.variants.get(Variant.dense.value)
-    if state is None or job.budget is None:
+async def _visual_audit_variants(job: JobRecord, profile: TemplateProfile, sources: list[SourceDoc]) -> None:
+    """Аудит по картинке КАЖДОГО варианта (задача M), не только dense, как
+    было до неё: содержание у трёх вариантов одно, но вёрстка разная, и
+    вопросы уровня колоды (C09/C11, теперь и в этой стадии — см.
+    `workflow.visual_stage`) читают именно её. Три варианта идут
+    ПАРАЛЛЕЛЬНО (тот же приём, что `_compose_variant`/`_audit_variant` в
+    `TaskGroup` выше), а не по очереди — иначе стадия тратила бы втрое
+    больше бюджета (задача H), чем при одном варианте."""
+    if job.budget is None:
+        return
+    job.visual_audit = {}
+    # Общий бюджет прогона у всех трёх вариантов один и тот же объект —
+    # `run_visual_stage` пишет в него секунды стадии (`budget.record`) из
+    # разных потоков (`asyncio.to_thread`) одновременно; без общего лока
+    # это гонка на `stage_seconds[...] += ...` (см. докстроку `lock` у
+    # `run_visual_stage`).
+    lock = threading.Lock()
+    async with asyncio.TaskGroup() as tg:
+        for variant in Variant:
+            if variant.value in job.variants:
+                tg.create_task(_visual_audit_one_variant(job, variant.value, profile, sources, lock))
+
+
+async def _visual_audit_one_variant(
+    job: JobRecord, variant_name: str, profile: TemplateProfile, sources: list[SourceDoc],
+    lock: threading.Lock,
+) -> None:
+    """Один вариант — см. докстроку `_visual_audit_variants`. Находки
+    ложатся в тот же список, что и детерминированные; HTML-отчёт варианта
+    перерисовывается с оценками модели. Сбой ЭТОГО варианта не роняет
+    готовую колоду и не задевает соседние (своя задача `TaskGroup`, свой
+    `try`, не общий на всех три сразу)."""
+    state = job.variants.get(variant_name)
+    if state is None:
         return
     try:
         deterministic = [f for f in state.findings if f not in state.visual_findings]
@@ -514,20 +549,22 @@ async def _visual_audit_dense(job: JobRecord, profile: TemplateProfile, sources:
             run_visual_stage, job.budget, state.deck_spec, deterministic,
             _build_visual_auditor(),
             lambda: list(state.preview_pngs), sources=sources,
-            autofixed_slides=state.autofixed_slides,
+            autofixed_slides=state.autofixed_slides, pptx_path=state.pptx_path, lock=lock,
         )
     except Exception as exc:  # noqa: BLE001: необязательная стадия не вправе ронять готовую колоду
-        job.visual_audit = {"ran": False, "skipped_reason": f"аудит по картинке упал: {exc}"}
+        job.visual_audit[variant_name] = {"ran": False, "skipped_reason": f"аудит по картинке упал: {exc}"}
         return
     summary = outcome.summary()
-    job.visual_audit = summary
+    job.visual_audit[variant_name] = summary
     if outcome.result is not None:
         state.visual_findings = outcome.findings
         state.set_findings(deterministic)
-    # HTML dense-варианта перерисовывается в любом случае (не только когда
-    # модель реально ответила): итоговый снимок бюджета (стадия visual_audit
-    # уже посчитана `run_visual_stage`) и причина пропуска, если аудит не
-    # пошёл, тоже часть отчёта задачи L, не только оценки модели.
+        state.content_avg = outcome.result.content_avg
+        state.design_avg = outcome.result.design_avg
+    # HTML варианта перерисовывается в любом случае (не только когда модель
+    # реально ответила): итоговый снимок бюджета (стадия visual_audit уже
+    # посчитана `run_visual_stage`) и причина пропуска, если аудит не пошёл,
+    # тоже часть отчёта задачи L, не только оценки модели.
     if state.html_path is not None:
         try:
             await asyncio.to_thread(

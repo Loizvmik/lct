@@ -116,8 +116,10 @@ def test_load_policy_reads_run_section(tmp_path: Path):
     app_yaml = Path("config/app.yaml")
     policy = load_policy(app_yaml)
     assert policy.budget_seconds == 300
-    assert policy.modes[RunMode.FULL] == ModeSpec(min_remaining=120, rerank=True, visual_audit_max_slides=4)
-    assert policy.modes[RunMode.FAST] == ModeSpec(min_remaining=75, rerank=False, visual_audit_max_slides=2)
+    # Задача M: 4 -> 8 / 2 -> 4 (аудит по картинке теперь идёт по трём
+    # вариантам параллельно, не по одному dense — см. `config/app.yaml`).
+    assert policy.modes[RunMode.FULL] == ModeSpec(min_remaining=120, rerank=True, visual_audit_max_slides=8)
+    assert policy.modes[RunMode.FAST] == ModeSpec(min_remaining=75, rerank=False, visual_audit_max_slides=4)
     assert policy.modes[RunMode.EMERGENCY] == ModeSpec(min_remaining=0, rerank=False, visual_audit_max_slides=0)
 
 
