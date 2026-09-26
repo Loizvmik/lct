@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 
 from deckforge.pattern.forms import MIN_HEADLINE_CHARS, FormPart, Limit, list_item_limit, pattern_form
 from deckforge.pattern.style import load_style
+from deckforge.template.patterns import CHART_TIER_TEXT
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 
 _WORD_RE = re.compile(r"\S+")
@@ -119,6 +120,12 @@ class SlideContract:
     # Запасные раскладки планировщика (`PatternAssignment.alternatives`):
     # писатель их не видит, они едут со слайдом до сборки.
     alternatives: tuple[str, ...] = ()
+    # Задача V1: данные графика или таблицы из источника
+    # (`data_types.VisualIntent.payload`): писатель переносит их в
+    # `visual` как есть и пишет подписи и вывод, запасной слайд строит
+    # визуал по ним без модели. `visual_reason`: почему визуал нужен.
+    visual_data: dict | None = None
+    visual_reason: str | None = None
 
     @property
     def is_divider(self) -> bool:
@@ -139,6 +146,10 @@ class SlideContract:
             out["subhead"] = {**self.subhead.to_dict(), "required": False}
         if self.required_visual in ("table", "chart"):
             out["visual"] = {"type": self.required_visual, **self.visual_limits}
+            if self.visual_data is not None:
+                out["visual"]["data"] = self.visual_data
+            if self.visual_reason:
+                out["visual"]["reason"] = self.visual_reason
         if self.target_density is not None:
             out["target_density"] = self.target_density
         return out
@@ -204,6 +215,31 @@ def _content_slots(intent, form) -> list[SlotContract]:
     return [_slot(main, count)] + [_slot(extra, 1, required=False) for extra in extras]
 
 
+def _matching_visual_intent(intent):
+    """Визуал слоя данных, если он того же вида, что визуал контракта."""
+    vi = getattr(intent, "visual_intent", None)
+    if vi is None or intent.required_visual not in ("table", "chart") or vi.type != intent.required_visual:
+        return None
+    return vi
+
+
+def _visual_data(intent) -> dict | None:
+    vi = _matching_visual_intent(intent)
+    return vi.payload() if vi is not None else None
+
+
+def _visual_reason(intent) -> str | None:
+    vi = _matching_visual_intent(intent)
+    return vi.reason if vi is not None else None
+
+
+def _chart_takes_main(intent, form) -> bool:
+    """График встаёт на главное текстовое место раскладки (у неё нет ни
+    родного графика, ни картинки-графика): писать туда нечего, пункты
+    легли бы под график."""
+    return intent.required_visual == "chart" and form is not None and form.chart_tier == CHART_TIER_TEXT
+
+
 def build_contract(assignment, profile, style=None) -> SlideContract:
     """Контракт одного слайда из назначения планировщика."""
     intent = assignment.intent
@@ -224,7 +260,7 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
         pattern_id=assignment.pattern_id,
         kind=assignment.kind,
         headline=_headline_spec(form),
-        slots=tuple(_content_slots(intent, form)) if not intent.divider else (),
+        slots=tuple(_content_slots(intent, form)) if not intent.divider and not _chart_takes_main(intent, form) else (),
         subhead=TextSpec.of(form.subhead) if form is not None and form.subhead is not None and not intent.divider else None,
         evidence=tuple(intent.needs),
         required_visual=intent.required_visual,
@@ -236,6 +272,8 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
         photo_caption=intent.photo_caption,
         gap_note=assignment.gap_note(),
         alternatives=tuple(getattr(assignment, "alternatives", ()) or ()),
+        visual_data=_visual_data(intent),
+        visual_reason=_visual_reason(intent),
     )
 
 

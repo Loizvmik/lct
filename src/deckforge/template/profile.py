@@ -39,6 +39,8 @@ from deckforge.render.soffice import RenderError, to_pngs
 from deckforge.settings import Settings
 from deckforge.template.assets import AssetCatalog, AssetRef, Placement, build_asset_catalog
 from deckforge.template.chart_palette import build_chart_series
+from deckforge.template.chart_rules import ChartRules, find_chart_rules
+from deckforge.template.prototypes import ChartStylePrototype, classify_slides, find_chart_prototypes
 from deckforge.template.grid import ColumnAxis, Grid, build_grid
 from deckforge.template.layouts import Background, LayoutEntry, PlaceholderSlot, build_layout_catalog
 from deckforge.template.naming import PaletteNote, name_palette_roles_report
@@ -248,7 +250,10 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # по своему ключу, который тоже перестаёт совпадать).
 # Детерминированная версия 2, а не 1: `source_density` паттерна (задача R)
 # снимается детерминированно и влилась одновременно с разделением кеша.
-DETERMINISTIC_SCHEMA_VERSION = 2
+# 2 -> 3: `PatternSlot.chart_frame` (картинка примера сама график) и
+# `chart_rules` (правила оформления диаграмм, которые шаблон пишет текстом),
+# оба снимаются без модели; старый кеш отдал бы их пустыми молча.
+DETERMINISTIC_SCHEMA_VERSION = 3
 MODEL_SCHEMA_VERSION = 1
 PROFILE_SCHEMA_VERSION = DETERMINISTIC_SCHEMA_VERSION * 1000 + MODEL_SCHEMA_VERSION
 
@@ -539,6 +544,50 @@ class PatternSlotModel(BaseModel):
     # source_shape_id`). `None`: старый кеш или фигура без id, клон тогда
     # ищет фигуру по коробке.
     source_shape_id: str | None = None
+    # Картинка примера сама изображает график (`patterns.PatternSlot.
+    # chart_frame`): рамка под наш график того же размера.
+    chart_frame: bool = False
+
+
+class ChartRulesModel(BaseModel):
+    """Зеркало `chart_rules.ChartRules`: правила оформления диаграмм,
+    снятые с текста слайдов шаблона. Пустое: шаблон о них молчит."""
+    overlap: int | None = None
+    gap_width: int | None = None
+    no_gridlines: bool = False
+    data_labels: bool = False
+    source_slide: int | None = None
+
+
+def _chart_rules_model(rules: ChartRules) -> ChartRulesModel:
+    return ChartRulesModel(
+        overlap=rules.overlap, gap_width=rules.gap_width, no_gridlines=rules.no_gridlines,
+        data_labels=rules.data_labels, source_slide=rules.source_slide,
+    )
+
+
+class ChartStylePrototypeModel(BaseModel):
+    """Зеркало `prototypes.ChartStylePrototype`: образец графика со слайда
+    шаблона (рамка, вид, палитра с картинки, правила оформления)."""
+    source_slide: int
+    frame_box: BoxModel
+    pattern_id: str | None = None
+    chart_type: str | None = None
+    palette: list[str] = []
+    gridlines: bool = True
+    show_values: bool = False
+    gap_width: int | None = None
+    overlap: int | None = None
+    axis_style: str = "axes"
+
+
+def _chart_prototype_model(proto: ChartStylePrototype) -> ChartStylePrototypeModel:
+    return ChartStylePrototypeModel(
+        source_slide=proto.source_slide, frame_box=_box_model(proto.frame_box), pattern_id=proto.pattern_id,
+        chart_type=proto.chart_type, palette=list(proto.palette), gridlines=proto.gridlines,
+        show_values=proto.show_values, gap_width=proto.gap_width, overlap=proto.overlap,
+        axis_style=proto.axis_style,
+    )
 
 
 # Поля схемы места: одним списком для применения ответа модели и для
@@ -553,6 +602,7 @@ def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
         anchor=slot.anchor, purpose=slot.purpose, content_hint=slot.content_hint,
         max_words=slot.max_words, ordinal=slot.ordinal, fixed=slot.fixed,
         schema_confidence=slot.schema_confidence, source_shape_id=slot.source_shape_id,
+        chart_frame=slot.chart_frame,
     )
 
 
@@ -675,6 +725,8 @@ class PatternModel(BaseModel):
     # собранных без майнинга (тестовые фикстуры): D05 тогда судит по
     # глобальному коридору.
     source_density: float | None = None
+    # Задача V1: класс слайда-примера (`patterns.Pattern.slide_class`).
+    slide_class: str = "content_pattern"
 
 
 def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> PatternModel:
@@ -686,7 +738,7 @@ def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> Pattern
         decor=[_decor_shape_model(d) for d in pattern.decor],
         capacity=_capacity_model(pattern.capacity), score=pattern.score, is_dark=pattern.is_dark,
         kind_confidence=pattern.kind_confidence, preview_path=preview_path,
-        source_density=pattern.source_density,
+        source_density=pattern.source_density, slide_class=pattern.slide_class,
     )
 
 
@@ -761,6 +813,8 @@ class DeterministicProfile(BaseModel):
     assets: AssetCatalogModel
     patterns: list[PatternModel]
     shape_vocabulary: list[ShapeVocabEntryModel]
+    chart_rules: ChartRulesModel = ChartRulesModel()
+    chart_prototypes: list[ChartStylePrototypeModel] = []
 
 
 def _deterministic_cache_file(cache_dir: Path | None, key: str) -> Path | None:
@@ -1052,6 +1106,14 @@ class TemplateProfile(BaseModel):
     # `compose/charts.py` красит каждый ряд/точку ТОЛЬКО этими цветами —
     # без этого `python-pptx` отдаёт раскраску стоковой теме Office.
     chart_series: list[str] = []
+    # Правила оформления диаграмм из текста шаблона (слайд 51 VK
+    # Education: перекрытие рядов, боковой зазор, без сетки): по ним
+    # `compose/charts.py` строит наш график, когда родного в шаблоне нет.
+    chart_rules: ChartRulesModel = ChartRulesModel()
+    # Задача V1: образцы графиков со слайдов шаблона (VK Education 47-50,
+    # WorkSpace 20-21): по ним строится наш график, когда родного графика
+    # в шаблоне нет (`compose/charts.py`).
+    chart_prototypes: list[ChartStylePrototypeModel] = []
     provenance: list[str]
     warnings: list[str]
     fingerprint: str
@@ -1235,6 +1297,8 @@ class TemplateProfile(BaseModel):
                 layouts_m = det_cached.layouts
                 assets_m = det_cached.assets
                 shape_vocabulary_m = det_cached.shape_vocabulary
+                chart_rules_m = det_cached.chart_rules
+                chart_prototypes_m = det_cached.chart_prototypes
                 # PatternModel, не Pattern — безопасно ТОЛЬКО потому, что
                 # `vision is None and schema_llm is None` здесь гарантировано
                 # (условие кеш-хита выше): ни `classify_patterns_by_vision`,
@@ -1254,6 +1318,12 @@ class TemplateProfile(BaseModel):
                 )
                 assets = build_asset_catalog(pkg, canvas, layouts)
                 patterns_for_vision = mine_patterns(pkg, canvas, grid, type_scale, assets)
+                # Задача V1: правила оформления графиков, образцы графиков и
+                # класс каждого слайда-примера, до уточнения вида моделью
+                # (она меняет только `kind`, класс остаётся).
+                chart_rules = find_chart_rules(pkg)
+                chart_prototypes = find_chart_prototypes(pkg, canvas, patterns_for_vision, chart_rules)
+                patterns_for_vision = classify_slides(patterns_for_vision, chart_rules, chart_prototypes)
                 # Task 10 код-ревью, находка №1: словарь карточных форм считается
                 # ПО ДЕКОРУ ГРУПП ПОВТОРА уже намайненных раскладок (`patterns_
                 # for_vision`, объект этого же прохода, до pydantic-сериализации —
@@ -1290,6 +1360,8 @@ class TemplateProfile(BaseModel):
                 layouts_m = [_layout_entry_model(entry) for entry in layouts]
                 assets_m = _asset_catalog_model(assets)
                 shape_vocabulary_m = [_shape_vocab_entry_model(e) for e in shape_vocabulary]
+                chart_rules_m = _chart_rules_model(chart_rules)
+                chart_prototypes_m = [_chart_prototype_model(p) for p in chart_prototypes]
 
         # Тема для отчёта и именования палитры — уточнённая по фактическому
         # тексту слайдов (`Usage.primary_theme`, см. theme.
@@ -1431,6 +1503,8 @@ class TemplateProfile(BaseModel):
                     type_scale=type_scale_m, grid=grid_m, layouts=layouts_m, assets=assets_m,
                     patterns=[_pattern_model(p) for p in patterns_for_vision],
                     shape_vocabulary=shape_vocabulary_m,
+                    chart_rules=chart_rules_m,
+                    chart_prototypes=chart_prototypes_m,
                 ),
             )
 
@@ -1451,6 +1525,8 @@ class TemplateProfile(BaseModel):
             pattern_kinds_source="model" if vision is not None else "geometry",
             shape_vocabulary=shape_vocabulary_m,
             chart_series=chart_series,
+            chart_rules=chart_rules_m,
+            chart_prototypes=chart_prototypes_m,
             provenance=provenance, warnings=warnings, fingerprint=fingerprint,
             schema_version=PROFILE_SCHEMA_VERSION,
         )

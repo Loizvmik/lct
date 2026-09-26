@@ -40,7 +40,8 @@ from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.normalize import normalize_deck
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
-    SLIDE_KINDS, BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock, Visual,
+    SLIDE_KINDS, BulletBlock, Card, CardBlock, ChartSeriesData, ChartVisual, DeckSpec, SlideSpec, TableVisual,
+    TextBlock, Visual,
     slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
 )
 from deckforge.provider.base import LLMProvider
@@ -410,11 +411,104 @@ def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> Sl
             blocks = [TextBlock(text="; ".join(needs))]
         else:
             blocks = [BulletBlock(items=list(needs))]
+    visual = _visual_from_contract(contract)
+    if visual is not None:
+        # График запасного слайда строится по данным источника: они уже
+        # сняты кодом, модель для них не нужна.
+        source_note = source_note or _CHART_SOURCE_NOTE
     return SlideSpec(
-        index=contract.slide_id, kind=contract.kind, headline=headline, blocks=blocks,
+        index=contract.slide_id, kind=contract.kind, headline=headline, blocks=blocks, visual=visual,
         source_note=source_note, findings=[finding], pattern_id=contract.pattern_id,
         alternatives=contract.alternatives,
         speaker_notes="Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Задача V1: визуал по данным источника
+# ---------------------------------------------------------------------------
+
+_CHART_SOURCE_NOTE = "Данные взяты из таблицы исходных материалов."
+
+
+def _format_number(value: float) -> str:
+    return str(int(value)) if float(value).is_integer() else f"{value:g}"
+
+
+def chart_problems(slide: SlideSpec, contract: SlideContract, source_text: str) -> list[str]:
+    """Числа графика, которых нет в источниках (`check_number`). Нужна,
+    только когда данных в контракте нет (график заказала модель структуры,
+    а слой данных ряда под него не нашёл): модель переписывает ряд сама и
+    иногда округляет («4,1 тыс.» вместо «4 100»), а такое число на графике
+    неотличимо от настоящего. Есть данные в контракте: ряд ставит код
+    (`_ensure_visual`), сверять нечего."""
+    if contract.required_visual != "chart" or contract.visual_data is not None:
+        return []
+    if slide.visual is None or slide.visual.chart is None:
+        return []
+    missing = []
+    for series in slide.visual.chart.series:
+        for value in series.values:
+            text = _format_number(value)
+            # «4 100» в источнике: обычный пробел между разрядами
+            # `check_number` не снимает, поэтому число ищется и в записи
+            # с пробелом.
+            grouped = f"{int(value):,}".replace(",", " ") if float(value).is_integer() else text
+            if not any(check_number_in_sources(q, source_text)["found"] for q in {text, grouped}):
+                missing.append(f"{series.name}: {text}")
+    if not missing:
+        return []
+    return [f"график: чисел нет в источниках ({', '.join(missing[:5])}); возьми числа из sources дословно"]
+
+
+def _visual_from_contract(contract: SlideContract) -> Visual | None:
+    """Визуал по данным слоя типов (`contract.visual_data`) или `None`."""
+    data = contract.visual_data
+    if not data:
+        return None
+    if contract.required_visual == "chart" and data.get("series"):
+        title = data.get("category_title") or "Категория"
+        return Visual(kind="chart", chart=ChartVisual(
+            kind=data.get("kind", "bar"), categories=list(data["categories"]),
+            series=[ChartSeriesData(name=s["name"], values=list(s["values"])) for s in data["series"]],
+            unit=data.get("unit"), axis_titles=(title, "Значение"),
+        ))
+    if contract.required_visual == "table" and data.get("rows"):
+        return Visual(kind="table", table=TableVisual(rows=[list(r) for r in data["rows"]]))
+    return None
+
+
+def _ensure_visual(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
+    """Визуал слайда по данным контракта. Числа, категории и вид графика
+    решил слой данных, и они ставятся кодом; от модели берутся подписи
+    осей и выделенная точка. Таблица модели остаётся, если она есть (модель
+    могла сократить шапку под раскладку), иначе ставится таблица источника.
+    Если визуала в ответе не было, это честная находка."""
+    target = _visual_from_contract(contract)
+    if target is None:
+        return slide
+    visual = slide.visual
+    if target.kind == "table":
+        if visual is not None and visual.kind == "table" and visual.table is not None:
+            return slide
+        slide.findings.append(f"Слайд {contract.slide_id}: таблица поставлена по источнику, в ответе модели её не было.")
+        return replace(slide, visual=target, source_note=slide.source_note or _CHART_SOURCE_NOTE)
+    mine = visual.chart if visual is not None and visual.kind == "chart" else None
+    chart = target.chart
+    if mine is None:
+        slide.findings.append(
+            f"Слайд {contract.slide_id}: график построен по таблице источника, в ответе модели его не было."
+        )
+    else:
+        highlight = mine.highlight_index
+        if highlight is not None and not (0 <= highlight < len(chart.categories)):
+            highlight = None
+        axis = mine.axis_titles if mine.axis_titles and all(mine.axis_titles) else chart.axis_titles
+        chart = replace(chart, axis_titles=axis, highlight_index=highlight)
+    caption = visual.caption if visual is not None else None
+    return replace(
+        slide, visual=Visual(kind="chart", caption=caption, chart=chart),
+        source_note=slide.source_note or _CHART_SOURCE_NOTE,
     )
 
 
@@ -465,8 +559,12 @@ def _write_one_slide(
         if reason and TIME_OUT_REASON in reason:
             entry["timed_out"] = True
         if slide is not None:
+            # Визуал по данным источника ставится до проверок: без него
+            # ремонт звался бы только затем, чтобы модель переписала ряд,
+            # который код и так знает.
+            slide = _ensure_visual(slide, contract)
             schema_problems = slide_spec_problems(slide)
-            problems = schema_problems + contract_problems(slide, contract)
+            problems = schema_problems + contract_problems(slide, contract) + chart_problems(slide, contract, source_text)
             if problems and clock is not None and not clock.can_start():
                 # Ремонт не успеет до отметки писателя: слайд остаётся
                 # как есть (с находкой ниже), невалидный идёт запасным.
@@ -480,8 +578,12 @@ def _write_one_slide(
                     prompt_body, payload, contract, llm, _answer_view(slide), problems,
                 )
                 repaired_problems = None
+                if repaired is not None:
+                    repaired = _ensure_visual(repaired, contract)
                 if repaired is not None and not slide_spec_problems(repaired):
-                    repaired_problems = contract_problems(repaired, contract)
+                    repaired_problems = contract_problems(repaired, contract) + chart_problems(
+                        repaired, contract, source_text,
+                    )
                 accepted = repaired_problems is not None and (
                     schema_problems or len(repaired_problems) < len(problems)
                 )
@@ -497,6 +599,7 @@ def _write_one_slide(
     if slide is None:
         slide = _fallback_slide(contract, reason=reason)
     else:
+        slide = _ensure_visual(slide, contract)
         left = contract_problems(slide, contract)
         entry["compliant"] = not left
         if left:

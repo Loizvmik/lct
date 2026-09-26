@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from deckforge.pattern.forms import PatternForm
 from deckforge.pattern.intent import SlideIntent
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
-from deckforge.template.patterns import is_fixed_phrase
+from deckforge.template.patterns import CHART_TIER_FRAME, is_fixed_phrase
 
 _THANKS_RE = re.compile(r"спасибо|благодар|thank|вопрос|questions|контакт|contact", re.IGNORECASE)
 
@@ -153,7 +153,7 @@ def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: i
     if visual == "table":
         checks["visual"] = form.has_table
     elif visual == "chart":
-        checks["visual"] = form.has_chart or form.has_table or form.has_image
+        checks["visual"] = has_chart_place(form)
     elif visual == "photo":
         checks["visual"] = form.has_image
     else:
@@ -162,9 +162,30 @@ def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: i
         # таблицы осталась бы чужими данными, а фото примера без нашего
         # удаляется, и в раскладке «текст рядом со скриншотом» половина
         # холста пустеет.
-        empty_visual = form.has_table or (form.has_image and p.kind in _PICTURE_KINDS)
+        empty_visual = form.has_table or (form.has_image and p.kind in _PICTURE_KINDS) or not_plain_content(form)
         checks["visual"] = (block is not None or intent.is_hero) and not empty_visual
     return checks
+
+
+def has_chart_place(form: PatternForm) -> bool:
+    """Задача V1: у раскладки есть куда поставить график: родной график
+    примера, картинка-график или крупное текстовое место без пунктов
+    (`forms.PatternForm.chart_tier`). Какое из трёх лучше, решает
+    стоимость (`scoring.chart_fit`), здесь только «можно ли»."""
+    return form.chart_tier is not None and form.slide_class in ("content_pattern", "visual_prototype")
+
+
+def not_plain_content(form: PatternForm) -> bool:
+    """Родной график примера на слайде без нашего графика: сборка удаляет
+    его данные-образец (`clone.remove_sample_frames`), и половина слайда
+    пустеет (ЛЦТ2026, slide21: график занимает левую половину). То же с
+    картинкой-графиком (VK Education, слайды 47-50): без нашего графика
+    она удаляется как чужое содержание, и слайд остаётся с одним
+    заголовком. Правила, лист ассетов и инструкция шаблона
+    (`prototypes.SLIDE_CLASSES`) не раскладки содержания вовсе."""
+    if form.slide_class in ("style_guide", "asset_sheet", "instruction"):
+        return True
+    return form.has_chart or form.chart_tier == CHART_TIER_FRAME or form.slide_class == "visual_prototype"
 
 
 # Порядок ослабления: от наименее важного к самому важному. Место

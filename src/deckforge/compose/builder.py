@@ -34,12 +34,12 @@ from deckforge.compose.blocks import (
     DROPPED_ROLE_TITLES, Paragraph, SlotContent, assign_content, assign_content_with_drops,
     expand_decor, filled_repeat_units, find_bullet_char, unfilled_unit_test,
 )
-from deckforge.compose.charts import ChartSpec, Series, add_chart
+from deckforge.compose.charts import ChartSpec, Series, add_chart, fill_native_chart
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
     CLONE_MARK_PREFIX, allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
     inherited_text_color, inherited_text_size, mark_slide, match_slots, native_table, prune_unfilled, remove_in_box,
-    remove_sample_frames, remove_stray_text, replace_picture, sample_slides_by_number,
+    remove_sample_frames, remove_shape, remove_stray_text, replace_picture, sample_slides_by_number,
     set_native_table_geometry, set_shape_box, set_table_text_size, set_text_size, shape_text, slide_refs,
     table_cell_styles, template_row_heights_emu, text_style,
 )
@@ -61,7 +61,10 @@ from deckforge.plan.variants import Variant
 from deckforge.settings import Settings
 from deckforge.template.grid import ColumnAxis, Grid
 from deckforge.template.naming import MIN_CONTRAST
-from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
+from deckforge.template.patterns import (
+    CHART_FRAME_MIN_AREA, CHART_TIER_NATIVE, Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec,
+    chart_target_slot,
+)
 from deckforge.template.typography import fill_scale_gaps
 from deckforge.template.profile import LayoutEntryModel, TemplateProfile
 from deckforge.workflow.versions import manifest as workflow_manifest
@@ -700,9 +703,22 @@ def _looks_numeric(cell: str) -> bool:
     return bool(_NUMERIC_CELL_RE.match(cell.strip())) if cell and cell.strip() else False
 
 
-def _place_chart_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, chart) -> None:
-    slot = _visual_slot(pattern, "chart") or _visual_slot(pattern, "table") or _visual_slot(pattern, "image")
-    if slot is None:
+def _chart_slot(pattern: Pattern) -> PatternSlot | None:
+    """Место графика: родной график примера, картинка-график, крупное
+    текстовое место (`patterns.chart_target_slot`, та же функция решает у
+    планировщика), иначе место таблицы. Любая картинка сюда больше не
+    годится: график в круглой рамке фото портрета не читается."""
+    slot, _tier = chart_target_slot(pattern.slots)
+    return slot or _visual_slot(pattern, "table")
+
+
+def _place_chart_visual(
+    slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, chart, *, box: Box | None = None,
+) -> None:
+    """`box`: рамка, уже найденная клоном образца графика
+    (`_clear_sample_charts`); без неё рамка из слота раскладки."""
+    slot = _chart_slot(pattern)
+    if slot is None and box is None:
         slide_spec.findings.append(
             f"Слайд {slide_spec.index}: в раскладке {pattern.pattern_id!r} нет слота под график "
             "— ChartVisual не отрисован."
@@ -710,7 +726,34 @@ def _place_chart_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile:
         return
     if not chart.series:
         return
+    spec = _chart_spec(slide_spec, pattern, chart)
+    try:
+        add_chart(slide, box or slot.box, spec, profile, prototype=_chart_prototype(profile, pattern, spec))
+    except ValueError as exc:
+        slide_spec.findings.append(f"Слайд {slide_spec.index}: график не построен ({exc}).")
 
+
+def _chart_prototype(profile: TemplateProfile, pattern: Pattern, spec: ChartSpec):
+    """Образец графика шаблона для нашего графика (задача V1). Раскладка
+    сама снята со слайда-образца: его образец (рамка уже его). Иначе, раз
+    родного графика у раскладки нет, стиль берётся у образца того же вида,
+    что наш график, а нет такого, у первого образца с палитрой: цвета и
+    правила шаблона лучше умолчаний python-pptx. `None`: образцов нет."""
+    prototypes = list(getattr(profile, "chart_prototypes", None) or [])
+    own = next((p for p in prototypes if p.pattern_id == pattern.pattern_id), None)
+    if own is not None:
+        return own
+    _slot, tier = chart_target_slot(pattern.slots)
+    if tier == CHART_TIER_NATIVE:
+        return None
+    with_palette = [p for p in prototypes if len(p.palette) >= 2]
+    same_kind = [p for p in with_palette if p.chart_type == spec.kind]
+    return (same_kind or with_palette or prototypes or [None])[0]
+
+
+def _chart_spec(slide_spec: SlideSpec, pattern: Pattern, chart) -> ChartSpec:
+    """`ChartSpec` из данных плана: ряды по вместимости раскладки, подписи
+    осей обязательны. Общий для своего графика и родного графика примера."""
     cap = pattern.capacity
     series = chart.series
     if cap.max_series and len(series) > cap.max_series:
@@ -728,15 +771,11 @@ def _place_chart_visual(slide, slide_spec: SlideSpec, pattern: Pattern, profile:
     if not axis_titles or not axis_titles[0] or not axis_titles[1]:
         axis_titles = ("Категория", chart.unit or "Значение")
 
-    spec = ChartSpec(
+    return ChartSpec(
         kind=chart.kind, categories=list(chart.categories),
         series=[Series(name=s.name, values=list(s.values)) for s in series],
         unit=chart.unit, highlight_index=chart.highlight_index, axis_titles=axis_titles,
     )
-    try:
-        add_chart(slide, slot.box, spec, profile)
-    except ValueError as exc:
-        slide_spec.findings.append(f"Слайд {slide_spec.index}: график не построен ({exc}).")
 
 
 def _contain_box(
@@ -1886,6 +1925,9 @@ def place_slide_by_clone(
     native_frame = table_ref.element if table_ref is not None and native_table(table_ref.element) is not None else None
     if native_frame is not None:
         keep.append(native_frame)
+    chart_frame = _native_chart_frame(slide_spec, pattern, matched, index_of)
+    if chart_frame is not None:
+        keep.append(chart_frame)
     filled = filled_repeat_units(pattern, native)
     # Колонка единицы повтора, в которую ничего не легло, уходит целиком,
     # даже если майнинг не узнал в ней единицу (`unfilled_unit_test`):
@@ -1929,6 +1971,8 @@ def place_slide_by_clone(
         _fill_native_table_on_clone(
             slide, slide_spec, pattern, profile, canvas, native_frame, table_ref.box, _only_frame_text(clean),
         )
+    elif chart_frame is not None and _fill_native_chart_on_clone(slide, slide_spec, pattern, chart_frame):
+        pass
     else:
         _place_visual_on_clone(
             slide, slide_spec, pattern, profile, canvas, matched, user_photos, keep,
@@ -2216,12 +2260,13 @@ def _place_visual_on_clone(
     if visual is None:
         return
     if visual.kind in ("table", "chart"):
-        slot = (
-            _visual_slot(pattern, "table") if visual.kind == "table"
-            else _visual_slot(pattern, "chart") or _visual_slot(pattern, "table") or _visual_slot(pattern, "image")
-        )
+        slot = _visual_slot(pattern, "table") if visual.kind == "table" else _chart_slot(pattern)
         if slot is not None:
             remove_in_box(slide, slot.box, canvas, keep=keep)
+        if visual.kind == "chart" and visual.chart is not None and pattern.slide_class == "visual_prototype":
+            frame = _clear_sample_charts(slide, canvas, keep, slot.box if slot is not None else None)
+            _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart, box=frame)
+            return
         _place_visual(slide, slide_spec, pattern, profile, user_photos, sole_content=sole_content)
         return
     if visual.kind not in ("photo", "icon"):
@@ -2244,6 +2289,61 @@ def _place_visual_on_clone(
             f"Слайд {slide_spec.index}: пользовательская фотография {photo_name!r} ({photo_path}) "
             f"не вставлена ({exc})."
         )
+
+
+def _clear_sample_charts(slide, canvas: Canvas, keep: list, slot_box: Box | None) -> Box | None:
+    """Картинки-графики образца (VK Education, слайд 47: гистограмма и
+    диаграмма с областями рядом) уходят все, не только та, что стала слотом:
+    чужие данные на нашем слайде хуже пустоты. Возвращает рамку нашего
+    графика: общую для всех убранных картинок (на слайде 47 это вся ширина,
+    а не левая половина), вместе с местом слота (его картинку уже убрал
+    `prune_unfilled`); `None`, если убирать было нечего."""
+    keep_ids = {id(e) for e in keep}
+    boxes = [slot_box] if slot_box is not None else []
+    for ref in slide_refs(slide, canvas):
+        if ref.kind != "picture" or ref.box is None or id(ref.element) in keep_ids:
+            continue
+        if CHART_FRAME_MIN_AREA <= ref.box.area < 0.9:
+            boxes.append(ref.box)
+            remove_shape(ref.element)
+    if len(boxes) < 2:
+        return None
+    left, top = min(b.left for b in boxes), min(b.top for b in boxes)
+    right, bottom = max(b.right for b in boxes), max(b.bottom for b in boxes)
+    return Box(left=left, top=top, width=right - left, height=bottom - top)
+
+
+def _native_chart_frame(slide_spec: SlideSpec, pattern: Pattern, matched: dict, index_of: dict):
+    """Рамка родного графика примера на клоне, если слайду нужен график и
+    у раскладки он есть (`CHART_TIER_NATIVE`). Иначе `None`: график примера
+    уйдёт вместе с данными-образцом (`remove_sample_frames`)."""
+    visual = slide_spec.visual
+    if visual is None or visual.kind != "chart" or visual.chart is None or not visual.chart.series:
+        return None
+    slot, tier = chart_target_slot(pattern.slots)
+    if tier != CHART_TIER_NATIVE:
+        return None
+    ref = matched.get(index_of.get(id(slot), -1))
+    return ref.element if ref is not None and ref.kind == "graphic_frame" else None
+
+
+def _fill_native_chart_on_clone(slide, slide_spec: SlideSpec, pattern: Pattern, frame) -> bool:
+    """BIND для графика (задача V1): данные слайда ложатся в родной график
+    примера, стиль, цвета и шрифты дизайнера остаются. Не легли (круговой
+    пример, а рядов несколько): рамка уходит, и `_place_visual_on_clone`
+    рисует свой график на её месте. Возвращает, лёг ли график."""
+    spec = _chart_spec(slide_spec, pattern, slide_spec.visual.chart)
+    try:
+        if fill_native_chart(slide, frame, spec):
+            slide_spec.findings.append(
+                f"Слайд {slide_spec.index}: данные подставлены в родной график примера "
+                f"(раскладка {pattern.pattern_id!r})."
+            )
+            return True
+    except Exception as exc:  # noqa: BLE001: незнакомая разметка графика: свой график вместо родного
+        slide_spec.findings.append(f"Слайд {slide_spec.index}: родной график примера не принял данные ({exc}).")
+    remove_shape(frame)
+    return False
 
 
 # Ячейка примера с заливкой темнее этого (относительная яркость) выделена
@@ -2380,6 +2480,7 @@ def _pattern_from_model(model) -> Pattern:
             anchor=s.anchor, purpose=s.purpose, content_hint=s.content_hint,
             max_words=s.max_words, ordinal=s.ordinal, fixed=s.fixed,
             schema_confidence=s.schema_confidence, source_shape_id=s.source_shape_id,
+            chart_frame=getattr(s, "chart_frame", False),
         )
         for s in model.slots
     ]
@@ -2410,6 +2511,7 @@ def _pattern_from_model(model) -> Pattern:
         layout_id=model.layout_id, kind=model.kind, slots=slots, repeat=repeat, decor=decor,
         capacity=capacity, score=model.score, is_dark=model.is_dark,
         kind_confidence=model.kind_confidence, source_density=model.source_density,
+        slide_class=getattr(model, "slide_class", "content_pattern"),
     )
 
 

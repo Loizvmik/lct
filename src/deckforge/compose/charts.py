@@ -30,11 +30,15 @@ Office, будто вставлен из чужого шаблона. `_series_p
 выделяют цветом/кеглем, а не насыщенностью.
 """
 from __future__ import annotations
+from copy import deepcopy
 from dataclasses import dataclass, field
 
 from pptx.chart.data import CategoryChartData, XyChartData
 from pptx.dml.color import RGBColor
-from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION
+from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION
+from pptx.opc.constants import RELATIONSHIP_TYPE as RT
+from pptx.oxml.ns import qn
+from pptx.parts.chart import ChartPart
 from pptx.util import Pt
 
 from deckforge.compose.colorpick import best_contrast_text_color_for_luminance, slide_background_luminance
@@ -92,9 +96,14 @@ class ChartSpec:
     axis_titles: tuple[str, str] | None = None
 
 
-def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile):
+def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile, prototype=None):
     """Строит нативный график в `box` (доли холста) на `slide`. Возвращает
-    `GraphicFrame` (`.chart`, `.has_chart` — интерфейс `python-pptx`)."""
+    `GraphicFrame` (`.chart`, `.has_chart` — интерфейс `python-pptx`).
+
+    `prototype` (задача V1): образец графика шаблона
+    (`profile.chart_prototypes`): его палитра заменяет палитру профиля,
+    если в ней хотя бы два цвета, а его сетка, подписи значений, зазор и
+    перекрытие заменяют правила профиля (`profile.chart_rules`)."""
     if spec.kind not in _KIND_TO_XL:
         raise ValueError(f"Неизвестный тип графика {spec.kind!r} — ожидается один из {CHART_KINDS}")
     if not spec.series:
@@ -102,6 +111,13 @@ def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile):
 
     left, top, width, height = _emu_box(box, profile)
     palette = _series_palette(profile, len(spec.series))
+    own = list(getattr(prototype, "palette", None) or [])
+    if len(own) >= 2:
+        # Рядов больше, чем цветов на картинке образца: следом идут цвета
+        # профиля, которых в образце нет, иначе два ряда выйдут одним цветом.
+        extra = [c for c in palette if c.upper() not in {o.upper() for o in own}]
+        palette = own + extra
+        palette = [palette[i % len(palette)] for i in range(max(len(palette), len(spec.series)))]
 
     if spec.kind == "scatter":
         frame = _add_scatter(slide, left, top, width, height, spec)
@@ -113,6 +129,10 @@ def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile):
         frame = slide.shapes.add_chart(_KIND_TO_XL[spec.kind], left, top, width, height, chart_data)
 
     _style_chart(slide, frame.chart, spec, profile, palette)
+    rules = rules_of_prototype(prototype) if prototype is not None else getattr(profile, "chart_rules", None)
+    apply_chart_rules(frame.chart, spec, rules)
+    if getattr(rules, "data_labels", False):
+        _show_values(frame.chart, spec)
     return frame
 
 
@@ -308,3 +328,228 @@ def _emu_box(box: Box, profile: TemplateProfile) -> tuple[int, int, int, int]:
         round(box.width * profile.canvas_width_emu),
         round(box.height * profile.canvas_height_emu),
     )
+
+
+# ---------------------------------------------------------------------------
+# Задача V1: правила оформления шаблона и родной график примера
+# ---------------------------------------------------------------------------
+
+# Типы, у которых есть `gap_width`/`overlap` (столбики и полосы).
+_BAR_KINDS = frozenset({"bar", "bar_stacked", "bar_h"})
+
+
+def apply_chart_rules(chart, spec: ChartSpec, rules) -> None:
+    """Правила оформления диаграмм из текста шаблона (`profile.
+    chart_rules`, слайд 51 VK Education): перекрытие рядов, боковой зазор,
+    без линий сетки. `rules` пустые или `None`: график остаётся как есть.
+
+    Перекрытие и зазор шаблон описывает для нескольких рядов: у одного
+    ряда нулевой боковой зазор склеил бы столбики в сплошной блок, а
+    пример самого шаблона (картинка на том же слайде) рисует одиночный
+    ряд с просветами. Поэтому у одного ряда эти два правила не
+    применяются; сетка убирается всегда, когда шаблон так просит."""
+    if rules is None:
+        return
+    if spec.kind in _BAR_KINDS and len(spec.series) > 1:
+        plot = chart.plots[0]
+        overlap = getattr(rules, "overlap", None)
+        if getattr(rules, "gap_width", None) is not None:
+            # Зазор между группами не уже зазора внутри группы: при
+            # «перекрытии −50%» и «зазоре 0%» группы сливаются, и по
+            # графику не понять, где кончается квартал (VK Education).
+            inner = -int(overlap) if overlap is not None and overlap < 0 else 0
+            plot.gap_width = max(int(rules.gap_width), inner)
+        if getattr(rules, "overlap", None) is not None and spec.kind != "bar_stacked":
+            # У накопительных столбиков перекрытие 100 по определению.
+            plot.overlap = int(rules.overlap)
+    if getattr(rules, "no_gridlines", False) and spec.kind in _CATEGORY_AXIS_KINDS:
+        chart.value_axis.has_major_gridlines = False
+        chart.value_axis.has_minor_gridlines = False
+        chart.category_axis.has_major_gridlines = False
+
+
+@dataclass(frozen=True)
+class _Rules:
+    gap_width: int | None = None
+    overlap: int | None = None
+    no_gridlines: bool = False
+    data_labels: bool = False
+
+
+def rules_of_prototype(prototype) -> _Rules:
+    """Правила оформления из образца графика шаблона в том же виде, что
+    `profile.chart_rules`."""
+    return _Rules(
+        gap_width=getattr(prototype, "gap_width", None), overlap=getattr(prototype, "overlap", None),
+        no_gridlines=not getattr(prototype, "gridlines", True),
+        data_labels=bool(getattr(prototype, "show_values", False)),
+    )
+
+
+def _show_values(chart, spec: ChartSpec) -> None:
+    """Подписи значений на столбиках и точках: шаблон просит «метки данных
+    вместо вертикальной оси» (VK Education, слайд 51). Ось значений
+    остаётся: без неё аудит (I05) не узнает единицу, а у длинного ряда она
+    нужна и по правилу самого шаблона."""
+    plot = chart.plots[0]
+    plot.has_data_labels = True
+    labels = plot.data_labels
+    labels.show_value = True
+    labels.number_format_is_linked = True
+    if spec.kind in ("bar", "bar_h"):
+        labels.position = XL_LABEL_POSITION.OUTSIDE_END
+    elif spec.kind == "line":
+        labels.position = XL_LABEL_POSITION.ABOVE
+
+
+# Круговые типы примера: в них ложится только один неотрицательный ряд.
+_PIE_TYPES = frozenset({
+    XL_CHART_TYPE.PIE, XL_CHART_TYPE.PIE_EXPLODED, XL_CHART_TYPE.DOUGHNUT, XL_CHART_TYPE.DOUGHNUT_EXPLODED,
+})
+
+
+def native_chart_accepts(chart, spec: ChartSpec) -> bool:
+    """Годится ли родной график примера под наши данные с сохранением его
+    типа. Круговой пример не покажет несколько рядов, точечный не покажет
+    текстовые категории; тогда сборка рисует свой график в его рамке."""
+    try:
+        chart_type = chart.chart_type
+    except Exception:  # noqa: BLE001: незнакомый тип python-pptx не называет
+        return False
+    if chart_type in _PIE_TYPES:
+        return len(spec.series) == 1 and all(v >= 0 for v in spec.series[0].values)
+    if chart_type in (XL_CHART_TYPE.XY_SCATTER, XL_CHART_TYPE.BUBBLE):
+        return False
+    return spec.kind != "scatter"
+
+
+def fill_native_chart(slide, frame_element, spec: ChartSpec) -> bool:
+    """Подменяет данные родного графика примера на клоне: тип, цвета,
+    шрифты, легенда и оформление осей остаются дизайнерскими, меняются
+    категории, ряды и встроенная таблица Excel. Возвращает `False`, если
+    график под эти данные не годится (`native_chart_accepts`): тогда
+    вызывающий рисует свой.
+
+    Часть графика у клона общая с примером (`clone._copy_relationships`
+    связывает клон с той же частью), и правка на месте поменяла бы данные
+    у каждого клона того же примера. Поэтому часть сперва копируется
+    (`_detach_chart_part`)."""
+    frame = _frame_of(slide, frame_element)
+    if frame is None or not getattr(frame, "has_chart", False):
+        return False
+    if not native_chart_accepts(frame.chart, spec):
+        return False
+    _detach_chart_part(slide, frame_element)
+    chart = _frame_of(slide, frame_element).chart
+    own_series = len(list(chart._chartSpace.iter(qn("c:ser"))))  # noqa: SLF001
+    data = CategoryChartData()
+    data.categories = spec.categories
+    for series in spec.series:
+        data.add_series(series.name, series.values)
+    chart.replace_data(data)
+    _color_added_series(chart, own_series)
+    _free_value_scale(chart)
+    _native_axis_titles(chart, spec)
+    return True
+
+
+def _color_added_series(chart, own_series: int) -> None:
+    """Ряды сверх рядов примера python-pptx копирует с последнего, вместе с
+    его заливкой, и два соседних ряда выходят одного цвета (ЛЦТ2026: пример
+    на два ряда, у нас три). Новому ряду даётся следующий акцент темы, тем
+    же способом, каким дизайнер покрасил свои (`a:schemeClr accentN`)."""
+    for i, ser in enumerate(chart._chartSpace.iter(qn("c:ser"))):  # noqa: SLF001
+        if i < own_series:
+            continue
+        sp_pr = ser.find(qn("c:spPr"))
+        fill = sp_pr.find(qn("a:solidFill")) if sp_pr is not None else None
+        if fill is None:
+            continue
+        for child in list(fill):
+            fill.remove(child)
+        scheme = fill.makeelement(qn("a:schemeClr"), {"val": f"accent{i % 6 + 1}"})
+        fill.append(scheme)
+
+
+def _frame_of(slide, frame_element):
+    return next((sh for sh in slide.shapes if sh._element is frame_element), None)  # noqa: SLF001
+
+
+def _detach_chart_part(slide, frame_element) -> None:
+    """Своя копия части графика для рамки `frame_element`: XML тот же, связи
+    со стилем и цветами графика те же (их никто не правит). Ссылка на
+    встроенную таблицу убирается, и `replace_data` заводит новую таблицу
+    для копии, а таблица примера остаётся нетронутой."""
+    chart_ref = frame_element.find(".//" + qn("c:chart"))
+    old_rid = chart_ref.get(qn("r:id"))
+    old_part = slide.part.related_part(old_rid)
+    package = old_part.package
+    partname = package.next_partname(ChartPart.partname_template)
+    new_part = ChartPart.load(partname, old_part.content_type, package, old_part.blob)
+    space = new_part._element  # noqa: SLF001
+    for ext in space.findall(qn("c:externalData")):
+        space.remove(ext)
+    for rel in old_part.rels.values():
+        if rel.is_external or rel.reltype == RT.PACKAGE:
+            continue
+        new_part.relate_to(rel.target_part, rel.reltype)
+    chart_ref.set(qn("r:id"), slide.part.relate_to(new_part, RT.CHART))
+    slide.part.drop_rel(old_rid)
+
+
+def _free_value_scale(chart) -> None:
+    """Шкала примера рассчитана на его числа: у ЛЦТ2026 шаг оси 1 при
+    значениях до 5, и на наших тысячах это тысячи делений. Шаг и границы
+    отдаются программе показа (авто)."""
+    for val_ax in chart._chartSpace.iter(qn("c:valAx")):  # noqa: SLF001
+        for tag in ("c:majorUnit", "c:minorUnit"):
+            for el in val_ax.findall(qn(tag)):
+                val_ax.remove(el)
+        scaling = val_ax.find(qn("c:scaling"))
+        if scaling is not None:
+            for tag in ("c:max", "c:min"):
+                for el in scaling.findall(qn(tag)):
+                    scaling.remove(el)
+
+
+def _native_axis_titles(chart, spec: ChartSpec) -> None:
+    """Подписи осей родного графика (I05 аудита требует их у осевых
+    типов). Начертание берётся у подписей делений той же оси, чтобы
+    подпись не вышла чёрной на тёмном фоне примера."""
+    try:
+        chart_type = chart.chart_type
+    except Exception:  # noqa: BLE001
+        return
+    if chart_type in _PIE_TYPES or not spec.axis_titles:
+        return
+    category_title, value_title = spec.axis_titles
+    value_text = f"{value_title}, {spec.unit}" if value_title and spec.unit else (value_title or spec.unit or "")
+    # Ручная раскладка области построения примера не оставляет места под
+    # подписи осей (у ЛЦТ2026 подпись оси значений легла на числа делений):
+    # с подписями раскладку считает программа показа.
+    plot_area = chart._chartSpace.find(qn("c:chart") + "/" + qn("c:plotArea"))  # noqa: SLF001
+    layout = plot_area.find(qn("c:layout")) if plot_area is not None else None
+    if layout is not None:
+        for child in list(layout):
+            layout.remove(child)
+    for axis_name, text in (("category_axis", category_title), ("value_axis", value_text)):
+        if not text:
+            continue
+        try:
+            axis = getattr(chart, axis_name)
+        except Exception:  # noqa: BLE001: у типа нет такой оси
+            continue
+        axis.has_title = True
+        axis.axis_title.text_frame.text = text
+        def_rpr = axis._element.find(  # noqa: SLF001
+            qn("c:txPr") + "/" + qn("a:p") + "/" + qn("a:pPr") + "/" + qn("a:defRPr"),
+        )
+        if def_rpr is None:
+            continue
+        for run in axis.axis_title.text_frame.paragraphs[0].runs:
+            r_pr = deepcopy(def_rpr)
+            r_pr.tag = qn("a:rPr")
+            old = run._r.find(qn("a:rPr"))  # noqa: SLF001
+            if old is not None:
+                run._r.remove(old)  # noqa: SLF001
+            run._r.insert(0, r_pr)  # noqa: SLF001
