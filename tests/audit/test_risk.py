@@ -33,6 +33,8 @@ def test_each_sign_raises_risk():
     assert risk_score(_slide(cloned=False), []) > base
     assert risk_score(_slide(), [_finding(0)]) > base
     assert risk_score(_slide(notes=("Слайд 1: текст слота «body» усечён — не влезает даже кеглем подписи (12.0pt).",)), []) > base
+    dropped = "Слайд 1: подзаголовок не попал на слайд — в раскладке 'p1' нет слота под эту роль: «x»."
+    assert risk_score(_slide(notes=(dropped,)), []) > base
     table = Visual(kind="table", table=TableVisual(rows=[["a", "b"], ["1", "2"]]))
     assert risk_score(_slide(visual=table), []) > base
     assert risk_score(_slide(visual=Visual(kind="photo")), []) > base
