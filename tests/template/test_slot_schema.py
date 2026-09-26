@@ -244,7 +244,7 @@ def test_without_schema_circle_still_receives_card_title():
 
 def test_clone_keeps_ordinal_of_filled_units_and_fixed_text_outside_repeat():
     pattern = _steps_pattern(ordinal=True)
-    closing = _slot("headline", 0.1, 0.8, 0.8, 0.1, "Спасибо за внимание", fixed=True)
+    closing = _slot("caption", 0.1, 0.8, 0.8, 0.1, "Спасибо за внимание", fixed=True)
     pattern = replace(pattern, slots=[*pattern.slots, closing])
 
     kept = _sample_text_slots(pattern, filled={0, 1})

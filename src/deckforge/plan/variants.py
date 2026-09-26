@@ -58,6 +58,7 @@
 "модель/код предлагает, сборка перепроверяет", что и у `pick_patterns`.
 """
 from __future__ import annotations
+import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
@@ -751,8 +752,16 @@ def _is_closing_pattern(p, profile) -> bool:
     выглядела концом презентации (27 сентября 2026)."""
     if p.kind not in ("section", "closing") or not p.source_slide_index:
         return False
+    if any(_THANKS_RE.search(sl.sample_text or "") for sl in p.slots):
+        # У VK Education «Спасибо за внимание!» стоит на слайде 52, а
+        # похожие слайды 53–55 схлопнуты в другой паттерн: по одному номеру
+        # финал не узнать.
+        return True
     last = max((n for q in profile.patterns for n in q.source_slide_index), default=None)
     return last is not None and min(p.source_slide_index) == last
+
+
+_THANKS_RE = re.compile(r"спасибо|благодар|thank|вопрос|questions|контакт|contact", re.IGNORECASE)
 
 
 def _ranked_candidates(

@@ -126,3 +126,18 @@ def test_two_cards_with_two_unit_layout_are_left_alone():
     out = normalize_deck(_deck(slide), FULL).slides[0]
 
     assert out.findings == []
+
+
+def test_a_blockless_content_slide_becomes_a_section():
+    """«О чём пойдёт речь» без единого пункта садился на финальную
+    раскладку «Спасибо за внимание!» (27 сентября 2026)."""
+    from deckforge.plan.normalize import normalize_deck
+    from deckforge.plan.spec import DeckSpec, SlideSpec
+
+    deck = DeckSpec(title="t", language="ru", slides=[
+        SlideSpec(index=1, kind="bullets", headline="О чём пойдёт речь"),
+    ])
+    out = normalize_deck(deck, _profile(_pattern("section", roles=("headline",)), _pattern("bullets", roles=("headline", "bullet"))))
+    assert out.slides[0].kind == "section"
+    assert any("разделитель" in f for f in out.slides[0].findings)
+

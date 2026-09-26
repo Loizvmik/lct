@@ -522,8 +522,11 @@ def test_low_confidence_drops_flags_first_and_description_below_half():
 def test_keeps_sample_text_rechecks_fixed_from_an_old_cache():
     """Профиль, записанный до фильтра, несёт `fixed=True` на подсказке
     дизайнера: сборка всё равно не оставляет её на слайде."""
-    pattern = _schema_pattern("Спасибо за внимание!", "Точки используются для навигации.")
-    thanks, hint = (replace(s, fixed=True) for s in pattern.slots)
+    pattern = _schema_pattern("Заголовок", "Спасибо за внимание!", "Точки используются для навигации.")
+    headline, thanks, hint = (replace(s, fixed=True) for s in pattern.slots)
 
+    # Заголовок всегда наш, даже с `fixed` из старого кеша; постоянная
+    # фраза в подписи остаётся, подсказка дизайнера уходит.
+    assert not headline.keeps_sample_text
     assert thanks.keeps_sample_text
     assert not hint.keeps_sample_text

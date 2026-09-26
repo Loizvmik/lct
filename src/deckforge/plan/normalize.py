@@ -66,8 +66,28 @@ def normalized_count(deck: DeckSpec) -> int:
     return int(deck.meta.get("normalized_slides", "0"))
 
 
+_HERO_KINDS = frozenset({"section", "image", "closing", "quote"})
+
+
+def _blockless_as_section(slide: SlideSpec, kinds: set[str]) -> SlideSpec | None:
+    """Слайд с одним заголовком, без блоков и визуала, но содержательного
+    вида (bullets, cards…): писатель ничего не написал, и он садился на
+    любую героическую раскладку, включая финальную «Спасибо за внимание!»
+    (27 сентября 2026, слайд «О чём пойдёт речь»). Честнее считать его
+    разделителем, если в шаблоне такие есть."""
+    if slide.kind in _HERO_KINDS or slide.blocks or slide.visual is not None or "section" not in kinds:
+        return None
+    return replace(slide, kind="section", findings=[
+        *slide.findings,
+        f"Слайд {slide.index}: содержания нет, только заголовок; собран как разделитель.",
+    ])
+
+
 def _normalize_slide(slide: SlideSpec, kinds: set[str], two_unit_cards: bool) -> SlideSpec:
     has_kpi_layout = any(k in kinds for k in _KPI_KINDS)
+    result = _blockless_as_section(slide, kinds)
+    if result is not None:
+        return result
     result = _single_card(slide, kinds, has_kpi_layout)
     if result is not None:
         return result
