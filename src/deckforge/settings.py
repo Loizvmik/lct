@@ -188,6 +188,10 @@ class FontBudgetConfig(BaseModel):
     # FontBudget`): доля от кегля примера и ступени шкалы шаблона вниз.
     min_ratio: float = 0.8
     max_steps: int = 2
+    # Заголовок обложки, разделителя, финала: его даёт пользователь и
+    # сокращать нельзя, поэтому предел мягче.
+    hero_headline_min_ratio: float = 0.6
+    hero_headline_max_steps: int = 4
 
 
 class ComposeConfig(BaseModel):

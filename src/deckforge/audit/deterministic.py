@@ -1146,22 +1146,23 @@ def _over_shrunk(ctx: _SlideContext, profile: TemplateProfile, config: AuditConf
     pattern = next((p for p in profile.patterns if p.pattern_id == ctx.clone_pattern), None)
     if pattern is None:
         return []
+    budget = font_budget()
     native = {
-        slot.source_shape_id: profile.denorm_pt(slot.size_pt)
+        slot.source_shape_id: (profile.denorm_pt(slot.size_pt), budget.for_slot(slot.role, pattern.kind))
         for slot in pattern.slots if slot.source_shape_id and slot.size_pt and slot.size_pt > 0
     }
     if not native:
         return []
-    budget = font_budget()
     scale = [profile.denorm_pt(v) for v in profile.type_scale.steps.values() if v > 0]
     tol = config.template.size_tolerance_pt
     findings = []
     for item in _text_shapes(ctx):
-        size0 = native.get(item.shape_id)
+        slot_native = native.get(item.shape_id)
         sizes = _all_run_sizes(item.element)
-        if size0 is None or not sizes:
+        if slot_native is None or not sizes:
             continue
-        floor = budget.floor_pt(size0, scale)
+        size0, slot_budget = slot_native
+        floor = slot_budget.floor_pt(size0, scale)
         size_pt = max(sizes)
         if size_pt >= floor - tol:
             continue

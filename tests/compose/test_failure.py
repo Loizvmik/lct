@@ -149,10 +149,32 @@ def test_font_budget_rejects_a_clone_that_needs_a_deeper_shrink(profile, monkeyp
     loose, prs = _clone_on_section(profile, headline, monkeypatch, FontBudget(min_ratio=0.0, max_steps=99))
     assert loose.reason is None and len(prs.slides) == 1, "без предела заголовок влезает мелким кеглем"
 
-    strict, prs = _clone_on_section(profile, headline, monkeypatch, FontBudget())
+    tight = FontBudget(hero_min_ratio=0.8, hero_max_steps=2)
+    strict, prs = _clone_on_section(profile, headline, monkeypatch, tight)
     assert strict.code == "FONT_BUDGET"
     assert "не помещается" in strict.reason
     assert len(prs.slides) == 0, "отклонённый клон убран из колоды"
+
+
+def test_hero_headline_has_a_softer_budget_than_other_slots():
+    budget = FontBudget()
+    assert budget.for_slot("headline", "section").floor_pt(44.0, [16.0, 44.0]) == pytest.approx(28.0)
+    assert budget.for_slot("headline", "cards") is budget
+    assert budget.for_slot("caption", "section") is budget
+
+
+def test_long_cover_title_stays_a_clone_on_vk_education(profile):
+    """Название презентации даёт пользователь, сокращать его нельзя:
+    длинный заголовок обложки ужимается мельче примера, но слайд остаётся
+    клоном, а не собирается с нуля."""
+    slide = SlideSpec(
+        index=0, kind="section", pattern_id="slide16",
+        headline="Сокращение времени согласования заявок на закупку в трёх регионах",
+    )
+    outcome, prs = _ladder(profile, slide, None, ("slide16",))
+    assert outcome.rung == "clone", outcome.notes
+    assert "failure_codes" not in slide.meta
+    assert len(prs.slides) == 1
 
 
 def test_audit_flags_text_shrunk_below_the_budget_as_structural(profile):

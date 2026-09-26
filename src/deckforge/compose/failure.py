@@ -164,6 +164,11 @@ class RepairPolicy:
 # ---------------------------------------------------------------------------
 
 
+# Виды раскладок, где заголовок и есть содержание: обложка, разделитель и
+# финал в профиле шаблона все вида `section`.
+HERO_KINDS = frozenset({"section"})
+
+
 @dataclass(frozen=True)
 class FontBudget:
     """Кегль при подгонке не ниже `min_ratio` от кегля примера и не больше
@@ -172,6 +177,18 @@ class FontBudget:
     36, у текста 16pt при шкале 16/14/12 предел 14 (0,8 дали бы 12,8)."""
     min_ratio: float = 0.8
     max_steps: int = 2
+    # Заголовок героической раскладки (обложка, разделитель, финал): его
+    # даёт пользователь, сокращать нельзя, а сборка обложки с нуля хуже,
+    # чем заголовок мельче примера. Поэтому предел мягче.
+    hero_min_ratio: float = 0.6
+    hero_max_steps: int = 4
+
+    def for_slot(self, role: str, pattern_kind: str) -> "FontBudget":
+        """Предел для конкретного места: у заголовка героической раскладки
+        свой, у остальных общий."""
+        if role == "headline" and pattern_kind in HERO_KINDS:
+            return FontBudget(self.hero_min_ratio, self.hero_max_steps, self.hero_min_ratio, self.hero_max_steps)
+        return self
 
     def floor_pt(self, native_pt: float, scale_pt: Iterable[float]) -> float:
         if native_pt <= 0:
@@ -209,7 +226,10 @@ def font_budget() -> FontBudget:
     if config is None:
         return FontBudget()
     budget = config.font_degradation_budget
-    return FontBudget(min_ratio=budget.min_ratio, max_steps=budget.max_steps)
+    return FontBudget(
+        min_ratio=budget.min_ratio, max_steps=budget.max_steps,
+        hero_min_ratio=budget.hero_headline_min_ratio, hero_max_steps=budget.hero_headline_max_steps,
+    )
 
 
 # ---------------------------------------------------------------------------

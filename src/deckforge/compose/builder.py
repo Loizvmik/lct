@@ -2138,7 +2138,10 @@ def place_slide_by_clone(
     for content, ref in bound:
         ref = _shrink_frame_away_from_decor(slide, ref, bound_elements, canvas)
         bind_text(ref.element, content.paragraphs, bullet_char=bullet_char)
-        overflow = _fit_cloned_text(slide, slide_spec, content, ref, profile, family, canvas, budget=budget)
+        overflow = _fit_cloned_text(
+            slide, slide_spec, content, ref, profile, family, canvas,
+            budget=budget.for_slot(content.slot.role, pattern.kind),
+        )
         if overflow is not None:
             _remove_last_slide(prs)
             return CloneOutcome(overflow, "FONT_BUDGET")
