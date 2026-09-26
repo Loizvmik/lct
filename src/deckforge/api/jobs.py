@@ -4,10 +4,12 @@
 
 Работа идёт в фоне через `asyncio.TaskGroup` (брифом дословно): три
 варианта вёрстки не зависят друг от друга ни на этапе сборки, ни на этапе
-аудита, ни на этапе выгрузки. С задачи N каждый вариант после текста идёт
-своей задачей `TaskGroup` целиком (`_run_variant`: rerank, переписывание
-под вариант, сборка, аудит, экспорт) в собственном бюджете времени, а не
-этап за этапом с ожиданием самого медленного соседа. Сами шаги пайплайна
+аудита, ни на этапе выгрузки. С задачи P каждый стиль после структуры идёт
+своей задачей `TaskGroup` целиком (`_run_variant`: раскладки на всю колоду,
+контракты, текст под них, сборка, аудит, экспорт) в собственном бюджете
+времени, а не этап за этапом с ожиданием самого медленного соседа. Текст
+пишется под раскладку своего стиля, поэтому общий у стилей только разбор и
+структура. Сами шаги пайплайна
 (`TemplateProfile.from_file`, `build_outline`, `write_slides`, `build_deck`,
 `run_deterministic`, `export_bundle`) — синхронный, блокирующий код (диск,
 subprocess `soffice`, CPU); каждый вызов уходит в `asyncio.to_thread`, чтобы
@@ -38,30 +40,31 @@ from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.findings import Finding
 from deckforge.compose.builder import build_deck
 from deckforge.export.bundle import export_bundle
-from deckforge.plan.outline import SourceDoc, build_outline
+from deckforge.pattern.intent import intents_from_outline
+from deckforge.plan.contracts import plan_contracts
+from deckforge.plan.outline import Outline, SourceDoc, build_outline, outline_to_dict
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
-from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import (
-    AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, REALIZE_RESERVE_SECONDS, RERANK_VARIANTS, REALIZE_VARIANTS,
-    realize_for_variant, rerank_patterns, write_slides,
-)
+from deckforge.plan.variants import Variant
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
 from deckforge.export.html import to_html_report
-from deckforge.workflow.budget import RunBudget, RunMode, load_policy
+from deckforge.workflow.budget import RunBudget, load_policy
 from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 
 STAGES: tuple[str, ...] = ("parse", "outline", "write", "compose", "audit", "export")
 
-# Задача N: стадии, общие для трёх вариантов. Их секунды идут в бюджет
-# прогона; всё после текста каждый вариант считает в своём бюджете
-# (`RunBudget.for_variant`), и снимок задания показывает их по вариантам.
-SHARED_STAGES: tuple[str, ...] = ("parse", "outline", "write")
+# Стадии, общие для трёх стилей. Их секунды идут в бюджет прогона; всё
+# после структуры (раскладки, текст под них, сборка, аудит, экспорт) каждый
+# стиль считает в своём бюджете (`RunBudget.for_variant`). С задачи P текст
+# пишется под раскладку своего стиля, поэтому стадия `write` у каждого своя
+# и в интерфейсе отмечается по первому стилю, который до неё дошёл.
+SHARED_STAGES: tuple[str, ...] = ("parse", "outline")
 
 
 class JobError(ValueError):
@@ -97,50 +100,9 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
         return None
 
 
-def _rerank(
-    deck: DeckSpec, profile: TemplateProfile, budget: RunBudget | None = None,
-    *, variants: list[Variant] | None = None, prefer_decor: bool = False,
-) -> dict[Variant, dict[int, str]]:
-    """Тот же шаг, что `cli._rerank`: модель выбирает раскладку из трёх для
-    airy и visual. Выключено в конфиге, нет ключа или режим прогона (задача
-    L, зафиксирован на контрольной точке `after_write`) rerank не
-    разрешает: пустой выбор, раскладку выбирает код. Задача N: зовётся на
-    один вариант, в его бюджете (`variants`), с тем же `prefer_decor`, что
-    потом уйдёт в `apply_variant`."""
-    try:
-        settings = Settings.load(APP_YAML_PATH)
-    except Exception:
-        return {}
-    if not settings.plan.rerank_variants:
-        return {}
-    if budget is not None and not budget.mode_spec().rerank:
-        return {}
-    llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
-    chosen = rerank_patterns(
-        deck, profile, variants if variants is not None else list(Variant), llm,
-        max_workers=settings.llm.pattern_picker_max_workers,
-        budget_seconds=settings.llm.pattern_picker_step_budget_seconds, prefer_decor=prefer_decor,
-    )
-    by_variant: dict[Variant, dict[int, str]] = {}
-    for (variant, index), pattern_id in chosen.items():
-        by_variant.setdefault(variant, {})[index] = pattern_id
-    return by_variant
-
-
-def _realize_settings() -> tuple[bool, int, float]:
-    """`(включено, потоков, бюджет шага)` переписывания под вариант (задача
-    N, `plan.realize_*`). Без читаемого конфига выключено: без конфига нет и
-    ключа модели, переписывать некому."""
-    try:
-        plan = Settings.load(APP_YAML_PATH).plan
-    except Exception:
-        return False, 1, 0.0
-    return plan.realize_variants, plan.realize_max_workers, plan.realize_step_budget_seconds
-
-
-def _build_realizer() -> LLMProvider | None:
-    """Провайдер переписывания под вариант: роль писателя (та же модель
-    пишет и сокращает). Отдельной функцией, чтобы тесты подменяли модель."""
+def _build_writer() -> LLMProvider | None:
+    """Провайдер писателя слайдов. Отдельной функцией, чтобы тесты
+    подменяли модель, не трогая остальные роли."""
     return _build_role_provider("writer")
 
 
@@ -170,15 +132,6 @@ def _writer_agent_max_steps() -> int:
         return Settings.load(APP_YAML_PATH).llm.slide_writer_agent_max_steps
     except Exception:
         return AGENT_MAX_STEPS_DEFAULT
-
-
-def _writer_fill_repair() -> int | None:
-    """Ремонт недобора, тот же приём, что `cli._writer_fill_repair`."""
-    try:
-        llm = Settings.load(APP_YAML_PATH).llm
-    except Exception:
-        return 0
-    return llm.slide_writer_fill_repair_max_items if llm.slide_writer_fill_repair else None
 
 
 def _artifacts_root() -> Path:
@@ -430,41 +383,29 @@ async def _run_job(
             title=title or "Презентация", language=language,
         )
 
-        job.enter_stage("write")
-        writer_llm = _build_role_provider("writer")
-        deck = await asyncio.to_thread(
-            write_slides, outline, source_docs, profile, writer_llm,
-            max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
-            template_path=template.path, fill_repair_max_items=_writer_fill_repair(),
-        )
-
-        # План презентации на диск рядом с результатом. Командная строка
-        # это делала всегда, интерфейс — нет, и разбирать жалобу «слайд
-        # выглядит плохо» приходилось по собранному .pptx, где уже не видно
-        # ни выбранной раскладки, ни находок сборки, ни того, что писала
-        # модель (25 сентября 2026: полдня ушло на попытку восстановить по
-        # файлу, почему заголовок вышел мелким, — без плана это гадание).
+        # Структура на диск рядом с результатом: она общая для трёх стилей,
+        # а план каждого стиля (раскладки и текст) ляжет в `<стиль>/deck.json`.
         try:
-            (job.dir / "deck.json").write_text(
-                json.dumps(deck_spec_to_dict(deck), ensure_ascii=False, indent=2), encoding="utf-8",
+            (job.dir / "outline.json").write_text(
+                json.dumps(outline_to_dict(outline), ensure_ascii=False, indent=2), encoding="utf-8",
             )
         except Exception:  # noqa: BLE001 — отладочный артефакт не вправе ронять генерацию
             pass
 
-        # Задача N: общие стадии позади. Дальше три варианта идут
-        # параллельно, каждый целиком (rerank, переписывание, сборка,
-        # аудит, экспорт, аудит по картинке) в своём бюджете: пять минут ТЗ
-        # считаются на одну презентацию, и медленный вариант не должен
-        # отнимать режим у соседей. Бюджеты заводятся все сразу, до старта
-        # задач, чтобы дедлайн у всех был один.
+        # Общие стадии позади. Дальше три стиля идут параллельно, каждый
+        # целиком (раскладки, текст под них, сборка, аудит, экспорт, аудит
+        # по картинке) в своём бюджете: пять минут ТЗ считаются на одну
+        # презентацию, и медленный стиль не должен отнимать режим у соседей.
+        # Бюджеты заводятся все сразу, до старта задач, чтобы дедлайн у всех
+        # был один.
         job.close_stage()
         budgets = {variant: job.budget.for_variant(variant.value) for variant in Variant}
         config = AuditConfig.load()
-        job.enter_stage("compose")
+        job.enter_stage("write")
         async with asyncio.TaskGroup() as tg:
             for variant in Variant:
                 tg.create_task(_run_variant(
-                    job, variant, deck, profile, template.path, source_docs, config, autofix, budgets[variant],
+                    job, variant, outline, profile, template.path, source_docs, config, autofix, budgets[variant],
                 ))
 
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
@@ -489,60 +430,46 @@ async def _run_job(
 
 
 async def _run_variant(
-    job: JobRecord, variant: Variant, deck: DeckSpec, profile: TemplateProfile, template_path: Path,
+    job: JobRecord, variant: Variant, outline: Outline, profile: TemplateProfile, template_path: Path,
     sources: list[SourceDoc], config: AuditConfig, autofix: bool, budget: RunBudget,
 ) -> None:
-    """Всё, что после текста, для одного варианта в его бюджете (задача N).
+    """Всё после структуры для одного стиля в его бюджете: раскладки на всю
+    колоду (`pattern.plan_patterns`, миллисекунды, без модели), контракты,
+    текст под них, сборка, аудит, экспорт.
 
-    Контрольные точки режима (задача L) те же, но свои у варианта:
-    `after_write` перед rerank и переписыванием, `after_compose` перед
-    аудитом по картинке. Автопочинка правит только `.pptx` своего варианта,
-    поэтому экспорт варианта соседей не ждёт."""
-    budget.decide_mode("after_write")
-    realize_on, realize_workers, realize_budget = _realize_settings()
-    realizer = _build_realizer() if realize_on and variant in REALIZE_VARIANTS else None
-    # Нарядная раскладка без переписывания даст переполнение, поэтому
-    # `prefer_decor` только когда переписывание реально пойдёт: есть модель
-    # и режим не аварийный (в аварийном времени хватает лишь на файл), и
-    # после шага останется время на сборку и экспорт.
-    prefer_decor = (
-        realizer is not None and budget.mode is not RunMode.EMERGENCY
-        and budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS) > 0
+    Контрольные точки режима (задача L) свои у стиля: `after_write` после
+    текста, `after_compose` перед аудитом по картинке. Автопочинка правит
+    только `.pptx` своего стиля, поэтому экспорт соседей не ждёт."""
+    started = budget.clock()
+    _assignments, contracts = await asyncio.to_thread(
+        plan_contracts, intents_from_outline(outline), profile, variant,
     )
-
-    preferred: dict[int, str] | None = None
-    if variant in RERANK_VARIANTS:
-        started = budget.clock()
-        chosen = await asyncio.to_thread(
-            _rerank, deck, profile, budget, variants=[variant], prefer_decor=prefer_decor,
-        )
-        preferred = chosen.get(variant)
-        budget.record("rerank", budget.clock() - started)
+    budget.record("plan", budget.clock() - started)
 
     started = budget.clock()
     variant_deck = await asyncio.to_thread(
-        apply_variant, deck, profile, variant, preferred, prefer_decor=prefer_decor,
+        write_slides, outline, contracts, sources, profile, _build_writer(),
+        max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(), style=variant,
     )
-    if prefer_decor:
-        realize_started = budget.clock()
-        variant_deck = await asyncio.to_thread(
-            realize_for_variant, variant_deck, variant, profile, realizer,
-            max_workers=realize_workers,
-            budget_seconds=budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS),
-        )
-        budget.record("realize", budget.clock() - realize_started)
-        started = budget.clock()
+    budget.record("write", budget.clock() - started)
+    budget.decide_mode("after_write")
+    job.reach_stage("compose")
+
+    started = budget.clock()
     built_path = await asyncio.to_thread(build_deck, variant_deck, profile, template_path, variant)
     dest_dir = job.dir / variant.value
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "deck.pptx"
     await asyncio.to_thread(shutil.copy2, built_path, dest)
-    # План варианта рядом с его файлом: после переписывания текст у airy и
-    # visual свой, и общий deck.json его уже не показывает.
+    # План стиля рядом с его файлом: раскладки и текст у каждого стиля свои.
+    # План dense ещё и под старым общим именем `deck.json` рядом с каталогами
+    # стилей: так разбор жалобы «слайд выглядит плохо» начинается с того же
+    # файла, что и раньше (25 сентября 2026: без плана это гадание).
     try:
-        (dest_dir / "deck.json").write_text(
-            json.dumps(deck_spec_to_dict(variant_deck), ensure_ascii=False, indent=2), encoding="utf-8",
-        )
+        plan_json = json.dumps(deck_spec_to_dict(variant_deck), ensure_ascii=False, indent=2)
+        (dest_dir / "deck.json").write_text(plan_json, encoding="utf-8")
+        if variant is Variant.dense:
+            (job.dir / "deck.json").write_text(plan_json, encoding="utf-8")
     except Exception:  # noqa: BLE001 — отладочный артефакт не вправе ронять генерацию
         pass
     job.variants[variant.value] = VariantState(variant=variant, deck_spec=variant_deck, pptx_path=dest)

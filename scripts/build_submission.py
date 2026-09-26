@@ -1,7 +1,7 @@
 """Драйвер сборки пакета submission/ для промежуточной сдачи DeckForge.
 
 Повторяет путь `deckforge generate` (cli._cmd_generate) один в один (parse ->
-outline -> write -> photos -> per-variant apply_variant/build_deck/audit), но
+outline -> photos -> для каждого стиля plan_patterns/контракты/write/build_deck/audit), но
 добавляет export_bundle (pdf/html/png) на каждый вариант и пишет пофазный
 замер времени + находки аудита в JSON рядом с пакетом, для сведения в
 итоговую таблицу отчёта.
@@ -31,9 +31,11 @@ from deckforge.audit.deterministic import run_deterministic
 from deckforge.cli import _build_namer, _build_pattern_kind_vlm, _build_role_provider, _writer_agent_max_steps, _writer_max_workers
 from deckforge.compose.builder import build_deck, count_embedded_photos
 from deckforge.export.bundle import export_bundle
+from deckforge.pattern.intent import intents_from_outline
+from deckforge.plan.contracts import plan_contracts
 from deckforge.plan.outline import build_outline, load_content_pack
-from deckforge.plan.photos import assign_photos, load_content_pack_photos
-from deckforge.plan.variants import Variant, apply_variant
+from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_photos
+from deckforge.plan.variants import Variant
 from deckforge.plan.writer import write_slides
 from deckforge.template.profile import TemplateProfile
 
@@ -80,17 +82,14 @@ def main() -> int:
     outline_s = t_outlined - t_parsed
     print(f"[{template.name}] структура: {len(outline.slides)} слайдов за {outline_s:.1f}с", flush=True)
 
-    deck = write_slides(
-        outline, sources, profile, writer_llm,
-        max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
-    )
-    t_written = time.monotonic()
-    write_s = t_written - t_outlined
-    print(f"[{template.name}] текст слайдов написан за {write_s:.1f}с", flush=True)
+    t_written = t_outlined
+    write_s = 0.0  # текст пишется у каждого стиля свой, см. variants[*].write_s
 
     photos = load_content_pack_photos(content_pack)
     photo_llm = _build_role_provider("photo_picker") if photos else None
-    deck, photo_report = assign_photos(deck, photos, photo_llm)
+    # Фото распределяются по пунктам структуры до планирования раскладок.
+    photo_by_slide, photo_report = assign_photos_to_outline(outline, photos, photo_llm)
+    intents = intents_from_outline(outline, photo_by_slide)
     t_photos = time.monotonic()
     photos_s = t_photos - t_written
     placed = photo_report.placed_count if photos else 0
@@ -123,8 +122,15 @@ def main() -> int:
         variant_dir = out_dir / variant_name
         variant_dir.mkdir(parents=True, exist_ok=True)
 
+        write_started = time.monotonic()
+        _assignments, contracts = plan_contracts(intents, profile, variant)
+        variant_deck = write_slides(
+            outline, contracts, sources, profile, writer_llm,
+            max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(), style=variant,
+        )
+        variant_write_s = time.monotonic() - write_started
+        print(f"[{template.name}] [{variant_name}] раскладки и текст за {variant_write_s:.1f}с", flush=True)
         step_started = time.monotonic()
-        variant_deck = apply_variant(deck, profile, variant)
         built_path = build_deck(variant_deck, profile, template, variant, user_photos=user_photos)
         build_s = time.monotonic() - step_started
 
@@ -187,6 +193,7 @@ def main() -> int:
 
         stats["variants"][variant_name] = {
             "slide_count": len(variant_deck.slides),
+            "write_s": round(variant_write_s, 1),
             "build_s": round(build_s, 1),
             "audit_s": round(audit_s, 2),
             "export_s": round(export_s, 1),

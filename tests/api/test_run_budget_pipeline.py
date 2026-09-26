@@ -40,34 +40,33 @@ def fake_vlm() -> _FakeVision:
     return _FakeVision()
 
 
-class _FakeRealizer(LLMProvider):
-    """Переписывает слайд одной строкой из всех чисел исходника: короче
-    любого места и с инвариантом смысла, то есть ответ, который код обязан
-    принять."""
+class _FakeWriter(LLMProvider):
+    """Писатель, который отвечает ровно по контракту слайда из запроса:
+    ответ, который код обязан принять без ремонта. Считает вызовы по
+    стилю, чтобы проверить, что текст пишется у каждого стиля свой."""
 
     def __init__(self) -> None:
         self.calls = 0
+        self.styles: dict[str, int] = {}
         self._lock = threading.Lock()
 
     def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        from tests.plan.test_writer import _compliant_answer
+
+        payload = json.loads(messages[1]["content"])
         with self._lock:
             self.calls += 1
-        payload = json.loads(messages[1]["content"])
-        text = "Цифры: " + ", ".join(payload["must_keep"]) if payload["must_keep"] else "Коротко"
-        return json.dumps({
-            "kind": payload["slide"]["kind"], "headline": payload["slide"]["headline"],
-            "blocks": [{"type": "text", "text": text}],
-            "source_note": payload["slide"].get("source_note") or "Источник: пакет",
-        }, ensure_ascii=False)
+            self.styles[payload.get("style")] = self.styles.get(payload.get("style"), 0) + 1
+        return json.dumps(_compliant_answer(payload["contract"]), ensure_ascii=False)
 
 
 @pytest.fixture(scope="module")
-def fake_realizer() -> _FakeRealizer:
-    return _FakeRealizer()
+def fake_writer() -> _FakeWriter:
+    return _FakeWriter()
 
 
 @pytest.fixture(scope="module")
-def budget_job(client: TestClient, template_id: str, store, fake_vlm: _FakeVision, fake_realizer: _FakeRealizer):
+def budget_job(client: TestClient, template_id: str, store, fake_vlm: _FakeVision, fake_writer: _FakeWriter):
     # Задача L: `visual_audit_max_slides` (3, как раньше) теперь строка режима
     # FULL, не плоское поле политики. Бюджет огромный (10_000с) — обе
     # контрольные точки увидят щедрый остаток и зафиксируют FULL.
@@ -80,9 +79,8 @@ def budget_job(client: TestClient, template_id: str, store, fake_vlm: _FakeVisio
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(jobs, "_build_visual_auditor", lambda: fake_vlm)
         mp.setattr(jobs, "_new_budget", lambda: RunBudget.from_policy(policy))
-        # Задача N: переписывание под вариант с фейковой моделью, без сети.
-        mp.setattr(jobs, "_build_realizer", lambda: fake_realizer)
-        mp.setattr(jobs, "_realize_settings", lambda: (True, 4, 60.0))
+        # Задача P: писатель под контракт с фейковой моделью, без сети.
+        mp.setattr(jobs, "_build_writer", lambda: fake_writer)
         brief, sources, meta = load_content_pack(CONTENT_PACK)
         response = client.post("/api/decks", json={
             "template_id": template_id, "brief": brief, "sources": [s.text for s in sources],
@@ -113,13 +111,13 @@ def test_pipeline_with_fake_model_runs_visual_audit(budget_job, fake_vlm: _FakeV
     assert fake_vlm.calls == expected_calls
 
     budget = snapshot["budget"]
-    # Задача N: общие стадии в бюджете прогона, помечены как общие; всё
-    # после текста — в бюджете каждого варианта.
-    assert budget["shared_stages"] == ["parse", "outline", "write"], budget
-    assert set(budget["stage_seconds"]) == {"parse", "outline", "write"}, budget
+    # Задача P: общие только разбор и структура; раскладки и текст у
+    # каждого стиля свои и считаются в его бюджете.
+    assert budget["shared_stages"] == ["parse", "outline"], budget
+    assert set(budget["stage_seconds"]) == {"parse", "outline"}, budget
     assert set(budget["variants"]) == {"dense", "airy", "visual"}, budget
     for name, part in budget["variants"].items():
-        for stage in ("compose", "audit", "export"):
+        for stage in ("plan", "write", "compose", "audit", "export"):
             assert stage in part["stage_seconds"], (name, part)
         # Дедлайн варианта — бюджет минус общие стадии.
         assert part["budget_seconds"] <= budget["budget_seconds"]
@@ -131,9 +129,6 @@ def test_pipeline_with_fake_model_runs_visual_audit(budget_job, fake_vlm: _FakeV
         assert part["mode_checkpoint"] == "after_compose", part
         assert [entry["mode"] for entry in part["mode_history"]] == ["full", "full"]
     assert "visual_audit" in budget["variants"]["dense"]["stage_seconds"]
-    for name in ("airy", "visual"):
-        assert "realize" in budget["variants"][name]["stage_seconds"]
-    assert "realize" not in budget["variants"]["dense"]["stage_seconds"]
 
     # Находки модели лежат в отчёте КАЖДОГО варианта — не только dense.
     variants = client.get(f"/api/decks/{snapshot['deck_id']}/variants").json()
@@ -181,18 +176,19 @@ def test_visual_audit_skipped_when_budget_exhausted(budget_job, fake_vlm: _FakeV
         assert "visual_audit" in variant_budget.skipped
 
 
-def test_realize_runs_per_variant_and_keeps_numbers(budget_job, fake_realizer: _FakeRealizer):
-    """Задача N: переписывание идёт у airy и visual, у dense нет; принятых
-    ответов не больше, чем вызовов модели, и на каждом переписанном слайде
-    раскладка та же, что выбрал вариант."""
+def test_each_style_writes_its_own_text_under_its_own_layouts(budget_job, fake_writer: _FakeWriter):
+    """Задача P: писатель зовётся у каждого стиля отдельно, текст ложится
+    в контракт (ремонтов нет, все места в пределах), раскладки колоды
+    стиля — из шаблона, и у стилей они разные."""
     _snapshot, job = budget_job
-    assert "realize_overflowing" not in job.variants["dense"].deck_spec.meta
-    accepted = 0
-    for name in ("airy", "visual"):
-        meta = job.variants[name].deck_spec.meta
-        assert "realize_overflowing" in meta, meta
-        accepted += int(meta["realize_accepted"])
-        for slide in job.variants[name].deck_spec.slides:
-            if any("текст переписан" in f for f in slide.findings):
-                assert slide.pattern_id and slide.pattern_id in {p.pattern_id for p in job.profile.patterns}
-    assert fake_realizer.calls >= accepted
+    assert set(fake_writer.styles) == {"dense", "airy", "visual"}
+    layouts = {}
+    known = {p.pattern_id for p in job.profile.patterns}
+    for name in ("dense", "airy", "visual"):
+        deck = job.variants[name].deck_spec
+        assert deck.meta["contract_repairs"] == "0", deck.meta
+        assert deck.meta["contract_places_ok"] == deck.meta["contract_places"], deck.meta
+        assert all(s.pattern_id in known for s in deck.slides)
+        layouts[name] = [s.pattern_id for s in deck.slides]
+    assert layouts["dense"] != layouts["visual"]
+    assert (job.dir / "outline.json").exists() and (job.dir / "deck.json").exists()

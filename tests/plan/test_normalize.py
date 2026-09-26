@@ -142,17 +142,24 @@ def test_a_blockless_content_slide_becomes_a_section():
     assert any("разделитель" in f for f in out.slides[0].findings)
 
 
-def test_third_cards_slide_becomes_a_two_column_list():
-    """Пять карточных слайдов из одиннадцати садились на одну раскладку
-    slide21 (27 сентября 2026): начиная с третьего карточки идут списком."""
-    from deckforge.plan.normalize import normalize_deck
-    from deckforge.plan.spec import BulletBlock
 
+
+def test_many_card_slides_stay_cards_the_planner_separates_them():
+    """Задача P: правило «с третьего карточного слайда списком» убрано,
+    повторы раскладок разводит глобальный планировщик."""
     profile = _profile(_pattern("cards", 4), _pattern("two_col", roles=("headline", "bullet")))
     cards = [Card(title=f"Заголовок {i}", body=f"Тело карточки номер {i} с фактом") for i in range(4)]
-    deck = _deck(*[_cards_slide(*cards) for _ in range(4)])
-    out = normalize_deck(deck, profile)
-    assert [s.kind for s in out.slides] == ["cards", "cards", "two_col", "two_col"]
-    third = out.slides[2].blocks[0]
-    assert isinstance(third, BulletBlock) and third.items[0].startswith("Заголовок 0: ")
+    out = normalize_deck(_deck(*[_cards_slide(*cards) for _ in range(4)]), profile)
+    assert [s.kind for s in out.slides] == ["cards"] * 4
 
+
+def test_a_slide_that_kept_its_contract_is_not_reshaped():
+    """Два коротких пункта с числами на раскладке списка, которую выбрал
+    планировщик, остаются списком, если текст уложился в контракт."""
+    slide = SlideSpec(
+        index=0, kind="bullets", headline="Итоги пилота",
+        blocks=[BulletBlock(items=["Медиана ожидания — 6,2 ч", "98,5% времени заявка ждёт"])],
+        source_note="Пилот, 2026", pattern_id="s3",
+    )
+    out = normalize_deck(_deck(slide), FULL, keep=frozenset({0})).slides[0]
+    assert out.kind == "bullets" and out.pattern_id == "s3"

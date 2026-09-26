@@ -70,6 +70,13 @@ import re
 from dataclasses import dataclass, field, replace
 from enum import Enum
 
+from deckforge.pattern.candidates import (  # noqa: F401 — перенесено в планировщик, имена для старых вызовов
+    KPI_CAPTION_MAX_ITEMS as _KPI_CAPTION_MAX_ITEMS, _THANKS_RE, _units_gap,
+    block_has_text as _block_has_text, compatible_kinds as _compatible_kinds,
+    is_closing_pattern as _is_closing_pattern, kinds_that_hold_cards as _kinds_that_hold_cards,
+    structural_gap,
+)
+from deckforge.pattern.intent import DIVIDER_LABELS as _DIVIDER_LABELS, MAX_SLIDES  # noqa: F401
 from deckforge.plan.spec import (
     BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SLIDE_KINDS, SlideSpec, TextBlock,
 )
@@ -77,7 +84,6 @@ from deckforge.plan.spec import (
 # Объём колоды — то же ограничение, что `outline.MIN_SLIDES`/`MAX_SLIDES`
 # (ТЗ дословно: "10-15 слайдов").
 MIN_SLIDES = 10
-MAX_SLIDES = 15
 
 
 class Variant(Enum):
@@ -121,18 +127,6 @@ _VARIANT_KIND_PRIORITY: dict[Variant, tuple[str, ...]] = {
     ),
 }
 
-# Полными фразами, не голыми словами-темами ("Данные", "Риски") — находка
-# координатора (обязательная проверка Task 13): AGENT.md outline-writer
-# требует от МОДЕЛИ, чтобы заголовок был утверждением, а не темой
-# ("Узкое место — не работа, а ожидание", не "Анализ процесса"); разделитель
-# использует ТОТ ЖЕ героический `kind="section"`, что и настоящие
-# содержательные слайды (визуально неотличим по начертанию/кеглю) — голое
-# слово-тема в нём читается как брак того же рода, что и у содержательного
-# слайда, даже когда голова слайда сгенерирована кодом, а не моделью.
-_DIVIDER_LABELS = (
-    "Дальше — контекст", "Дальше — цифры", "Дальше — решение",
-    "Дальше — результаты", "Дальше — риски", "Дальше — план", "Дальше — итоги",
-)
 
 
 # ---------------------------------------------------------------------------
@@ -140,144 +134,12 @@ _DIVIDER_LABELS = (
 # ---------------------------------------------------------------------------
 
 
-# Число элементов `KpiBlock`, ниже которого содержание — ОДИН героический
-# фактоид (Task 18, вид `kpi_caption`), а не панель из нескольких метрик
-# (`kind="kpi"`): 1 — буквально "одно число", не наблюдение за файлами, а
-# сама граница смысла между "фактоид" и "панель" (панель начинается с двух).
-_KPI_CAPTION_MAX_ITEMS = 1
 
 
-def _kinds_that_hold_cards(profile) -> tuple[str, ...]:
-    """Виды раскладок этого шаблона, среди которых есть хоть одна с
-    повтором по ролям карточек. `cards` идёт первым, если он есть: при
-    прочих равных родной вид всё-таки предпочтительнее."""
-    if profile is None:
-        return ()
-    kinds = {
-        p.kind for p in profile.patterns
-        if p.repeat is not None and set(p.repeat.slot_roles) & {"card_title", "card_body"}
-    }
-    if not kinds:
-        return ()
-    ordered = ["cards"] if "cards" in kinds else []
-    ordered += sorted(k for k in kinds if k != "cards")
-    return tuple(ordered)
 
 
-def _compatible_kinds(slide: SlideSpec, profile=None) -> tuple[str, ...]:
-    """`kind`, на раскладку которых содержание `slide` ляжет БЕЗ ПОТЕРИ
-    контента структурно (не по замеру — замер и ужимание делает `compose`
-    при сборке, здесь только "физически есть куда положить эту РОЛЬ
-    содержания"): `CardBlock` требует `Pattern.repeat` с ролями
-    `card_title`/`card_body` (гарантированно только у `kind="cards"` —
-    `compose.blocks._assign_cards` иначе молча ничего не разложит, см. её
-    докстроку про `pattern.repeat is None -> []`), `KpiBlock` требует
-    нескольких `kpi_value`/`kpi_label` слотов (гарантированно только у
-    `kind="kpi"`, ОДИН элемент — у `kind="kpi_caption"` тоже, см. `_KPI_
-    CAPTION_MAX_ITEMS`); `TableVisual` — `table`; безблочный слайд (только
-    заголовок) — героический `kind="section"`. Остальное (текст/буллеты
-    без карточек и KPI) достаточно гибко для нескольких `kind` —
-    `compose.blocks` раскладывает их ПО РОЛИ слота, а не по `kind` пакета
-    целиком, так что список этих "гибких" `kind` НАМЕРЕННО не включает
-    `"section"` (геройские раскладки почти всегда несут только заголовок —
-    вписать туда список пунктов было бы для содержания молча потерянным,
-    см. докстроку модуля про то, почему `apply_variant` вообще не рискует
-    содержанием).
-
-    Task 18, находка №2 брифа ("модель не знает, какие формы умеет шаблон"):
-    раньше `QuoteBlock` не проверялся здесь ВООБЩЕ — даже слайд, который
-    slide-writer честно написал с `kind="quote"` и `QuoteBlock`, "теряло" эту
-    форму на этом шаге (единственном месте, где `kind` окончательно
-    проставляется на сборку, см. докстроку модуля — `write_slides`/
-    `pick_patterns` их не вызывают в реальном пайплайне вовсе, `cli.py`/
-    `api/jobs.py` идут прямо от `write_slides` к `apply_variant`): `has_quote`
-    отсутствовал в проверках выше, слайд с одним `QuoteBlock` (не
-    `TextBlock`/`BulletBlock`) проваливался в `n_text=0, has_bullets=False`
-    и молча получал `kind="bullets"` по умолчанию — весь смысл написанной
-    моделью цитаты для ПОДБОРА раскладки терялся здесь, даже когда в
-    шаблоне есть настоящая раскладка-цитата. `compose.blocks._assign_quote`
-    (уже умеет класть `QuoteBlock` и в `"quote"`-слот, и, если его нет, в
-    `"body"`/`"card_body"`) не единственная причина, почему это раньше
-    "работало" — работало ХУЖЕ, чем могло: содержание не терялось, но
-    ВИЗУАЛЬНО цитата ложилась как обычный абзац."""
-    has_card = any(isinstance(b, CardBlock) and b.items for b in slide.blocks)
-    kpi_block = next((b for b in slide.blocks if isinstance(b, KpiBlock) and b.items), None)
-    has_table = slide.visual is not None and slide.visual.table is not None
-    has_quote = any(isinstance(b, QuoteBlock) and b.text.strip() for b in slide.blocks)
-    n_text = sum(1 for b in slide.blocks if isinstance(b, TextBlock))
-    has_bullets = any(isinstance(b, BulletBlock) and b.items for b in slide.blocks)
-
-    if has_card:
-        # Вид раскладки — ярлык, снятый ГЕОМЕТРИЕЙ, а держать карточки
-        # умеет не только он: любая раскладка с повтором по ролям карточек
-        # разложит их не хуже (`compose.blocks._assign_cards` смотрит на
-        # `Pattern.repeat`, а не на `Pattern.kind`).
-        #
-        # Живой прогон 25 сентября 2026 на VK Education: все шесть
-        # раскладок вида `cards` идут БЕЗ единого украшения, а из шести
-        # двухколоночных украшены пять — и одна из них, `slide26`, несёт
-        # ровно такой повтор. Жёсткая привязка к `cards` запирала слайд в
-        # голых раскладках, хотя рядом была подходящая и оформленная.
-        return _kinds_that_hold_cards(profile) or ("cards",)
-    if kpi_block is not None:
-        if len(kpi_block.items) <= _KPI_CAPTION_MAX_ITEMS:
-            return ("kpi_caption", "kpi")
-        return ("kpi",)
-    if has_table:
-        return ("table",)
-    if has_quote:
-        # `quote` первый по предпочтению, но НЕ единственный совместимый —
-        # шаблон может не нести ни одной раскладки-цитаты вовсе (обычный
-        # случай на бедных шаблонах), тогда `_assign_quote` всё равно
-        # разложит текст цитаты в "body"/"card_body" ближайшего гибкого
-        # `kind` (см. докстроку выше), не теряя содержание.
-        return ("quote", "section", "bullets")
-    if not slide.blocks and slide.visual is None:
-        return ("section",)
-    # Найдено этой задачей ("разбор незнакомого шаблона в бюджет", находка
-    # №6, дефект рендера): слайд, который outline/slide-writer осознанно
-    # написали `kind="section"` (герой-заголовок + ОДНА короткая мысль —
-    # обычный стиль открывающего/переходного слайда, не список), раньше сюда
-    # не доходил вовсе — "section" был совместим ТОЛЬКО с полностью
-    # безблочным слайдом (проверка `not slide.blocks` строкой выше), а
-    # единственный `TextBlock` сразу проваливался в ветку ниже
-    # (`n_text >= 1 -> ("bullets", "two_col")"), теряя авторский выбор
-    # `kind` целиком. На богатом шаблоне (VK Education) это выбирало
-    # раскладку `two_col` — ДВЕ колонки контента под ОДИН текстовый блок:
-    # первая колонка получала контент, вторая (`bullet`-слот справа) —
-    # ничего, и на слайде оставался пустой декор второй колонки (в этом
-    # конкретном шаблоне — сплошная чёрная плашка-подложка без текста,
-    # живой дефект обязательной проверки этой задачи). "section" — ровно та
-    # раскладка, слот которой (`body`/`caption`) рассчитан на одну короткую
-    # мысль без второй колонки; `bullets` остаётся запасным вариантом на
-    # случай, если у шаблона вовсе нет `section`-раскладки с подходящей
-    # вместимостью (`two_col` НЕ в пуле — её вторая колонка не про этот
-    # случай, см. выше, а не смежный вариант вкуса).
-    if slide.kind == "section" and not has_bullets and n_text <= 1 and slide.visual is None:
-        return ("section", "bullets")
-    if slide.visual is not None and slide.visual.kind in ("photo", "icon"):
-        n_text_with_photo = sum(1 for b in slide.blocks if isinstance(b, (TextBlock, BulletBlock)) and _block_has_text(b))
-        if n_text_with_photo >= 1:
-            # Фото/мокап РЯДОМ с содержательным текстом — Task 18,
-            # `photo_text` (не героическая картинка на весь холст без
-            # текста, для неё `image` остаётся первым в списке ниже, когда
-            # текста на слайде фактически нет).
-            return ("photo_text", "image", "bullets", "two_col")
-        return ("image", "bullets", "two_col")
-
-    if n_text >= 2:
-        return ("two_col", "bullets")
-    if has_bullets or n_text >= 1:
-        return ("bullets", "two_col")
-    return ("bullets",)
 
 
-def _block_has_text(block) -> bool:
-    if isinstance(block, TextBlock):
-        return bool(block.text.strip())
-    if isinstance(block, BulletBlock):
-        return any(item.strip() for item in block.items)
-    return False
 
 
 def _content_char_len(slide: SlideSpec) -> int:
@@ -728,40 +590,8 @@ def _choose_kind_and_pattern(
     return best.kind, best.pattern_id
 
 
-def structural_gap(slide: SlideSpec, profile) -> str | None:
-    """Почему ни одна раскладка шаблона не вмещает содержание слайда по
-    структуре, или `None`, если какая-то вмещает.
-
-    `_choose_kind_and_pattern` в этом случае не падает, а берёт лучшее из
-    худшего, и раньше делал это молча: шесть карточек садились на сетку из
-    четырёх, таблица на раскладку без таблицы, и по отчёту было не понять,
-    почему слайд вышел обрезанным. Выбор эта функция не меняет, только
-    называет причину числами."""
-    if profile is None or not profile.patterns:
-        return None
-    for block in slide.blocks:
-        if isinstance(block, CardBlock) and block.items:
-            holders = [
-                p for p in profile.patterns
-                if p.repeat is not None and set(p.repeat.slot_roles) & {"card_title", "card_body"}
-            ]
-            return _units_gap(len(block.items), holders, "карточек", "карточки")
-        if isinstance(block, KpiBlock) and block.items:
-            holders = [p for p in profile.patterns if p.kind in ("kpi", "kpi_caption")]
-            return _units_gap(len(block.items), holders, "показателей", "показатели")
-    if slide.visual is not None and slide.visual.table is not None:
-        if not any(p.kind == "table" for p in profile.patterns):
-            return "нужен слот под таблицу, в шаблоне его нет"
-    return None
 
 
-def _units_gap(needed: int, holders: list, many: str, target: str) -> str | None:
-    if not holders:
-        return f"{many} на слайде: {needed}, раскладок под {target} в шаблоне нет"
-    most = max(max(p.capacity.max_items, p.repeat.count if p.repeat is not None else 0) for p in holders)
-    if needed > most:
-        return f"нужно {needed} единиц, максимум в шаблоне {most}"
-    return None
 
 
 def _is_cover(slide: SlideSpec) -> bool:
@@ -770,23 +600,8 @@ def _is_cover(slide: SlideSpec) -> bool:
     return slide.index == 0 and slide.kind == "section"
 
 
-def _is_closing_pattern(p, profile) -> bool:
-    """Финальная раскладка шаблона: героическая, снятая с последнего
-    слайда-примера («Спасибо за внимание!» с QR-кодом у VK Education). Ей
-    место только на последнем слайде колоды: на втором слайде она
-    выглядела концом презентации (27 сентября 2026)."""
-    if p.kind not in ("section", "closing") or not p.source_slide_index:
-        return False
-    if any(_THANKS_RE.search(sl.sample_text or "") for sl in p.slots):
-        # У VK Education «Спасибо за внимание!» стоит на слайде 52, а
-        # похожие слайды 53–55 схлопнуты в другой паттерн: по одному номеру
-        # финал не узнать.
-        return True
-    last = max((n for q in profile.patterns for n in q.source_slide_index), default=None)
-    return last is not None and min(p.source_slide_index) == last
 
 
-_THANKS_RE = re.compile(r"спасибо|благодар|thank|вопрос|questions|контакт|contact", re.IGNORECASE)
 
 
 def _ranked_candidates(
