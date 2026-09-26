@@ -15,7 +15,9 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from deckforge.template.patterns import CHARS_PER_WORD, keeps_sample_text, slot_char_capacity
+from deckforge.template.patterns import (
+    CHART_TIER_TEXT, CHARS_PER_WORD, chart_target_slot, keeps_sample_text, slot_char_capacity,
+)
 
 TEXT_ROLES = ("body", "bullet", "card_body")
 _UNIT_BODY_ROLES = ("card_body", "bullet", "body")
@@ -78,6 +80,12 @@ class PatternForm:
     has_image: bool
     decor: int
     repeated: bool
+    # Задача V1: насколько раскладка годится под график
+    # (`patterns.CHART_TIER_*`: родной график, картинка-график примера,
+    # крупное текстовое место), `None`: графику места нет.
+    chart_tier: int | None = None
+    # Класс слайда-примера (`template.prototypes.SLIDE_CLASSES`).
+    slide_class: str = "content_pattern"
 
     @property
     def main(self) -> FormPart | None:
@@ -190,7 +198,21 @@ def pattern_form(pattern) -> PatternForm:
         has_chart="chart" in roles,
         has_image="image" in roles,
         decor=len(pattern.decor), repeated=repeat is not None,
+        chart_tier=_chart_tier(pattern, parts),
+        slide_class=getattr(pattern, "slide_class", "content_pattern"),
     )
+
+
+def _chart_tier(pattern, parts: list[FormPart]) -> int | None:
+    """Ступень пригодности под график. Текстовое место годится только у
+    раскладки, чьё главное содержание абзац или список: график в одной
+    карточке из трёх ломает ряд, а не заменяет содержание."""
+    _slot, tier = chart_target_slot(pattern.slots)
+    if tier == CHART_TIER_TEXT:
+        main = next((p for p in parts if p.required), None)
+        if main is None or main.block not in ("bullets", "text"):
+            return None
+    return tier
 
 
 def list_item_limit(part: FormPart, count: int) -> Limit:
@@ -292,7 +314,10 @@ def capabilities_of(pattern, form: PatternForm | None = None) -> PatternCapabili
         card_has_icon=bool(cards is not None and (unit_decor or "icon" in repeat_roles)),
         card_has_image=bool(cards is not None and "image" in repeat_roles),
         supports_table=form.has_table,
-        supports_chart=form.has_chart or form.has_table or form.has_image,
+        # Место под график по ступеням задачи V1 (родной график, картинка-
+        # график примера, крупное текстовое место), а не любая картинка:
+        # фото-рамка графику не место.
+        supports_chart=form.chart_tier is not None or form.has_chart or form.has_table,
         supports_photo=form.has_image,
         supports_quote=quote is not None,
         supports_kpi=kpi is not None,

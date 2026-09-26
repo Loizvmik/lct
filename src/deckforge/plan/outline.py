@@ -16,11 +16,13 @@ prompt` там). Код здесь читает файл, вызывает мо�
 падение (тот же принцип, что и у `name_palette_roles_report`)."""
 from __future__ import annotations
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import yaml
 
+from deckforge.plan.data_types import VisualIntent, visual_intents
+from deckforge.plan.series import stems
 from deckforge.provider.base import LLMProvider
 
 AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "outline-writer" / "AGENT.md"
@@ -73,6 +75,11 @@ class OutlineSlide:
     # график). Оба поля необязательны: без них число берётся из `needs`.
     items: int | None = None
     form: str | None = None
+    # Задача V1: визуал пункта по типу данных источников
+    # (`plan.data_types.VisualIntent`, `apply_visual_intents`): что
+    # показать, обязательно ли, почему и по каким данным. Решает код до
+    # письма, писатель получает данные готовыми.
+    visual_intent: VisualIntent | None = None
 
 
 @dataclass(frozen=True)
@@ -235,7 +242,7 @@ def build_outline(
     n = _clamp_target(target_slides)
 
     if llm is None:
-        return Outline(slides=_fallback_outline(n), title=title, language=language)
+        return Outline(slides=apply_visual_intents(_fallback_outline(n), sources), title=title, language=language)
 
     _meta, prompt_body = _load_agent_prompt()
     payload = {
@@ -276,7 +283,7 @@ def build_outline(
     else:
         slides = _clamp_slide_count(slides, n)
 
-    return Outline(slides=slides, title=title, language=language)
+    return Outline(slides=apply_visual_intents(slides, sources), title=title, language=language)
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +321,118 @@ def outline_to_dict(outline: Outline) -> dict:
     return {
         "title": outline.title, "language": outline.language,
         "slides": [
-            {"kind": s.kind, "intent": s.intent, "needs": list(s.needs), "items": s.items, "form": s.form}
+            {
+                "kind": s.kind, "intent": s.intent, "needs": list(s.needs), "items": s.items, "form": s.form,
+                **({"visual_intent": s.visual_intent.to_dict()} if s.visual_intent is not None else {}),
+            }
             for s in outline.slides
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# Задача V1: визуал из типа данных, до письма
+# ---------------------------------------------------------------------------
+
+_HERO_KINDS = ("title", "closing")
+# Новый пункт с визуалом встаёт после пункта, с которым у набора данных
+# столько общих основ слов; одной мало: «контекст» и «контента» дают
+# одну основу, а о разном.
+_NEAR_WORDS = 2
+# Форма пункта структуры по типу визуала слоя данных.
+_FORM_OF = {"chart": "chart", "table": "table", "kpi": "kpi"}
+
+
+def _slide_text(slide: OutlineSlide) -> str:
+    return " ".join([slide.intent, *slide.needs])
+
+
+def _overlap(slide: OutlineSlide, vi: VisualIntent) -> int:
+    return len(stems(_slide_text(slide)) & vi.data.words) if vi.data is not None else 0
+
+
+def apply_visual_intents(slides: list[OutlineSlide], sources: list[SourceDoc]) -> list[OutlineSlide]:
+    """Визуал пунктов структуры по типам данных источников
+    (`plan.data_types`).
+
+    1. Пункт, которому модель структуры сама назначила график или таблицу,
+       получает ближайший по смыслу набор данных подходящего вида.
+    2. Набор, для которого визуал обязателен (`VisualIntent.required`:
+       динамика от четырёх точек, сравнение от трёх категорий, части
+       целого), и который ни один пункт не взял, получает пункт сам: пункт
+       «данные» без особой формы, пересказывающий эти числа (модель
+       спланировала ряд списком), переделывается под график; иначе новый
+       пункт встаёт после самого близкого по смыслу; при полной колоде
+       (`MAX_SLIDES`) под график переделывается любой пункт без формы.
+    Каждый набор данных достаётся одному пункту."""
+    intents = visual_intents(sources)
+    if not intents or not slides:
+        return slides
+    slides = list(slides)
+    used: set[str] = set()
+
+    for i, slide in enumerate(slides):
+        if slide.form not in ("chart", "table") or slide.visual_intent is not None:
+            continue
+        pool = [
+            vi for vi in intents
+            if vi.data_ref not in used and (vi.type == "chart" if slide.form == "chart" else vi.type in ("table", "chart"))
+        ]
+        best = _best(slide, pool)
+        if best is None:
+            continue
+        if slide.form == "table" and best.type == "chart" and best.required:
+            # Слой данных главнее формы, которую назвала модель: динамику
+            # по кварталам она заказала таблицей (живой прогон V1, VK
+            # Education), а по правилам типа данных здесь нужен график.
+            slides[i] = replace(slide, form="chart", visual_intent=best)
+            used.add(best.data_ref)
+            continue
+        if slide.form == "table" and best.type == "chart":
+            best = VisualIntent(
+                type="table", required=False, data_ref=best.data_ref, data=best.data,
+                reason="структура заказала таблицу по этим числам",
+            )
+        slides[i] = replace(slide, visual_intent=best)
+        used.add(best.data_ref)
+
+    for vi in intents:
+        if not vi.required or vi.data_ref in used:
+            continue
+        content = [i for i, s in enumerate(slides) if s.kind not in _HERO_KINDS and s.visual_intent is None]
+        free = [i for i in content if slides[i].form is None]
+        retold = [i for i in free if slides[i].kind == "data" and _overlap(slides[i], vi) > 0]
+        if retold:
+            target = max(retold, key=lambda i: (_overlap(slides[i], vi), -i))
+            slides[target] = replace(slides[target], form=_FORM_OF[vi.type], items=1, visual_intent=vi)
+        elif len(slides) < MAX_SLIDES:
+            near = max(content, key=lambda i: (_overlap(slides[i], vi), -i), default=None)
+            at = near + 1 if near is not None and _overlap(slides[near], vi) >= _NEAR_WORDS else max(1, len(slides) - 1)
+            slides.insert(at, _new_slide(vi))
+        elif free:
+            slides[free[0]] = replace(slides[free[0]], form=_FORM_OF[vi.type], items=1, visual_intent=vi)
+        else:
+            continue
+        used.add(vi.data_ref)
+    return slides
+
+
+def _best(slide: OutlineSlide, pool: list[VisualIntent]) -> VisualIntent | None:
+    """Ближайший по словам набор; при равенстве первый по источнику. Без
+    единого общего слова первый обязательный, потом первый вообще: модель
+    заказала график, и числа у неё из тех же источников."""
+    if not pool:
+        return None
+    return max(enumerate(pool), key=lambda p: (_overlap(slide, p[1]), p[1].required, -p[0]))[1]
+
+
+def _new_slide(vi: VisualIntent) -> OutlineSlide:
+    ds = vi.data
+    what = ds.table.heading if ds is not None and ds.table.heading else "данные источника"
+    names = ", ".join(s.name for s in ds.series.series) if ds is not None and ds.series is not None else ""
+    return OutlineSlide(
+        kind="data",
+        intent=f"Вывод из чисел раздела «{what}»" + (f": {names}" if names else ""),
+        needs=[f"{vi.reason}; вывод из ряда {names or what}"],
+        items=1, form=_FORM_OF[vi.type], visual_intent=vi,
+    )

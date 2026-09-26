@@ -192,6 +192,11 @@ class PatternSlot:
     # ставит туда слайд, чьи слоты остались в паттерне). У групп путь не
     # нужен: id уникален в пределах слайда. `None`: id не было.
     source_shape_id: str | None = None
+    # Картинка примера сама изображает график («Пример оформления
+    # графика» у VK Education, слайды 47-50): родных графиков в таком
+    # шаблоне нет, и рамка этой картинки лучшее место под наш график того
+    # же размера. Ставится только у роли `image`, см. `mark_chart_frames`.
+    chart_frame: bool = False
 
     @property
     def keeps_sample_text(self) -> bool:
@@ -402,6 +407,12 @@ class Pattern:
     photo_area: float = 0.0
     photo_slot_area: float = 0.0
     layout_photo_ids: list[str] = field(default_factory=list)
+    # Задача V1: чем слайд-пример служит шаблону (`prototypes.SLIDE_CLASSES`):
+    # раскладкой содержания, образцом оформления графика, правилами
+    # оформления, листом ассетов или инструкцией дизайнера. Под содержание
+    # берутся только раскладки содержания, образец графика только под
+    # график. Снимается детерминированно (`prototypes.classify_slides`).
+    slide_class: str = "content_pattern"
 
 
 # --- геометрические допуски (бриф, Step 2, п.4 — оба числа литералом) ------
@@ -518,8 +529,17 @@ def mine_patterns(
             bg_image_cache, decor_image_cache, photo_cache,
         )
         if pattern is not None:
-            candidates.append(pattern)
-    return _dedup(candidates)
+            candidates.append(mark_chart_frames(pattern))
+    # Задача V1: класс слайда-примера здесь, а не у вызывающего: майнинг
+    # зовут и из дозапроса видов поверх кеша (`profile._reclassify_pattern_
+    # kinds`), и класс, поставленный снаружи, там терялся (живой прогон:
+    # образцы графиков VK Education вышли раскладками содержания).
+    from deckforge.template.chart_rules import find_chart_rules
+    from deckforge.template.prototypes import classify_slides, find_chart_prototypes
+
+    patterns = _dedup(candidates)
+    rules = find_chart_rules(pkg)
+    return classify_slides(patterns, rules, find_chart_prototypes(pkg, canvas, patterns, rules))
 
 
 def _slide_parts(pkg: PptxPackage) -> list[str]:
@@ -2646,3 +2666,83 @@ def _dedup(patterns: list[Pattern]) -> list[Pattern]:
         rest = sorted((set(existing.source_slide_index) | set(p.source_slide_index)) - {own})
         by_signature[sig] = replace(winner, source_slide_index=[own, *rest])
     return sorted(by_signature.values(), key=lambda p: -p.score)
+
+
+# --- рамка под график -------------------------------------------------------
+
+# Слова, по которым слайд-пример сам говорит, что его картинка график:
+# «Пример оформления графика», «Гистограмма и диаграмма с областями».
+# «Инфографика» не график, а «диаграмма Ганта» таймлайн: столбики по
+# категориям туда не лягут.
+_CHART_WORDS_RE = re.compile(r"(?<!инфо)график|диаграмм|гистограмм|\bchart|\bgraph\b", re.IGNORECASE)
+_NOT_CHART_RE = re.compile(r"ганта|gantt|инфографик", re.IGNORECASE)
+# Картинка-график меньше этой доли холста: пиктограмма у подписи, а не
+# рамка, в которой график читается.
+CHART_FRAME_MIN_AREA = 0.15
+# Текстовое место не меньше этой доли холста годится под график, если
+# своего места под него у раскладки нет (раскладка «заголовок и список»).
+CHART_TEXT_AREA_MIN = 0.2
+
+# Ступени пригодности раскладки под график, от лучшей: родной график
+# примера, картинка-график примера, крупное текстовое место.
+CHART_TIER_NATIVE = 0
+CHART_TIER_FRAME = 1
+CHART_TIER_TEXT = 2
+_CHART_TEXT_ROLES = ("body", "bullet", "card_body")
+
+
+def slide_mentions_chart(text: str) -> bool:
+    """Текст слайда говорит, что на нём график: общее правило для рамки
+    под график (`mark_chart_frames`) и образца графика
+    (`prototypes.find_chart_prototypes`)."""
+    return bool(_CHART_WORDS_RE.search(text or "")) and not _NOT_CHART_RE.search(text or "")
+
+
+def mark_chart_frames(pattern: Pattern) -> Pattern:
+    """Помечает `chart_frame` у крупных картинок слайда, чей текст говорит
+    о графике. Детерминированно, по тексту примера: модель разбора не
+    нужна, а решение одно и то же на каждом разборе."""
+    text = " ".join(s.sample_text or "" for s in pattern.slots)
+    if not slide_mentions_chart(text):
+        return pattern
+    slots = [
+        replace(s, chart_frame=True) if s.role == "image" and s.box.area >= CHART_FRAME_MIN_AREA else s
+        for s in pattern.slots
+    ]
+    if all(a is b for a, b in zip(slots, pattern.slots)):
+        return pattern
+    return replace(pattern, slots=slots)
+
+
+def chart_target_slot(slots) -> tuple[object | None, int | None]:
+    """Место, куда ляжет график слайда, и ступень пригодности
+    (`CHART_TIER_*`). Одна функция для планировщика (какая раскладка
+    годится под график и насколько) и для сборки (куда его ставить), чтобы
+    они не разошлись. Принимает и `PatternSlot`, и его JSON-зеркало.
+
+    Текстовое место выбирается тем же порядком, что главная часть формы
+    (`pattern.forms`): самое ёмкое по знакам, без текста примера."""
+    slots = list(slots)
+
+    def area(s) -> float:
+        box = getattr(s, "box", None)
+        return box.width * box.height if box is not None else 0.0
+
+    def biggest(pool):
+        return max(pool, key=area) if pool else None
+
+    native = biggest([s for s in slots if s.role == "chart"])
+    if native is not None:
+        return native, CHART_TIER_NATIVE
+    frame = biggest([s for s in slots if s.role == "image" and getattr(s, "chart_frame", False)])
+    if frame is not None:
+        return frame, CHART_TIER_FRAME
+    text = [
+        s for s in slots
+        if s.role in _CHART_TEXT_ROLES and not keeps_sample_text(s) and s.max_chars > 0
+    ]
+    if text:
+        main = max(text, key=lambda s: (slot_char_capacity(s), area(s)))
+        if area(main) >= CHART_TEXT_AREA_MIN:
+            return main, CHART_TIER_TEXT
+    return None, None

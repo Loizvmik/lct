@@ -10,7 +10,7 @@
 (`items`, если модель структуры его назвала, иначе число `needs`, иначе
 типичное для вида пункта)."""
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Объём колоды по ТЗ: 10-15 слайдов. Разделители airy не выводят за верх.
 MAX_SLIDES = 15
@@ -57,6 +57,11 @@ class SlideIntent:
     # Разделитель стиля airy: текста не пишет никто, заголовок статичный.
     divider: bool = False
     label: str | None = None
+    # Визуал пункта из слоя типов данных (`plan.data_types.VisualIntent`,
+    # через `OutlineSlide.visual_intent`): едет в контракт писателя как
+    # есть, чтобы числа графика и таблицы были числами источника, а не
+    # пересказом модели.
+    visual_intent: object | None = field(default=None, compare=False)
 
     @property
     def is_hero(self) -> bool:
@@ -97,6 +102,7 @@ def intents_from_outline(outline, photos: dict[int, tuple[str, str | None]] | No
             index=i, outline_kind=slide.kind, intent=slide.intent, needs=tuple(slide.needs),
             items=_items_of(slide), form=form if form in FORMS else None,
             photo=photo[0] if photo else None, photo_caption=photo[1] if photo else None,
+            visual_intent=getattr(slide, "visual_intent", None),
         ))
     return result
 

@@ -24,6 +24,7 @@ from deckforge.pattern.forms import (
 )
 from deckforge.pattern.intent import SlideIntent
 from deckforge.pattern.style import StylePolicy
+from deckforge.template.patterns import CHART_TIER_FRAME
 
 # Героические виды: картинка в них часть оформления, пустой её не считаем.
 _HERO_IMAGE_KINDS = frozenset({"section", "image", "closing"})
@@ -74,7 +75,7 @@ def matches(token: str, form: PatternForm) -> bool:
     if token == "sparse_cards":
         return block == "cards" and form.units <= 3
     if token == "chart":
-        return form.has_chart or form.has_table
+        return form.has_chart or form.has_table or is_chart_frame(form)
     if token == "diagram":
         return form.repeated and form.decor >= max(form.units, 1)
     if token == "image":
@@ -126,6 +127,8 @@ def static_cost(
     ):
         cost += w("orphan_image")
     cost += photo_void_cost(pattern, intent, style)
+    if intent.required_visual == "chart":
+        cost += w("chart_fit") * style.chart_weight * chart_fit(form)
     if position == 0 and cover_id is not None and pattern.pattern_id != cover_id:
         cost += w("cover_miss")
     if (
@@ -134,6 +137,25 @@ def static_cost(
     ):
         cost += w("cover_miss")
     return cost
+
+
+# Ступень пригодности раскладки под график без места под него вовсе:
+# хуже любой из трёх (`patterns.CHART_TIER_*`), такую раскладку берёт
+# только ослабленный фильтр кандидатов.
+_NO_CHART_PLACE = 3
+
+
+def is_chart_frame(form: PatternForm) -> bool:
+    """Картинка примера сама график: для вкуса стиля это место под график,
+    как и родной график."""
+    return form.chart_tier == CHART_TIER_FRAME
+
+
+def chart_fit(form: PatternForm) -> float:
+    """0 у родного графика примера (подменяются только данные, стиль
+    дизайнера остаётся), 1 у картинки-графика (наш график встаёт в её
+    рамку), 2 у крупного текстового места, 3 без места. Задача V1."""
+    return float(_NO_CHART_PLACE if form.chart_tier is None else form.chart_tier)
 
 
 def repeat_cost(pattern_id: str, previous: str | None, uses: int, style: StylePolicy) -> float:

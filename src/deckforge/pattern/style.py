@@ -24,6 +24,7 @@ _DEFAULT_WEIGHTS = {
     "overflow": 1000.0, "consecutive_repeat": 500.0, "repeated_pattern": 30.0,
     "style_mismatch": 20.0, "density_mismatch": 10.0, "pattern_quality": 5.0,
     "decor": 10.0, "orphan_image": 15.0, "cover_miss": 50.0, "short_headline": 60.0, "sample_photo_void": 200.0,
+    "chart_fit": 25.0,
 }
 _DEFAULT_STYLES = {
     "dense": {
@@ -82,6 +83,9 @@ class StylePolicy:
     dividers: bool
     weights: dict[str, float] = field(default_factory=lambda: dict(_DEFAULT_WEIGHTS))
     diversity: Diversity = field(default_factory=Diversity)
+    # Во сколько раз стиль строже к месту под график (`scoring.chart_fit`):
+    # visual предпочитает родной график и картинку-график сильнее прочих.
+    chart_weight: float = 1.0
 
     def weight(self, name: str) -> float:
         return float(self.weights.get(name, _DEFAULT_WEIGHTS.get(name, 0.0)))
@@ -130,4 +134,5 @@ def load_style(style, path: Path | None = None) -> StylePolicy:
         dividers=bool(raw["dividers"]),
         weights={k: float(v) for k, v in weights.items()},
         diversity=_load_diversity(str(path or STYLES_YAML_PATH)),
+        chart_weight=float(raw.get("chart_weight", 1.0)),
     )

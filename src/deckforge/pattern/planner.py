@@ -14,7 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deckforge.pattern.candidates import (
-    RELAX_TITLES, candidates_for, compatible_kinds, cover_pattern_id, has_fixed_headline, is_closing_pattern,
+    RELAX_TITLES, candidates_for, compatible_kinds, cover_pattern_id, has_fixed_headline, not_plain_content,
+    is_closing_pattern,
 )
 from deckforge.pattern.forms import PatternForm, forms_of
 from deckforge.pattern.intent import SlideIntent, intents_from_outline, with_dividers
@@ -233,6 +234,10 @@ def repick_pattern(
             continue
         if has_fixed_headline(p) and position != last:
             continue
+        if not_plain_content(forms[p.pattern_id]) and not _has_chart(slide):
+            # Место под график без графика пустеет: картинку-график и
+            # данные-образец родного графика сборка удаляет (задача V1).
+            continue
         cost = static_cost(
             intent, p, forms[p.pattern_id], policy, position=position, last=last,
             cover_id=cover_id, closing_ids=closing_ids,
@@ -264,3 +269,6 @@ def _same_form_alternatives(
         other for other, _cost in scored
         if other != chosen and patterns[other].kind == want_kind and block(other) == want_block
     )[:MAX_ALTERNATIVES]
+def _has_chart(slide) -> bool:
+    visual = getattr(slide, "visual", None)
+    return visual is not None and visual.kind == "chart" and visual.chart is not None
