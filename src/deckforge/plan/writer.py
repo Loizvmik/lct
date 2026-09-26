@@ -296,11 +296,15 @@ def _fallback_slide(kind: str, index: int, intent: str, needs: list[str], *, rea
     # заголовка ничего нет. Живой прогон 25 сентября 2026 на VK Tech:
     # титульный слайд получил строку «Нужны данные: Название инициативы» —
     # для обложки это мусор, а не честность.
+    # Пункты идут на слайд как есть, без приставки «Нужны данные»: в
+    # готовой колоде она читалась как брак (живой прогон 27 сентября 2026),
+    # а что слайд запасной, говорят находка выше и заметка докладчика.
     needs_fit_this_slide = needs and kind not in _HEADLINE_ONLY_KINDS
-    blocks = [BulletBlock(items=[f"Нужны данные: {n}" for n in needs])] if needs_fit_this_slide else []
+    blocks = [BulletBlock(items=list(needs))] if needs_fit_this_slide else []
     return SlideSpec(
         index=index, kind=kind, headline=headline, blocks=blocks,
         source_note=source_note, findings=[finding],
+        speaker_notes="Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
     )
 
 

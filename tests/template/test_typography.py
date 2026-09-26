@@ -209,3 +209,16 @@ def test_families_total_reflects_normalized_control_file_scenario():
     assert families_total == 2
     assert families == ["Montserrat", "Poppins"]
     assert family_variants["Montserrat"] == ["Montserrat", "Montserrat Medium"]
+
+
+def test_fill_scale_gaps_adds_intermediate_sizes_between_distant_steps():
+    """VK Education: шкала 12/14/16/44/48/88, между 16 и 44 пусто, и
+    заголовок ужимался сразу до кегля текста (обложка живого прогона
+    27 сентября 2026)."""
+    from deckforge.template.typography import fill_scale_gaps
+
+    filled = fill_scale_gaps([12, 14, 16, 44, 48, 88])
+    assert [v for v in filled if 16 < v < 44] == [18, 20, 24, 28, 32, 36, 40]
+    assert [v for v in filled if 44 <= v <= 48] == [44, 48]
+    assert fill_scale_gaps([16, 20, 24]) == [16, 20, 24]
+

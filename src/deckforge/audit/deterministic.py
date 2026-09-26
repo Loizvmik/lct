@@ -59,6 +59,7 @@ from deckforge.ooxml.ns import local_name, qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import ShapeRef, walk_shapes
 from deckforge.template.naming import contrast_ratio
+from deckforge.template.typography import fill_scale_gaps
 from deckforge.template.profile import TemplateProfile
 
 EMU_PER_INCH = 914400
@@ -1176,6 +1177,9 @@ def _allowed_font_sizes(profile: TemplateProfile) -> set[float]:
     шаблона" (ни в ступенях, ни в фактических кеглях его собственных
     слайдов), не "не совпадает с одним из шести круглых чисел"."""
     sizes = {profile.denorm_pt(v) for v in profile.type_scale.steps.values() if v > 0}
+    # Промежуточные кегли между далёкими ступенями (см. `typography.
+    # fill_scale_gaps`): сборка ужимает по ним, и они не брак.
+    sizes |= set(fill_scale_gaps(sizes))
     for pattern in profile.patterns:
         for slot in pattern.slots:
             if slot.size_pt and slot.size_pt > 0:

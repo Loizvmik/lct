@@ -58,6 +58,7 @@ from deckforge.settings import Settings
 from deckforge.template.grid import ColumnAxis, Grid
 from deckforge.template.naming import MIN_CONTRAST
 from deckforge.template.patterns import Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec
+from deckforge.template.typography import fill_scale_gaps
 from deckforge.template.profile import LayoutEntryModel, TemplateProfile
 from deckforge.workflow.versions import manifest as workflow_manifest
 
@@ -2248,7 +2249,10 @@ def _shrink_sequence(profile: TemplateProfile, slot_size_pt: float) -> list[floa
             seq.append(value)
     if caption_pt > 0 and abs(seq[-1] - caption_pt) > 0.05:
         seq.append(caption_pt)
-    return seq
+    # Между далёкими ступенями (44 -> 16 у VK Education) промежуточные
+    # кегли, иначе заголовок ужимается сразу до кегля текста.
+    filled = [v for v in fill_scale_gaps(seq) if v <= size_pt + 0.05 and v >= caption_pt - 0.05]
+    return sorted(set(filled) | {size_pt}, reverse=True)
 
 
 def _joined_text(paragraphs: list[Paragraph]) -> str:

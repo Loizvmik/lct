@@ -60,6 +60,30 @@ from deckforge.template.usage import FontUsage, Usage
 # вида 14.191503267973856 вперемешку с округлёнными до 0.1pt синтетическими
 # ступенями (найдено general-purpose ревьюером, Task 4, повторное ревью).
 _SIZE_ROUNDING_STEP = 0.5
+# Промежуточные кегли между далёкими ступенями шкалы. Шкала снимается с
+# фактического употребления, и у VK Education это 12/14/16/44/48/88: между
+# заголовком 44 и текстом 16 ничего нет. Заголовок, не влезший на 44,
+# падал сразу на 16 (обложка живого прогона 27 сентября 2026). Между
+# ступенями, отличающимися больше чем в полтора раза, добавляются ступени
+# этой лестницы; аудит T02 считает их легитимными тем же правилом.
+_INTERMEDIATE_LADDER = (40.0, 36.0, 32.0, 28.0, 24.0, 20.0, 18.0)
+_GAP_RATIO = 1.5
+
+
+def fill_scale_gaps(sizes) -> list[float]:
+    """Кегли по возрастанию с промежуточными ступенями там, где соседние
+    отличаются больше чем в `_GAP_RATIO` раза."""
+    ordered = sorted({float(v) for v in sizes if v and v > 0})
+    out: list[float] = []
+    for i, value in enumerate(ordered):
+        out.append(value)
+        if i + 1 < len(ordered):
+            nxt = ordered[i + 1]
+            if nxt / value > _GAP_RATIO:
+                out.extend(v for v in sorted(_INTERMEDIATE_LADDER) if value + 0.05 < v < nxt - 0.05)
+    return out
+
+
 
 # Прореживание шкалы: "два значения ближе 1.5pt схлопываются в одно"
 # (брифом, Step 2) — переиспользует общую cluster() из grid.py.

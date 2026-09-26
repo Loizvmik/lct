@@ -579,7 +579,10 @@ def test_a_fallback_slide_says_what_data_it_needs(PROFILE):
 
     middle = deck.slides[1]
     assert middle.blocks, "запасной слайд не должен оставаться с одним заголовком"
-    assert any("Нужны данные" in i for b in middle.blocks for i in getattr(b, "items", []))
+    assert all("Нужны данные" not in i for b in middle.blocks for i in getattr(b, "items", [])), \
+        "приставка ушла из текста слайда: о запасном варианте говорят находка и заметка"
+    assert any("Нужны данные" in f for f in middle.findings)
+    assert middle.speaker_notes
 
 
 def test_a_cover_slide_does_not_ask_for_data(PROFILE):
