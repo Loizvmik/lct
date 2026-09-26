@@ -568,6 +568,8 @@ def run_visual(
     *,
     sources: list[SourceDoc] | None = None,
     max_workers: int = 4,
+    only_slides: "set[int] | None" = None,
+    deck_level: bool = True,
 ) -> VisualAuditResult:
     """Одиннадцать недетерминированных проверок (`CHECK_IDS`) готовой
     колоды по картинке каждого слайда — интерфейс брифа дословно
@@ -580,7 +582,14 @@ def run_visual(
     (`audit.deterministic`), визуальный аудит смотрит на СМЫСЛ картинки, не
     на её геометрию/палитру. Тот же принцип "параметр интерфейса шире, чем
     нужно одному конкретному шагу", что и `profile` в `plan.outline.
-    build_outline` (см. её докстроку)."""
+    build_outline` (см. её докстроку).
+
+    `only_slides` (задача H, бюджет прогона): позиции слайдов с нуля, по
+    которым задавать вопросы C01-C08, C10; `None` значит все. Соседи для
+    контекста и `total_slides` в промпте берутся по всей колоде, чтобы
+    модель видела слайд на его настоящем месте. `deck_level=False`
+    пропускает коллаж C09/C11: в пайплайне он не нужен, связность колоды
+    не то, что ловит проверка рискованных слайдов."""
     del profile
     started = time.monotonic()
 
@@ -617,6 +626,7 @@ def run_visual(
                     _run_one_slide, vlm, agent_body, i, total, spec, png_path, slide, pairs, source_text,
                 ): i
                 for i, (png_path, slide) in enumerate(pairs)
+                if only_slides is None or i in only_slides
             }
             for future in as_completed(futures):
                 calls += 1
@@ -626,14 +636,16 @@ def run_visual(
                 if slide_score is not None:
                     slide_scores[slide_index] = slide_score
 
-        calls += 1
-        deck_findings, deck_score = _run_deck_level(vlm, agent_body, spec, pngs, pairs)
-        findings.extend(deck_findings)
+        if deck_level:
+            calls += 1
+            deck_findings, deck_score = _run_deck_level(vlm, agent_body, spec, pngs, pairs)
+            findings.extend(deck_findings)
 
     findings.sort(key=lambda f: (f.slide_index if f.slide_index is not None else -1, f.check_id, f.message))
 
+    checked = total if only_slides is None else len([i for i in range(total) if i in only_slides])
     return VisualAuditResult(
-        findings=findings, skipped_reason=None, slides_checked=total,
+        findings=findings, skipped_reason=None, slides_checked=checked,
         model_calls=calls, elapsed_seconds=time.monotonic() - started,
         slide_scores=slide_scores, deck_score=deck_score,
         content_avg=_axis_average(slide_scores, "content"),
@@ -651,3 +663,145 @@ def _axis_average(slide_scores: dict[int, "SlideScore"], axis: str) -> float | N
     if not values:
         return None
     return sum(values) / len(values)
+
+
+# ---------------------------------------------------------------------------
+# Пачка рискованных слайдов одним коллажем (задача H)
+# ---------------------------------------------------------------------------
+
+def _build_labeled_collage(items: list[tuple[int, Path]]) -> bytes:
+    """Как `_build_collage`, но подпись у каждой миниатюры: настоящий
+    номер слайда в колоде, а не порядковый в коллаже. В пачку идут не все
+    слайды подряд, а выборка, и модель должна отвечать по тем номерам,
+    которые перечислены в манифесте."""
+    import io
+
+    thumbs: list[tuple[int, Image.Image]] = []
+    for position, path in items:
+        with Image.open(path) as im:
+            im = im.convert("RGB")
+            ratio = _COLLAGE_WIDTH_PX / im.width
+            thumbs.append((position, im.resize((_COLLAGE_WIDTH_PX, max(1, round(im.height * ratio))))))
+
+    total_height = sum(t.height + _COLLAGE_GAP_PX + _COLLAGE_LABEL_HEIGHT_PX for _p, t in thumbs)
+    collage = Image.new("RGB", (_COLLAGE_WIDTH_PX, max(1, total_height)), color=(255, 255, 255))
+    draw = ImageDraw.Draw(collage)
+    font = ImageFont.load_default()
+    y = 0
+    for position, thumb in thumbs:
+        draw.text((2, y), f"Слайд {position + 1}", fill=(0, 0, 0), font=font)
+        y += _COLLAGE_LABEL_HEIGHT_PX
+        collage.paste(thumb, (0, y))
+        y += thumb.height + _COLLAGE_GAP_PX
+
+    buf = io.BytesIO()
+    collage.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _build_batch_prompt(agent_body: str, spec: DeckSpec, positions: list[int], source_text: str) -> str:
+    payload = {
+        "mode": "batch",
+        "answer_only_keys": list(PER_SLIDE_CHECK_IDS),
+        "note": "Коллаж из нескольких слайдов, формат ответа описан в разделе про пачку.",
+        "total_slides": len(spec.slides),
+        "deck_title": spec.title,
+        "deck_language": spec.language,
+        "source_materials": source_text,
+        "slides": [
+            {"index_1based": pos + 1, "headline": spec.slides[pos].headline} for pos in positions
+        ],
+    }
+    return f"{agent_body}\n\nСлужебные данные:\n{json.dumps(payload, ensure_ascii=False)}"
+
+
+def _parse_batch_answer(raw: str, positions: list[int]) -> dict[int, tuple[dict | None, Exception | None, str]]:
+    """Разбор ответа пачкой: `{"slides": {"3": {...ответ по слайду 3...}}}`.
+    Не разобрался весь ответ: `ValueError`, вызывающий повторит запрос.
+    Не хватает одного слайда: ошибка только у него, остальные слайды не
+    теряются (то же правило «невалидный ответ модели: находка, не
+    исключение» из докстроки модуля)."""
+    try:
+        data = json.loads(_strip_markdown_fence(raw))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"ответ не разобрался как JSON: {exc}") from exc
+    slides = data.get("slides") if isinstance(data, dict) else None
+    if not isinstance(slides, dict):
+        raise ValueError("в ответе нет объекта slides с ответами по номерам слайдов")
+    out: dict[int, tuple[dict | None, Exception | None, str]] = {}
+    for pos in positions:
+        entry = slides.get(str(pos + 1))
+        if entry is None:
+            out[pos] = (None, ValueError(f"нет ответа по слайду {pos + 1}"), raw[:500])
+            continue
+        entry_raw = json.dumps(entry, ensure_ascii=False)
+        try:
+            out[pos] = (_parse_answer(entry_raw, PER_SLIDE_CHECK_IDS), None, entry_raw)
+        except ValueError as exc:
+            out[pos] = (None, exc, entry_raw)
+    return out
+
+
+def run_visual_batch(
+    pngs: list[Path], spec: DeckSpec, vlm, *, only_slides: list[int],
+    sources: list[SourceDoc] | None = None,
+) -> VisualAuditResult:
+    """Вопросы C01-C08, C10 по нескольким слайдам ОДНИМ вызовом модели на
+    коллаже с манифестом «номер слайда -> заголовок». Экономит вызовы, а не
+    секунды: параллельные вызовы `run_visual(only_slides=...)` и так идут
+    за время одного. Надёжен ли ответ по коллажу, проверено живым прогоном
+    (docs/ARCHITECTURE.md, раздел про бюджет), поэтому в пайплайне режим
+    выбирается конфигом (`run.visual_audit_batch`), а не зашит."""
+    started = time.monotonic()
+    if vlm is None or not _supports_vision(vlm):
+        # Та же честная причина пропуска, что и у `run_visual`.
+        return run_visual(pngs, spec, None, vlm, only_slides=set(), deck_level=False)
+    positions = [p for p in only_slides if 0 <= p < min(len(pngs), len(spec.slides))]
+    if not positions:
+        return VisualAuditResult(elapsed_seconds=time.monotonic() - started)
+
+    _meta, agent_body = _load_agent_prompt()
+    prompt = _build_batch_prompt(agent_body, spec, positions, _join_sources(sources))
+    try:
+        collage = _build_labeled_collage([(p, pngs[p]) for p in positions])
+    except Exception as exc:  # noqa: BLE001: сборка коллажа не должна ронять аудит
+        return VisualAuditResult(
+            findings=[_malformed_finding(p, exc, None) for p in positions],
+            slides_checked=len(positions), elapsed_seconds=time.monotonic() - started,
+        )
+
+    parsed: dict[int, tuple[dict | None, Exception | None, str]] | None = None
+    last_exc: Exception | None = None
+    last_raw: str | None = None
+    calls = 0
+    for _attempt in range(_MAX_MODEL_ATTEMPTS):
+        calls += 1
+        try:
+            last_raw = vlm.ask_image(collage, prompt, max_tokens=_DECK_LEVEL_MAX_TOKENS)
+            parsed = _parse_batch_answer(last_raw, positions)
+            break
+        except Exception as exc:  # noqa: BLE001: сеть или формат: повтор, затем находка C00
+            last_exc = exc
+
+    findings: list[Finding] = []
+    slide_scores: dict[int, SlideScore] = {}
+    for pos in positions:
+        if parsed is None:
+            findings.append(_malformed_finding(pos, last_exc, last_raw))
+            continue
+        answers, exc, raw = parsed[pos]
+        if answers is None:
+            findings.append(_malformed_finding(pos, exc, raw))
+            continue
+        findings.extend(_findings_from_answers(pos, answers))
+        score = _extract_scores(raw, _SLIDE_SCORE_NUM_KEYS)
+        if score is not None:
+            slide_scores[pos] = score
+
+    findings.sort(key=lambda f: (f.slide_index if f.slide_index is not None else -1, f.check_id, f.message))
+    return VisualAuditResult(
+        findings=findings, slides_checked=len(positions), model_calls=calls,
+        elapsed_seconds=time.monotonic() - started, slide_scores=slide_scores,
+        content_avg=_axis_average(slide_scores, "content"),
+        design_avg=_axis_average(slide_scores, "design"),
+    )
