@@ -211,7 +211,9 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # первым слайд, с которого сняты слоты (`patterns._dedup`). Старый кеш без
 # id прочитался бы молча с `None`, и клон навсегда остался бы на угадывании
 # по коробкам.
-PROFILE_SCHEMA_VERSION = 20
+# 20 -> 21: подсказка «Вставить фото» в рамке становится слотом `image`
+# (`patterns._promote_photo_placeholders`); старый кеш держал её подписью.
+PROFILE_SCHEMA_VERSION = 21
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при

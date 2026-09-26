@@ -864,3 +864,16 @@ def test_dedup_puts_the_slide_of_the_winner_first():
 
     assert merged.pattern_id == "slide9"
     assert merged.source_slide_index == [9, 4, 7]
+
+
+
+def test_a_photo_placeholder_hint_becomes_an_image_slot_in_its_frame(profile_fixture):
+    """VK Tech slide11: подпись «Вставить фото» посреди залитой плашки без
+    картинки. Она становится слотом `image` в рамке плашки, а не подписью
+    (живой прогон 27 сентября 2026: подсказка оставалась на слайде, фото
+    пользователя не вставлялось)."""
+    pattern = next(p for p in profile_fixture("VK Tech шаблон.pptx").patterns if 11 in p.source_slide_index)
+    images = [s for s in pattern.slots if s.role == "image"]
+    assert images, [s.role for s in pattern.slots]
+    assert not any("фото" in (s.sample_text or "").lower() for s in pattern.slots if s.role != "image")
+    assert images[0].box.width > 0.3, "рамка фото берётся от плашки, а не от маленькой подписи"

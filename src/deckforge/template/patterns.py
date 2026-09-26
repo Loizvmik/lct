@@ -500,6 +500,7 @@ def _mine_slide(
 
     repeat, repeat_roles_by_index = _find_repeat(content, tiers)
     slots = _finalize_roles(content, tiers, repeat_roles_by_index, canvas, scale)
+    slots = _promote_photo_placeholders(slots, decor, canvas)
 
     if repeat is not None:
         # slot_roles достраивается ФИНАЛЬНЫМИ ролями (не предварительными
@@ -1323,6 +1324,49 @@ def _columns(slots: list[PatternSlot]) -> list[list[int]]:
     if len(matched) < 2:
         return []
     return [m[0] for m in matched]
+
+
+# Подсказка дизайнера «сюда фото»: текст в рамке под фотографию. VK Tech
+# slide11: подпись «Вставить фото» посреди залитой плашки, у которой нет
+# ни картинки, ни плейсхолдера; разбор считал подпись слотом caption, схема
+# помечала её постоянным текстом, и подсказка оставалась на готовом слайде,
+# а фотография пользователя не вставлялась «нет слота под фото» (живой
+# прогон 27 сентября 2026).
+_PHOTO_PLACEHOLDER_RE = re.compile(
+    r"^\s*(вставить|вставь(те)?|добавить|добавь(те)?|место\s+под|place|insert|add)?\s*"
+    r"(фото(графи[юя])?|изображение|картинк[ау]|логотип|photo|image|picture|logo)\s*(сюда|здесь|here)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _promote_photo_placeholders(slots: list[PatternSlot], decor: list[ShapeRef], canvas: Canvas) -> list[PatternSlot]:
+    """Слот с текстом-подсказкой «вставить фото» становится слотом `image`
+    в рамке той залитой фигуры, внутри которой он стоит (сама подсказка
+    обычно маленькая и по центру рамки); без такой фигуры остаётся своя
+    коробка."""
+    out: list[PatternSlot] = []
+    for slot in slots:
+        text = " ".join((slot.sample_text or "").split())
+        if slot.role in _PICTURE_SLOT_ROLES or not _PHOTO_PLACEHOLDER_RE.match(text):
+            out.append(slot)
+            continue
+        frame = None
+        for ref in decor:
+            if ref.kind == "shape" and ref.box is not None and _box_contains(ref.box, slot.box):
+                if frame is None or ref.box.area < frame.area:
+                    frame = ref.box
+        out.append(replace(slot, role="image", box=frame or slot.box, sample_text="", max_chars=0, wraps=False))
+    return out
+
+
+_PICTURE_SLOT_ROLES = frozenset({"image", "icon"})
+
+
+def _box_contains(outer: Box, inner: Box, tolerance: float = 0.005) -> bool:
+    return (
+        outer.left - tolerance <= inner.left and outer.top - tolerance <= inner.top
+        and outer.right + tolerance >= inner.right and outer.bottom + tolerance >= inner.bottom
+    )
 
 
 def _finalize_roles(
