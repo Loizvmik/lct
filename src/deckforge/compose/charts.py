@@ -274,7 +274,7 @@ def _apply_axes(chart, spec: ChartSpec, family: str, size_pt: float, text_hex: s
             _color_title_runs(category_axis.axis_title, family, size_pt, text_hex)
         value_axis.has_title = True
         value_axis.axis_title.text_frame.text = (
-            f"{value_title}, {spec.unit}" if value_title and spec.unit else (value_title or spec.unit or "")
+            _value_title(value_title, spec.unit)
         )
         _color_title_runs(value_axis.axis_title, family, size_pt, text_hex)
     elif spec.unit:
@@ -374,6 +374,15 @@ def apply_chart_rules(chart, spec: ChartSpec, rules) -> None:
         chart.value_axis.has_major_gridlines = False
         chart.value_axis.has_minor_gridlines = False
         chart.category_axis.has_major_gridlines = False
+
+
+def _value_title(title: str | None, unit: str | None) -> str:
+    """Подпись оси значений с единицей. Модель часто сама пишет единицу в
+    подпись («Затраты, млн ₽»), и вторая дала бы «млн ₽, млн ₽» (живой
+    прогон V1)."""
+    if title and unit and unit.lower() not in title.lower():
+        return f"{title}, {unit}"
+    return title or unit or ""
 
 
 # Цвета ближе этого (евклидово по RGB 0..255) на графике не различить.
@@ -541,7 +550,7 @@ def _native_axis_titles(chart, spec: ChartSpec) -> None:
     if chart_type in _PIE_TYPES or not spec.axis_titles:
         return
     category_title, value_title = spec.axis_titles
-    value_text = f"{value_title}, {spec.unit}" if value_title and spec.unit else (value_title or spec.unit or "")
+    value_text = _value_title(value_title, spec.unit)
     # Ручная раскладка области построения примера не оставляет места под
     # подписи осей (у ЛЦТ2026 подпись оси значений легла на числа делений):
     # с подписями раскладку считает программа показа.
