@@ -30,7 +30,16 @@ from deckforge.template.profile import TemplateProfile
 TEMPLATES_DIR = Path("dataset/templates")
 TEMPLATE = TEMPLATES_DIR / "VK Tech шаблон.pptx"
 PROFILE = TemplateProfile.from_file(TEMPLATE, cache_dir=None)
-CONFIG = AuditConfig.load()
+# Порог заполненности ниже, чем в `config/audit.yaml`: чистая колода без
+# декора заполнена на 21% (см. докстроку `clean_deck_path`), а тестам нужна
+# колода без единой находки. Нижнюю границу D05 проверяет свой тест на
+# заведомо пустом слайде, ему 0.15 хватает с запасом.
+def _test_config():
+    loaded = AuditConfig.load()
+    return loaded.model_copy(update={"density": loaded.density.model_copy(update={"fill_ratio_min": 0.15})})
+
+
+CONFIG = _test_config()
 
 # Макет шаблона без единого плейсхолдера (разведано: `slideLayout18.xml`,
 # имя "DEFAULT") — слайды на нём начинаются пустыми, ничего постороннего не
@@ -38,12 +47,16 @@ CONFIG = AuditConfig.load()
 # намеренным содержимым (таблица/график/картинка/дубликат).
 BLANK_LAYOUT_PART = "ppt/slideLayouts/slideLayout18.xml"
 
+# Списочная раскладка VK Tech со списком в правой половине (см. докстроку
+# `clean_deck_path`).
+_CLEAN_PATTERN = "slide9"
+
 CLEAN_SPEC = DeckSpec(
     title="Аудит — чистая колода",
     language="ru",
     slides=[
         SlideSpec(
-            index=0, kind="bullets",
+            index=0, kind="bullets", pattern_id=_CLEAN_PATTERN,
             headline="Где уходит время на согласование заявок",
             blocks=[
                 BulletBlock(items=[
@@ -95,9 +108,16 @@ def clean_deck_path() -> Path:
     задевает краем иконку и получает вдобавок L02 (наложение). Проверяется
     при этом плотность/типографика, а не композиция.
 
-    Вырезается только картиночный декор: плашки и линии остаются, они
-    участвуют в проверках осмысленно (L02 намеренно НЕ считает браком
-    полное вложение текста в плашку — это тоже проверяется тестами).
+    Вырезается весь декор, а раскладка задана явно (`_CLEAN_PATTERN`,
+    список справа, левая половина холста свободна под блоки тестов). До
+    27 сентября 2026 колода без явного выбора садилась на слайд-пример с
+    кодом (slide31: список справа, слева пусто), тесты писались под эту
+    геометрию. Слайды с примером кода больше не раскладки, ближайшая по
+    геометрии slide9 несёт плашку слева, ровно там, куда тесты кладут свои
+    блоки: без плашки L02 не мешает, а заполненность 21% ниже порога D05
+    только для `CONFIG` из `config/audit.yaml`; тесты берут `CONFIG`
+    с порогом 0.15 (см. ниже), сам порог D05 проверяет отдельный тест на
+    заведомо пустом слайде. Тесты про плашки добавляют свои плашки сами.
 
     Сборка идёт с нуля (`clone_examples=False`): с тех пор как клон
     перебирается у всех кандидатов раньше сборки с нуля, слайд вставал
@@ -106,7 +126,7 @@ def clean_deck_path() -> Path:
     нужна колода без находок, а не лучший слайд продукта."""
     profile = PROFILE.model_copy(update={
         "patterns": [
-            p.model_copy(update={"decor": [d for d in p.decor if d.kind != "picture"]})
+            p.model_copy(update={"decor": []})
             for p in PROFILE.patterns
         ],
     })

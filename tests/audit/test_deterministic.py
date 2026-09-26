@@ -24,6 +24,7 @@ from pptx.chart.data import CategoryChartData
 from pptx.dml.color import RGBColor
 from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_SHAPE
+from pptx import Presentation
 from pptx.util import Inches, Pt
 
 from deckforge.audit.config import AuditConfig
@@ -44,7 +45,10 @@ from deckforge.template.profile import TemplateProfile
 # через точечный импорт).
 TEMPLATE = Path("dataset/templates/VK Tech шаблон.pptx")
 PROFILE = TemplateProfile.from_file(TEMPLATE, cache_dir=None)
-CONFIG = AuditConfig.load()
+# Тот же порог заполненности 0.15, что у `conftest.CONFIG` (см. там):
+# чистая колода без декора заполнена на 21%.
+_LOADED = AuditConfig.load()
+CONFIG = _LOADED.model_copy(update={"density": _LOADED.density.model_copy(update={"fill_ratio_min": 0.15})})
 
 
 def _ids(findings: list[Finding]) -> set[str]:
@@ -230,7 +234,7 @@ def test_L05_catches_a_block_off_the_template_grid(deck_with):
     assert "L05" in _ids(run_deterministic(path, PROFILE, CONFIG))
 
 
-def test_L05_does_not_flag_a_block_aligned_to_a_well_supported_cluster_axis(deck_with):
+def test_L05_does_not_flag_a_block_aligned_to_a_well_supported_cluster_axis(deck_with, clean_deck_path):
     """Регрессия на находку код-ревью (Task 11 повторное ревью, находка №1).
     Раньше L05 брал только ТОП-4 оси `Grid.columns` ПО СПИСКУ (тот
     отсортирован по confidence), а направляющие (`p:guide`) получали
@@ -257,14 +261,24 @@ def test_L05_does_not_flag_a_block_aligned_to_a_well_supported_cluster_axis(deck
         ColumnAxisModel(center=0.10 + i * 0.001, count=2, confidence=1.0, source="guide")
         for i in range(4)
     ]
-    real_axis = ColumnAxisModel(center=0.35, count=470, confidence=0.05, source="cluster")
-    grid = PROFILE.grid.model_copy(update={"columns": [*noisy_guides, real_axis]})
+    # 0.20, а не 0.35: с 27 сентября 2026 список чистой колоды стоит от
+    # 0.38 холста (раскладка slide9), и блок на 0.35 задевал бы его краем
+    # (побочный L02).
+    real_axis = ColumnAxisModel(center=0.20, count=470, confidence=0.05, source="cluster")
+    # Собственные блоки чистой колоды (заголовок, список) стоят по осям
+    # настоящей сетки шаблона; в синтетической сетке их оси должны остаться,
+    # иначе L05 флагает их самих, а не блок теста.
+    own_axes = [
+        ColumnAxisModel(center=sh.left / PROFILE.canvas_width_emu, count=470, confidence=0.05, source="cluster")
+        for sh in Presentation(str(clean_deck_path)).slides[0].shapes if sh.has_text_frame
+    ]
+    grid = PROFILE.grid.model_copy(update={"columns": [*noisy_guides, real_axis, *own_axes]})
     profile = PROFILE.model_copy(update={"grid": grid})
 
-    # На настоящей массовой оси (0.35 доли холста = 3.5″ на холсте 10″) —
+    # На настоящей массовой оси (0.20 доли холста = 2.0″ на холсте 10″) —
     # не должен флагаться, несмотря на то что она не входит в "первые
     # четыре" направляющие по старому (сломанному) критерию.
-    on_real_axis = deck_with(lambda s: _add_text(s, 3.5, 1.3, 0.6, 0.7, "На оси", size_pt=14, family="Play"))
+    on_real_axis = deck_with(lambda s: _add_text(s, 2.0, 1.3, 0.6, 0.7, "На оси", size_pt=14, family="Play"))
     assert _ids(run_deterministic(on_real_axis, profile, CONFIG)) == set()
 
     # На направляющей с крошечной поддержкой — тоже не должен флагаться:

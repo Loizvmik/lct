@@ -670,7 +670,7 @@ def _choose_kind_and_pattern(
     # садился на разделитель с подписью 14 pt вместо обложки с 40 pt
     # (прогон 26 сентября 2026, VK Education). Для неё решает ранжир ниже
     # с `cover_bias`.
-    if variant is Variant.dense and slide.pattern_id and slide.index != 0:
+    if variant is Variant.dense and slide.pattern_id and not _is_cover(slide):
         authored = next((p for p in profile.patterns if p.pattern_id == slide.pattern_id), None)
         if authored is not None:
             return authored.kind, authored.pattern_id
@@ -684,6 +684,12 @@ def _choose_kind_and_pattern(
             return chosen.kind, chosen.pattern_id
     best = ranked[0][1]
     return best.kind, best.pattern_id
+
+
+def _is_cover(slide: SlideSpec) -> bool:
+    """Обложка: первый слайд героического вида. Списочный слайд на первой
+    позиции (тестовые колоды) обложкой не считается."""
+    return slide.index == 0 and slide.kind == "section"
 
 
 def _ranked_candidates(
@@ -719,7 +725,7 @@ def _ranked_candidates(
         (
             _pattern_rank_key(
                 p, variant, item_count, char_len, kind_rank[p.kind], avoid, history, needs_image,
-                is_cover=(slide.index == 0),
+                is_cover=_is_cover(slide),
             ),
             p,
         )
