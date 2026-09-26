@@ -1180,3 +1180,57 @@ def test_truncation_returns_text_unchanged_when_it_fits():
     )
 
     assert out == "Короткая строка" and not truncated
+
+
+def _record_paths(monkeypatch, accept_clone_of: str | None) -> list[tuple[str, str]]:
+    """Подменяет клон и сборку с нуля записью вызовов: порядок путей виден
+    без настоящих примеров шаблона. Клон принимается только у раскладки
+    `accept_clone_of`."""
+    from deckforge.compose import builder
+
+    calls: list[tuple[str, str]] = []
+
+    def fake_clone(prs, slide_spec, pattern, *args, **kwargs):
+        calls.append(("clone", pattern.pattern_id))
+        return ["клон принят"] if pattern.pattern_id == accept_clone_of else None
+
+    real_place = builder.place_slide
+
+    def fake_place(prs, slide_spec, pattern, *args, **kwargs):
+        calls.append(("scratch", pattern.pattern_id))
+        return real_place(prs, slide_spec, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(builder, "_try_clone", fake_clone)
+    monkeypatch.setattr(builder, "place_slide", fake_place)
+    return calls
+
+
+def test_every_candidate_is_tried_as_a_clone_before_building_from_scratch(monkeypatch):
+    """Клон второй раскладки лучше сборки с нуля первой: сборка с нуля
+    теряет группы, градиенты и форму фото примера. Пока хоть один клон не
+    перебран, с нуля не собирается ничего."""
+    first, second = _clean_section_pattern("first"), _clean_section_pattern("second")
+    slide_spec = SlideSpec(index=0, kind="section", headline="Итоги квартала", subhead="Что изменилось")
+    prs, canvas, audit_config = _new_deck_in_progress()
+    calls = _record_paths(monkeypatch, accept_clone_of="second")
+
+    chosen, notes = _place_best_candidate(prs, slide_spec, [first, second], PROFILE, canvas, audit_config)
+
+    assert chosen.pattern_id == "second"
+    assert calls == [("clone", "first"), ("clone", "second")]
+    assert "клон принят" in notes
+
+
+def test_scratch_build_starts_only_after_all_clones_failed(monkeypatch):
+    first, second = _clean_section_pattern("first"), _clean_section_pattern("second")
+    slide_spec = SlideSpec(index=0, kind="section", headline="Итоги квартала", subhead="Что изменилось")
+    prs, canvas, audit_config = _new_deck_in_progress()
+    calls = _record_paths(monkeypatch, accept_clone_of=None)
+
+    _place_best_candidate(prs, slide_spec, [first, second], PROFILE, canvas, audit_config)
+
+    # Сколько раз собирать с нуля, решает аудит; важен порядок: сначала
+    # клоны всех кандидатов, потом ни одного клона.
+    assert calls[:2] == [("clone", "first"), ("clone", "second")]
+    assert calls[2:] and all(path == "scratch" for path, _ in calls[2:])
+    assert len(prs.slides) == 1

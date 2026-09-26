@@ -132,6 +132,14 @@ class PatternSlot:
     max_words: int | None = None
     ordinal: bool = False
     fixed: bool = False
+    # `p:cNvPr/@id` фигуры слайда-примера, с которой снят слот. Клон
+    # (`compose.clone.match_slots`) находит по нему фигуру прямо, а не
+    # угадывает по совпадению коробок: коробку слота сдвигает притяжка к
+    # полям (`_snap_to_margins`), а id у копии тот же, что у примера. Id
+    # относится к первому слайду `Pattern.source_slide_index` (`_dedup`
+    # ставит туда слайд, чьи слоты остались в паттерне). У групп путь не
+    # нужен: id уникален в пределах слайда. `None`: id не было.
+    source_shape_id: str | None = None
 
     @property
     def keeps_sample_text(self) -> bool:
@@ -253,6 +261,10 @@ class DecorShape:
     # орнаменты) терялась целиком — собранный слайд выходил белым листом
     # там, где в шаблоне цветная композиция.
     image_part: str | None = None
+    # `p:cNvPr/@id` исходной фигуры на слайде-примере, тот же смысл, что у
+    # `PatternSlot.source_shape_id`: по нему клон убирает декор
+    # незаполненных единиц повтора, не сравнивая коробки.
+    source_shape_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1426,6 +1438,7 @@ def _build_slot(ref: ShapeRef, tier: _TierInfo | None, role: str, canvas: Canvas
         role=role, box=ref.box, size_pt=round(size_pt, 1), color_hex=color_hex,
         align=align, max_chars=max_chars, wraps=wraps, sample_text=text,
         anchor=tier.anchor if tier is not None else "t",
+        source_shape_id=ref.shape_id or None,
     )
 
 
@@ -2088,6 +2101,7 @@ def _to_decor(
         repeat_group=repeat_index is not None, repeat_index=repeat_index or 0,
         prst=prst, adj=adj, image_part=image_part,
         badge_text=badge_text, badge_size_pt=badge_size, badge_color_hex=badge_color,
+        source_shape_id=ref.shape_id or None,
     )
 
 
@@ -2136,7 +2150,13 @@ def _dedup_signature(pattern: Pattern) -> tuple:
 
 def _dedup(patterns: list[Pattern]) -> list[Pattern]:
     """Паттерны с совпадающим `kind` и попарно близкими боксами слотов
-    схлопываются, `source_slide_index` накапливается (бриф, Step 2, п.8)."""
+    схлопываются, `source_slide_index` накапливается (бриф, Step 2, п.8).
+
+    Первым в `source_slide_index` стоит слайд победителя, остальные по
+    возрастанию: слоты и декор паттерна сняты именно с него, и их
+    `source_shape_id` верны только на нём. Клон (`builder._clone_source`)
+    и превью берут первый номер. Раньше список сортировался целиком, и
+    победитель с номером больше проигравшего клонировал чужой слайд."""
     by_signature: dict[tuple, Pattern] = {}
     for p in patterns:
         sig = _dedup_signature(p)
@@ -2144,7 +2164,8 @@ def _dedup(patterns: list[Pattern]) -> list[Pattern]:
         if existing is None:
             by_signature[sig] = p
             continue
-        merged_indices = sorted(set(existing.source_slide_index) | set(p.source_slide_index))
         winner = p if p.score > existing.score else existing
-        by_signature[sig] = replace(winner, source_slide_index=merged_indices)
+        own = winner.source_slide_index[0]
+        rest = sorted((set(existing.source_slide_index) | set(p.source_slide_index)) - {own})
+        by_signature[sig] = replace(winner, source_slide_index=[own, *rest])
     return sorted(by_signature.values(), key=lambda p: -p.score)

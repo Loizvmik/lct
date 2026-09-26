@@ -1276,15 +1276,17 @@ def _place_best_candidate(
     защиту как доказательство, что аудит встроен, а не приделан" (бриф).
 
     `source_slides`: слайды-примеры шаблона по номеру (`build_deck`
-    берёт их до очистки колоды). Если у кандидата есть свой пример, сначала
-    пробуется клон (`_try_clone`), и только если он не собрался или не
-    прошёл тот же аудит, кандидат собирается с нуля. `None`/пусто: только
-    сборка с нуля, как было до клонирования."""
+    берёт их до очистки колоды). Клон идёт первым для ВСЕХ кандидатов
+    (`_try_clone`), и только если ни один клон не собрался или не прошёл
+    тот же аудит, кандидаты собираются с нуля. Сборка с нуля теряет
+    группы, градиенты и форму фото примера, поэтому клон второй раскладки
+    лучше нуля первой. `None`/пусто: только сборка с нуля, как было до
+    клонирования."""
     tried = candidates[:_MAX_LAYOUT_ATTEMPTS]
     notes: list[str] = []
     best: tuple[int, Pattern, list[str]] | None = None  # (число находок, паттерн, коды находок)
 
-    for attempt, pattern in enumerate(tried, start=1):
+    for pattern in tried:
         cloned = _try_clone(
             prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
             bullet_char=bullet_char, user_photos=user_photos,
@@ -1292,6 +1294,8 @@ def _place_best_candidate(
         if cloned is not None:
             notes.extend(cloned)
             return pattern, notes
+
+    for attempt, pattern in enumerate(tried, start=1):
         trial_spec = replace(slide_spec, findings=[])
         place_slide(
             prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char,
@@ -1370,7 +1374,8 @@ def _clone_examples_enabled() -> bool:
 def _clone_source(pattern: Pattern, source_slides: dict[int, object] | None):
     """(номер, слайд) примера, с которого снята раскладка, или `None`.
     Берётся первый номер: `patterns._dedup` схлопывает похожие примеры в
-    один паттерн, и первый: тот, чьи коробки слотов лежат в профиле."""
+    один паттерн и ставит первым тот, чьи слоты и id фигур лежат в
+    профиле."""
     if not source_slides or not pattern.source_slide_index:
         return None
     number = pattern.source_slide_index[0]
@@ -1388,7 +1393,8 @@ def _try_clone(
     аудит, что и сборка с нуля (`audit_slide_layout`, L01-L04, D05): тогда
     слайд остаётся в колоде, а функция отдаёт находки для `slide_spec`.
     Неудача: слайд убран, причина дописана в `notes`, возвращается `None`
-    и вызывающий собирает этот же кандидат с нуля."""
+    и вызывающий пробует клон следующего кандидата, а с нуля собирает,
+    только когда не принят ни один клон."""
     source = _clone_source(pattern, source_slides)
     if source is None:
         return None
@@ -1420,7 +1426,7 @@ def _try_clone(
         reason = f"аудит нашёл {len(errors)} ошибок уровня ошибки: {', '.join(ids)}"
     notes.append(
         f"Слайд {slide_spec.index}: клон слайда-примера №{number} (раскладка {pattern.pattern_id!r}) "
-        f"не принят — {reason}; слайд собирается заново."
+        f"не принят — {reason}."
     )
     return None
 
@@ -1971,6 +1977,7 @@ def _pattern_from_model(model) -> Pattern:
             align=s.align, max_chars=s.max_chars, wraps=s.wraps, sample_text=s.sample_text,
             anchor=s.anchor, purpose=s.purpose, content_hint=s.content_hint,
             max_words=s.max_words, ordinal=s.ordinal, fixed=s.fixed,
+            source_shape_id=s.source_shape_id,
         )
         for s in model.slots
     ]
@@ -1987,6 +1994,7 @@ def _pattern_from_model(model) -> Pattern:
             repeat_group=d.repeat_group, repeat_index=d.repeat_index,
             image_part=d.image_part, badge_text=d.badge_text,
             badge_size_pt=d.badge_size_pt, badge_color_hex=d.badge_color_hex, prst=d.prst,
+            source_shape_id=d.source_shape_id,
         )
         for d in model.decor
     ]
