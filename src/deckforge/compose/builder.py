@@ -239,7 +239,7 @@ def build_deck(
         slide_spec = spec.slides[position]
         position += 1
         if slide_spec.semantic_gap:
-            _refill_semantic_gap(slide_spec, repair, spec.meta, patterns)
+            _refill_semantic_gap(slide_spec, repair, spec.meta, patterns, profile)
         candidates = _capable_first(slide_spec, _resolve_pattern(slide_spec, patterns, profile, variant, history), forms)
         if not candidates:
             slide_spec.findings.append(
@@ -1308,6 +1308,7 @@ _MAX_CLONE_ATTEMPTS = 1 + MAX_ALTERNATIVES
 
 def _refill_semantic_gap(
     slide_spec: SlideSpec, repair: "SlideRepair | None", meta: dict, patterns: list[Pattern] = (),
+    profile=None,
 ) -> None:
     """Содержательный пункт остался без содержания (`SlideSpec.semantic_
     gap`, задача V2): один ремонт по контракту его раскладки, и слайд
@@ -1342,8 +1343,34 @@ def _refill_semantic_gap(
         "собран разделителем вынужденно, это брак плана."
     )
     slide_spec.kind = "section"
-    slide_spec.pattern_id = None
-    slide_spec.alternatives = ()
+    # Разделитель посреди колоды не встаёт на обложку и финал «Спасибо за
+    # внимание!»: живой прогон 27 сентября 2026 (visual) собрал три таких
+    # слайда финальной раскладкой. Берутся героические раскладки без
+    # постоянного заголовка, по очереди, чтобы не повторяться.
+    dividers = _divider_layouts(patterns, profile)
+    if dividers:
+        start = slide_spec.index % len(dividers)
+        ordered = dividers[start:] + dividers[:start]
+        slide_spec.pattern_id = ordered[0]
+        slide_spec.alternatives = tuple(ordered[1:])
+    else:
+        slide_spec.pattern_id = None
+        slide_spec.alternatives = ()
+
+
+def _divider_layouts(patterns: list[Pattern], profile) -> list[str]:
+    """Героические раскладки, годные под разделитель посреди колоды: не
+    обложка, не финальная и без постоянного заголовка."""
+    from deckforge.pattern.candidates import cover_pattern_id, has_fixed_headline, is_closing_pattern
+
+    if profile is None:
+        return []
+    cover = cover_pattern_id(profile)
+    return [
+        p.pattern_id for p in patterns
+        if p.kind == "section" and p.pattern_id != cover and not is_closing_pattern(p, profile)
+        and not has_fixed_headline(p)
+    ]
 
 
 def _capable_first(slide_spec: SlideSpec, candidates: list[Pattern], forms: dict) -> list[Pattern]:

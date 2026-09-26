@@ -3,12 +3,21 @@
 Живой прогон 27 сентября 2026 (visual, слайд 8): «Результат
 пилота/проверки» вышел заголовком на героической раскладке."""
 from __future__ import annotations
+from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 from deckforge.compose import builder
 from deckforge.plan.invariants import invariant_for, invariant_problems
 from deckforge.plan.normalize import normalize_deck
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec
+from deckforge.template.profile import TemplateProfile
+
+
+@pytest.fixture(scope="module")
+def profile_vk():
+    return TemplateProfile.from_file(Path("dataset/templates/Шаблон презентации VK Education.pptx"), cache_dir=None)
 
 
 def _contract(outline_kind: str, *, divider: bool = False, evidence=("пилот: −80%",), quote: bool = False):
@@ -107,3 +116,17 @@ def test_without_hero_layouts_the_empty_item_keeps_its_layout():
 
     assert slide.kind == "bullets" and slide.pattern_id == "slide13"
     assert "одним заголовком" in slide.findings[-1] and meta["semantic_gaps"] == "1"
+
+
+def test_forced_divider_never_takes_the_closing_or_cover_layout(profile_vk):
+    from deckforge.pattern.candidates import cover_pattern_id, is_closing_pattern
+
+    patterns = [builder._pattern_from_model(m) for m in profile_vk.patterns]
+    slide = _empty(5)
+    slide.semantic_gap = "пункт плана содержательный"
+
+    builder._refill_semantic_gap(slide, None, {}, patterns, profile_vk)
+
+    chosen = next(p for p in profile_vk.patterns if p.pattern_id == slide.pattern_id)
+    assert chosen.kind == "section"
+    assert slide.pattern_id != cover_pattern_id(profile_vk) and not is_closing_pattern(chosen, profile_vk)
