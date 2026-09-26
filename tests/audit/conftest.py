@@ -97,14 +97,20 @@ def clean_deck_path() -> Path:
 
     Вырезается только картиночный декор: плашки и линии остаются, они
     участвуют в проверках осмысленно (L02 намеренно НЕ считает браком
-    полное вложение текста в плашку — это тоже проверяется тестами)."""
+    полное вложение текста в плашку — это тоже проверяется тестами).
+
+    Сборка идёт с нуля (`clone_examples=False`): с тех пор как клон
+    перебирается у всех кандидатов раньше сборки с нуля, слайд вставал
+    клоном второй раскладки, а клон несёт графику примера целиком, мимо
+    вырезанного выше декора (полноэкранная картинка, D05 и L06). Фикстуре
+    нужна колода без находок, а не лучший слайд продукта."""
     profile = PROFILE.model_copy(update={
         "patterns": [
             p.model_copy(update={"decor": [d for d in p.decor if d.kind != "picture"]})
             for p in PROFILE.patterns
         ],
     })
-    return build_deck(CLEAN_SPEC, profile, TEMPLATE, Variant.dense)
+    return build_deck(CLEAN_SPEC, profile, TEMPLATE, Variant.dense, clone_examples=False)
 
 
 @pytest.fixture

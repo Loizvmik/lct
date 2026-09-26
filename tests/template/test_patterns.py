@@ -802,3 +802,43 @@ def test_an_asset_sheet_slide_is_not_mined_as_a_pattern(profile_fixture):
         for pattern in profile_fixture(name).patterns:
             assert len(pattern.decor) <= _MAX_DECOR_SHAPES, (name, pattern.pattern_id, len(pattern.decor))
 
+
+
+def test_slots_and_decor_carry_the_id_of_their_source_shape(profile_fixture):
+    """Id исходной фигуры (`p:cNvPr/@id`) снимается с того слайда, который
+    стоит первым в `source_slide_index`: по нему клон находит фигуру, не
+    угадывая по коробке. Id чужого слайда указал бы клону не на ту фигуру."""
+    from deckforge.ooxml.walk import walk_shapes
+
+    for name in ALL_TEMPLATES:
+        with PptxPackage.open(f"dataset/templates/{name}") as pkg:
+            canvas = pkg.canvas()
+            for pattern in profile_fixture(name).patterns:
+                part = f"ppt/slides/slide{pattern.source_slide_index[0]}.xml"
+                ids = {r.shape_id for r in walk_shapes(pkg.xml(part), canvas)}
+                for slot in pattern.slots:
+                    assert slot.source_shape_id in ids, (name, pattern.pattern_id, slot.role)
+                for decor in pattern.decor:
+                    assert decor.source_shape_id in ids, (name, pattern.pattern_id, decor.kind)
+
+
+def test_dedup_puts_the_slide_of_the_winner_first():
+    """Слоты схлопнутого паттерна сняты со слайда победителя, и клон
+    берёт первый номер: победитель со слайда 9 против проигравших со
+    слайдов 4 и 7 обязан стоять первым, иначе клон уйдёт на чужой пример."""
+    from dataclasses import replace
+
+    from deckforge.template.patterns import Pattern, _dedup
+
+    slot = PatternSlot(role="headline", box=Box(0.1, 0.1, 0.5, 0.1), size_pt=24.0, color_hex=None,
+                       align="l", max_chars=40, wraps=False, source_shape_id="2")
+    cap = Capacity(max_items=1, max_chars_per_item=40, max_bullets=0, max_series=0, max_rows=0, max_cols=0)
+    loser = Pattern(pattern_id="slide4", source_slide_index=[4], layout_id="L", kind="section", slots=[slot],
+                    repeat=None, decor=[], capacity=cap, score=0.5, is_dark=False)
+    winner = replace(loser, pattern_id="slide9", source_slide_index=[9], score=0.9)
+    third = replace(loser, pattern_id="slide7", source_slide_index=[7], score=0.1)
+
+    (merged,) = _dedup([loser, winner, third])
+
+    assert merged.pattern_id == "slide9"
+    assert merged.source_slide_index == [9, 4, 7]

@@ -251,29 +251,63 @@ def _kind_fits(role: str, ref: ShapeRef) -> bool:
     return ref.kind == "shape" and _has_text_body(ref.element)
 
 
+def clone_map(refs: Iterable[ShapeRef]) -> dict[str, ShapeRef]:
+    """Id фигуры (`p:cNvPr/@id`) → лист дерева клона. `deepcopy` в
+    `clone_example_slide` id не меняет, а python-pptx новым фигурам даёт
+    id больше занятых, поэтому id из профиля (`PatternSlot.source_shape_id`)
+    указывает в клоне ровно на ту фигуру, с которой снят слот. Id, который
+    встречается на слайде дважды (так бывает у файлов после ручной
+    склейки), в карту не попадает: по нему фигуру не узнать, и вызывающий
+    идёт по коробке."""
+    seen: dict[str, ShapeRef] = {}
+    doubled: set[str] = set()
+    for ref in refs:
+        if not ref.shape_id:
+            continue
+        if ref.shape_id in seen:
+            doubled.add(ref.shape_id)
+        seen[ref.shape_id] = ref
+    return {k: v for k, v in seen.items() if k not in doubled}
+
+
 def match_slots(slide, slots: list[PatternSlot], canvas: Canvas) -> dict[int, ShapeRef | None]:
-    """Номер слота в `slots` → фигура клона на его месте (IoU коробок не
-    ниже `SLOT_MATCH_IOU`) или `None`, если такой не нашлось. Разбор жадный
-    по убыванию IoU и каждая фигура отдаётся одному слоту: у двух слотов
-    одной строки таблицы-таймлайна коробки близки, и без этого оба
-    указали бы на одну и ту же фигуру."""
+    """Номер слота в `slots` → фигура клона на его месте или `None`, если
+    такой не нашлось.
+
+    Сначала по id исходной фигуры (`clone_map`): слот снят с этого же
+    слайда, и id узнаёт фигуру, даже когда притяжка к полям сдвинула
+    коробку слота ниже порога. Фигура по id принимается, только если вид
+    подходит слоту (`_kind_fits`): id из профиля другого разбора мог
+    указать на картинку там, где нужна надпись. Остальные слоты идут по
+    IoU коробок (не ниже `SLOT_MATCH_IOU`), жадно по убыванию и каждая
+    фигура одному слоту: у двух слотов одной строки таблицы-таймлайна
+    коробки близки, и без этого оба указали бы на одну и ту же фигуру."""
     refs = [r for r in slide_refs(slide, canvas) if r.box is not None]
+    by_id = clone_map(refs)
+    result: dict[int, ShapeRef | None] = {i: None for i in range(len(slots))}
+    used: set[int] = set()
+    for i, slot in enumerate(slots):
+        ref = by_id.get(slot.source_shape_id) if slot.source_shape_id else None
+        if ref is None or id(ref.element) in used or not _kind_fits(slot.role, ref):
+            continue
+        result[i] = ref
+        used.add(id(ref.element))
     pairs = []
     for i, slot in enumerate(slots):
+        if result[i] is not None:
+            continue
         for j, ref in enumerate(refs):
-            if not _kind_fits(slot.role, ref):
+            if id(ref.element) in used or not _kind_fits(slot.role, ref):
                 continue
             score = _box_score(slot.box, ref.box)
             if score >= SLOT_MATCH_IOU:
                 pairs.append((score, i, j))
     pairs.sort(key=lambda t: -t[0])
-    result: dict[int, ShapeRef | None] = {i: None for i in range(len(slots))}
-    used: set[int] = set()
     for _score, i, j in pairs:
-        if result[i] is not None or j in used:
+        if result[i] is not None or id(refs[j].element) in used:
             continue
         result[i] = refs[j]
-        used.add(j)
+        used.add(id(refs[j].element))
     return result
 
 
@@ -849,15 +883,44 @@ def prune_unfilled(
     `protect`: коробки декора, который остаётся: у автофигуры PowerPoint
     почти всегда есть пустой `p:txBody`, и плашка заполненной карточки,
     совпавшая коробкой с пустым слотом, иначе ушла бы вместе с ним.
+    Фигура ищется сначала по id исходной фигуры (`clone_map`), и тогда
+    удаляется ровно она; коробка остаётся запасным путём для декора и
+    слотов без id или с id, которого в клоне нет. `protect` нужен только
+    запасному пути: фигура, найденная по id, чужой плашкой быть не может.
     Возвращает, сколько фигур удалено."""
     keep_ids = {id(el) for el in keep}
-    decor_boxes = [d.box for d in decor_unfilled]
+    refs = slide_refs(slide, canvas)
+    by_id = clone_map(refs)
+    decor_boxes: list[Box] = []
+    slot_items: list[PatternSlot] = []
+    by_id_hits: dict[int, bool] = {}  # id(элемента) → это слот (иначе декор)
+    for d in decor_unfilled:
+        ref = by_id.get(d.source_shape_id) if d.source_shape_id else None
+        if ref is not None and ref.kind == d.kind:
+            by_id_hits.setdefault(id(ref.element), False)
+        else:
+            decor_boxes.append(d.box)
+    for s in slots_unfilled:
+        ref = by_id.get(s.source_shape_id) if s.source_shape_id else None
+        if ref is not None and _kind_fits(s.role, ref):
+            by_id_hits[id(ref.element)] = True
+        else:
+            slot_items.append(s)
     protected = list(protect)
-    slot_items = list(slots_unfilled)
     removed = 0
     emptied_groups: list = []
-    for ref in slide_refs(slide, canvas):
-        if ref.box is None or id(ref.element) in keep_ids:
+    for ref in refs:
+        if id(ref.element) in keep_ids or ref.element.getparent() is None:
+            continue
+        if id(ref.element) in by_id_hits:
+            if by_id_hits[id(ref.element)]:
+                group = _top_group(ref.element)
+                if group is not None:
+                    emptied_groups.append(group)
+            remove_shape(ref.element)
+            removed += 1
+            continue
+        if ref.box is None:
             continue
         hit = any(same_box(box, ref.box) for box in decor_boxes)
         slot_hit = False

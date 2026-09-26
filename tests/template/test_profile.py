@@ -781,3 +781,15 @@ def test_pattern_preview_path_is_none_without_a_saved_preview_or_cache_dir(tmp_p
     assert profile.pattern_preview_path(pattern, cache_dir=cache_dir) is None
     assert profile.pattern_preview_path(pattern, cache_dir=None) is None
 
+
+
+def test_source_shape_ids_survive_the_json_roundtrip():
+    """Id исходных фигур слотов и декора доходят через JSON кеша до
+    сборки: без них клон снова угадывает фигуру по коробке."""
+    profile = TemplateProfile.from_file(TEMPLATES_DIR / "Шаблон презентации VK Education.pptx", cache_dir=None)
+    restored = TemplateProfile.model_validate_json(profile.to_json())
+    slots = [s for p in restored.patterns for s in p.slots]
+    decor = [d for p in restored.patterns for d in p.decor]
+    assert slots and all(s.source_shape_id for s in slots)
+    assert decor and all(d.source_shape_id for d in decor)
+    assert restored == profile

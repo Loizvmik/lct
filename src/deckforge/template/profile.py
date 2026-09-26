@@ -202,7 +202,13 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # теперь учитывает `max_words`. Старый кеш прочитался бы молча с пустой
 # схемой и признаком «none», и дозапрос на кеш-хите это бы исправил, но
 # версия бампается по правилу выше: смысл полей изменился.
-PROFILE_SCHEMA_VERSION = 18
+# 18 -> 19: задача I — у `PatternSlotModel` и `DecorShapeModel` появился
+# `source_shape_id` (id исходной фигуры на слайде-примере, по нему клон
+# находит фигуру без сравнения коробок), а `source_slide_index` ставит
+# первым слайд, с которого сняты слоты (`patterns._dedup`). Старый кеш без
+# id прочитался бы молча с `None`, и клон навсегда остался бы на угадывании
+# по коробкам.
+PROFILE_SCHEMA_VERSION = 19
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -486,6 +492,10 @@ class PatternSlotModel(BaseModel):
     max_words: int | None = None
     ordinal: bool = False
     fixed: bool = False
+    # Id исходной фигуры на слайде-примере (`patterns.PatternSlot.
+    # source_shape_id`). `None`: старый кеш или фигура без id, клон тогда
+    # ищет фигуру по коробке.
+    source_shape_id: str | None = None
 
 
 # Поля схемы места: одним списком для применения ответа модели и для
@@ -499,6 +509,7 @@ def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
         align=slot.align, max_chars=slot.max_chars, wraps=slot.wraps, sample_text=slot.sample_text,
         anchor=slot.anchor, purpose=slot.purpose, content_hint=slot.content_hint,
         max_words=slot.max_words, ordinal=slot.ordinal, fixed=slot.fixed,
+        source_shape_id=slot.source_shape_id,
     )
 
 
@@ -569,6 +580,9 @@ class DecorShapeModel(BaseModel):
     # Пресет-форма автофигуры (`a:prstGeom`, например `ellipse`): без неё
     # круглый значок шаблона рисуется квадратом.
     prst: str | None = None
+    # Id исходной фигуры на слайде-примере (`patterns.DecorShape.
+    # source_shape_id`): по нему клон убирает декор незаполненных единиц.
+    source_shape_id: str | None = None
 
 
 def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
@@ -579,7 +593,7 @@ def _decor_shape_model(decor: DecorShape) -> DecorShapeModel:
         repeat_group=decor.repeat_group, repeat_index=decor.repeat_index,
         image_part=decor.image_part, badge_text=decor.badge_text,
         badge_size_pt=decor.badge_size_pt, badge_color_hex=decor.badge_color_hex,
-        prst=decor.prst,
+        prst=decor.prst, source_shape_id=decor.source_shape_id,
     )
 
 

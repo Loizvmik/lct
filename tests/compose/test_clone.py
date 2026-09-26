@@ -21,8 +21,8 @@ from deckforge.audit.config import AuditConfig
 from deckforge.compose import builder
 from deckforge.compose.blocks import Paragraph
 from deckforge.compose.clone import (
-    bind_text, clone_example_slide, fill_native_table, match_slots, native_table, sample_slides_by_number,
-    shape_text, slide_refs,
+    bind_text, box_iou, clone_example_slide, clone_map, fill_native_table, match_slots, native_table,
+    prune_unfilled, sample_slides_by_number, shape_text, slide_refs,
 )
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
@@ -131,10 +131,12 @@ def test_unfilled_repeat_units_are_removed(profile, deck):
 def test_missing_headline_shape_falls_back_to_building_from_scratch(profile, deck):
     prs, sources = deck
     pattern = _pattern(profile, "slide21")
-    # Коробка заголовка уведена туда, где в примере пусто: клону некуда
-    # положить заголовок, и слайд обязан собраться старым путём.
+    # Коробка заголовка уведена туда, где в примере пусто, и id фигуры
+    # стёрт: клону некуда положить заголовок, и слайд обязан собраться
+    # старым путём.
     slots = [
-        replace(s, box=Box(0.05, 0.9, 0.3, 0.05)) if s.role == "headline" else s for s in pattern.slots
+        replace(s, box=Box(0.05, 0.9, 0.3, 0.05), source_shape_id=None) if s.role == "headline" else s
+        for s in pattern.slots
     ]
     broken = replace(pattern, slots=slots)
     spec = _cards_spec(2)
@@ -422,3 +424,95 @@ def test_lone_table_frame_starts_at_the_left_margin_when_the_left_column_is_gone
     assert abs(alone.left - profile.grid.margin_left) < 0.01
     assert alone.width >= builder._TABLE_MIN_WIDTH
 
+
+
+# ---------------------------------------------------------------------------
+# Привязка слотов к фигурам клона по id исходной фигуры
+# ---------------------------------------------------------------------------
+
+
+def _fresh_clone(profile, deck, pattern_id: str, number: int):
+    prs, sources = deck
+    pattern = _pattern(profile, pattern_id)
+    layout = builder._find_layout(prs, pattern.layout_id)
+    return pattern, clone_example_slide(prs, sources[number], layout)
+
+
+def test_slot_finds_its_shape_by_id_when_the_box_drifted(profile, deck):
+    """Коробка слота уехала ниже порога IoU (так бывает после притяжки к
+    полям), а id у клона тот же, что у примера: фигура находится по id."""
+    pattern, slide = _fresh_clone(profile, deck, "slide21", 21)
+    canvas = _canvas(profile)
+    baseline = match_slots(slide, pattern.slots, canvas)
+    h = next(i for i, s in enumerate(pattern.slots) if s.role == "headline")
+    assert baseline[h] is not None and pattern.slots[h].source_shape_id
+    box = pattern.slots[h].box
+    drifted = Box(box.left + box.width * 0.4, box.top, box.width, box.height)
+    assert box_iou(drifted, baseline[h].box) < 0.85
+
+    slots = list(pattern.slots)
+    slots[h] = replace(slots[h], box=drifted)
+    assert match_slots(slide, slots, canvas)[h].element is baseline[h].element
+
+    slots[h] = replace(slots[h], source_shape_id=None)
+    assert match_slots(slide, slots, canvas)[h] is None
+
+
+def test_shape_of_a_foreign_kind_by_id_is_rejected_and_the_box_decides(profile, deck):
+    """Id указал на картинку там, где слоту нужна надпись: такая фигура не
+    принимается, и слот находит свою фигуру по коробке."""
+    pattern, slide = _fresh_clone(profile, deck, "slide26", 26)
+    canvas = _canvas(profile)
+    baseline = match_slots(slide, pattern.slots, canvas)
+    h = next(i for i, s in enumerate(pattern.slots) if s.role == "headline")
+    picture = next(r for r in slide_refs(slide, canvas) if r.kind == "picture")
+
+    slots = list(pattern.slots)
+    slots[h] = replace(slots[h], source_shape_id=picture.shape_id)
+    matched = match_slots(slide, slots, canvas)
+
+    assert matched[h] is not None and matched[h].element is baseline[h].element
+    assert matched[h].kind == "shape"
+
+
+def test_prune_removes_unfilled_slot_and_decor_by_id(profile, deck):
+    """Незаполненный слот и декор незаполненной единицы убираются по id,
+    даже если их коробки в профиле не совпадают ни с одной фигурой клона."""
+    pattern, slide = _fresh_clone(profile, deck, "slide26", 26)
+    canvas = _canvas(profile)
+    slot = next(s for s in pattern.slots if s.role == "card_body" and s.source_shape_id)
+    decor = next(d for d in pattern.decor if d.source_shape_id)
+    nowhere = Box(0.97, 0.97, 0.01, 0.01)
+    before = clone_map(slide_refs(slide, canvas))
+    assert slot.source_shape_id in before and decor.source_shape_id in before
+
+    removed = prune_unfilled(
+        slide, [replace(decor, box=nowhere)], [replace(slot, box=nowhere)], canvas,
+    )
+
+    after = clone_map(slide_refs(slide, canvas))
+    assert removed >= 2
+    assert slot.source_shape_id not in after and decor.source_shape_id not in after
+    assert len(after) >= len(before) - removed
+
+
+def test_doubled_shape_id_is_not_trusted(profile, deck):
+    """Id, который на слайде встречается дважды, фигуру не узнаёт: такие
+    id в карту клона не попадают, и слот идёт по коробке."""
+    _pattern_, slide = _fresh_clone(profile, deck, "slide21", 21)
+    canvas = _canvas(profile)
+    refs = [r for r in slide_refs(slide, canvas) if r.shape_id]
+    first, second = refs[0], refs[1]
+    nv = second.element.find(".//" + qn("p:cNvPr"))
+    nv.set("id", first.shape_id)
+
+    ids = clone_map(slide_refs(slide, canvas))
+
+    assert first.shape_id not in ids
+
+
+def test_pattern_from_model_keeps_source_shape_ids(profile):
+    for model in profile.patterns:
+        pattern = builder._pattern_from_model(model)
+        assert [s.source_shape_id for s in pattern.slots] == [s.source_shape_id for s in model.slots]
+        assert [d.source_shape_id for d in pattern.decor] == [d.source_shape_id for d in model.decor]
