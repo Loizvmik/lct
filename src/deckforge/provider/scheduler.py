@@ -101,6 +101,8 @@ class _Waiter:
     seq: int
     remaining: Callable[[], float]
     priority: int = StagePriority.STRUCTURE
+    # Чьё задание (id бюджета): слоты делятся между заданиями поровну.
+    owner: int | None = None
 
 
 class ModelScheduler:
@@ -113,27 +115,38 @@ class ModelScheduler:
         self._waiters: list[_Waiter] = []
         self._seq = itertools.count()
         self.peak = 0
+        # Сколько вызовов каждого задания идёт сейчас (по `owner`).
+        self._running: dict[int | None, int] = {}
 
     def _head(self) -> _Waiter | None:
-        # Без бюджета (разбор шаблона, командная строка без бюджета)
-        # вызов стоит за всеми заданиями с часами: их пять минут важнее.
-        def key(w: _Waiter) -> tuple[int, float, int]:
+        # Внутри класса стадии слот идёт заданию, у которого сейчас меньше
+        # вызовов в работе, и только потом тому, у кого меньше времени до
+        # резерва. Живой прогон 28 сентября 2026 (три стиля разом, у всех
+        # одни часы): по одному остатку времени первое созданное задание
+        # держало все шесть слотов, второе ждало очередь 539 с суммарно,
+        # третье получило три вызова из тринадцати и собрало десять слайдов
+        # запасным вариантом. Без бюджета (разбор шаблона, командная строка
+        # без бюджета) вызов стоит за всеми заданиями с часами.
+        def key(w: _Waiter) -> tuple[int, int, float, int]:
             try:
                 left = w.remaining()
             except Exception:  # noqa: BLE001: сломанный бюджет не должен вешать очередь
                 left = math.inf
-            return (int(w.priority), left, w.seq)
+            running = self._running.get(w.owner, 0) if w.owner is not None else 0
+            return (int(w.priority), running, left, w.seq)
 
         return min(self._waiters, key=key) if self._waiters else None
 
     def acquire(
         self, remaining: Callable[[], float] | None = None, *, timeout: float | None = None,
-        priority: int = StagePriority.STRUCTURE,
+        priority: int = StagePriority.STRUCTURE, owner: int | None = None,
     ) -> float:
         """Занять слот; возвращает секунды ожидания. `timeout` истёк, а
         слот так и не дали: `OutOfTime`. `priority` из `StagePriority`:
-        класс важнее остатка времени."""
-        waiter = _Waiter(next(self._seq), remaining or (lambda: math.inf), int(priority))
+        класс важнее остатка времени. `owner`: задание (id бюджета), между
+        заданиями одного класса слоты делятся поровну; тот же `owner`
+        передаётся в `release`."""
+        waiter = _Waiter(next(self._seq), remaining or (lambda: math.inf), int(priority), owner)
         started = time.monotonic()
         give_up = None if timeout is None else started + max(timeout, 0.0)
         with self._cond:
@@ -149,12 +162,20 @@ class ModelScheduler:
                 # Следующий в очереди мог стать головой, пока этот ждал.
                 self._cond.notify_all()
             self._busy += 1
+            if owner is not None:
+                self._running[owner] = self._running.get(owner, 0) + 1
             self.peak = max(self.peak, self._busy)
         return time.monotonic() - started
 
-    def release(self) -> None:
+    def release(self, owner: int | None = None) -> None:
         with self._cond:
             self._busy = max(0, self._busy - 1)
+            if owner is not None:
+                left = self._running.get(owner, 0) - 1
+                if left > 0:
+                    self._running[owner] = left
+                else:
+                    self._running.pop(owner, None)
             self._cond.notify_all()
 
     @property
@@ -243,9 +264,10 @@ class ScheduledProvider:
         # собрал 7 слайдов запасным вариантом.
         remaining = None if self.budget is None else (lambda: self.budget.remaining() - self.reserve)
         try:
+            owner = None if self.budget is None else id(self.budget)
             waited = self.scheduler.acquire(
                 remaining, timeout=None if math.isinf(allowed) else allowed - MIN_CALL_SECONDS,
-                priority=self.priority,
+                priority=self.priority, owner=owner,
             )
         except OutOfTime as exc:
             raise self._skip("очередь к модели не дошла до вызова", str(exc)) from exc
@@ -268,7 +290,7 @@ class ScheduledProvider:
             ok = True
             return result
         finally:
-            self.scheduler.release()
+            self.scheduler.release(owner)
             if called and self.budget is not None:
                 self.budget.record_call(self.role, time.monotonic() - started, waited, ok=ok)
 

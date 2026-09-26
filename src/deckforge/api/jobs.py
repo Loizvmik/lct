@@ -117,6 +117,7 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
             model=settings.llm.model_for(role), api_key=settings.yandex_api_key,
             folder_id=settings.yandex_folder_id,
             deadline_seconds=deadline_seconds if deadline_seconds is not None else settings.llm.deadline_seconds,
+            reasoning_effort=settings.llm.reasoning_for(role),
         )
     except (ValueError, ModelNotAllowed):
         return None

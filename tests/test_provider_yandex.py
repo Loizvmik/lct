@@ -599,3 +599,19 @@ def test_per_call_deadline_only_shortens_the_provider_deadline():
     assert provider._call_deadline(None) == provider._deadline_seconds
     assert provider._call_deadline(5.0) == 5.0
     assert provider._call_deadline(10_000.0) == provider._deadline_seconds
+
+
+def test_reasoning_effort_goes_into_the_request_body_only_when_set(monkeypatch):
+    """Уровень рассуждений по роли (`llm.reasoning` в app.yaml) уходит в тело
+    запроса как `reasoning_effort`; без настройки параметра в теле нет, и
+    модель рассуждает по своему умолчанию."""
+    payload = {"choices": [{"message": {"content": '{"ok": true}'}, "finish_reason": "stop"}]}
+    captured = _stub_post(monkeypatch, payload)
+
+    plain = _offline_provider()
+    plain.complete([{"role": "user", "content": "Скажи ОК"}])
+    quiet = YandexProvider(model="qwen3.6-35b-a3b", api_key="x", folder_id="y", reasoning_effort="none")
+    quiet.complete([{"role": "user", "content": "Скажи ОК"}])
+
+    assert "reasoning_effort" not in captured[0]
+    assert captured[1]["reasoning_effort"] == "none"

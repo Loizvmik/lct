@@ -300,3 +300,43 @@ def test_budget_summary_splits_queue_wait_by_stage_class():
     budget.record_call("visual_audit", 4.0, 2.5, ok=True)
     budget.record_call("repair", 2.0, 0.5, ok=True)
     assert budget.summary()["queue_wait_by_class"] == {"P0": 1.0, "P1": 0.5, "P3": 2.5}
+
+
+def test_slots_are_shared_between_jobs_of_the_same_class():
+    """Лимит 2. Задание A поставило три вызова, задание B один, часы у всех
+    одни. Второй слот получает B, а не второй вызов A: внутри класса слот
+    идёт заданию, у которого сейчас меньше вызовов в работе."""
+    scheduler = ModelScheduler(2)
+    model = _SlowModel(delay=0.05)
+    hold = threading.Event()
+
+    class _Blocking(_SlowModel):
+        def complete(self, messages, *, deadline_seconds=None, **_kwargs) -> str:
+            hold.wait(2.0)
+            return super().complete(messages, deadline_seconds=deadline_seconds)
+
+    first_model = _Blocking(delay=0.0)
+    job_a = _FixedBudget(200.0)
+    job_b = _FixedBudget(200.0)
+    a_first = ScheduledProvider(first_model, role="writer", budget=job_a, scheduler=scheduler)
+    a_more = ScheduledProvider(model, role="writer", budget=job_a, scheduler=scheduler)
+    b_one = ScheduledProvider(model, role="writer", budget=job_b, scheduler=scheduler)
+
+    threads = [threading.Thread(target=_ask, args=(a_first, "a1"))]
+    threads[0].start()
+    while scheduler.busy < 1:
+        time.sleep(0.005)
+    # Второй слот пока занят «чужим» вызовом, чтобы очередь накопилась.
+    scheduler.acquire()
+    for provider, name in ((a_more, "a2"), (a_more, "a3"), (b_one, "b1")):
+        thread = threading.Thread(target=_ask, args=(provider, name))
+        thread.start()
+        threads.append(thread)
+    while len(scheduler._waiters) < 3:
+        time.sleep(0.005)
+    scheduler.release()
+    hold.set()
+    for thread in threads:
+        thread.join()
+
+    assert model.order[0] == "b1", model.order

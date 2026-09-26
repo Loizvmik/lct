@@ -114,9 +114,21 @@ class LLMConfig(BaseModel):
     pattern_picker_max_workers: int = 8
     pattern_picker_step_budget_seconds: float = 40.0
 
+    # Рассуждения модели по ролям (`reasoning_effort` в теле запроса Yandex:
+    # none / low / medium / high). Живой замер 28 сентября 2026: писатель на
+    # qwen3.6 с рассуждениями отвечал 16-25 с на слайд и упирался в потолок
+    # max_tokens, без них 0,7-3 с с тем же JSON. Роль без записи идёт с
+    # настройкой модели по умолчанию (параметр не посылается).
+    reasoning: dict[str, str] = {}
+
     def model_for(self, role: str) -> str:
         """Модель для роли; если роль не описана явно — модель по умолчанию."""
         return getattr(self.roles, role, None) or self.model
+
+    def reasoning_for(self, role: str) -> str | None:
+        """Уровень рассуждений для роли, `None`: параметр не посылать."""
+        value = self.reasoning.get(role)
+        return value or None
 
 
 class PathsConfig(BaseModel):

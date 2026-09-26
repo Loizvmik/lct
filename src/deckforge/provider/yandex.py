@@ -135,6 +135,7 @@ class YandexProvider(LLMProvider, VisionProvider):
         timeout: float = 180.0,
         deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
         now: Callable[[], float] = time.monotonic,
+        reasoning_effort: str | None = None,
     ):
         # Settings.load() намеренно не проверяет секреты (config/app.yaml
         # должен грузиться и без .env — этим пользуются тесты, которые
@@ -158,6 +159,10 @@ class YandexProvider(LLMProvider, VisionProvider):
         self._timeout = timeout
         self._deadline_seconds = deadline_seconds
         self._now = now
+        # `reasoning_effort` уходит в тело запроса как есть (`none` выключает
+        # рассуждения у qwen3.6 через OpenAI-совместимый API Yandex); `None`:
+        # параметр не посылается, модель рассуждает по своему умолчанию.
+        self._reasoning_effort = reasoning_effort
         self._client = httpx.Client(
             timeout=timeout,
             headers={"Authorization": f"Api-Key {api_key}", "Content-Type": "application/json"},
@@ -202,6 +207,8 @@ class YandexProvider(LLMProvider, VisionProvider):
             "model": self.model_uri, "messages": messages,
             "max_tokens": max_tokens, "temperature": temperature,
         }
+        if self._reasoning_effort:
+            body["reasoning_effort"] = self._reasoning_effort
         payload, tried_budgets = self._post_with_budget_escalation(
             body, deadline_at=deadline_at, expects_json=schema is not None, budget_cap=budget_cap,
         )
@@ -257,6 +264,8 @@ class YandexProvider(LLMProvider, VisionProvider):
                 {"type": "image_url", "image_url": {"url": url}},
             ]}],
         }
+        if self._reasoning_effort:
+            body["reasoning_effort"] = self._reasoning_effort
         payload, tried_budgets = self._post_with_budget_escalation(body, deadline_at=deadline_at)
         return self._extract(payload, tried_budgets=tried_budgets)
 
