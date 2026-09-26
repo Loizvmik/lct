@@ -254,6 +254,7 @@ import yaml
 from PIL import Image, ImageDraw, ImageFont
 
 from deckforge.provider.base import VisionProvider
+from deckforge.provider.yandex import JSON_ONLY_NUDGE
 from deckforge.render.soffice import RenderError, to_pngs
 from deckforge.template.patterns import Pattern
 
@@ -896,8 +897,13 @@ def describe_pattern_slots(
         for attempt in range(_SCHEMA_ATTEMPTS):
             if attempt and isinstance(last_exc, httpx.HTTPError):
                 time.sleep(_SCHEMA_RETRY_PAUSE_SECONDS * attempt)
+            # Повтор после пустого или не-JSON ответа идёт с подсказкой «только
+            # JSON»: у reasoning-модели весь бюджет уходил на рассуждения
+            # (два паттерна на шаблон в прогоне 27 сентября 2026), и тот же
+            # запрос без подсказки повторял тот же исход.
+            attempt_prompt = prompt if not attempt else f"{prompt}\n\n{JSON_ONLY_NUDGE}"
             try:
-                raw = llm.ask_image(png, prompt, max_tokens=_SCHEMA_MAX_TOKENS)
+                raw = llm.ask_image(png, attempt_prompt, max_tokens=_SCHEMA_MAX_TOKENS)
                 parsed = json.loads(_strip_markdown_fence(raw))
             except Exception as exc:  # noqa: BLE001 — сеть/разбор пробуем ещё раз, не роняем профиль
                 last_exc = exc
