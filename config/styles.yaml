@@ -1,0 +1,49 @@
+# Стиль генерации (dense / airy / visual) как целевая функция глобального
+# планировщика паттернов (`deckforge.pattern.planner`). Раздел 6 и 7.2
+# docs/architecture: стиль не переставляет готовый текст, а решает, какую
+# композицию получит каждый слайд, и уже под неё пишется текст.
+version: 1.0.0
+
+# Веса стоимости назначения (раздел 7.2). `overflow` умножается на долю
+# содержания, которое раскладка не вмещает: фактически запрет, но мягкий,
+# чтобы колода собиралась и на бедном шаблоне. `decor` умножается на
+# `decor_weight` стиля и на богатство декора раскладки (0..1).
+weights:
+  overflow: 1000
+  consecutive_repeat: 100
+  repeated_pattern: 30
+  style_mismatch: 20
+  density_mismatch: 10
+  pattern_quality: 5
+  decor: 10
+  # Место под фото на раскладке, а фото у слайда нет: картинка примера из
+  # клона удаляется, и остаётся пустота (27 сентября 2026, VK Education).
+  orphan_image: 15
+  # Первый слайд не на обложке, последний не на финальной раскладке.
+  cover_miss: 50
+
+styles:
+  dense:
+    target_density: 0.80
+    # Порядок значим: первый вид совпадает полностью, дальше по убыванию.
+    prefer: [table, cards, two_col, kpi, bullets]
+    # Слов на единицу содержания (пункт, карточку): цель писателю и нижняя
+    # граница, ниже которой раскладка считается тесной для стиля.
+    words_per_item: 16
+    min_words_per_item: 8
+    decor_weight: 0.5
+    dividers: false
+  airy:
+    target_density: 0.50
+    prefer: [section, quote, kpi_caption, sparse_cards, kpi]
+    words_per_item: 9
+    min_words_per_item: 4
+    decor_weight: 0.5
+    dividers: true
+  visual:
+    target_density: 0.55
+    prefer: [image, photo_text, chart, diagram, cards]
+    words_per_item: 10
+    min_words_per_item: 4
+    decor_weight: 2.0
+    dividers: false
