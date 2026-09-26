@@ -53,6 +53,7 @@ from deckforge.audit.config import AuditConfig
 from deckforge.audit.findings import Finding, Repair, Severity
 from deckforge.compose.clone import clone_pattern_id
 from deckforge.compose.colorpick import slide_background_luminance
+from deckforge.compose.failure import font_budget
 from deckforge.compose.textfit import measure
 from deckforge.ink import (
     dominant_run_style as _dominant_run_style,
@@ -1128,6 +1129,48 @@ def _check_T02(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
                 item.box, True, "Заменить кегль на ближайшую ступень шкалы шаблона.",
             ))
             break
+    findings.extend(_over_shrunk(ctx, profile, config))
+    return findings
+
+
+def _over_shrunk(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
+    """T02, задача V3: текст клона ужат глубже предела (`compose.failure.
+    FontBudget`: 0,8 от кегля примера и не больше двух ступеней шкалы
+    вниз). Кегль из шкалы, но заголовок 44pt, ставший 18pt, это не подгонка,
+    а потеря дизайна, и чинится она раскладкой или текстом (structural), а
+    не ещё одной ступенью кегля. Судится только клон: у него известен
+    пример и фигура, с которой снят слот (`source_shape_id`); у сборки с
+    нуля мерить не от чего."""
+    if ctx.clone_pattern is None:
+        return []
+    pattern = next((p for p in profile.patterns if p.pattern_id == ctx.clone_pattern), None)
+    if pattern is None:
+        return []
+    native = {
+        slot.source_shape_id: profile.denorm_pt(slot.size_pt)
+        for slot in pattern.slots if slot.source_shape_id and slot.size_pt and slot.size_pt > 0
+    }
+    if not native:
+        return []
+    budget = font_budget()
+    scale = [profile.denorm_pt(v) for v in profile.type_scale.steps.values() if v > 0]
+    tol = config.template.size_tolerance_pt
+    findings = []
+    for item in _text_shapes(ctx):
+        size0 = native.get(item.shape_id)
+        sizes = _all_run_sizes(item.element)
+        if size0 is None or not sizes:
+            continue
+        floor = budget.floor_pt(size0, scale)
+        size_pt = max(sizes)
+        if size_pt >= floor - tol:
+            continue
+        findings.append(_finding(
+            "T02", "major", ctx, item,
+            f"Кегль {size_pt:g}pt ужат глубже предела: у примера {size0:g}pt, предел {floor:g}pt.",
+            item.box, False, "Взять раскладку просторнее, сократить текст или разделить слайд.",
+            repair="structural",
+        ))
     return findings
 
 

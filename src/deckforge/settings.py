@@ -183,12 +183,23 @@ class RenderConfig(BaseModel):
         return None
 
 
+class FontBudgetConfig(BaseModel):
+    # Предел ужимания кегля при подгонке текста (`compose.failure.
+    # FontBudget`): доля от кегля примера и ступени шкалы шаблона вниз.
+    min_ratio: float = 0.8
+    max_steps: int = 2
+
+
 class ComposeConfig(BaseModel):
     # Собирать слайд клоном слайда-примера шаблона (`compose.clone`), а
     # сборку с нуля держать запасным путём. Выключатель нужен на случай,
     # если на незнакомом шаблоне клон начнёт давать брак: вернуть старое
     # поведение одной строкой конфига, не откатывая код.
     clone_examples: bool = True
+    # Задача V3: ступени починки по категории отказа (`compose.failure.
+    # RepairPolicy`); пусто: таблица по умолчанию из кода.
+    repair_policy: dict[str, list[str]] = Field(default_factory=dict)
+    font_degradation_budget: FontBudgetConfig = FontBudgetConfig()
 
 
 class PlanConfig(BaseModel):

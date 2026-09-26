@@ -193,6 +193,12 @@ class SlideSpec:
     # стоимости (`pattern.planner.PatternAssignment.alternatives`). Сборка
     # берёт их второй ступенью лестницы, если клон `pattern_id` отклонён.
     alternatives: tuple[str, ...] = ()
+    # Служебные пометки сборки, не содержание (задача V3): `failure_codes`
+    # (почему клон не принят, `compose.failure.Failure.label` через
+    # запятую, главная в `failure_primary`), `ladder_path` (пройденные
+    # ступени) и `ladder_rung`
+    # (сработавшая). Читает HTML-отчёт: «почему не клон».
+    meta: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -595,7 +601,7 @@ def slide_spec_to_dict(slide: SlideSpec) -> dict:
         "visual": _visual_to_dict(slide.visual),
         "source_note": slide.source_note, "speaker_notes": slide.speaker_notes,
         "findings": list(slide.findings), "pattern_id": slide.pattern_id,
-        "alternatives": list(slide.alternatives),
+        "alternatives": list(slide.alternatives), "meta": dict(slide.meta),
     }
 
 
@@ -606,7 +612,7 @@ def slide_spec_from_debug_dict(data: dict) -> SlideSpec:
         visual=_visual_from_debug_dict(data.get("visual")),
         source_note=data.get("source_note"), speaker_notes=data.get("speaker_notes"),
         findings=list(data.get("findings") or []), pattern_id=data.get("pattern_id"),
-        alternatives=tuple(data.get("alternatives") or ()),
+        alternatives=tuple(data.get("alternatives") or ()), meta=dict(data.get("meta") or {}),
     )
 
 
