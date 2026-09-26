@@ -703,19 +703,19 @@ def structural_gap(slide: SlideSpec, profile) -> str | None:
                 p for p in profile.patterns
                 if p.repeat is not None and set(p.repeat.slot_roles) & {"card_title", "card_body"}
             ]
-            return _units_gap(len(block.items), holders, "карточек")
+            return _units_gap(len(block.items), holders, "карточек", "карточки")
         if isinstance(block, KpiBlock) and block.items:
             holders = [p for p in profile.patterns if p.kind in ("kpi", "kpi_caption")]
-            return _units_gap(len(block.items), holders, "показателей")
+            return _units_gap(len(block.items), holders, "показателей", "показатели")
     if slide.visual is not None and slide.visual.table is not None:
         if not any(p.kind == "table" for p in profile.patterns):
             return "нужен слот под таблицу, в шаблоне его нет"
     return None
 
 
-def _units_gap(needed: int, holders: list, what: str) -> str | None:
+def _units_gap(needed: int, holders: list, many: str, target: str) -> str | None:
     if not holders:
-        return f"нужно {needed} {what}, раскладок под них в шаблоне нет"
+        return f"{many} на слайде: {needed}, раскладок под {target} в шаблоне нет"
     most = max(max(p.capacity.max_items, p.repeat.count if p.repeat is not None else 0) for p in holders)
     if needed > most:
         return f"нужно {needed} единиц, максимум в шаблоне {most}"

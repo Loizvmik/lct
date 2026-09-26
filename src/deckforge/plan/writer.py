@@ -695,6 +695,7 @@ def _repair_underfill(
     ]
     outcome = "отброшен"
     result = slide
+    after = None
     try:
         repaired = slide_spec_from_dict(json.loads(_complete(llm, messages, _SLIDE_SCHEMA, WRITER_MAX_TOKENS)), slide.index)
     except Exception as exc:  # отказ ремонта не портит уже хороший слайд
@@ -708,7 +709,7 @@ def _repair_underfill(
     if log is not None:
         log.append({
             "index": slide.index, "seconds": round(time.monotonic() - started, 1), "outcome": outcome,
-            "fill_before": before["fill"],
+            "fill_before": before["fill"], "fill_after": after["fill"] if outcome == "принят" else before["fill"],
         })
     return result
 
@@ -795,6 +796,12 @@ def write_slides(
         deck.meta["fill_repairs"] = str(len(repair_log))
         deck.meta["fill_repairs_accepted"] = str(sum(1 for r in repair_log if r["outcome"] == "принят"))
         deck.meta["fill_repair_seconds"] = f"{sum(r['seconds'] for r in repair_log):.1f}"
+        # По слайду: заполнение до и после, секунды, исход. Нужно для разбора
+        # прогона по deck.json без повторного вызова модели.
+        deck.meta["fill_repair_log"] = "; ".join(
+            f"{r['index']}: {r['fill_before']}->{r['fill_after']}, {r['seconds']}с, {r['outcome']}"
+            for r in sorted(repair_log, key=lambda r: r["index"])
+        )
     return normalize_deck(deck, profile)
 
 

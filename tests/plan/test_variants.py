@@ -590,6 +590,20 @@ def test_fitting_content_gets_no_layout_gap_finding():
     assert not any("раскладка под содержание не найдена" in f for f in slide.findings)
 
 
+def test_kpis_without_kpi_layouts_are_named():
+    """Живой прогон 26 сентября 2026, VK Education: показатель без единой
+    kpi-раскладки в шаблоне сел на раскладку-картинку молча."""
+    from types import SimpleNamespace
+
+    from deckforge.plan.spec import Kpi, KpiBlock
+    from deckforge.plan.variants import structural_gap
+
+    profile = SimpleNamespace(patterns=[SimpleNamespace(kind="image", repeat=None)])
+    slide = SlideSpec(index=7, kind="kpi_caption", headline="Х", blocks=[KpiBlock(items=[Kpi(value="80%", label="а")])])
+
+    assert structural_gap(slide, profile) == "показателей на слайде: 1, раскладок под показатели в шаблоне нет"
+
+
 def test_table_without_table_layout_is_named():
     from deckforge.plan.spec import TableVisual
     from deckforge.plan.variants import structural_gap
