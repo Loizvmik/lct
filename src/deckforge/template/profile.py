@@ -218,7 +218,34 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # уверенности не ниже 0,8, а `fixed` ещё и только для короткой фразы без
 # подсказок дизайнера (`patterns.is_fixed_phrase`). В кеше v21 подсказка
 # «Точки используются для навигации» могла лежать как `fixed`.
-PROFILE_SCHEMA_VERSION = 22
+#
+# Задача T (раздельный кэш разбора, deckforge_updated_architecture.md,
+# раздел 19): единая версия выше объединяла ДВЕ независимые причины бампа —
+# смысл детерминированного разбора (типографика/палитра-без-имён/сетка/
+# лейауты/ассеты/паттерны-геометрией/словарь форм) и смысл модельной части
+# (имена ролей палитры, вид раскладки моделью, схема слотов, превью). Бамп
+# по любой из двух причин ронял ОБЕ половины кеша разом — правка, меняющая
+# только промпт схемы слотов, заставляла заново гонять `mine_patterns`/
+# `build_layout_catalog`/`build_asset_catalog` тоже, хотя они не менялись
+# ни на строку. Версия разделена на `DETERMINISTIC_SCHEMA_VERSION` (кеш —
+# `DeterministicProfile` ниже, ключ `sha256(файл)+эта версия`, независим от
+# модели/промптов) и `MODEL_SCHEMA_VERSION` (палитра-имена/вид/схема/превью).
+# `PROFILE_SCHEMA_VERSION` остаётся ОДНИМ числом ради обратной совместимости
+# (`TemplateProfile.schema_version`, имя файла комбинированного кеша,
+# `profile_key` — ни один вызывающий код и тест не должен знать про две
+# версии) и просто вычисляется из двух младшей арифметикой; значение целиком
+# меняется по сравнению с 1..22 выше — старый комбинированный кеш
+# инвалидируется один раз, тем же ожидаемым способом, что и любой бамп
+# раньше (см. историю выше). Дальнейшие правки бампают ТУ версию, которая
+# реально изменила смысл: деталь детерминированного разбора —
+# `DETERMINISTIC_SCHEMA_VERSION`, деталь именования/вида/схемы/превью —
+# `MODEL_SCHEMA_VERSION`; бамп детерминированной обязан перезапускать всё
+# (проще всего добиться этого, ничего специально не делая: комбинированная
+# версия меняется тоже, а `DeterministicProfile` — свой отдельный кеш-файл
+# по своему ключу, который тоже перестаёт совпадать).
+DETERMINISTIC_SCHEMA_VERSION = 1
+MODEL_SCHEMA_VERSION = 1
+PROFILE_SCHEMA_VERSION = DETERMINISTIC_SCHEMA_VERSION * 1000 + MODEL_SCHEMA_VERSION
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -693,6 +720,95 @@ def _slot_schema_of(models: list[PatternModel]) -> dict[str, dict[int, dict]]:
 
 
 # ---------------------------------------------------------------------------
+# Задача T: детерминированная часть разбора — отдельный кеш-файл, версия
+# независима от модельной (см. докстроку `DETERMINISTIC_SCHEMA_VERSION`
+# выше). Хранит РОВНО то, что вычисляет `with PptxPackage.open(...)` в
+# `from_file` ДО обращений к модели: типографику, сетку, лейауты, ассеты,
+# паттерны только геометрией (без вида от модели/схемы слотов/превью —
+# `_pattern_model(p)` без `preview_path`, `kind`/`kind_confidence` те, что
+# дал `patterns._classify_kind`), словарь форм и итоговую (уточнённую по
+# `Usage.primary_theme`) тему отчёта. Читается на кеш-миссе комбинированного
+# кеша ТОЛЬКО когда сам вызов идёт без `vision`/`schema` (см. `from_file`) —
+# с моделью для вида раскладки нужен настоящий `patterns.Pattern`
+# (`dataclasses.replace` внутри `classify_patterns_by_vision`), а не его
+# JSON-зеркало ниже.
+# ---------------------------------------------------------------------------
+
+
+class DeterministicProfile(BaseModel):
+    deterministic_schema_version: int
+    source_name: str
+    source_path: str
+    canvas_width_emu: int
+    canvas_height_emu: int
+    theme: ThemeModel
+    theme_part: str
+    master_part: str
+    type_scale: TypeScaleModel
+    grid: GridModel
+    layouts: list[LayoutEntryModel]
+    assets: AssetCatalogModel
+    patterns: list[PatternModel]
+    shape_vocabulary: list[ShapeVocabEntryModel]
+
+
+def _deterministic_cache_file(cache_dir: Path | None, key: str) -> Path | None:
+    return cache_dir / f"{key}-det.json" if cache_dir is not None else None
+
+
+def _load_deterministic_cache(cache_dir: Path | None, key: str) -> DeterministicProfile | None:
+    """Кеш-хит детерминированной части или `None` — по версии СЫРОГО
+    словаря, ДО pydantic-валидации, тем же приёмом и по той же причине, что
+    и `TemplateProfile.from_file` для комбинированного кеша (см. её
+    докстроку): поле, добавленное позже, иначе тихо получило бы дефолт.
+    Повреждённый/чужой файл — не крах, а честный кеш-мисс: следующий код
+    просто разбирает пакет заново."""
+    path = _deterministic_cache_file(cache_dir, key)
+    if path is None or not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict) or raw.get("deterministic_schema_version") != DETERMINISTIC_SCHEMA_VERSION:
+        return None
+    try:
+        return DeterministicProfile.model_validate(raw)
+    except Exception:
+        return None
+
+
+def _save_deterministic_cache(cache_dir: Path | None, key: str, det: DeterministicProfile) -> None:
+    """Кеш — оптимизация повторного разбора, не источник правды (тот же
+    принцип, что и `LocalProfileStore`/комбинированный кеш ниже): ошибка
+    записи молча проглатывается."""
+    path = _deterministic_cache_file(cache_dir, key)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(det.model_dump_json(), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _theme_from_model(model: ThemeModel) -> ThemeInfo:
+    """Восстанавливает `ThemeInfo` из зеркала — нужно ТОЛЬКО как редкий
+    запасной путь при кеш-хите детерминированной части, если у ЭТОГО вызова
+    `usage.primary_theme` вдруг пуст (см. `theme = usage.primary_theme or
+    ...` в `from_file`): сырой `theme_for_layouts`, который вычислял бы
+    `read_theme`, на кеш-хите не пересчитывается, есть только его зеркало в
+    `DeterministicProfile.theme`."""
+    return ThemeInfo(
+        scheme=dict(model.scheme), clr_map=dict(model.clr_map),
+        major_font=model.major_font, minor_font=model.minor_font, scheme_name=model.scheme_name,
+        font_scheme_degraded=model.font_scheme_degraded, text_styles_degraded=model.text_styles_degraded,
+        is_stock_office_palette=model.is_stock_office_palette, theme_font_share=model.theme_font_share,
+        unresolved=[UnresolvedColor(tag=u.tag, val=u.val, reason=u.reason) for u in model.unresolved],
+    )
+
+
+# ---------------------------------------------------------------------------
 # TemplateProfile
 # ---------------------------------------------------------------------------
 
@@ -1009,7 +1125,8 @@ class TemplateProfile(BaseModel):
         # VISION`: не передан — тот же, что `vision`; `None` явно — схема не
         # снимается.
         schema_llm = vision if schema is _SCHEMA_FROM_VISION else schema
-        fingerprint = profile_key(path.read_bytes(), PROFILE_SCHEMA_VERSION)
+        template_bytes = path.read_bytes()
+        fingerprint = profile_key(template_bytes, PROFILE_SCHEMA_VERSION)
 
         # Найдено этой задачей: `cache_dir` объявлен типом `Path | None`, но
         # Python не приводит аргументы к аннотации сама — вызывающий код,
@@ -1082,52 +1199,99 @@ class TemplateProfile(BaseModel):
                         pass  # кеш — оптимизация, не обязана быть надёжной
                 return cached
 
+        # Задача T: кеш-хит детерминированной части — только когда СЕЙЧАС нет
+        # ни `vision`, ни `schema` (см. докстроку `DeterministicProfile`).
+        # Проверяется ДО открытия пакета: при попадании `with PptxPackage.
+        # open` ниже всё равно нужен (`collect_usage` — единственное, что
+        # неизбежно пересчитывается на каждом вызове, палитра и провенанс
+        # читают именно `usage`, не геометрию), но сама геометрия (`build_
+        # grid`/`build_layout_catalog`/`build_asset_catalog`/`mine_patterns`/
+        # `build_shape_vocabulary`) — нет.
+        det_key = profile_key(template_bytes, DETERMINISTIC_SCHEMA_VERSION)
+        det_cached = (
+            _load_deterministic_cache(effective_cache_dir, det_key)
+            if vision is None and schema_llm is None else None
+        )
+
         with PptxPackage.open(path) as pkg:
             canvas = pkg.canvas()
             usage = collect_usage(pkg, canvas)
-            type_scale = build_type_scale(pkg, canvas, usage)
-            grid = build_grid(pkg, canvas)
-            master_part = pick_primary_master(pkg)
-            theme_for_layouts = read_theme(pkg, master_part)
-            theme_part = pkg.related(master_part, "theme")[0]
-            layouts = build_layout_catalog(
-                pkg, canvas, theme_for_layouts, grid, usage=usage, type_scale=type_scale,
-            )
-            assets = build_asset_catalog(pkg, canvas, layouts)
-            patterns = mine_patterns(pkg, canvas, grid, type_scale, assets)
-            # Task 10 код-ревью, находка №1: словарь карточных форм считается
-            # ПО ДЕКОРУ ГРУПП ПОВТОРА уже намайненных раскладок (`patterns`,
-            # объект этого же прохода, до pydantic-сериализации — см.
-            # докстроку `template/shapes.py`), не по переписи всех автофигур
-            # пакета — макеты/мастера служебными рамками перевешивают язык
-            # карточек, который реально использует шаблон.
-            #
-            # "Разбор незнакомого шаблона в бюджет", продолжение 3 —
-            # НАРОЧНО посчитан здесь, ДО уточнения вида раскладки моделью
-            # (`classify_patterns_by_vision` ниже, теперь вне блока `with`,
-            # см. его комментарий), не после, как было раньше. Безопасно:
-            # `build_shape_vocabulary`/`_card_decor_vocabulary` читают
-            # только `Pattern.decor` (репит-группы) и `Pattern.slots`
-            # (текстовые слоты) — ни одного обращения к `Pattern.kind` во
-            # всём `template/shapes.py` нет (см. её докстроку), а
-            # `classify_patterns_by_vision` меняет только `kind`
-            # (`dataclasses.replace(p, kind=...)`), никогда `decor`/`slots`.
-            # Результат этого вызова одинаков что до, что после уточнения
-            # вида — переставить его раньше нужно ТОЛЬКО чтобы `pkg` можно
-            # было закрыть до параллельного запуска именования палитры и
-            # уточнения вида раскладки моделью ниже (обоим обращениям к
-            # модели сам pkg не нужен, но `build_shape_vocabulary` — нужен, а
-            # держать zip-пакет открытым во время сетевых вызовов моделей
-            # незачем).
-            shape_vocabulary = build_shape_vocabulary(pkg, canvas, patterns)
+            if det_cached is not None:
+                type_scale_m = det_cached.type_scale
+                grid_m = det_cached.grid
+                master_part = det_cached.master_part
+                theme_part = det_cached.theme_part
+                layouts_m = det_cached.layouts
+                assets_m = det_cached.assets
+                shape_vocabulary_m = det_cached.shape_vocabulary
+                # PatternModel, не Pattern — безопасно ТОЛЬКО потому, что
+                # `vision is None and schema_llm is None` здесь гарантировано
+                # (условие кеш-хита выше): ни `classify_patterns_by_vision`,
+                # ни `describe_pattern_slots` не тронут геометрию/декор этих
+                # объектов при отсутствующей модели (обе — при `llm is None`
+                # — отдают вход как есть, см. их докстроки).
+                patterns_for_vision = list(det_cached.patterns)
+                theme_for_layouts = None
+            else:
+                type_scale = build_type_scale(pkg, canvas, usage)
+                grid = build_grid(pkg, canvas)
+                master_part = pick_primary_master(pkg)
+                theme_for_layouts = read_theme(pkg, master_part)
+                theme_part = pkg.related(master_part, "theme")[0]
+                layouts = build_layout_catalog(
+                    pkg, canvas, theme_for_layouts, grid, usage=usage, type_scale=type_scale,
+                )
+                assets = build_asset_catalog(pkg, canvas, layouts)
+                patterns_for_vision = mine_patterns(pkg, canvas, grid, type_scale, assets)
+                # Task 10 код-ревью, находка №1: словарь карточных форм считается
+                # ПО ДЕКОРУ ГРУПП ПОВТОРА уже намайненных раскладок (`patterns_
+                # for_vision`, объект этого же прохода, до pydantic-сериализации —
+                # см. докстроку `template/shapes.py`), не по переписи всех
+                # автофигур пакета — макеты/мастера служебными рамками
+                # перевешивают язык карточек, который реально использует шаблон.
+                #
+                # "Разбор незнакомого шаблона в бюджет", продолжение 3 —
+                # НАРОЧНО посчитан здесь, ДО уточнения вида раскладки моделью
+                # (`classify_patterns_by_vision` ниже, теперь вне блока `with`,
+                # см. его комментарий), не после, как было раньше. Безопасно:
+                # `build_shape_vocabulary`/`_card_decor_vocabulary` читают
+                # только `Pattern.decor` (репит-группы) и `Pattern.slots`
+                # (текстовые слоты) — ни одного обращения к `Pattern.kind` во
+                # всём `template/shapes.py` нет (см. её докстроку), а
+                # `classify_patterns_by_vision` меняет только `kind`
+                # (`dataclasses.replace(p, kind=...)`), никогда `decor`/`slots`.
+                # Результат этого вызова одинаков что до, что после уточнения
+                # вида — переставить его раньше нужно ТОЛЬКО чтобы `pkg` можно
+                # было закрыть до параллельного запуска именования палитры и
+                # уточнения вида раскладки моделью ниже (обоим обращениям к
+                # модели сам pkg не нужен, но `build_shape_vocabulary` — нужен, а
+                # держать zip-пакет открытым во время сетевых вызовов моделей
+                # незачем).
+                shape_vocabulary = build_shape_vocabulary(pkg, canvas, patterns_for_vision)
+                # Модели строятся сразу — деталь задачи T: и `_build_
+                # provenance`/`_build_warnings` (только читают атрибуты,
+                # работают одинаково что с дата-классом, что с его JSON-
+                # зеркалом), и финальная сборка `TemplateProfile` ниже, и
+                # кеш детерминированной части используют одни и те же
+                # объекты, независимо от того, какая ветка их дала.
+                type_scale_m = _type_scale_model(type_scale)
+                grid_m = _grid_model(grid)
+                layouts_m = [_layout_entry_model(entry) for entry in layouts]
+                assets_m = _asset_catalog_model(assets)
+                shape_vocabulary_m = [_shape_vocab_entry_model(e) for e in shape_vocabulary]
 
         # Тема для отчёта и именования палитры — уточнённая по фактическому
         # тексту слайдов (`Usage.primary_theme`, см. theme.
         # refine_font_scheme_degraded), не сырая `theme_for_layouts` выше:
         # каталог лейаутов исторически считается по сырой теме (см.
         # conftest.py), а отчёт человеку обязан отражать окончательный,
-        # уточнённый вывод о деградации fontScheme.
-        theme = usage.primary_theme or theme_for_layouts
+        # уточнённый вывод о деградации fontScheme. На кеш-хите
+        # детерминированной части `theme_for_layouts` не пересчитывается
+        # (`None` выше) — запасной путь восстанавливает её из зеркала кеша,
+        # см. докстроку `_theme_from_model`.
+        theme = usage.primary_theme or (
+            theme_for_layouts if theme_for_layouts is not None else _theme_from_model(det_cached.theme)
+        )
 
         # "Разбор незнакомого шаблона в бюджет", продолжение 3 — именование
         # ролей палитры (`naming.name_palette_roles_report`) и уточнение
@@ -1193,14 +1357,16 @@ class TemplateProfile(BaseModel):
             if effective_cache_dir is not None and vision is not None else None
         )
         with ThreadPoolExecutor(max_workers=3) as pool:
-            vision_future = pool.submit(classify_patterns_by_vision, patterns, path, vision)
+            vision_future = pool.submit(classify_patterns_by_vision, patterns_for_vision, path, vision)
             palette_future = pool.submit(name_palette_roles_report, usage, theme, namer)
             # Задача F: превью и схема слотов одним рендером; схема идёт
             # параллельно с видом раскладки, а не после него, — у неё свой
             # пул потоков (`llm.pattern_schema_max_workers`), и разбор
             # шаблона не должен ждать их по очереди.
-            preview_future = pool.submit(_previews_and_slot_schema, patterns, path, preview_dir, schema_llm)
-            patterns, vision_notes = vision_future.result()
+            preview_future = pool.submit(
+                _previews_and_slot_schema, patterns_for_vision, path, preview_dir, schema_llm,
+            )
+            patterns_after_vision, vision_notes = vision_future.result()
             palette_report = palette_future.result()
             preview_paths, slot_schema, schema_notes, schema_done = preview_future.result()
 
@@ -1208,12 +1374,12 @@ class TemplateProfile(BaseModel):
 
         provenance = _build_provenance(
             master_part=master_part, theme_part=theme_part, theme=theme, usage=usage,
-            type_scale=type_scale, grid=grid, assets=assets, layouts=layouts,
-            patterns=patterns, palette_notes=palette_report.notes, vision_notes=vision_notes,
+            type_scale=type_scale_m, grid=grid_m, assets=assets_m, layouts=layouts_m,
+            patterns=patterns_after_vision, palette_notes=palette_report.notes, vision_notes=vision_notes,
         )
         warnings = _build_warnings(
-            theme=theme, usage=usage, type_scale=type_scale, grid=grid,
-            assets=assets, layouts=layouts, palette_notes=palette_report.notes,
+            theme=theme, usage=usage, type_scale=type_scale_m, grid=grid_m,
+            assets=assets_m, layouts=layouts_m, palette_notes=palette_report.notes,
         )
         # Заметки классификации вида раскладки моделью (см. `classify_
         # patterns_by_vision`) — ПЕРВАЯ строка (сводка "N из M") в provenance
@@ -1228,24 +1394,51 @@ class TemplateProfile(BaseModel):
         provenance.extend(schema_notes[:1])
         warnings.extend(schema_notes[1:])
 
+        if det_cached is not None:
+            # `patterns_after_vision` уже `list[PatternModel]` без единого
+            # изменения (см. комментарий у `patterns_for_vision` выше) —
+            # оборачивать их `_pattern_model` заново незачем и опасно (это
+            # ожидает дата-класс `Pattern`, не его зеркало).
+            pattern_models = list(patterns_after_vision)
+        else:
+            pattern_models = [_pattern_model(p, preview_paths.get(p.pattern_id)) for p in patterns_after_vision]
+            # Задача T: деterministic-кеш пишется здесь, а не только когда
+            # запрошен `vision`/`schema`, — следующий вызов того же файла
+            # (с любой моделью или без неё) переиспользует геометрию, не
+            # только полный комбинированный кеш-хит текущей конфигурации.
+            # Паттерны в НЕМ — геометрией, ДО уточнения моделью
+            # (`patterns_for_vision`, не `patterns_after_vision`): деterministic-
+            # часть обязана быть одной и той же независимо от того, был ли у
+            # ЭТОГО конкретного вызова ключ `vision`.
+            _save_deterministic_cache(
+                effective_cache_dir, det_key,
+                DeterministicProfile(
+                    deterministic_schema_version=DETERMINISTIC_SCHEMA_VERSION,
+                    source_name=path.name, source_path=str(path.resolve()),
+                    canvas_width_emu=canvas.width_emu, canvas_height_emu=canvas.height_emu,
+                    theme=_theme_model(theme), theme_part=theme_part, master_part=master_part,
+                    type_scale=type_scale_m, grid=grid_m, layouts=layouts_m, assets=assets_m,
+                    patterns=[_pattern_model(p) for p in patterns_for_vision],
+                    shape_vocabulary=shape_vocabulary_m,
+                ),
+            )
+
         profile = cls(
             source_name=path.name, source_path=str(path.resolve()),
             canvas_width_emu=canvas.width_emu, canvas_height_emu=canvas.height_emu,
             theme=_theme_model(theme), theme_part=theme_part, master_part=master_part,
             palette_roles=dict(palette_report.roles),
             palette_roles_source=palette_report.source,
-            type_scale=_type_scale_model(type_scale), grid=_grid_model(grid),
-            layouts=[_layout_entry_model(entry) for entry in layouts],
-            assets=_asset_catalog_model(assets),
-            patterns=_apply_slot_schema(
-                [_pattern_model(p, preview_paths.get(p.pattern_id)) for p in patterns], slot_schema,
-            ),
+            type_scale=type_scale_m, grid=grid_m,
+            layouts=layouts_m,
+            assets=assets_m,
+            patterns=_apply_slot_schema(pattern_models, slot_schema),
             pattern_schema_source="model" if schema_done else "none",
             # "model" значит «модель спрашивали», а не «модель ответила» —
             # см. комментарий у самого поля. Ответила она или отказала, видно
             # по `provenance`/`warnings` (заметки `classify_patterns_by_vision`).
             pattern_kinds_source="model" if vision is not None else "geometry",
-            shape_vocabulary=[_shape_vocab_entry_model(e) for e in shape_vocabulary],
+            shape_vocabulary=shape_vocabulary_m,
             chart_series=chart_series,
             provenance=provenance, warnings=warnings, fingerprint=fingerprint,
             schema_version=PROFILE_SCHEMA_VERSION,
