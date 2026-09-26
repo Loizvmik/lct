@@ -9,10 +9,13 @@ import {
   Finding,
   getJob,
   getVariants,
+  JobResponse,
+  listJobs,
   SEVERITY_LABELS,
   VariantName,
   VariantSummary,
   VARIANT_LABELS,
+  VARIANT_ORDER,
 } from "@/lib/api";
 
 function AuditScreen() {
@@ -28,9 +31,27 @@ function AuditScreen() {
   const [applying, setApplying] = useState(false);
   const [lastResult, setLastResult] = useState<{ applied: number; skipped: number } | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
+  // Задача Q: стили одного запуска — отдельные задания пакета; переключатель
+  // ведёт на аудит соседнего задания, а не на вариант внутри этого.
+  const [siblings, setSiblings] = useState<JobResponse[]>([]);
 
   useEffect(() => {
-    getJob(params.jobId).then((job) => setTemplateId(job.template_id)).catch(() => undefined);
+    getJob(params.jobId)
+      .then((job) => {
+        setTemplateId(job.template_id);
+        if (job.batch_id) {
+          listJobs(job.batch_id)
+            .then((jobs) =>
+              setSiblings(
+                jobs
+                  .filter((j) => j.status === "done")
+                  .sort((a, b) => VARIANT_ORDER.indexOf(a.style) - VARIANT_ORDER.indexOf(b.style)),
+              ),
+            )
+            .catch(() => undefined);
+        }
+      })
+      .catch(() => undefined);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.jobId]);
 
@@ -38,7 +59,7 @@ function AuditScreen() {
     getVariants(params.jobId)
       .then((variants) => {
         setAll(variants);
-        const current = variants.find((v) => v.variant === variantName);
+        const current = variants.find((v) => v.variant === variantName) ?? variants[0];
         if (current) {
           setSelected(new Set(current.findings.filter((f) => f.fixable).map((f) => f.id)));
         }
@@ -51,7 +72,8 @@ function AuditScreen() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [params.jobId, variantName]);
 
-  const variant = all?.find((v) => v.variant === variantName) ?? null;
+  // С задачи Q в задании одна презентация: без совпадения по имени берётся она.
+  const variant = all?.find((v) => v.variant === variantName) ?? all?.[0] ?? null;
 
   const slideFindings = useMemo(
     () => (variant ? variant.findings.filter((f) => f.slide_index === slideIndex) : []),
@@ -124,15 +146,16 @@ function AuditScreen() {
       </p>
 
       <div className="row-actions" style={{ marginBottom: 16 }}>
-        {(["dense", "airy", "visual"] as VariantName[]).map((name) => (
-          <button
-            key={name}
-            className={name === variantName ? "" : "secondary"}
-            onClick={() => router.push(`/decks/${params.jobId}/audit?variant=${name}`)}
-          >
-            {VARIANT_LABELS[name]}
-          </button>
-        ))}
+        {siblings.length > 1 &&
+          siblings.map((job) => (
+            <button
+              key={job.job_id}
+              className={job.job_id === params.jobId ? "" : "secondary"}
+              onClick={() => router.push(`/decks/${job.job_id}/audit?variant=${job.style}`)}
+            >
+              {VARIANT_LABELS[job.style]}
+            </button>
+          ))}
         {templateId && (
           <Link className="button secondary" href={`/templates/${templateId}/brief`}>
             ← Изменить бриф и сгенерировать заново

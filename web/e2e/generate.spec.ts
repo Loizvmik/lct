@@ -37,25 +37,22 @@ test("полный путь: шаблон -> бриф -> варианты -> а�
     "Выборка: 1240 заявок, медиана ожидания 18 часов, чистая работа — 28 минут.",
   );
 
-  await page.getByRole("button", { name: /Сгенерировать три варианта/ }).click();
-  await page.waitForURL(/\/decks\/[a-f0-9]+$/, { timeout: 30_000 });
-  await expect(page.getByRole("heading", { level: 1, name: "Генерация колоды" })).toBeVisible();
+  await page.getByRole("button", { name: /Собрать три варианта/ }).click();
+  // Задача Q: одна кнопка создаёт три задания (по стилю), экран пакета
+  // показывает прогресс каждого отдельно.
+  await page.waitForURL(/\/batches\/[a-f0-9]+$/, { timeout: 30_000 });
+  await expect(page.locator(".variant-card")).toHaveCount(3);
 
   // Прогресс — реальные этапы, не крутилка (ТЗ, Step 3 брифа задачи).
   await expect(page.locator(".stage-track .stage").first()).toBeVisible();
 
-  // Вся генерация: разбор + структура + текст + три варианта + аудит +
-  // выгрузка — до пяти минут по ТЗ; берём запас на CI/холодный кеш шаблона.
-  await page.waitForURL(/\/decks\/[a-f0-9]+\/variants$/, { timeout: 5 * 60 * 1000 });
+  // Каждое задание: разбор + структура + текст + сборка + аудит + выгрузка,
+  // до пяти минут по ТЗ на задание; задания идут параллельно.
+  await expect(page.locator(".variant-card .preview img")).toHaveCount(3, { timeout: 5 * 60 * 1000 });
 
-  await expect(page.getByRole("heading", { level: 1, name: /три варианта вёрстки/ })).toBeVisible();
-  const variantCards = page.locator(".variant-card");
-  await expect(variantCards).toHaveCount(3);
   for (const label of ["Плотный", "Воздушный", "Визуальный"]) {
     await expect(page.getByText(label, { exact: true })).toBeVisible();
   }
-  // Каждый вариант несёт хотя бы одно превью-изображение слайда.
-  await expect(page.locator(".variant-card .preview img").first()).toBeVisible();
 
   await page.locator(".variant-card").first().getByRole("link", { name: /Аудит и починка/ }).click();
   await page.waitForURL(/\/decks\/[a-f0-9]+\/audit\?variant=/);
@@ -93,6 +90,7 @@ test("полный путь: шаблон -> бриф -> варианты -> а�
   // реальный маршрут экспорта API (скачивание файла не гоняем через
   // браузерный download-диалог в CI — проверяем сам URL).
   await page.goto(`/decks/${page.url().match(/decks\/([a-f0-9]+)/)![1]}/variants`);
+  await expect(page.locator(".variant-card")).toHaveCount(1);
   const pptxLink = page.locator('.variant-card a:text("pptx")').first();
   await expect(pptxLink).toHaveAttribute("href", /\/api\/decks\/.+\/export\?format=pptx&variant=/);
 });

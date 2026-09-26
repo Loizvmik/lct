@@ -9,7 +9,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState } from "react";
-import { getJob } from "@/lib/api";
+import { getJob, listJobs, VariantName } from "@/lib/api";
 
 type StepKey = "template" | "brief" | "variants" | "audit";
 
@@ -24,11 +24,30 @@ export default function StepNav() {
   const pathname = usePathname();
   const templateMatch = pathname.match(/^\/templates\/([^/]+)/);
   const deckMatch = pathname.match(/^\/decks\/([^/]+)/);
+  // Задача Q: экран пакета стилей (`/batches/{id}`) — тот же шаг 3.
+  const batchMatch = pathname.match(/^\/batches\/([^/]+)/);
+  const batchIdFromUrl = batchMatch ? decodeURIComponent(batchMatch[1]) : null;
   const templateIdFromUrl = templateMatch ? decodeURIComponent(templateMatch[1]) : null;
   const jobId = deckMatch ? decodeURIComponent(deckMatch[1]) : null;
 
   const [jobTemplateId, setJobTemplateId] = useState<string | null>(null);
   const [deckReady, setDeckReady] = useState(false);
+  const [jobStyle, setJobStyle] = useState<VariantName>("dense");
+  const [jobBatchId, setJobBatchId] = useState<string | null>(null);
+  const [batchTemplateId, setBatchTemplateId] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!batchIdFromUrl) return;
+    let cancelled = false;
+    listJobs(batchIdFromUrl)
+      .then((jobs) => {
+        if (!cancelled && jobs.length) setBatchTemplateId(jobs[0].template_id);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [batchIdFromUrl]);
 
   useEffect(() => {
     if (!jobId) {
@@ -42,6 +61,8 @@ export default function StepNav() {
         if (cancelled) return;
         setJobTemplateId(job.template_id);
         setDeckReady(job.status === "done");
+        setJobStyle(job.style);
+        setJobBatchId(job.batch_id);
       })
       .catch(() => undefined);
     return () => {
@@ -49,14 +70,16 @@ export default function StepNav() {
     };
   }, [jobId]);
 
-  const templateId = templateIdFromUrl ?? jobTemplateId;
+  // Шаблон пакета берётся, только пока мы на экране пакета: старое значение
+  // не сбрасывается в эффекте, а просто не читается на других экранах.
+  const templateId = templateIdFromUrl ?? jobTemplateId ?? (batchIdFromUrl ? batchTemplateId : null);
 
   let current: StepKey = "template";
   if (templateMatch && pathname.endsWith("/brief")) current = "brief";
   else if (templateMatch) current = "template";
   else if (pathname.includes("/audit")) current = "audit";
   else if (pathname.includes("/variants")) current = "variants";
-  else if (deckMatch) current = "variants"; // экран прогресса генерации — на пути к вариантам
+  else if (deckMatch || batchMatch) current = "variants"; // экран прогресса генерации — на пути к вариантам
 
   // «Пройденные шаги кликабельны, будущие — нет»: шаг «пройден», когда
   // данные, нужные для его экрана, уже есть — шаблон разобран (`template_id`
@@ -71,9 +94,10 @@ export default function StepNav() {
       case "brief":
         return templateId ? `/templates/${templateId}/brief` : null;
       case "variants":
+        if (jobId && jobBatchId) return `/batches/${jobBatchId}`;
         return jobId && deckReady ? `/decks/${jobId}/variants` : null;
       case "audit":
-        return jobId && deckReady ? `/decks/${jobId}/audit?variant=dense` : null;
+        return jobId && deckReady ? `/decks/${jobId}/audit?variant=${jobStyle}` : null;
     }
   }
 

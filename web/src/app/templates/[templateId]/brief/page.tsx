@@ -2,7 +2,7 @@
 
 import { useRouter, useParams } from "next/navigation";
 import { useEffect, useState } from "react";
-import { createDeck } from "@/lib/api";
+import { createDeckBatch, VariantName, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
 import { loadBriefDraft, saveBriefDraft } from "@/lib/briefDraft";
 import { EXAMPLE_BRIEF, EXAMPLE_SOURCES, EXAMPLE_TARGET_SLIDES, EXAMPLE_TITLE } from "@/lib/exampleContent";
 
@@ -14,6 +14,8 @@ export default function BriefPage() {
   const [sources, setSources] = useState("");
   const [targetSlides, setTargetSlides] = useState<number | "">("");
   const [autofix, setAutofix] = useState(true);
+  // Задача Q: «все» — три стиля тремя заданиями одной кнопкой, либо один.
+  const [style, setStyle] = useState<VariantName | "all">("all");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -64,15 +66,18 @@ export default function BriefPage() {
     setError(null);
     saveBriefDraft(params.templateId, { title, brief, sources, targetSlides, autofix });
     try {
-      const { job_id } = await createDeck({
+      // Один запрос создаёт по заданию на стиль: они идут параллельно, у
+      // каждого свой бюджет, а структура презентации считается один раз.
+      const { batch_id } = await createDeckBatch({
         template_id: params.templateId,
         brief,
         sources: sources.trim() ? [sources] : [],
         title: title.trim() || undefined,
         target_slides: targetSlides === "" ? undefined : Number(targetSlides),
         autofix,
+        styles: style === "all" ? VARIANT_ORDER : [style],
       });
-      router.push(`/decks/${job_id}`);
+      router.push(`/batches/${batch_id}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Не удалось запустить генерацию");
       setBusy(false);
@@ -148,6 +153,19 @@ export default function BriefPage() {
             </p>
           </div>
           <div>
+            <label>Стиль</label>
+            <select value={style} onChange={(e) => setStyle(e.target.value as VariantName | "all")}>
+              <option value="all">Все три стиля (три презентации параллельно)</option>
+              {VARIANT_ORDER.map((name) => (
+                <option value={name} key={name}>
+                  Только {VARIANT_LABELS[name].toLowerCase()}
+                </option>
+              ))}
+            </select>
+            <p className="field-hint">
+              Каждый стиль — отдельная презентация со своим бюджетом пяти минут.
+            </p>
+
             <label>Починка находок</label>
             <label style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
               <input type="checkbox" checked={autofix} onChange={(e) => setAutofix(e.target.checked)} style={{ width: "auto" }} />
@@ -161,7 +179,7 @@ export default function BriefPage() {
 
       <div className="row-actions">
         <button onClick={submit} disabled={busy}>
-          {busy ? "Запускаем…" : "Сгенерировать три варианта →"}
+          {busy ? "Запускаем…" : style === "all" ? "Собрать три варианта →" : "Собрать презентацию →"}
         </button>
       </div>
     </div>

@@ -47,11 +47,21 @@ export interface JobResponse {
   stages: Stage[];
   deck_id: string | null;
   error: string | null;
+  // Задача Q: одно задание = одна презентация одного стиля; задания,
+  // созданные одной кнопкой, несут общий `batch_id`.
+  style: VariantName;
+  batch_id: string | null;
+  mode: string | null;
+  seconds: number | null;
   budget?: {
     budget_seconds: number;
     elapsed_seconds: number;
     stage_seconds: Record<string, number>;
     skipped: Record<string, string>;
+    mode: string | null;
+    // Стадии, полученные готовыми (разбор шаблона, общая структура
+    // пакета): значение «переиспользовано».
+    shared_stages?: Record<string, string>;
   } | null;
   // Задача M: сводка аудита по картинке — по КАЖДОМУ варианту (ключ —
   // имя варианта), не одна на всю колоду, как было, пока аудитом
@@ -99,6 +109,8 @@ export interface VariantSummary {
   // отсутствуют, пока аудит по картинке не прошёл или ничего не оценил.
   content_avg?: number | null;
   design_avg?: number | null;
+  // Задача T: метрики верности шаблону, снимок `FidelityReport`.
+  fidelity?: { summary?: string } | null;
 }
 
 export interface FixResponse {
@@ -149,12 +161,33 @@ export interface CreateDeckRequest {
   autofix?: boolean;
 }
 
-export async function createDeck(payload: CreateDeckRequest): Promise<{ job_id: string }> {
+export async function createDeck(
+  payload: CreateDeckRequest & { style?: VariantName },
+): Promise<{ job_id: string }> {
   const response = await fetch(`${API_BASE}/api/decks`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload),
   });
+  return asJson(response);
+}
+
+// Задача Q: несколько стилей одним запросом — по заданию на стиль, они идут
+// параллельно, каждое со своим бюджетом; структура считается один раз.
+export async function createDeckBatch(
+  payload: CreateDeckRequest & { styles: VariantName[] },
+): Promise<{ batch_id: string; job_ids: string[] }> {
+  const response = await fetch(`${API_BASE}/api/decks/batch`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+  return asJson(response);
+}
+
+export async function listJobs(batchId?: string): Promise<JobResponse[]> {
+  const query = batchId ? `?batch_id=${encodeURIComponent(batchId)}` : "";
+  const response = await fetch(`${API_BASE}/api/jobs${query}`);
   return asJson(response);
 }
 
@@ -214,12 +247,20 @@ export const STAGE_LABELS: Record<Stage, string> = {
   parse: "Разбор шаблона",
   outline: "Структура презентации",
   write: "Текст слайдов",
-  compose: "Вёрстка трёх вариантов",
+  compose: "Вёрстка",
   audit: "Детерминированный аудит",
   export: "Выгрузка (PDF/HTML/превью)",
 };
 
 export const STAGE_ORDER: Stage[] = ["parse", "outline", "write", "compose", "audit", "export"];
+
+export const VARIANT_ORDER: VariantName[] = ["dense", "airy", "visual"];
+
+export const MODE_LABELS: Record<string, string> = {
+  full: "полный режим",
+  fast: "быстрый режим",
+  emergency: "аварийный режим",
+};
 
 export const VARIANT_LABELS: Record<VariantName, string> = {
   dense: "Плотный",

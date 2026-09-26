@@ -147,6 +147,7 @@ button.secondary,
 
 input[type="text"],
 input[type="number"],
+select,
 textarea {
   width: 100%;
   background: var(--panel-2);
@@ -320,6 +321,17 @@ label {
   border-color: var(--brand);
   color: var(--text);
   background: rgba(76, 141, 255, 0.12);
+}
+
+/* Задача Q: прогресс задания в узкой колонке пакета стилей идёт столбиком. */
+.job-progress .stage-track {
+  flex-direction: column;
+  gap: 6px;
+}
+
+.job-progress .stage-track .stage {
+  padding: 8px 10px;
+  text-align: left;
 }
 
 .variant-card {
