@@ -2188,7 +2188,7 @@ def place_slide_by_clone(
         # Главный блок целиком не лёг (карточки на раскладку без повтора):
         # клон с одной подписью вместо карточек хуже, чем следующий
         # кандидат (задача V2, airy слайд 3: вместо двух карточек «Май»).
-        return CloneOutcome(f"блоки без места в раскладке: {', '.join(lost)}")
+        return CloneOutcome(f"блоки без места в раскладке: {', '.join(lost)}", "BLOCK_NO_SLOT")
     clean: list[SlotContent] = []
     for content in contents:
         hit = _placeholder_text_hit(content, audit_config)
