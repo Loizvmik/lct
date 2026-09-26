@@ -20,10 +20,11 @@ from deckforge.pattern.forms import forms_of
 from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec
 from deckforge.plan.variants import Variant
 from deckforge.provider.base import LLMProvider
+import deckforge.provider.scheduler as scheduler_module
+from deckforge.provider.scheduler import ModelScheduler
 from deckforge.template.profile import TemplateProfile
 from deckforge.workflow.repair import SlideRepairer, contract_for_slide
 
-import deckforge.plan.writer as writer_module
 
 TEMPLATE = Path("dataset/templates/Шаблон презентации VK Education.pptx")
 _LONG = " ".join(["длинное пояснение про очередь заявок и ожидание согласующего"] * 5)
@@ -227,9 +228,9 @@ def test_repairer_respects_its_call_limit_and_works_without_a_model(profile):
 
 
 def test_repair_calls_share_the_writer_limit(profile, monkeypatch):
-    """Починка трёх стилей идёт через тот же семафор, что и письмо: больше
-    `WRITER_GLOBAL_CONCURRENCY` одновременных вызовов модели не бывает."""
-    monkeypatch.setattr(writer_module, "_MODEL_SLOTS", threading.BoundedSemaphore(2))
+    """Починка трёх стилей идёт через тот же планировщик процесса, что и
+    письмо: больше его лимита одновременных вызовов модели не бывает."""
+    monkeypatch.setattr(scheduler_module, "_DEFAULT", ModelScheduler(2))
     llm = _ShortenLLM()
     repairers = [SlideRepairer(profile=profile, llm=llm, sources=[], max_calls=10) for _ in range(3)]
     threads = [

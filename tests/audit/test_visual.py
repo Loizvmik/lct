@@ -23,7 +23,7 @@ from PIL import Image
 from deckforge.audit.visual import (
     CHECK_IDS, DECK_LEVEL_CHECK_IDS, PER_SLIDE_CHECK_IDS, VisualAuditResult,
     _build_collage, _build_shape_manifest, _build_slide_prompt, _extract_scores, _findings_from_answers,
-    _load_agent_prompt, _parse_answer, _parse_scores, _supports_vision, run_visual,
+    _load_agent_prompt, _parse_answer, _parse_scores, _supports_vision, run_visual, slides_within_time,
 )
 from deckforge.compose.builder import Variant, build_deck
 from deckforge.plan.outline import SourceDoc
@@ -903,3 +903,33 @@ def test_deterministic_finding_slide_also_flagged_by_visual_audit(vlm, tmp_path)
     # а не только заголовок").
     assert det_ids, "детерминированный аудит обязан заметить опустошённый слайд"
     assert "C05" in vis_ids, f"визуальный аудит не заметил опустошённый слайд, ответил: {vis_ids}"
+
+
+# --- Задача W: число слайдов на аудит по остатку времени ---
+
+
+@pytest.mark.parametrize(
+    ("max_slides", "remaining", "reserve", "call", "expected"),
+    [
+        (6, 250.0, 45.0, 25.0, 6),   # времени с избытком: решает режим
+        (6, 120.0, 45.0, 25.0, 3),   # (120 - 45) / 25 = 3
+        (6, 99.0, 45.0, 25.0, 2),    # floor(54 / 25) = 2
+        (6, 60.0, 45.0, 25.0, 0),    # меньше одного вызова сверх резерва
+        (6, 40.0, 45.0, 25.0, 0),    # остаток уже меньше резерва
+        (0, 250.0, 45.0, 25.0, 0),   # режим аудит выключил
+        (3, 250.0, 45.0, 0.0, 3),    # оценки нет: решает режим
+    ],
+)
+def test_slides_within_time_follows_the_remaining_budget(max_slides, remaining, reserve, call, expected):
+    assert slides_within_time(max_slides, remaining, reserve, call) == expected
+
+
+def test_supports_vision_looks_through_the_scheduler_wrapper():
+    """Обёртка планировщика (задача W) не прячет мультимодальность."""
+    from deckforge.provider.scheduler import ModelScheduler, ScheduledProvider
+
+    class _Vision(VisionProvider):
+        def ask_image(self, png, prompt, *, max_tokens=1024):
+            return "{}"
+
+    assert _supports_vision(ScheduledProvider(_Vision(), role="visual_audit", scheduler=ModelScheduler(1)))

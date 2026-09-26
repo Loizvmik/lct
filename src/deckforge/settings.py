@@ -76,6 +76,10 @@ class LLMConfig(BaseModel):
     # комментарий про происхождение числа в app.yaml. Со значением по
     # умолчанию по той же причине, что и `deadline_seconds` выше.
     slide_writer_max_workers: int = 4
+    # Задача W: одновременных вызовов модели на процесс, у всех ролей и
+    # всех заданий вместе (`provider.scheduler.ModelScheduler`). Дефолт
+    # дублирует `provider.scheduler.DEFAULT_LIMIT`.
+    model_concurrency: int = 6
     # Task 19 ("настоящий агент вместо одиночного вызова"): сколько сетевых
     # кругов агентного цикла `plan.writer._write_with_agent_loop` разрешено
     # одному слайду — бриф задачи буквально: "Цикл ограничен двумя шагами".
@@ -227,6 +231,13 @@ class RunConfig(BaseModel):
     modes: dict[str, RunModeConfig] = Field(default_factory=_default_run_modes)
     visual_audit_min_risk: float = 1.0
     visual_audit_batch: bool = False
+    # Задача W: резервы времени и оценки длительности вызова. Дефолты
+    # дублируют `workflow.budget.BudgetPolicy`, происхождение чисел в app.yaml.
+    visual_audit_reserve_seconds: float = 45.0
+    compose_export_reserve_seconds: float = 60.0
+    export_reserve_seconds: float = 30.0
+    visual_audit_call_seconds: float = 25.0
+    writer_call_seconds: float = 20.0
 
 
 class Settings(BaseModel):

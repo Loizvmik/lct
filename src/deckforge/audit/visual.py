@@ -56,6 +56,7 @@ slide`/`_run_deck_level`) и превращается в один finding `check
 должна обрывать проверку оставшихся слайдов)."""
 from __future__ import annotations
 import json
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,6 +74,7 @@ from deckforge.plan.spec import (
     BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock,
 )
 from deckforge.provider.base import VisionProvider
+from deckforge.provider.scheduler import OutOfTime, ScheduledProvider
 from deckforge.template.profile import TemplateProfile
 
 AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "content-auditor" / "AGENT.md"
@@ -283,6 +285,10 @@ class VisualAuditResult:
 def _supports_vision(vlm) -> bool:
     if vlm is None:
         return False
+    # Обёртка планировщика (задача W) сама ничего не умеет, смотрим на
+    # провайдера под ней.
+    if isinstance(vlm, ScheduledProvider):
+        vlm = vlm.inner
     card = getattr(vlm, "card", None)
     if card is not None and hasattr(card, "vision"):
         return bool(card.vision)
@@ -689,6 +695,10 @@ def _ask_and_parse_with_retry(
     for _attempt in range(_MAX_MODEL_ATTEMPTS):
         try:
             raw = ask()
+        except OutOfTime as exc:
+            # Планировщик не начал вызов: у задания нет времени (задача W).
+            # Повтор упрётся в то же самое.
+            return None, exc, None
         except Exception as exc:  # noqa: BLE001 — сеть/модель посреди аудита колоды не должна обрывать проверку остальных слайдов
             last_exc, last_raw = exc, None
             continue
@@ -710,7 +720,8 @@ def _run_one_slide(vlm, agent_body: str, index: int, total: int, spec: DeckSpec,
         lambda: vlm.ask_image(png_bytes, prompt, max_tokens=_PER_SLIDE_MAX_TOKENS), PER_SLIDE_CHECK_IDS,
     )
     if answers is None:
-        return [_malformed_finding(index, exc, raw)], None
+        # Не спросили по времени: это не сбой модели, находки C00 нет.
+        return ([] if isinstance(exc, OutOfTime) else [_malformed_finding(index, exc, raw)]), None
     return _findings_from_answers(index, answers, roles), _extract_scores(raw, _SLIDE_SCORE_NUM_KEYS)
 
 
@@ -725,8 +736,24 @@ def _run_deck_level(vlm, agent_body: str, spec: DeckSpec, pngs: list[Path], pair
         lambda: vlm.ask_image(collage, prompt, max_tokens=_DECK_LEVEL_MAX_TOKENS), DECK_LEVEL_CHECK_IDS,
     )
     if answers is None:
-        return [_malformed_finding(None, exc, raw)], None
+        return ([] if isinstance(exc, OutOfTime) else [_malformed_finding(None, exc, raw)]), None
     return _findings_from_answers(None, answers), _extract_scores(raw, _DECK_SCORE_NUM_KEYS)
+
+
+def slides_within_time(max_slides: int, remaining: float, reserve: float, call_seconds: float) -> int:
+    """Сколько рискованных слайдов успеет аудит по картинке (задача W):
+    `min(N режима, floor((remaining - reserve) / call_seconds))`. Режим
+    решается на контрольной точке раньше, а до аудита доходит уже меньше
+    времени: сборка и экспорт могли затянуться. Оценка вызова берётся по
+    прошлым вызовам этого задания, до первого из конфига."""
+    if max_slides <= 0:
+        return 0
+    spare = remaining - reserve
+    if spare <= 0:
+        return 0
+    if call_seconds <= 0:
+        return max_slides
+    return max(0, min(max_slides, math.floor(spare / call_seconds)))
 
 
 def run_visual(

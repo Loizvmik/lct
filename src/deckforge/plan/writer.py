@@ -22,12 +22,12 @@
 Вид слайда и раскладку ответ модели не меняет: `kind` и `pattern_id`
 приходят из контракта."""
 from __future__ import annotations
+import inspect
 import os
 import json
 import re
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout, as_completed
 from dataclasses import replace
 from pathlib import Path
 
@@ -44,6 +44,7 @@ from deckforge.plan.spec import (
     slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
 )
 from deckforge.provider.base import LLMProvider
+from deckforge.provider.scheduler import OutOfTime, scheduled
 from deckforge.provider.yandex import WRITER_BUDGET_CAP
 
 AGENT_PATH_WRITER = Path(__file__).resolve().parents[3] / "agents" / "slide-writer" / "AGENT.md"
@@ -138,23 +139,56 @@ def _run_tool_call(call: dict, profile, contract: SlideContract, source_text: st
     return {"error": f"неизвестный инструмент {name!r}, доступны: {', '.join(_TOOL_NAMES)}"}
 
 
-# Одновременных вызовов писателя на весь процесс, у всех стилей вместе.
-# С задачи P три стиля пишут текст параллельно, каждый своим пулом; живой
-# прогон 27 сентября 2026 (VK Education, 3 стиля по 4 потока) получил 429
-# Too Many Requests на восьми слайдах visual из двенадцати, и они ушли в
-# запасной вариант. Очередь за общим пределом дешевле запасного слайда.
-WRITER_GLOBAL_CONCURRENCY = 6
-_MODEL_SLOTS = threading.BoundedSemaphore(WRITER_GLOBAL_CONCURRENCY)
+# Одновременность вызовов модели держит планировщик процесса (`provider.
+# scheduler`, задача W): один лимит на писателя, починку, аудит по картинке
+# и схему слотов, очередь по остатку бюджета задания. До задачи W здесь был
+# свой семафор на 6 (задача P: при 12 одновременных Yandex отвечал 429),
+# и роли вне писателя шли мимо него.
+
+
+class WriteClock:
+    """Сколько времени у писателя (задача W). `deadline`: момент по
+    `time.monotonic()`, после которого новый вызов модели не начинается и
+    слайд идёт запасным вариантом. `call_seconds`: оценка одного вызова;
+    повтор и ремонт не начинаются, если не успеют до `deadline`. `cutoff`:
+    жёсткий потолок, после которого незаконченные слайды не ждут вовсе."""
+
+    def __init__(self, deadline: float, call_seconds=None, cutoff: float | None = None) -> None:
+        self.deadline = deadline
+        self._call_seconds = call_seconds
+        self.cutoff = cutoff if cutoff is not None else deadline
+
+    def call_seconds(self) -> float:
+        try:
+            return float(self._call_seconds()) if callable(self._call_seconds) else float(self._call_seconds or 0.0)
+        except Exception:  # noqa: BLE001: оценка не вправе ронять письмо
+            return 0.0
+
+    def can_start(self, *, needs_full_call: bool = True) -> bool:
+        need = self.call_seconds() if needs_full_call else 0.0
+        return time.monotonic() + need <= self.deadline
+
+
+TIME_OUT_REASON = "время на текст вышло: задание упёрлось в свой бюджет"
 
 
 def _complete(llm: LLMProvider, messages: list[dict], schema: dict, max_tokens: int) -> str:
-    """Вызов модели с поднятым потолком бюджета; провайдер без `budget_cap`
-    (тестовые заглушки) зовётся по-старому."""
-    with _MODEL_SLOTS:
-        try:
-            return llm.complete(messages, schema=schema, max_tokens=max_tokens, budget_cap=WRITER_BUDGET_CAP)
-        except TypeError:
-            return llm.complete(messages, schema=schema, max_tokens=max_tokens)
+    """Вызов модели с поднятым потолком бюджета через планировщик процесса;
+    провайдер без `budget_cap` (тестовые заглушки) зовётся по-старому."""
+    llm = scheduled(llm, role="writer")
+    # Проверка по сигнатуре, а не повтором на `TypeError`: повтор через
+    # планировщик считался бы вторым вызовом модели в бюджете задания.
+    if _accepts_budget_cap(getattr(llm, "inner", llm)):
+        return llm.complete(messages, schema=schema, max_tokens=max_tokens, budget_cap=WRITER_BUDGET_CAP)
+    return llm.complete(messages, schema=schema, max_tokens=max_tokens)
+
+
+def _accepts_budget_cap(llm) -> bool:
+    try:
+        params = inspect.signature(llm.complete).parameters
+    except (TypeError, ValueError):
+        return False
+    return "budget_cap" in params or any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _why(exc: BaseException) -> str:
@@ -208,7 +242,7 @@ def _clean_block(block):
 
 def _write_with_agent_loop(
     prompt_body: str, payload: dict, contract: SlideContract, llm: LLMProvider, profile, source_text: str,
-    *, max_steps: int,
+    *, max_steps: int, clock: WriteClock | None = None,
 ) -> tuple[SlideSpec | None, str | None]:
     """Агентный цикл одного слайда: на каждом шаге, кроме последнего,
     модель вправе ответить вызовом инструментов; любой другой объект
@@ -218,6 +252,10 @@ def _write_with_agent_loop(
     step = 0
     while step < max(1, max_steps):
         step += 1
+        # Каждый круг, включая первый, только если успеет до отметки
+        # писателя: иначе он съест время сборки и экспорта (задача W).
+        if clock is not None and not clock.can_start():
+            return None, f"шаг {step}/{max_steps}: {TIME_OUT_REASON}"
         is_final_step = step >= max_steps
         turn_payload = dict(payload)
         if is_final_step and max_steps > 1:
@@ -230,6 +268,9 @@ def _write_with_agent_loop(
         schema = _SLIDE_SCHEMA if is_final_step else _AGENT_TURN_SCHEMA
         try:
             raw = _complete(llm, messages, schema, WRITER_MAX_TOKENS)
+        except OutOfTime as exc:
+            # Планировщик не начал вызов: у задания нет времени сверх резерва.
+            return None, f"шаг {step}/{max_steps}: {TIME_OUT_REASON} ({exc})"
         except Exception as exc:
             return None, f"шаг {step}/{max_steps}: модель не ответила — {_why(exc)}"
         try:
@@ -398,6 +439,7 @@ def _with_photo(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
 def _write_one_slide(
     contract: SlideContract, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
     *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, style: str | None = None, log: list[dict] | None = None,
+    clock: WriteClock | None = None,
 ) -> SlideSpec:
     """Пишет один слайд. Ничего не трогает снаружи, кроме `log` (append из
     нескольких потоков под GIL безопасен), поэтому зовётся из пула."""
@@ -418,12 +460,22 @@ def _write_one_slide(
         reason = "модель не подключена (нет ключа) — текст слайдов не писался вовсе"
     else:
         slide, reason = _write_with_agent_loop(
-            prompt_body, payload, contract, llm, profile, source_text, max_steps=agent_max_steps,
+            prompt_body, payload, contract, llm, profile, source_text, max_steps=agent_max_steps, clock=clock,
         )
+        if reason and TIME_OUT_REASON in reason:
+            entry["timed_out"] = True
         if slide is not None:
             schema_problems = slide_spec_problems(slide)
             problems = schema_problems + contract_problems(slide, contract)
-            if problems:
+            if problems and clock is not None and not clock.can_start():
+                # Ремонт не успеет до отметки писателя: слайд остаётся
+                # как есть (с находкой ниже), невалидный идёт запасным.
+                entry["repair"] = "пропущен по времени"
+                if schema_problems:
+                    slide = None
+                    entry["timed_out"] = True
+                    reason = f"ответ не прошёл проверку ({'; '.join(schema_problems)}), {TIME_OUT_REASON}"
+            elif problems:
                 repaired, repair_reason = _ask_repair(
                     prompt_body, payload, contract, llm, _answer_view(slide), problems,
                 )
@@ -465,7 +517,7 @@ def _write_one_slide(
 def write_slides(
     outline: Outline, contracts: list[SlideContract], sources: list[SourceDoc], profile, llm: LLMProvider | None,
     *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
-    style=None,
+    style=None, clock: WriteClock | None = None,
 ) -> DeckSpec:
     """Текст всех слайдов колоды под их контракты, параллельно.
 
@@ -478,7 +530,13 @@ def write_slides(
     расчётом стоимости, что у планировщика (`pattern.repick_pattern`).
 
     В `DeckSpec.meta`: сколько мест контракта заполнено в его пределах
-    (`contract_places_ok`/`contract_places`), сколько было ремонтов."""
+    (`contract_places_ok`/`contract_places`), сколько было ремонтов.
+
+    `clock` (задача W): отметки времени задания. Новые вызовы модели не
+    начинаются после `clock.deadline`, а слайды, не готовые к жёсткому
+    потолку `clock.cutoff`, не ждутся: они идут запасным вариантом с
+    находкой, и задание уходит к сборке с тем, что есть. Число таких
+    слайдов в `meta["time_fallbacks"]`."""
     _meta, prompt_body = _load_agent_prompt(AGENT_PATH_WRITER)
     source_text = "\n\n".join(f"### {s.name}\n{s.text}" for s in sources)
     total = len(contracts)
@@ -487,16 +545,33 @@ def write_slides(
     slides: list[SlideSpec | None] = [None] * total
     log: list[dict] = []
     started = time.monotonic()
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
+    abandoned = 0
+    pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
+    try:
         futures = {
             pool.submit(
                 _write_one_slide, contract, profile, prompt_body, source_text, total, llm,
-                agent_max_steps=agent_max_steps, style=style_value, log=log,
+                agent_max_steps=agent_max_steps, style=style_value, log=log, clock=clock,
             ): i
             for i, contract in enumerate(contracts)
         }
-        for future in as_completed(futures):
-            slides[futures[future]] = future.result()
+        wait_for = None if clock is None else max(0.0, clock.cutoff - time.monotonic())
+        try:
+            for future in as_completed(futures, timeout=wait_for):
+                slides[futures[future]] = future.result()
+        except FuturesTimeout:
+            # Жёсткий потолок: зависшие слайды не ждём, их поток доработает
+            # в фоне, и результат выбросится.
+            for future, i in futures.items():
+                if slides[i] is None:
+                    future.cancel()
+                    abandoned += 1
+                    contract = contracts[i]
+                    slides[i] = _divider_slide(contract) if contract.is_divider else _with_photo(
+                        _fallback_slide(contract, reason=TIME_OUT_REASON), contract,
+                    )
+    finally:
+        pool.shutdown(wait=clock is None, cancel_futures=True)
 
     deck = DeckSpec(title=outline.title, language=outline.language, slides=list(slides))  # type: ignore[arg-type]
     deck.meta["contract_places"] = str(sum(e.get("places", 0) for e in log))
@@ -505,6 +580,9 @@ def write_slides(
     deck.meta["contract_repairs"] = str(len(repairs))
     deck.meta["contract_repairs_accepted"] = str(sum(1 for e in repairs if e["repair"] == "принят"))
     deck.meta["write_seconds"] = f"{time.monotonic() - started:.1f}"
+    timed_out = sum(1 for e in list(log) if e.get("timed_out"))
+    if clock is not None:
+        deck.meta["time_fallbacks"] = str(timed_out + abandoned)
     compliant = frozenset(e["index"] for e in log if e.get("compliant"))
     deck = normalize_deck(deck, profile, keep=compliant)
     if style_value and profile is not None:

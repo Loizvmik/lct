@@ -19,9 +19,10 @@ from typing import Callable, Iterable
 
 from deckforge.audit.findings import Finding
 from deckforge.audit.risk import pick_risky_slides
-from deckforge.audit.visual import VisualAuditResult, run_visual, run_visual_batch
+from deckforge.audit.visual import VisualAuditResult, run_visual, run_visual_batch, slides_within_time
 from deckforge.plan.outline import SourceDoc
 from deckforge.plan.spec import DeckSpec
+from deckforge.provider.scheduler import ScheduledProvider
 from deckforge.workflow.budget import RunBudget, RunMode
 
 
@@ -37,6 +38,8 @@ class VisualStageOutcome:
     skipped_reason: str | None = None
     seconds: float = 0.0
     batch: bool = False
+    # Задача W: сколько слайдов разрешили режим и остаток времени.
+    allowed_by_time: int | None = None
 
     @property
     def findings(self) -> list[Finding]:
@@ -55,6 +58,7 @@ class VisualStageOutcome:
             "model_calls": self.result.model_calls if self.result is not None else 0,
             "seconds": round(self.seconds, 1),
             "batch": self.batch,
+            "allowed_by_time": self.allowed_by_time,
         }
 
 
@@ -113,8 +117,31 @@ def run_visual_stage(
     if vlm is None:
         return _done(VisualStageOutcome(skipped_reason="модель для аудита по картинке не задана (нет ключа)"))
 
+    # Задача W: число слайдов по остатку времени на момент стадии, не
+    # только по режиму с контрольной точки.
+    reserve = getattr(policy, "visual_audit_reserve_seconds", 0.0)
+    first_guess = getattr(policy, "visual_audit_call_seconds", 0.0)
+    call_seconds = (
+        budget.median_call_seconds("visual_audit", first_guess)
+        if hasattr(budget, "median_call_seconds") else first_guess
+    )
+    remaining = budget.remaining()
+    allowed = slides_within_time(mode.visual_audit_max_slides, remaining, reserve, call_seconds)
+    if allowed <= 0:
+        if hasattr(budget, "note_time_skip"):
+            budget.note_time_skip("visual_audit: аудит по картинке не начат, время до резерва вышло")
+        return _done(VisualStageOutcome(
+            allowed_by_time=0,
+            skipped_reason=(
+                f"по времени: осталось {max(remaining, 0.0):.0f}с, резерв {reserve:.0f}с, "
+                f"вызов около {call_seconds:.0f}с"
+            ),
+        ))
+    if hasattr(budget, "record_call") and not isinstance(vlm, ScheduledProvider):
+        vlm = ScheduledProvider(vlm, role="visual_audit", budget=budget, reserve=reserve)
+
     picked = pick_risky_slides(
-        spec, det_findings, max_slides=mode.visual_audit_max_slides,
+        spec, det_findings, max_slides=allowed,
         min_score=policy.visual_audit_min_risk, autofixed_slides=autofixed_slides,
     )
     if not picked:
@@ -122,7 +149,7 @@ def run_visual_stage(
         # зовётся — он едет ВМЕСТЕ с этим же вызовом модели (см. комментарий
         # у `deck_level=True` ниже), отдельного пути на "риска нет, но
         # связность колоды всё равно проверь" эта задача не заводит.
-        return _done(VisualStageOutcome(skipped_reason="рискованных слайдов нет"))
+        return _done(VisualStageOutcome(skipped_reason="рискованных слайдов нет", allowed_by_time=allowed))
 
     try:
         pngs = render_pngs()
@@ -144,5 +171,7 @@ def run_visual_stage(
             only_slides=set(positions), deck_level=True, pptx_path=pptx_path,
         )
     if result.skipped_reason:
-        return _done(VisualStageOutcome(picked=picked, skipped_reason=result.skipped_reason))
-    return _done(VisualStageOutcome(result=result, picked=picked, batch=policy.visual_audit_batch))
+        return _done(VisualStageOutcome(picked=picked, skipped_reason=result.skipped_reason, allowed_by_time=allowed))
+    return _done(VisualStageOutcome(
+        result=result, picked=picked, batch=policy.visual_audit_batch, allowed_by_time=allowed,
+    ))

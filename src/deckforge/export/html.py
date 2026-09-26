@@ -1043,7 +1043,27 @@ def _run_budget_html(budget: dict | None, risky_slides: dict[int, dict] | None) 
             for pos, risk in items
         )
 
-    text = mode_txt + ((" · " + stages_txt) if stages_txt else "") + risky_txt
+    # Задача W: сколько раз звали модель и сколько ждали общую очередь,
+    # что пропущено по времени и что сделано запасным путём на потолке.
+    calls_txt = ""
+    if budget.get("model_calls"):
+        calls_txt = (
+            f"; вызовов модели {budget['model_calls']}, "
+            f"ожидание очереди {budget.get('queue_wait_seconds', 0):.0f}с"
+        )
+    skipped = budget.get("time_skipped") or {}
+    skipped_txt = ""
+    if skipped:
+        skipped_txt = "; пропущено по времени: " + ", ".join(
+            f"{what} ×{count}" if count > 1 else what for what, count in skipped.items()
+        )
+    warnings = budget.get("warnings") or []
+    warnings_txt = ("; потолок бюджета: " + "; ".join(warnings)) if warnings else ""
+
+    text = (
+        mode_txt + ((" · " + stages_txt) if stages_txt else "") + calls_txt + skipped_txt + warnings_txt
+        + risky_txt
+    )
     return f'<div id="run-budget">{_esc(text)}</div>'
 
 

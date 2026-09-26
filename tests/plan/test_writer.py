@@ -419,3 +419,72 @@ def test_a_tool_call_on_the_final_step_gets_one_more_turn_not_a_fallback(PROFILE
     deck = write_slides(outline, contracts, [], PROFILE, llm=_Stubborn(), max_workers=1)
 
     assert not any("запасным вариантом" in f for s in deck.slides for f in s.findings)
+
+
+# --- Задача W: письмо в остатке времени задания ---
+
+
+def test_no_model_call_starts_after_the_writer_deadline(PROFILE):
+    """Отметка писателя уже прошла: модель не зовётся, каждый слайд идёт
+    запасным вариантом с находкой про время, а не тянет задание за лимит."""
+    outline = _outline(4)
+    contracts = _contracts(PROFILE, outline)
+    llm = _ContractLLM()
+    clock = writer_module.WriteClock(deadline=time.monotonic() - 1.0, call_seconds=lambda: 10.0)
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=2, clock=clock)
+
+    assert llm.requests == []
+    assert int(deck.meta["time_fallbacks"]) >= 3
+    content = [s for s in deck.slides if s.findings]
+    assert content and all(any("время на текст вышло" in f for f in s.findings) for s in content)
+
+
+def test_repair_is_skipped_when_it_would_not_finish_before_the_deadline(PROFILE):
+    """Первый ответ нарушает контракт, но ремонт не успеет до отметки: он
+    не запускается, слайд остаётся с находкой о нарушении."""
+    outline = _outline(3)
+    contracts = _contracts(PROFILE, outline)
+    content_index = contracts[1].slide_id
+    llm = _ContractLLM(overrun={content_index})
+    clock = writer_module.WriteClock(deadline=time.monotonic() + 60.0, call_seconds=lambda: 0.0)
+
+    def only_the_first_call(*, needs_full_call: bool = True) -> bool:
+        # Время есть ровно на первый вызов слайда: к ремонту оценка вызова
+        # уже не помещается до отметки.
+        return not any(r["position"]["index"] == content_index for r in llm.requests)
+
+    clock.can_start = only_the_first_call  # type: ignore[method-assign]
+    deck = write_slides(outline, contracts, [], PROFILE, llm=llm, max_workers=1, clock=clock)
+
+    asked = [r for r in llm.requests if r["position"]["index"] == content_index]
+    assert len(asked) == 1, "ремонта не было"
+    slide = next(s for s in deck.slides if s.index == content_index)
+    assert any("не уложился в контракт" in f for f in slide.findings)
+    assert not any("запасным вариантом" in f for f in slide.findings), "валидный ответ не выброшен"
+
+
+def test_slides_unfinished_at_the_hard_ceiling_are_not_waited_for(PROFILE):
+    """Модель зависла: к жёсткому потолку незаконченные слайды идут
+    запасным вариантом, и письмо возвращается вовремя, не дожидаясь её."""
+    outline = _outline(4)
+    contracts = _contracts(PROFILE, outline)
+    release = threading.Event()
+
+    class _Hung(LLMProvider):
+        def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+            release.wait(30.0)
+            raise RuntimeError("отпущен тестом")
+
+    now = time.monotonic()
+    clock = writer_module.WriteClock(deadline=now + 10.0, call_seconds=lambda: 0.0, cutoff=now + 0.5)
+    try:
+        started = time.monotonic()
+        deck = write_slides(outline, contracts, [], PROFILE, llm=_Hung(), max_workers=4, clock=clock)
+        took = time.monotonic() - started
+    finally:
+        release.set()
+
+    assert took < 3.0
+    assert int(deck.meta["time_fallbacks"]) >= 3
+    validate_deck_spec(deck)

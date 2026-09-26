@@ -47,10 +47,11 @@ from deckforge.plan.contracts import plan_contracts
 from deckforge.plan.outline import Outline, SourceDoc, build_outline, outline_to_dict
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import GenerationStyle, Variant
-from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, WriteClock, write_slides
 from deckforge.workflow.repair import repairer_for
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
+from deckforge.provider.scheduler import ScheduledProvider, default_scheduler
 from deckforge.provider.yandex import YandexProvider
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
@@ -68,6 +69,14 @@ STAGES: tuple[str, ...] = ("parse", "outline", "write", "compose", "audit", "exp
 # `_run_variant` сам, с разбивкой (`plan` отдельно от `write`).
 SHARED_STAGES: tuple[str, ...] = ("parse", "outline")
 
+# Итог задания, которое уложилось в бюджет только благодаря жёсткому
+# потолку (задача W): файл есть, но часть сделана запасным путём.
+DONE_WITH_WARNINGS = "done_with_warnings"
+
+# Сколько секунд бюджета оставить после аудита по картинке на
+# перерисовку HTML-отчёта с оценками модели.
+VISUAL_AUDIT_TAIL_SECONDS = 5.0
+
 
 class JobError(ValueError):
     """Ошибка, чей текст безопасно показать пользователю API как есть
@@ -83,9 +92,20 @@ def finding_id(finding: Finding) -> str:
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:12]
 
 
+def _in_budget(llm, role: str, budget: RunBudget | None, *, reserve: float = 0.0):
+    """Провайдер роли через планировщик процесса (задача W): общий лимит
+    одновременных вызовов, очередь по остатку бюджета задания, дедлайн
+    вызова не дальше `remaining() - reserve`."""
+    if llm is None or isinstance(llm, ScheduledProvider):
+        return llm
+    return ScheduledProvider(llm, role=role, budget=budget, reserve=reserve)
+
+
 def _build_role_provider(role: str, *, deadline_seconds: float | None = None) -> LLMProvider | None:
     """Тот же приём, что `cli._build_role_provider` — без ключа/сети
-    пайплайн обязан продолжать работать запасными вариантами, не падать."""
+    пайплайн обязан продолжать работать запасными вариантами, не падать.
+    Вызовы идут через планировщик процесса; задания оборачивают провайдера
+    ещё раз своим бюджетом (`_in_budget`)."""
     try:
         settings = Settings.load(APP_YAML_PATH)
     except Exception:
@@ -93,13 +113,14 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
     if not settings.yandex_api_key or not settings.yandex_folder_id:
         return None
     try:
-        return YandexProvider(
+        provider = YandexProvider(
             model=settings.llm.model_for(role), api_key=settings.yandex_api_key,
             folder_id=settings.yandex_folder_id,
             deadline_seconds=deadline_seconds if deadline_seconds is not None else settings.llm.deadline_seconds,
         )
     except (ValueError, ModelNotAllowed):
         return None
+    return provider
 
 
 def _build_writer() -> LLMProvider | None:
@@ -223,6 +244,10 @@ class JobRecord:
         # брифа с экрана вариантов/аудита, генерировать заново по уже
         # разобранному шаблону, не загружая .pptx повторно.
         budget = self.budget.summary() if self.budget is not None else None
+        warnings = budget["warnings"] if budget else []
+        outcome = None
+        if self.status == "done":
+            outcome = DONE_WITH_WARNINGS if warnings else "done"
         return {
             "job_id": self.job_id, "template_id": self.template_id, "status": self.status,
             "stage": self.stage, "stages": list(self.stages), "deck_id": self.job_id,
@@ -233,6 +258,11 @@ class JobRecord:
             "mode": budget["mode"] if budget else None,
             "seconds": budget["elapsed_seconds"] if budget else None,
             "budget": budget,
+            # Задача W: `status` остаётся "done" (интерфейс ждёт ровно его),
+            # а `outcome` говорит, сработал ли жёсткий потолок, и
+            # `warnings` перечисляет, что сделано запасным путём.
+            "outcome": outcome,
+            "warnings": warnings,
             "visual_audit": self.visual_audit,
             # Задача R: находки, которые автопочинка не трогает, потому что
             # нужен другой текст или другая раскладка, по вариантам.
@@ -348,7 +378,8 @@ class JobStore:
         try:
             profile = await asyncio.to_thread(
                 TemplateProfile.from_file, path,
-                namer=_build_role_provider("palette_namer"), vision=_build_role_provider("pattern_kind"),
+                namer=_in_budget(_build_role_provider("palette_namer"), "palette_namer", None),
+                vision=_in_budget(_build_role_provider("pattern_kind"), "pattern_kind", None),
             )
         except Exception as exc:  # noqa: BLE001 — любая причина разбора превращается в читаемую 400-ошибку
             shutil.rmtree(tdir, ignore_errors=True)
@@ -457,7 +488,8 @@ async def _run_job(
 
         async def compute_outline() -> Outline:
             return await asyncio.to_thread(
-                build_outline, brief, source_docs, profile, _build_role_provider("outline"), target_slides,
+                build_outline, brief, source_docs, profile,
+                _in_budget(_build_role_provider("outline"), "outline", job.budget), target_slides,
                 title=title or "Презентация", language=language,
             )
 
@@ -523,11 +555,27 @@ async def _run_variant(
     budget.record("plan", budget.clock() - started)
 
     started = budget.clock()
+    policy = budget.policy
+    # Задача W: писатель в бюджете задания. Новый вызов (и повтор, и
+    # ремонт) не начинается, если после него не останется времени на
+    # сборку, аудит и экспорт; незаконченные к жёсткому потолку слайды не
+    # ждутся. Пул не меньше лимита планировщика: одно задание вправе занять
+    # все слоты, три делят их через очередь.
+    clock = WriteClock(
+        deadline=budget.deadline_at(reserve=policy.compose_export_reserve_seconds),
+        call_seconds=lambda: budget.median_call_seconds("writer", policy.writer_call_seconds),
+        cutoff=budget.deadline_at(reserve=policy.export_reserve_seconds),
+    )
+    writer = _in_budget(_build_writer(), "writer", budget, reserve=policy.compose_export_reserve_seconds)
     variant_deck = await asyncio.to_thread(
-        write_slides, outline, contracts, sources, profile, _build_writer(),
-        max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(), style=variant,
+        write_slides, outline, contracts, sources, profile, writer,
+        max_workers=max(_writer_max_workers(), default_scheduler().limit),
+        agent_max_steps=_writer_agent_max_steps(), style=variant, clock=clock,
     )
     budget.record("write", budget.clock() - started)
+    late = int(variant_deck.meta.get("time_fallbacks", "0") or 0)
+    if late:
+        budget.warn(f"{late} слайд(ов) собраны запасным вариантом: время на текст вышло")
     budget.decide_mode("after_write")
     job.reach_stage("compose")
 
@@ -608,14 +656,28 @@ async def _visual_audit_variant(
         return
     if job.visual_audit is None:
         job.visual_audit = {}
+    # Жёсткий потолок (задача W): вызовы аудита и так режутся по остатку
+    # бюджета, но зависший поток задание не ждёт. Брошенный поток
+    # доработает в фоне, его результат выбросится.
+    limit = budget.remaining() - VISUAL_AUDIT_TAIL_SECONDS
+    started = budget.clock()
     try:
         deterministic = [f for f in state.findings if f not in state.visual_findings]
-        outcome = await asyncio.to_thread(
+        if limit <= 0:
+            raise asyncio.TimeoutError
+        outcome = await asyncio.wait_for(asyncio.to_thread(
             run_visual_stage, budget, state.deck_spec, deterministic,
             _build_visual_auditor(),
             lambda: list(state.preview_pngs), sources=sources,
             autofixed_slides=state.autofixed_slides, pptx_path=state.pptx_path,
-        )
+        ), timeout=limit)
+    except asyncio.TimeoutError:
+        reason = "по времени: аудит по картинке брошен на жёстком потолке бюджета"
+        budget.record("visual_audit", budget.clock() - started)
+        budget.skipped.setdefault("visual_audit", reason)
+        budget.warn("аудит по картинке брошен: время задания вышло")
+        job.visual_audit[variant_name] = {"ran": False, "skipped_reason": reason}
+        return
     except Exception as exc:  # noqa: BLE001: необязательная стадия не вправе ронять готовую колоду
         job.visual_audit[variant_name] = {"ran": False, "skipped_reason": f"аудит по картинке упал: {exc}"}
         return
