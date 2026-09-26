@@ -1,0 +1,35 @@
+# systemd unit — API DeckForge (FastAPI/uvicorn) на арендованном сервере
+# (задача Z). Без `--reload`: он ненадёжен на долгом прогоне (см. коммент
+# у DECKFORGE_RELOAD в scripts/run.sh) — правки в src/ на сервере вида
+# "поправил и перезапустил защиту" не ожидаются, перезапуск через systemd
+# обычным `restart` дешевле и предсказуемее.
+#
+# Установка (см. подробности в docs/DEPLOY.md):
+#   sudo cp deploy/deckforge-api.service /etc/systemd/system/
+#   # поправьте WorkingDirectory/User/Group под реальный путь и пользователя
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now deckforge-api
+#
+# Порт 8000 — тот же, что и у scripts/run.sh; сервис на нём не трогаем при
+# разработке, а замену на этот unit делаем только на арендованном сервере.
+[Unit]
+Description=DeckForge API (FastAPI/uvicorn)
+After=network.target
+
+[Service]
+Type=simple
+# ЗАМЕНИТЕ путь и пользователя на реальные (клон репозитория и системного
+# пользователя, от имени которого он развёрнут).
+User=deckforge
+Group=deckforge
+WorkingDirectory=/opt/deckforge
+EnvironmentFile=/opt/deckforge/.env
+ExecStart=/opt/deckforge/.venv/bin/uvicorn deckforge.api.app:app --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=3
+# Секреты только в EnvironmentFile (.env, права 600) — не в этом файле и не
+# в journalctl: сама переменная не логируется, только сообщения приложения.
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
