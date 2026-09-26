@@ -160,6 +160,12 @@ class SlotFit:
     native_words: int
     native_chars: int
     titled: bool = False
+    # Строк (абзацев в одну строку), которые рамка держит при пределе
+    # ужимания: пункт списка это абзац, и три коротких пункта в рамке в
+    # две строки не лягут, сколько бы слов она ни держала одной фразой
+    # (VK Education, пример 13: полоса подзаголовка во всю ширину, 35 слов
+    # и две строки). 0: не мерили.
+    lines: int = 0
 
 
 def _prefix(words: int) -> str:
@@ -188,6 +194,20 @@ def _fit_words(frame: TextFrame, *, native: bool, title: str | None) -> int:
     return lo
 
 
+def _fit_lines(frame: TextFrame) -> int:
+    """Сколько однострочных абзацев ложится в рамку при пределе ужимания."""
+    lo, hi = 0, 1
+    while frame.fitting_size("\n".join(["Срок"] * hi)) is not None and hi < 200:
+        lo, hi = hi, hi * 2
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if frame.fitting_size("\n".join(["Срок"] * mid)) is not None:
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
 def _titled(pattern, slot) -> bool:
     """Тело единицы повтора, у которой нет места под заголовок: заголовок
     карточки клон поставит жирной первой строкой этого же места
@@ -205,7 +225,7 @@ def _slot_fit(frame: TextFrame, titled: bool) -> SlotFit:
     native = _fit_words(frame, native=True, title=title)
     return SlotFit(
         words=words, chars=len(_prefix(words)), native_words=native, native_chars=len(_prefix(native)),
-        titled=titled,
+        titled=titled, lines=_fit_lines(frame),
     )
 
 

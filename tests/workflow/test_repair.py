@@ -256,7 +256,12 @@ def test_contract_for_a_slide_keeps_its_unit_count(profile):
     contract = contract_for_slide(_long_slide(), "slide13", profile, "dense")
 
     assert contract.pattern_id == "slide13"
-    assert contract.slots[0].block == "bullets" and contract.slots[0].count == 3, "единиц столько, сколько на слайде"
+    assert contract.slots[0].block == "bullets" and contract.slots[0].count == 2, (
+        "единиц столько, сколько на слайде, но не больше, чем держит место: у примера 13 это полоса "
+        "в две строки (замер клона, задача V5), и третий пункт в ней не ляжет никаким сокращением"
+    )
+    two = replace(_long_slide(), blocks=[BulletBlock(items=[_LONG, _LONG])])
+    assert contract_for_slide(two, "slide13", profile, "dense").slots[0].count == 2
 
 
 def test_planner_backups_come_right_after_the_chosen_layout(profile):

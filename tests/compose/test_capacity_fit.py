@@ -223,3 +223,20 @@ def test_crowded_looks_cover_neighbours_and_the_repeat_limit(profile):
     assert look_key(by_id["slide26"]) in crowded, "сосед справа"
     assert look_key(by_id["slide13"]) in crowded, "предел повторов исчерпан"
     assert look_key(by_id["slide24"]) not in crowded
+
+
+def test_a_list_gets_no_more_items_than_the_place_has_lines(profile):
+    """Пример 13: главное текстовое место это полоса во всю ширину в две
+    строки. Одной фразой она держит три десятка слов, а списком только два
+    пункта: пункт это абзац не короче строки. Живой прогон dense 28
+    сентября 2026: три коротких пункта клон отклонил, слайд разделили на
+    два пустоватых."""
+    main = forms_of(profile)["slide13"].main
+    assert main.block in ("bullets", "text")
+    assert main.unit.lines is not None and main.units <= main.unit.lines
+
+    spec = SlideSpec(
+        index=2, kind="bullets", headline="98,5% времени ожидание", pattern_id="slide13",
+        blocks=[BulletBlock(items=["Сквозная медиана: 31,5 часа", "Чистая работа: 28 минут"][: main.units])],
+    )
+    assert _clone(profile, spec, "slide13").reason is None

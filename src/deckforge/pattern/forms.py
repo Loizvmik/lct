@@ -47,6 +47,9 @@ class Limit:
     # тесна ли раскладка стилю (`scoring.overflow`), а предел `max_words`
     # остаётся тем, что клон ещё примет, ужав кегль в пределах бюджета.
     native_words: int | None = None
+    # Строк места по замеру клона (`SlotFit.lines`): столько однострочных
+    # пунктов список в нём вмещает. `None`: замера нет.
+    lines: int | None = None
 
     @property
     def target_words(self) -> int:
@@ -122,7 +125,10 @@ def _slot_limit(slot, fit=None) -> Limit:
         native = min(native, slot.max_words)
     # Ноль знаков у `Limit` значит «мерить нечем»; место, где по замеру
     # не помещается ни слова, так и говорит: одно слово, один знак.
-    return Limit(max_words=max(1, int(words)), max_chars=max(1, int(chars)), native_words=int(native))
+    return Limit(
+        max_words=max(1, int(words)), max_chars=max(1, int(chars)), native_words=int(native),
+        lines=int(fit.lines) if fit.lines else None,
+    )
 
 
 def _capacity(slot, fit=None) -> int:
@@ -211,6 +217,9 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
         main = free[0]
         limit = _limit(main)
         list_units = max(1, min(MAX_LIST_ITEMS, limit.max_words // _MIN_LIST_ITEM_WORDS or 1))
+        if limit.lines:
+            # Пункт это абзац не короче строки: пунктов не больше строк места.
+            list_units = max(1, min(list_units, limit.lines))
         parts.append(FormPart(
             block="bullets" if list_units >= 2 else "text", units=list_units, unit=limit, role=main.role,
             purpose=main.purpose, content_hint=main.content_hint,
@@ -259,9 +268,22 @@ def list_item_limit(part: FormPart, count: int) -> Limit:
     единицу, предел не делится."""
     if part.block != "bullets" or count <= 1:
         return part.unit
-    words = max(_MIN_LIST_ITEM_WORDS, part.unit.max_words // count)
-    chars = max(0, part.unit.max_chars // count - 1) if part.unit.max_chars else 0
-    native = part.unit.native_words // count if part.unit.native_words is not None else None
+    unit = part.unit
+    if unit.lines and unit.lines >= count:
+        # По замеру: каждому пункту целые строки места, остаток строк
+        # (перенос внутри абзаца) делится так же, а не знаки поровну.
+        share = (unit.lines // count) / unit.lines
+        words = max(_MIN_LIST_ITEM_WORDS, int(unit.max_words * share))
+        chars = max(1, int(unit.max_chars * share) - 1)
+        native = int(unit.native_words * share) if unit.native_words is not None else None
+        return Limit(max_words=words, max_chars=chars, native_words=native, lines=unit.lines // count)
+    words = max(_MIN_LIST_ITEM_WORDS, unit.max_words // count)
+    chars = max(0, unit.max_chars // count - 1) if unit.max_chars else 0
+    if unit.lines:
+        # Пунктов больше строк места: каждому меньше строки.
+        native = 0 if unit.native_words is not None else None
+        return Limit(max_words=words, max_chars=chars, native_words=native, lines=0)
+    native = unit.native_words // count if unit.native_words is not None else None
     return Limit(max_words=words, max_chars=chars, native_words=native)
 
 
