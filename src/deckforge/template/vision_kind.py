@@ -249,6 +249,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
 
+import httpx
 import yaml
 from PIL import Image, ImageDraw, ImageFont
 
@@ -729,14 +730,25 @@ _MAX_WORDS_RANGE = (1, 80)
 # пересказывает картинку, а писателю нужна подсказка, не абзац.
 _SCHEMA_TEXT_MAX_CHARS = 120
 
-# Стартовый бюджет ответа на один слайд. Ответ длиннее, чем у вида
-# раскладки (по пять полей на каждое место, мест до десятка), поэтому
-# бюджет выше `_TOKENS_PER_ITEM`, но ниже потолка эскалации провайдера
-# (`provider.yandex.MAX_TOKENS_BUDGET_CAP=6144`), иначе эскалация не
-# сделает ни шага (см. докстроку модуля, находка №2 второй попытки).
-_SCHEMA_MAX_TOKENS = 4096
+# Стартовый бюджет ответа на один слайд — сразу потолок провайдера
+# (`provider.yandex.MAX_TOKENS_BUDGET_CAP`). Живой прогон 26 сентября 2026
+# (VK Education, 33 паттерна): со старта 4096 почти каждый вызов уходил в
+# `finish_reason=length` и платил лишний сетевой круг эскалации до 7168,
+# ответ длиннее, чем у вида раскладки (пять полей на каждое место).
+_SCHEMA_MAX_TOKENS = 7168
 
-DEFAULT_SCHEMA_MAX_WORKERS = 8
+# Попыток на паттерн и пауза перед повтором, секунды (растёт с номером
+# попытки). Тот же прогон: при 8 потоках схемы поверх 8 потоков вида
+# раскладки половина вызовов получила 429 даже после HTTP-ретраев
+# провайдера. Пауза разводит повтор с тем всплеском, который его вызвал.
+# Только после сетевой ошибки (`httpx.HTTPError`): невалидный JSON или
+# пустой ответ ждать бессмысленно, повтор сразу.
+_SCHEMA_ATTEMPTS = 3
+_SCHEMA_RETRY_PAUSE_SECONDS = 5.0
+
+# 8 -> 4 тем же прогоном: схема идёт одновременно с видом раскладки
+# (`llm.pattern_kind_max_workers=8`), и вместе они упирались в 429.
+DEFAULT_SCHEMA_MAX_WORKERS = 4
 
 
 def _default_schema_max_workers() -> int:
@@ -881,7 +893,9 @@ def describe_pattern_slots(
         payload = {"kind": pattern.kind, "slots": manifest}
         prompt = f"{agent_body}\n\nСлужебные данные:\n{json.dumps(payload, ensure_ascii=False)}"
         last_exc: Exception | None = None
-        for _attempt in range(_MAX_MODEL_ATTEMPTS):
+        for attempt in range(_SCHEMA_ATTEMPTS):
+            if attempt and isinstance(last_exc, httpx.HTTPError):
+                time.sleep(_SCHEMA_RETRY_PAUSE_SECONDS * attempt)
             try:
                 raw = llm.ask_image(png, prompt, max_tokens=_SCHEMA_MAX_TOKENS)
                 parsed = json.loads(_strip_markdown_fence(raw))
@@ -894,7 +908,7 @@ def describe_pattern_slots(
             accepted, notes = validate_slot_schema(pattern, parsed)
             return pattern.pattern_id, accepted, notes, True
         return pattern.pattern_id, {}, [
-            f"{pattern.pattern_id}: схема слотов не получена после {_MAX_MODEL_ATTEMPTS} попыток ({last_exc})."
+            f"{pattern.pattern_id}: схема слотов не получена после {_SCHEMA_ATTEMPTS} попыток ({last_exc})."
         ], False
 
     started = time.monotonic()

@@ -100,9 +100,10 @@ llm:
   # Задача F: схема слотов (`template.vision_kind.describe_pattern_slots`)
   # — по вызову на КАЖДЫЙ паттерн шаблона (их десятки), а не только на
   # неуверенные, как у вида раскладки. Идёт параллельно с ним в разборе,
-  # который в пятиминутный бюджет генерации не входит. 8 — тот же порядок,
-  # что у `pattern_kind_max_workers` (тот же провайдер, та же форма вызова).
-  pattern_schema_max_workers: 8
+  # который в пятиминутный бюджет генерации не входит. 4, а не 8, как у
+  # вида раскладки: живой прогон 26 сентября 2026 с 8 потоками поверх его 8
+  # упёрся в 429 у половины вызовов (см. `vision_kind.DEFAULT_SCHEMA_MAX_WORKERS`).
+  pattern_schema_max_workers: 4
   pattern_picker_deadline_seconds: 20.0
   pattern_picker_max_workers: 8
   pattern_picker_step_budget_seconds: 40.0

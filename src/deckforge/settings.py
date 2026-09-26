@@ -99,7 +99,7 @@ class LLMConfig(BaseModel):
     # по той же причине, что и поля выше.
     # Задача F: сколько паттернов описывает модель одновременно при снятии
     # схемы слотов. Дефолт дублирует `vision_kind.DEFAULT_SCHEMA_MAX_WORKERS`.
-    pattern_schema_max_workers: int = 8
+    pattern_schema_max_workers: int = 4
     pattern_picker_deadline_seconds: float = 20.0
     pattern_picker_max_workers: int = 8
     pattern_picker_step_budget_seconds: float = 40.0
