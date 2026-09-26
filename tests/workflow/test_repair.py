@@ -102,7 +102,11 @@ def test_shortened_text_is_accepted_and_replaces_the_slide_text(profile):
     assert len(repair.calls) == 1
     _index, pattern_id, problems = repair.calls[0]
     assert pattern_id == "slide13"
-    assert any("L03" in p for p in problems), "модель должна знать, почему клон отклонён"
+    # Причина отказа: переполнение, найденное аудитом (L03) или пределом
+    # ужимания кегля при подгонке (задача V3), с указанием места.
+    assert any("L03" in p or "не помещается" in p for p in problems), "модель должна знать, почему клон отклонён"
+    assert slide.meta["failure_codes"].startswith("TEXT_OVERFLOW/")
+    assert slide.meta["ladder_path"].startswith("clone>roomier>shorten")
     assert slide.blocks[0].items == _SHORT, "в колоде тот текст, что лёг на слайд"
     assert len(prs.slides) == 1
     name = prs.slides[0]._element.find(

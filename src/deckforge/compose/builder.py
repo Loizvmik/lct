@@ -44,6 +44,10 @@ from deckforge.compose.clone import (
     table_cell_styles, template_row_heights_emu, text_style,
 )
 from deckforge.compose.decor import apply_decor
+from deckforge.compose.failure import (
+    Failure, FontBudget, RepairPolicy, classify, condense_to_theses, font_budget, from_findings, primary,
+    repair_policy,
+)
 from deckforge.compose.tables import TableSpec, add_table, column_shares
 from deckforge.compose.textfit import measure, register_template_fonts
 from deckforge.ooxml.color import Color, resolve_color
@@ -1347,7 +1351,7 @@ def _place_best_candidate(
 def _clone_candidates(
     prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, notes: list[str], *, bullet_char: str, user_photos: dict[str, Path] | None,
-    source_slides: dict[int, object] | None,
+    source_slides: dict[int, object] | None, failures: list[Failure] | None = None,
 ) -> tuple[Pattern, int] | None:
     """Клон каждого из первых `_MAX_CLONE_ATTEMPTS` кандидатов по порядку.
     Возвращает `(раскладка, её номер в списке)` принятого клона (слайд
@@ -1370,7 +1374,7 @@ def _clone_candidates(
     for position, pattern in enumerate(tried):
         cloned = _try_clone(
             prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
-            bullet_char=bullet_char, user_photos=user_photos,
+            bullet_char=bullet_char, user_photos=user_photos, failures=failures,
         )
         if cloned is None:
             continue
@@ -1571,7 +1575,7 @@ def split_slide(slide_spec: SlideSpec, capacity: int) -> tuple[SlideSpec, SlideS
         notes = f"{notes} {slide_spec.speaker_notes}"
     tail = replace(
         slide_spec, index=slide_spec.index + 1, blocks=[tail_block], visual=None,
-        speaker_notes=notes, findings=[],
+        speaker_notes=notes, findings=[], meta={},
     )
     return head, tail
 
@@ -1584,93 +1588,336 @@ def _adopt(slide_spec: SlideSpec, other: SlideSpec) -> None:
         setattr(slide_spec, name, getattr(other, name))
 
 
+def _text_capacity(pattern: Pattern) -> int:
+    """Сколько знаков держат текстовые места раскладки: мера «просторнее»
+    для ступени `roomier`."""
+    return sum(slot.max_chars for slot in pattern.slots if slot.max_chars > 0)
+
+
+def _has_places(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> bool:
+    """Раскладка примет всё содержание: есть место под заголовок и ни один
+    блок не остаётся без слота (`_lost_blocks`)."""
+    if slide_spec.headline and not any(slot.role == "headline" for slot in pattern.slots):
+        return False
+    return _lost_blocks(slide_spec, pattern, grid) == 0
+
+
+@dataclass
+class _Ladder:
+    """Общее состояние лестницы одного слайда: куда класть, что уже
+    пробовали и почему не вышло. Ступени политики починки (`compose.
+    failure.RepairPolicy`) это её методы."""
+    prs: object
+    slide_spec: SlideSpec
+    candidates: list[Pattern]
+    profile: TemplateProfile
+    canvas: Canvas
+    audit_config: AuditConfig
+    forms: dict
+    repair: SlideRepair | None
+    room: int
+    kw: dict
+    look: TemplateLook | None
+    notes: list[str] = field(default_factory=list)
+    failures: list[Failure] = field(default_factory=list)
+    path: list[str] = field(default_factory=list)
+    # Клоны с исходным текстом, принятые аудитом, но пустоватые (D05):
+    # (заполненность, номер кандидата, раскладка).
+    underfilled: list[tuple[float, int, Pattern]] = field(default_factory=list)
+    tried: set[str] = field(default_factory=set)
+    # Главная причина первого отказа: по ней выбран путь политики. Позже
+    # набегают причины отказа запасных, но путь они уже не меняют.
+    main: Failure | None = None
+
+    @property
+    def heroic(self) -> bool:
+        return not self.slide_spec.blocks and self.slide_spec.visual is None
+
+    @property
+    def fill_min(self) -> float:
+        return 0.0 if self.heroic else self.audit_config.density.fill_ratio_min
+
+    def _clone(self, spec: SlideSpec, pattern: Pattern):
+        return _try_clone(
+            self.prs, spec, pattern, self.profile, self.canvas, self.audit_config, self.kw["source_slides"],
+            self.notes, bullet_char=self.kw["bullet_char"], user_photos=self.kw["user_photos"],
+            failures=self.failures,
+        )
+
+    def _position(self, pattern: Pattern) -> int:
+        return next(i for i, p in enumerate(self.candidates) if p is pattern)
+
+    def done(self, rung: str, pattern: Pattern, tail: SlideSpec | None = None) -> LadderOutcome:
+        spec = self.slide_spec
+        spec.meta["ladder_rung"] = rung
+        spec.meta["ladder_path"] = ">".join(self.path)
+        labels = list(dict.fromkeys(f.label for f in self.failures))
+        if labels:
+            spec.meta["failure_codes"] = ",".join(labels)
+            spec.meta["failure_primary"] = (self.main or primary(self.failures)).label
+        return LadderOutcome(pattern, self.notes + [_rung_note(spec, rung, pattern)], rung, tail=tail)
+
+    def rung_of(self, pattern: Pattern) -> str:
+        return "clone" if self._position(pattern) == 0 else "adapt"
+
+    # -- клон с исходным текстом ------------------------------------------
+
+    def clone_original(self, patterns: list[Pattern], *, settle: bool = True) -> Pattern | None:
+        """Клоны раскладок `patterns` по порядку с исходным текстом слайда.
+        Первый не ниже порога заполненности принимается; пустоватые
+        запоминаются. `settle`: если плотного так и не нашлось, взять
+        самый заполненный из запомненных (пустоватый клон в стиле шаблона
+        лучше белого листа сборки с нуля)."""
+        for pattern in patterns:
+            if pattern.pattern_id in self.tried:
+                continue
+            self.tried.add(pattern.pattern_id)
+            cloned = self._clone(self.slide_spec, pattern)
+            if cloned is None:
+                continue
+            clone_notes, fill = cloned
+            if fill >= self.fill_min:
+                self.notes.extend(clone_notes)
+                return pattern
+            _remove_last_slide(self.prs)
+            self.underfilled.append((fill, self._position(pattern), pattern))
+            self.failures.append(classify("UNDERFILLED", f"заполнен на {fill:.0%}", pattern.pattern_id))
+            self.notes.append(
+                f"Слайд {self.slide_spec.index}: клон раскладки {pattern.pattern_id!r} заполнен на {fill:.0%} "
+                f"(порог {self.fill_min:.0%}) — ищем раскладку плотнее."
+            )
+        return self.accept_best() if settle else None
+
+    def accept_best(self) -> Pattern | None:
+        if not self.underfilled:
+            return None
+        _fill, _position, pattern = max(self.underfilled, key=lambda item: (item[0], -item[1]))
+        self.underfilled = []
+        rebuilt = self._clone(self.slide_spec, pattern)
+        if rebuilt is None:
+            return None
+        clone_notes, fill = rebuilt
+        self.notes.extend(clone_notes)
+        self.notes.append(
+            f"Слайд {self.slide_spec.index}: слайд заполнен на {fill:.0%}: содержания мало для любой "
+            f"раскладки (выбран самый заполненный клон, {pattern.pattern_id!r})."
+        )
+        return pattern
+
+    def spares(self) -> list[Pattern]:
+        """Запасные раскладки планировщика (идут сразу за выбранной,
+        `_resolve_pattern`) в пределах бюджета клонов."""
+        return self.candidates[1:_MAX_CLONE_ATTEMPTS]
+
+    def roomier(self) -> Pattern | None:
+        spares = sorted(self.spares(), key=lambda p: -_text_capacity(p))
+        return self.clone_original(spares)
+
+    def alternate(self, category: str) -> Pattern | None:
+        """Другая раскладка. При нехватке мест смотрим все совместимые
+        раскладки вида, а не только запасные, но берём лишь те, где есть
+        место под заголовок и под каждый блок: сокращение текста тут не
+        поможет, поможет только место."""
+        if category == "MISSING_SLOT":
+            grid = _grid_from_model(self.profile.grid)
+            pool = [p for p in self.candidates[1:] if _has_places(self.slide_spec, p, grid)]
+            return self.clone_original(pool[:_MAX_CLONE_ATTEMPTS - 1])
+        return self.clone_original(self.spares())
+
+    def larger(self) -> Pattern | None:
+        found = _main_units(self.slide_spec)
+        need = found[1] if found is not None else 0
+        pool = [
+            p for p in self.candidates[1:]
+            if p.pattern_id in self.forms and self.forms[p.pattern_id].units >= need
+        ]
+        pool.sort(key=lambda p: self.forms[p.pattern_id].units)
+        return self.clone_original(pool[:_MAX_CLONE_ATTEMPTS - 1])
+
+    def denser(self) -> Pattern | None:
+        spares = sorted(self.spares(), key=_text_capacity)
+        return self.clone_original(spares, settle=False)
+
+    # -- другой текст ----------------------------------------------------
+
+    def _clone_variant(self, spec: SlideSpec) -> Pattern | None:
+        cloned = _clone_candidates(
+            self.prs, spec, self.candidates, self.profile, self.canvas, self.audit_config, self.notes,
+            bullet_char=self.kw["bullet_char"], user_photos=self.kw["user_photos"],
+            source_slides=self.kw["source_slides"], failures=self.failures,
+        )
+        return cloned[0] if cloned is not None else None
+
+    def shorten(self) -> Pattern | None:
+        spec = self.slide_spec
+        if self.repair is None:
+            self.failures.append(classify("NO_MODEL", "починка текста без модели недоступна"))
+            return None
+        problems = [n.split(": ", 1)[-1] for n in self.notes]
+        try:
+            shortened = self.repair.shorten(spec, self.candidates[0].pattern_id, problems)
+        except Exception as exc:  # noqa: BLE001: починка необязательна, сборка слайда важнее
+            shortened = None
+            self.failures.append(classify("SHORTEN_ERROR", f"{type(exc).__name__}: {exc}"))
+            self.notes.append(f"Слайд {spec.index}: сокращение текста упало ({type(exc).__name__}: {exc}).")
+        else:
+            if shortened is None:
+                self.failures.append(classify("SHORTEN_EMPTY", "модель не вернула сокращённый текст"))
+        if shortened is None:
+            return None
+        shortened = replace(shortened, index=spec.index, findings=[], meta={})
+        pattern = self._clone_variant(shortened)
+        if pattern is not None:
+            _adopt(spec, shortened)
+            return pattern
+        self.notes.append(f"Слайд {spec.index}: сокращённый текст клон тоже не принял, дальше по лестнице.")
+        return None
+
+    def fallback_text(self) -> Pattern | None:
+        spec = self.slide_spec
+        condensed = condense_to_theses(spec)
+        if condensed is None:
+            return None
+        condensed = replace(condensed, meta={})
+        pattern = self._clone_variant(condensed)
+        if pattern is None:
+            self.notes.append(f"Слайд {spec.index}: текст, сокращённый без модели, клон тоже не принял.")
+            return None
+        _adopt(spec, condensed)
+        self.notes.append(
+            f"Слайд {spec.index}: модель не сократила текст, оставлены первые предложения пунктов "
+            "(сокращение без модели, проверьте, не потерялись ли факты)."
+        )
+        return pattern
+
+    def split(self, category: str) -> LadderOutcome | None:
+        spec = self.slide_spec
+        found = _main_units(spec)
+        if found is None:
+            return None
+        if category == "TOO_MANY_UNITS":
+            capacity = _units_capacity(self.candidates[:_MAX_CLONE_ATTEMPTS], self.forms)
+        else:
+            # Переполнение текстом при числе единиц в пределах раскладки:
+            # пополам, каждой половине вся рамка.
+            capacity = (found[1] + 1) // 2 if found[1] >= 2 else 0
+        halves = split_slide(spec, capacity) if self.room >= 1 else None
+        if halves is None:
+            why = "колода уже на пределе числа слайдов" if self.room < 1 else "две половины всё равно не влезут"
+            self.notes.append(
+                f"Слайд {spec.index}: нужно {found[1]} единиц, у лучшей раскладки максимум "
+                f"{capacity}; разделить нельзя: {why}."
+            )
+            return None
+        head, tail = halves
+        pattern = self._clone_variant(head)
+        if pattern is None:
+            return None
+        _adopt(spec, head)
+        self.notes.append(
+            f"Слайд {spec.index}: нужно {found[1]} единиц, у лучшей раскладки максимум "
+            f"{capacity}, слайд разделён на два ({len(head.blocks[found[0]].items)} + "
+            f"{len(tail.blocks[0].items)}), продолжение следующим слайдом."
+        )
+        return self.done("split", pattern, tail=tail)
+
+    def scratch(self) -> LadderOutcome:
+        pattern = _scratch_candidates(
+            self.prs, self.slide_spec, self.candidates, self.profile, self.canvas, self.audit_config, self.notes,
+            bullet_char=self.kw["bullet_char"], user_photos=self.kw["user_photos"],
+            image_bytes=self.kw["image_bytes"], look=self.look,
+        )
+        return self.done("scratch", pattern)
+
+    def settle_or_scratch(self) -> LadderOutcome:
+        """Последняя ступень: пустоватый клон в стиле шаблона лучше белого
+        листа, иначе сборка с нуля."""
+        best = self.accept_best()
+        return self.done(self.rung_of(best), best) if best is not None else self.scratch()
+
+
+# Ступени, которым нужен другой текст слайда: на героическом слайде
+# (титул, разделитель) текста одна строка, чинить в нём нечего.
+_TEXT_STEPS = frozenset({"shorten", "fallback_text", "split"})
+
+
 def _place_with_ladder(
     prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, *, forms: dict, repair: SlideRepair | None, room: int, bullet_char: str,
     user_photos: dict[str, Path] | None, image_bytes: Callable[[str], bytes | None] | None,
     source_slides: dict[int, object] | None, look: TemplateLook | None = None,
+    policy: RepairPolicy | None = None,
 ) -> LadderOutcome:
-    """Лестница отказов одного слайда (раздел 11): 1) клон раскладки
-    планировщика; 2) клон запасной раскладки того же вида (запасные
-    планировщика идут в `candidates` сразу за выбранной, `_resolve_pattern`);
-    3) сокращение текста под контракт раскладки (`repair.shorten`, один
-    вызов модели) и снова клон; 4) разбиение слайда на два, если единиц
-    больше, чем держит лучшая раскладка, и в колоде есть место (`room`);
-    5) только потом сборка с нуля.
+    """Лестница отказов одного слайда (раздел 11), с задачи V3 зависящая
+    от причины отказа (разделы 12-13 идей четвёртой редакции).
 
-    Переполнение по числу единиц идёт сразу на ступень 4: сокращение под
-    контракт на K единиц выбросило бы лишние карточки вместе с фактами, а
-    разбиение сохраняет всё. Героический слайд (титул, разделитель) не
-    чинится: у него один заголовок, чинить в нём нечего.
+    Первая ступень всегда клон раскладки планировщика. Если он не принят,
+    каждая попытка уже назвала причину (`compose.failure.Failure`), и
+    главная из них (`failure.primary`) выбирает путь в `RepairPolicy`:
+    переполнение текстом идёт к раскладке просторнее, сокращению и
+    разбиению; нехватка мест к другой раскладке с местами и сразу к сборке
+    с нуля (сокращение не поможет); лишние единицы к раскладке с большим
+    повтором и разбиению; пустоватый клон к раскладке плотнее. Если
+    сокращение моделью не удалось, в путь встаёт ступень отказа модели
+    (сокращение без модели). Кончился путь без успеха: лучший пустоватый
+    клон или сборка с нуля, пустого слайда не бывает.
 
-    Каждая ступень пишет находку, какая сработала; счётчик по ступеням
-    копит `build_deck`."""
-    notes: list[str] = []
-    cloned = _clone_candidates(
-        prs, slide_spec, candidates, profile, canvas, audit_config, notes,
-        bullet_char=bullet_char, user_photos=user_photos, source_slides=source_slides,
+    Счётчики ступеней (`LADDER_RUNGS`) прежние: клон другой раскладки это
+    `adapt`, сокращение моделью или без неё `shorten`. Причины и путь
+    пишутся в `slide_spec.meta` (`failure_codes`, `ladder_path`,
+    `ladder_rung`) для HTML-отчёта."""
+    ladder = _Ladder(
+        prs, slide_spec, candidates, profile, canvas, audit_config, forms, repair, room,
+        kw={
+            "bullet_char": bullet_char, "user_photos": user_photos, "image_bytes": image_bytes,
+            "source_slides": source_slides,
+        },
+        look=look,
     )
-    if cloned is not None:
-        pattern, position = cloned
-        rung = "clone" if position == 0 else "adapt"
-        return LadderOutcome(pattern, notes + [_rung_note(slide_spec, rung, pattern)], rung)
-
-    heroic = not slide_spec.blocks and slide_spec.visual is None
+    ladder.path.append("clone")
+    first = ladder.clone_original(candidates[:1], settle=False)
+    if first is not None:
+        return ladder.done("clone", first)
     can_clone = any(_clone_source(p, source_slides) for p in candidates[:_MAX_CLONE_ATTEMPTS])
-    capacity = _units_capacity(candidates[:_MAX_CLONE_ATTEMPTS], forms)
-    found = _main_units(slide_spec)
-    overflow = found is not None and capacity >= 1 and found[1] > capacity
+    main = ladder.main = primary(ladder.failures)
+    if not can_clone or main is None:
+        ladder.path.append("scratch")
+        return ladder.scratch()
 
-    if can_clone and not heroic and not overflow and repair is not None:
-        problems = [n.split(": ", 1)[-1] for n in notes]
-        try:
-            shortened = repair.shorten(slide_spec, candidates[0].pattern_id, problems)
-        except Exception as exc:  # noqa: BLE001: починка необязательна, сборка слайда важнее
-            shortened = None
-            notes.append(f"Слайд {slide_spec.index}: сокращение текста упало ({type(exc).__name__}: {exc}).")
-        if shortened is not None:
-            shortened = replace(shortened, index=slide_spec.index, findings=[])
-            cloned = _clone_candidates(
-                prs, shortened, candidates, profile, canvas, audit_config, notes,
-                bullet_char=bullet_char, user_photos=user_photos, source_slides=source_slides,
-            )
-            if cloned is not None:
-                _adopt(slide_spec, shortened)
-                pattern = cloned[0]
-                return LadderOutcome(pattern, notes + [_rung_note(slide_spec, "shorten", pattern)], "shorten")
-            notes.append(f"Слайд {slide_spec.index}: сокращённый текст клон тоже не принял, дальше по лестнице.")
-
-    if can_clone and overflow:
-        halves = split_slide(slide_spec, capacity) if room >= 1 else None
-        if halves is None:
-            why = "колода уже на пределе числа слайдов" if room < 1 else "две половины всё равно не влезут"
-            notes.append(
-                f"Слайд {slide_spec.index}: нужно {found[1]} единиц, у лучшей раскладки максимум "
-                f"{capacity}; разделить нельзя: {why}."
-            )
+    policy = policy or repair_policy()
+    queue = list(policy.steps(main.category))
+    seen: set[str] = set()
+    while queue:
+        step = queue.pop(0)
+        if step in seen or (step in _TEXT_STEPS and ladder.heroic):
+            continue
+        seen.add(step)
+        ladder.path.append(step)
+        if step == "scratch":
+            return ladder.settle_or_scratch()
+        if step == "split":
+            outcome = ladder.split(main.category)
+            if outcome is not None:
+                return outcome
+            continue
+        if step in ("shorten", "fallback_text"):
+            pattern = ladder.shorten() if step == "shorten" else ladder.fallback_text()
+            if pattern is not None:
+                return ladder.done("shorten", pattern)
+            if step == "shorten" and ladder.failures and ladder.failures[-1].category == "MODEL_FAILURE":
+                queue[:0] = list(policy.steps("MODEL_FAILURE"))
+            continue
+        if step == "accept_best":
+            pattern = ladder.accept_best()
+        elif step == "alternate":
+            pattern = ladder.alternate(main.category)
         else:
-            head, tail = halves
-            cloned = _clone_candidates(
-                prs, head, candidates, profile, canvas, audit_config, notes,
-                bullet_char=bullet_char, user_photos=user_photos, source_slides=source_slides,
-            )
-            if cloned is not None:
-                _adopt(slide_spec, head)
-                pattern = cloned[0]
-                notes.append(
-                    f"Слайд {slide_spec.index}: нужно {found[1]} единиц, у лучшей раскладки максимум "
-                    f"{capacity}, слайд разделён на два ({len(head.blocks[found[0]].items)} + "
-                    f"{len(tail.blocks[0].items)}), продолжение следующим слайдом."
-                )
-                return LadderOutcome(
-                    pattern, notes + [_rung_note(slide_spec, "split", pattern)], "split", tail=tail,
-                )
+            pattern = getattr(ladder, step)()
+        if pattern is not None:
+            return ladder.done(ladder.rung_of(pattern), pattern)
 
-    pattern = _scratch_candidates(
-        prs, slide_spec, candidates, profile, canvas, audit_config, notes,
-        bullet_char=bullet_char, user_photos=user_photos, image_bytes=image_bytes, look=look,
-    )
-    return LadderOutcome(pattern, notes + [_rung_note(slide_spec, "scratch", pattern)], "scratch")
+    ladder.path.append("scratch")
+    return ladder.settle_or_scratch()
 
 
 def _rung_note(slide_spec: SlideSpec, rung: str, pattern: Pattern) -> str:
@@ -1713,8 +1960,11 @@ _CLONE_FRAME_ROLES = frozenset({"headline", "subhead", "source"})
 class CloneOutcome:
     """Итог `place_slide_by_clone`: `reason` равен `None`, если слайд
     собран (он последний в колоде), иначе это причина отказа (слайда в
-    колоде нет)."""
+    колоде нет). `code`: та же причина кодом `compose.failure` (задача
+    V3), по нему лестница выбирает путь починки; текст `reason` остаётся
+    для людей и для маркеров `audit.risk`."""
     reason: str | None
+    code: str | None = None
 
 
 def _clone_examples_enabled() -> bool:
@@ -1739,7 +1989,7 @@ def _clone_source(pattern: Pattern, source_slides: dict[int, object] | None):
 def _try_clone(
     prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, source_slides: dict[int, object] | None, notes: list[str],
-    *, bullet_char: str, user_photos: dict[str, Path] | None,
+    *, bullet_char: str, user_photos: dict[str, Path] | None, failures: list[Failure] | None = None,
 ) -> tuple[list[str], float] | None:
     """Пробует собрать слайд клоном примера раскладки `pattern`. Успех:
     клон собрался (все слоты с содержимым нашли свою фигуру) и прошёл тот же
@@ -1748,11 +1998,16 @@ def _try_clone(
     функция отдаёт находки для `slide_spec` и заполненность слайда (то же
     число, что судит D05), по которой `_place_best_candidate` выбирает
     между принятыми клонами.
-    Неудача: слайд убран, причина дописана в `notes`, возвращается `None`
+    Неудача: слайд убран, причина дописана в `notes`, а кодом (`compose.
+    failure.Failure`) в `failures`, если он передан; возвращается `None`
     и вызывающий пробует клон следующего кандидата, а с нуля собирает,
     только когда не принят ни один клон."""
+    if failures is None:
+        failures = []
     source = _clone_source(pattern, source_slides)
     if source is None:
+        if source_slides:
+            failures.append(classify("NO_EXAMPLE", "у раскладки нет слайда-примера", pattern.pattern_id))
         return None
     number, source_slide = source
     trial_spec = replace(slide_spec, findings=[])
@@ -1765,8 +2020,10 @@ def _try_clone(
     except Exception as exc:  # noqa: BLE001: незнакомая разметка примера: запасной путь, а не падение колоды
         if len(prs.slides) > slides_before:
             _remove_last_slide(prs)
-        outcome = CloneOutcome(f"клон не собрался ({type(exc).__name__}: {exc})")
+        outcome = CloneOutcome(f"клон не собрался ({type(exc).__name__}: {exc})", "CLONE_EXCEPTION")
     reason = outcome.reason
+    if reason is not None:
+        failures.append(classify(outcome.code or "CLONE_EXCEPTION", reason, pattern.pattern_id))
     if reason is None:
         errors = _clone_errors(
             audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index),
@@ -1779,6 +2036,7 @@ def _try_clone(
                 *trial_spec.findings,
             ], fill
         _remove_last_slide(prs)
+        failures.extend(from_findings(errors, pattern.pattern_id))
         ids = sorted({f.check_id for f in errors})
         # Текст первой находки нужен ступени сокращения (`repair.shorten`):
         # модель должна знать, какое место не вместило текст, а не только код.
@@ -1824,7 +2082,7 @@ def place_slide_by_clone(
     (`_native_repeat_contents`), а лишние единицы удаляются."""
     layout = _find_layout(prs, pattern.layout_id)
     if layout is None:
-        return CloneOutcome(f"лейаут {pattern.layout_id!r} не найден в открытом шаблоне")
+        return CloneOutcome(f"лейаут {pattern.layout_id!r} не найден в открытом шаблоне", "LAYOUT_NOT_FOUND")
     canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
     grid = _grid_from_model(profile.grid)
 
@@ -1845,7 +2103,7 @@ def place_slide_by_clone(
         # в PowerPoint показывает подсказку «Нажмите дважды», а заголовок
         # разделителя выходит пустым (наблюдение 8.2). Такой клон честнее
         # отклонить, чем собрать с пустым местом.
-        return CloneOutcome(f"слот «{blank.role_hint}» получил пустой текст")
+        return CloneOutcome(f"слот «{blank.role_hint}» получил пустой текст", "EMPTY_SLOT_TEXT")
     visual = slide_spec.visual
     table_rows = visual.table.rows if visual is not None and visual.kind == "table" and visual.table else None
     table_slot = _visual_slot(pattern, "table") if table_rows else None
@@ -1857,10 +2115,10 @@ def place_slide_by_clone(
         # раскладке, у которой слоты только под список). Таблица в слоте
         # под неё: содержание, слайд не пуст, а блок-пояснение уходит в
         # находки (`_note_drops`) так же, как у сборки с нуля.
-        return CloneOutcome("ни один блок содержания не нашёл слота в раскладке")
+        return CloneOutcome("ни один блок содержания не нашёл слота в раскладке", "BLOCK_NO_SLOT")
     native = _native_repeat_contents(pattern, clean)
     if native is None:
-        return CloneOutcome("элементов больше, чем единиц повтора в примере")
+        return CloneOutcome("элементов больше, чем единиц повтора в примере", "UNITS_OVER_REPEAT")
 
     slide = clone_example_slide(prs, source_slide, layout)
     matched = match_slots(slide, pattern.slots, canvas)
@@ -1870,15 +2128,23 @@ def place_slide_by_clone(
         ref = matched.get(index_of.get(id(content.slot), -1))
         if ref is None:
             _remove_last_slide(prs)
-            return CloneOutcome(f"в примере не нашлось фигуры под слот «{content.role_hint}»")
+            code = "HEADLINE_NO_SHAPE" if content.slot.role == "headline" else "SLOT_NO_SHAPE"
+            return CloneOutcome(f"в примере не нашлось фигуры под слот «{content.role_hint}»", code)
         bound.append((content, ref))
 
     family = _primary_family(profile)
     bound_elements = [ref.element for _, ref in bound]
+    budget = font_budget()
     for content, ref in bound:
         ref = _shrink_frame_away_from_decor(slide, ref, bound_elements, canvas)
         bind_text(ref.element, content.paragraphs, bullet_char=bullet_char)
-        _fit_cloned_text(slide, slide_spec, content, ref, profile, family, canvas)
+        overflow = _fit_cloned_text(
+            slide, slide_spec, content, ref, profile, family, canvas,
+            budget=budget.for_slot(content.slot.role, pattern.kind),
+        )
+        if overflow is not None:
+            _remove_last_slide(prs)
+            return CloneOutcome(overflow, "FONT_BUDGET")
         _fix_cloned_contrast(slide, ref, profile, canvas, audit_config)
 
     keep = [ref.element for _, ref in bound]
@@ -2092,12 +2358,17 @@ def _shrink_frame_away_from_decor(slide, ref, bound_elements: list, canvas: Canv
 
 def _fit_cloned_text(
     slide, slide_spec: SlideSpec, content: SlotContent, ref, profile: TemplateProfile, family: str, canvas: Canvas,
-) -> None:
+    *, budget: FontBudget | None = None,
+) -> str | None:
     """ADAPT: текст клона обязан влезть в рамку примера. Кегль примера
     остаётся, если текст помещается; иначе ужимается по той же шкале, что
-    у сборки с нуля (`_shrink_sequence`, не ниже подписи). Если не влез и
-    на подписи, кегль остаётся минимальным, а решение «не годится» примет
-    аудит (L03) и отправит слайд на сборку с нуля."""
+    у сборки с нуля (`_shrink_sequence`), но не глубже предела `budget`
+    (задача V3: не ниже 0,8 от кегля примера и не больше двух ступеней
+    шкалы вниз). Возвращает `None`, если текст лёг, иначе причину отказа:
+    текст, которому нужен кегль глубже предела, это переполнение
+    (`TEXT_OVERFLOW`), и чинить его другой раскладкой или сокращением
+    честнее, чем подписью вместо заголовка. `budget=None`: без предела,
+    только шкала до подписи."""
     style = text_style(ref.element)
     # Кегль, которым PowerPoint нарисует текст: свой у run, иначе
     # унаследованный от лейаута/мастера, и только если его нет, из профиля.
@@ -2109,10 +2380,13 @@ def _fit_cloned_text(
     height_in = ref.box.height * canvas.height_emu / EMU_PER_INCH - top_in - bottom_in
     text = _joined_text(content.paragraphs)
     if width_in <= 0 or height_in <= 0 or not text.strip():
-        return
+        return None
     if measure(text, fam, size, width_in, line_spacing=spacing).lines > len(content.paragraphs):
         allow_wrap(ref.element)
     sizes = [size] + [s for s in _shrink_sequence(profile, content.slot.size_pt) if s < size - 0.05]
+    if budget is not None:
+        floor = budget.floor_pt(size, sizes[1:])
+        sizes = [s for s in sizes if s >= floor - 0.05] or [size]
     for candidate in sizes:
         if measure(text, fam, candidate, width_in, line_spacing=spacing).height_in <= height_in + _FIT_TOLERANCE_IN:
             # Кегль пишется, только если его пришлось ужать (ступень шкалы
@@ -2121,12 +2395,18 @@ def _fit_cloned_text(
             # шкалы (VK Tech: 47pt у заголовка лейаута, находка T02).
             if candidate != size:
                 set_text_size(ref.element, candidate)
-            return
+            return None
+    if budget is not None:
+        return (
+            f"текст слота «{content.role_hint}» не помещается в рамку примера даже кеглем "
+            f"{sizes[-1]:.1f}pt (предел ужимания от {size:.1f}pt)"
+        )
     set_text_size(ref.element, sizes[-1])
     slide_spec.findings.append(
         f"Слайд {slide_spec.index}: текст слота «{content.role_hint}» не помещается в рамку "
         f"примера даже кеглем {sizes[-1]:.1f}pt."
     )
+    return None
 
 
 def _fix_cloned_contrast(slide, ref, profile: TemplateProfile, canvas: Canvas, audit_config: AuditConfig) -> None:

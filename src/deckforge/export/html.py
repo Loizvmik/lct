@@ -977,12 +977,43 @@ def _slide_section(
     notes = getattr(spec_slide, "speaker_notes", None) if spec_slide is not None else None
     notes_html = f'<aside class="slide-notes">{_esc(notes.strip())}</aside>' if notes and notes.strip() else ""
     score_html = _score_badge_html(score)
+    why_html = _why_not_clone_html(spec_slide)
     return (
         f'<section class="slide" data-index="{index}" data-kind="{_esc(kind)}" '
         f'data-theme="{theme}" aria-label="{_esc(title)}" style="background:{bg_css};">'
-        f'<div class="slide-inner">{blocks_html}</div>{notes_html}{score_html}'
+        f'<div class="slide-inner">{blocks_html}</div>{notes_html}{score_html}{why_html}'
         f"</section>"
     )
+
+
+# Категории отказа (`compose.failure.CATEGORIES`) простыми словами для
+# отчёта. Своя копия, как и `_LADDER_LABELS`: экспорту незачем тянуть сборку.
+_FAILURE_LABELS = {
+    "TEXT_OVERFLOW": "текст не влез",
+    "MISSING_SLOT": "нет места под блок",
+    "TOO_MANY_UNITS": "единиц больше, чем в раскладке",
+    "LOW_DENSITY": "слайд пустоват",
+    "OVERLAP": "наложение или выход за край",
+    "BUILD_ERROR": "ошибка сборки клона",
+    "MODEL_FAILURE": "модель не сократила текст",
+}
+
+
+def _why_not_clone_html(spec_slide: SlideSpec | None) -> str:
+    """Задача V3: почему слайд собран не клоном выбранной раскладки и каким
+    путём (`SlideSpec.meta`, пишет `compose.builder._place_with_ladder`).
+    Видно в режиме обзора; пусто, если клон принят сразу или колоду
+    собирали без лестницы."""
+    meta = getattr(spec_slide, "meta", None) or {}
+    codes = [c for c in meta.get("failure_codes", "").split(",") if c]
+    if not codes:
+        return ""
+    reasons = list(dict.fromkeys(_FAILURE_LABELS.get(c.split("/", 1)[0], c) for c in codes))
+    rung = dict(_LADDER_LABELS).get(meta.get("ladder_rung", ""), meta.get("ladder_rung", ""))
+    text = "Не клон: " + "; ".join(reasons) + (f" → {rung}" if rung else "")
+    detail = f"Коды: {', '.join(codes)}. Путь: {meta.get('ladder_path', '')}"
+    return f'<div class="slide-ladder" title="{_esc(detail)}">{_esc(text)}</div>'
+
 
 
 def _css_vars(profile: TemplateProfile) -> str:
@@ -1096,6 +1127,15 @@ def _ladder_html(deck_spec: DeckSpec) -> str:
     if all(value is None for _label, value in counts):
         return ""
     text = "Лестница сборки: " + ", ".join(f"{label} {value or 0}" for label, value in counts)
+    # Задача V3: сколько слайдов не взяли клон по каждой главной причине.
+    reasons: dict[str, int] = {}
+    for slide in deck_spec.slides:
+        main = (getattr(slide, "meta", None) or {}).get("failure_primary", "")
+        if main:
+            label = _FAILURE_LABELS.get(main.split("/", 1)[0], main)
+            reasons[label] = reasons.get(label, 0) + 1
+    if reasons:
+        text += "; почему не клон: " + ", ".join(f"{label} {n}" for label, n in reasons.items())
     return f'<div id="build-ladder">{_esc(text)}</div>'
 
 
@@ -1206,6 +1246,13 @@ body.overview #template-fidelity {{ display: block; }}
   padding: 4px 10px; border-radius: 12px;
 }}
 body.overview #build-ladder {{ display: block; }}
+/* Задача V3: почему слайд собран не клоном, только в режиме обзора. */
+.slide-ladder {{
+  display: none; position: absolute; left: 8px; bottom: 8px; z-index: 4; max-width: 90%;
+  font: 11px var(--font-fallback); color: #fff; background: rgba(17,17,17,.72);
+  padding: 2px 8px; border-radius: 999px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+body.overview .slide-ladder {{ display: block; }}
 .block {{ position: absolute; }}
 .text-frame {{ position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-start; }}
 .text-frame p, .text-frame li {{ margin: 0 0 .25em 0; padding: 0; }}
