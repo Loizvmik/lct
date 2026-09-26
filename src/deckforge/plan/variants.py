@@ -619,7 +619,7 @@ _HARD_REQUIREMENT_KINDS = frozenset({"cards", "kpi", "kpi_caption", "table", "ph
 def _choose_kind_and_pattern(
     slide: SlideSpec, profile, variant: Variant, *,
     avoid: frozenset[str] = frozenset(), history: _SelectionHistory = _EMPTY_HISTORY,
-    preferred: str | None = None,
+    preferred: str | None = None, is_last: bool = False,
 ) -> tuple[str, str | None]:
     """`kind`+`pattern_id` для один слайд — брифом: "выбирает раскладку из
     списка, который ей дал разбор шаблона... если предложит несуществующую,
@@ -679,12 +679,19 @@ def _choose_kind_and_pattern(
     # садился на разделитель с подписью 14 pt вместо обложки с 40 pt
     # (прогон 26 сентября 2026, VK Education). Для неё решает ранжир ниже
     # с `cover_bias`.
-    if variant is Variant.dense and slide.pattern_id and not _is_cover(slide):
+    # Выбор писателя наследуется, пока раскладка ещё не звучала в колоде:
+    # без этого шесть слайдов из одиннадцати садились на slide21 (VK
+    # Education, 27 сентября 2026), а штраф за повтор в ранжире до них не
+    # доходил. Повторный выбор идёт через ранжир с его штрафом за повтор.
+    if (
+        variant is Variant.dense and slide.pattern_id and not _is_cover(slide)
+        and history.counts.get(slide.pattern_id, 0) == 0
+    ):
         authored = next((p for p in profile.patterns if p.pattern_id == slide.pattern_id), None)
-        if authored is not None:
+        if authored is not None and not (_is_closing_pattern(authored, profile) and not is_last):
             return authored.kind, authored.pattern_id
 
-    ranked = _ranked_candidates(slide, profile, variant, avoid=avoid, history=history)
+    ranked = _ranked_candidates(slide, profile, variant, avoid=avoid, history=history, is_last=is_last)
     if not ranked:
         return slide.kind, None
     if preferred:
@@ -737,9 +744,21 @@ def _is_cover(slide: SlideSpec) -> bool:
     return slide.index == 0 and slide.kind == "section"
 
 
+def _is_closing_pattern(p, profile) -> bool:
+    """Финальная раскладка шаблона: героическая, снятая с последнего
+    слайда-примера («Спасибо за внимание!» с QR-кодом у VK Education). Ей
+    место только на последнем слайде колоды: на втором слайде она
+    выглядела концом презентации (27 сентября 2026)."""
+    if p.kind not in ("section", "closing") or not p.source_slide_index:
+        return False
+    last = max((n for q in profile.patterns for n in q.source_slide_index), default=None)
+    return last is not None and min(p.source_slide_index) == last
+
+
 def _ranked_candidates(
     slide: SlideSpec, profile, variant: Variant, *,
     avoid: frozenset[str] = frozenset(), history: _SelectionHistory = _EMPTY_HISTORY,
+    is_last: bool = False,
 ) -> list[tuple[tuple, object]]:
     """Все кандидаты слайда с их ключами, от лучшего к худшему. Пустой
     список только у профиля без единого паттерна. Сортировка устойчивая,
@@ -763,7 +782,10 @@ def _ranked_candidates(
         kind_pool = [next(iter(available))]
 
     kind_rank = {kind: i for i, kind in enumerate(kind_pool)}
-    candidates = [p for p in profile.patterns if p.kind in kind_pool]
+    candidates = [
+        p for p in profile.patterns
+        if p.kind in kind_pool and (is_last or not _is_closing_pattern(p, profile))
+    ]
 
     needs_image = slide.visual is not None and slide.visual.kind in ("photo", "icon")
     keyed = [
@@ -777,6 +799,10 @@ def _ranked_candidates(
         for p in candidates
     ]
     keyed.sort(key=lambda pair: pair[0])
+    if is_last and slide.kind == "section":
+        # Последний героический слайд тянется к финальной раскладке шаблона
+        # среди тех, куда текст влезает.
+        keyed.sort(key=lambda pair: (pair[0][0], 0 if _is_closing_pattern(pair[1], profile) else 1))
     return keyed
 
 
@@ -862,7 +888,9 @@ def _pattern_choices(
     history = _EMPTY_HISTORY
     for slide in slides:
         avoid = avoid_by_slide.get(id(slide), frozenset())
-        _kind, pattern_id = _choose_kind_and_pattern(slide, profile, variant, avoid=avoid, history=history)
+        _kind, pattern_id = _choose_kind_and_pattern(
+            slide, profile, variant, avoid=avoid, history=history, is_last=(slide is slides[-1]),
+        )
         result[id(slide)] = pattern_id
         history = history.with_choice(pattern_id)
     return result
@@ -960,6 +988,7 @@ def apply_variant(
         avoid = avoid_by_slide.get(id(slide), frozenset())
         kind, pattern_id = _choose_kind_and_pattern(
             slide, profile, variant, avoid=avoid, history=history, preferred=preferred.get(i),
+            is_last=(i == len(slides) - 1),
         )
         # Свой список находок на вариант: раньше три варианта делили один
         # список, и находки сборки dense попадали в airy и visual (53 → 98 →

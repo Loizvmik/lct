@@ -877,3 +877,18 @@ def test_a_photo_placeholder_hint_becomes_an_image_slot_in_its_frame(profile_fix
     assert images, [s.role for s in pattern.slots]
     assert not any("фото" in (s.sample_text or "").lower() for s in pattern.slots if s.role != "image")
     assert images[0].box.width > 0.3, "рамка фото берётся от плашки, а не от маленькой подписи"
+
+
+def test_a_fixed_headline_never_keeps_the_sample_text():
+    """Заголовок всегда наш: «Спасибо за внимание!» перекрывало заголовок
+    второго слайда (27 сентября 2026)."""
+    from dataclasses import replace
+    from deckforge.template.patterns import PatternSlot, keeps_sample_text
+    from deckforge.ooxml.geometry import Box
+
+    slot = PatternSlot(role="headline", box=Box(0.1, 0.1, 0.5, 0.2), size_pt=48.0, color_hex=None,
+                       align="l", max_chars=40, wraps=True, sample_text="Спасибо за внимание!", fixed=True)
+    assert not keeps_sample_text(slot)
+    caption = replace(slot, role="caption", sample_text="Спасибо за внимание!")
+    assert keeps_sample_text(caption)
+

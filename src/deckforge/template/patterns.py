@@ -131,6 +131,11 @@ def keeps_sample_text(slot) -> bool:
     """Место, куда содержание не кладётся и где остаётся текст примера:
     порядковый номер или постоянный текст, прошедший `is_fixed_phrase`.
     Принимает и `PatternSlot`, и его JSON-зеркало."""
+    if slot.role in ("headline", "subhead"):
+        # Заголовок всегда наш: «Спасибо за внимание!» финального слайда
+        # VK Education прошло фильтр как постоянный текст и перекрыло
+        # заголовок второго слайда колоды (27 сентября 2026).
+        return False
     return bool(slot.ordinal) or (bool(slot.fixed) and is_fixed_phrase(slot.sample_text))
 
 

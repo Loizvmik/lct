@@ -663,3 +663,35 @@ def test_a_layout_with_a_photo_slot_loses_to_an_equal_one_without_when_there_is_
     first_without = next(i for i, (_k, p) in enumerate(ranked) if p is without[0])
     assert first_without < first_with or ranked[first_with][0][:5] < ranked[first_without][0][:5]
 
+
+def test_closing_layout_is_reserved_for_the_last_slide():
+    """«Спасибо за внимание!» с QR-кодом (последний слайд-пример шаблона)
+    попадал на второй слайд колоды (27 сентября 2026)."""
+    from deckforge.plan.variants import _is_closing_pattern, _ranked_candidates
+
+    closing = [p for p in PROFILE.patterns if _is_closing_pattern(p, PROFILE)]
+    if not closing:
+        pytest.skip("в этом шаблоне последний слайд-пример не героический")
+    middle = SlideSpec(index=2, kind="section", headline="Дальше — цифры")
+    assert all(p not in closing for _k, p in _ranked_candidates(middle, PROFILE, Variant.dense))
+    last = SlideSpec(index=9, kind="section", headline="Спасибо, вопросы")
+    ranked_last = _ranked_candidates(last, PROFILE, Variant.dense, is_last=True)
+    assert any(p in closing for _k, p in ranked_last)
+
+
+def test_dense_stops_inheriting_a_layout_the_writer_chose_twice():
+    """Шесть слайдов из одиннадцати садились на slide21: выбор писателя
+    наследовался без штрафа за повтор."""
+    from deckforge.plan.variants import _EMPTY_HISTORY
+
+    chosen = next(p for p in PROFILE.patterns if p.kind == "bullets").pattern_id
+    slide = SlideSpec(index=3, kind="bullets", headline="Где уходит время", pattern_id=chosen,
+                      blocks=[BulletBlock(items=["а", "б", "в"])])
+    fresh = _choose_kind_and_pattern(slide, PROFILE, Variant.dense, history=_EMPTY_HISTORY)
+    assert fresh[1] == chosen
+    used = _EMPTY_HISTORY.with_choice(chosen).with_choice(chosen)
+    again = _choose_kind_and_pattern(slide, PROFILE, Variant.dense, history=used)
+    others = [p for p in PROFILE.patterns if p.kind == "bullets" and p.pattern_id != chosen]
+    if others:
+        assert again[1] != chosen
+
