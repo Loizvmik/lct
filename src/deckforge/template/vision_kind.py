@@ -244,6 +244,7 @@ import io
 import json
 import re
 import tempfile
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from pathlib import Path
@@ -686,3 +687,235 @@ def classify_patterns_by_vision(
     ]
     notes.extend(sorted(skip_notes))
     return result, notes
+
+
+# ---------------------------------------------------------------------------
+# Схема слотов раскладки: что это за место и что сюда писать
+# ---------------------------------------------------------------------------
+#
+# Роли слотов ставит код (`patterns._finalize_roles`) по геометрии и
+# кеглю. Кружок с номером шага и заголовок карточки для него одно и то же:
+# залитая фигура с короткой подписью. Три попытки различить их эвристикой
+# откачены (628e65c, комментарий у `compose.blocks._assign_cards`), потому
+# что разница не в геометрии, а в смысле, и видна она глазом. Модель
+# смотрит на превью слайда-примера один раз при разборе шаблона и
+# описывает каждое место. Разбор в пятиминутный бюджет генерации не входит,
+# так что цена здесь только во времени подготовки.
+#
+# Живёт в этом модуле, а не в отдельном: граница пакета `template/`
+# (`tests/template/test_architecture.py`) разрешает звать модель только
+# `naming.py` и `vision_kind.py`, и обе задачи этого модуля устроены
+# одинаково (картинка слайда-примера, закрытая форма ответа, код проверяет).
+
+SCHEMA_AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "pattern-schema" / "AGENT.md"
+
+# Роли без текста: в манифест для модели они не попадают, описывать там
+# нечего (картинку, таблицу и график код заполняет сам).
+_SCHEMA_SKIP_ROLES = frozenset({"image", "icon", "chart", "table"})
+
+# `ordinal` принимается, только если в примере на этом месте стоит
+# короткая метка («1», «02», «А») или пусто. Модель, назвавшая порядковым
+# номером место с фразой в примере, ошиблась, и довериться ей значило бы
+# навсегда запереть рабочий слот текстом шаблона.
+_ORDINAL_MAX_SAMPLE_CHARS = 3
+
+# Разумные пределы `max_words`: меньше одного слова не бывает, а больше
+# восьмидесяти на одно место слайда не пишут (это уже страница текста).
+# Число вне пределов значит, что модель не поняла вопрос, и поле
+# игнорируется целиком, а не обрезается до края.
+_MAX_WORDS_RANGE = (1, 80)
+
+# Длины текстовых полей ответа: одна фраза. Длиннее значит, что модель
+# пересказывает картинку, а писателю нужна подсказка, не абзац.
+_SCHEMA_TEXT_MAX_CHARS = 120
+
+# Стартовый бюджет ответа на один слайд. Ответ длиннее, чем у вида
+# раскладки (по пять полей на каждое место, мест до десятка), поэтому
+# бюджет выше `_TOKENS_PER_ITEM`, но ниже потолка эскалации провайдера
+# (`provider.yandex.MAX_TOKENS_BUDGET_CAP=6144`), иначе эскалация не
+# сделает ни шага (см. докстроку модуля, находка №2 второй попытки).
+_SCHEMA_MAX_TOKENS = 4096
+
+DEFAULT_SCHEMA_MAX_WORKERS = 8
+
+
+def _default_schema_max_workers() -> int:
+    try:
+        from deckforge.settings import Settings
+
+        return Settings.load(APP_YAML_PATH).llm.pattern_schema_max_workers
+    except Exception:
+        return DEFAULT_SCHEMA_MAX_WORKERS
+
+
+def _repeat_units(pattern) -> dict[int, int]:
+    """Номер единицы повтора для каждого слота, входящего в повтор:
+    индекс слота -> порядковый номер единицы вдоль оси (с нуля). Та же
+    нумерация, что у `compose.blocks._repeat_unit_coords`. Принимает и
+    `Pattern`, и его JSON-зеркало `PatternModel`: нужны только роли,
+    коробки и `repeat`."""
+    repeat = pattern.repeat
+    if repeat is None:
+        return {}
+    along = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
+    members = [i for i, s in enumerate(pattern.slots) if s.role in repeat.slot_roles]
+    coords = sorted({round(along(pattern.slots[i].box), 3) for i in members})
+    return {i: coords.index(round(along(pattern.slots[i].box), 3)) for i in members}
+
+
+def slot_manifest(pattern) -> list[dict]:
+    """То, что модель знает о местах раскладки. `index` — позиция слота в
+    `pattern.slots` плюс один (модели удобнее считать с единицы)."""
+    units = _repeat_units(pattern)
+    manifest = []
+    for i, slot in enumerate(pattern.slots):
+        if slot.role in _SCHEMA_SKIP_ROLES:
+            continue
+        b = slot.box
+        manifest.append({
+            "index": i + 1,
+            "role": slot.role,
+            "box": [round(b.left, 3), round(b.top, 3), round(b.width, 3), round(b.height, 3)],
+            "size_pt": round(slot.size_pt, 1),
+            "sample": (slot.sample_text or "").strip()[:_SCHEMA_TEXT_MAX_CHARS],
+            "repeat_unit": units.get(i),
+        })
+    return manifest
+
+
+def _clean_phrase(value) -> str | None:
+    if not isinstance(value, str):
+        return None
+    text = " ".join(value.split())
+    if not text or len(text) > _SCHEMA_TEXT_MAX_CHARS:
+        return None
+    return text
+
+
+def validate_slot_schema(pattern, answer: dict) -> tuple[dict[int, dict], list[str]]:
+    """Проверяет ответ модели по одному паттерну. Возвращает (индекс слота
+    с нуля -> принятые поля, заметки об отброшенном).
+
+    Модель предлагает, код проверяет: ключ, которого нет в манифесте,
+    отбрасывается целиком; поле с негодным значением игнорируется, а
+    остальные поля того же места принимаются."""
+    allowed = {item["index"]: item for item in slot_manifest(pattern)}
+    accepted: dict[int, dict] = {}
+    notes: list[str] = []
+    for key, entry in answer.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            notes.append(f"{pattern.pattern_id}: ключ {key!r} не номер места — отброшен.")
+            continue
+        if index not in allowed or not isinstance(entry, dict):
+            notes.append(f"{pattern.pattern_id}: места {key!r} нет в раскладке — отброшено.")
+            continue
+        slot = pattern.slots[index - 1]
+        fields: dict = {}
+        purpose = _clean_phrase(entry.get("purpose"))
+        if purpose is not None:
+            fields["purpose"] = purpose
+        hint = _clean_phrase(entry.get("content_hint"))
+        if hint is not None:
+            fields["content_hint"] = hint
+        words = entry.get("max_words")
+        if isinstance(words, int) and not isinstance(words, bool):
+            if _MAX_WORDS_RANGE[0] <= words <= _MAX_WORDS_RANGE[1]:
+                fields["max_words"] = words
+            else:
+                notes.append(f"{pattern.pattern_id}: место {index}: max_words={words} вне пределов — не принято.")
+        sample = (slot.sample_text or "").strip()
+        if entry.get("ordinal") is True:
+            if len(sample) <= _ORDINAL_MAX_SAMPLE_CHARS:
+                fields["ordinal"] = True
+            else:
+                notes.append(
+                    f"{pattern.pattern_id}: место {index}: «{sample[:30]}» слишком длинно для "
+                    "порядкового номера — ordinal не принят."
+                )
+        if entry.get("fixed") is True:
+            # Постоянный текст без текста не бывает: пустое место, объявленное
+            # неизменным, просто навсегда осталось бы пустым.
+            if sample:
+                fields["fixed"] = True
+            else:
+                notes.append(f"{pattern.pattern_id}: место {index} пусто в примере — fixed не принят.")
+        if fields:
+            accepted[index - 1] = fields
+    return accepted, notes
+
+
+def describe_pattern_slots(
+    patterns: list,
+    png_by_pattern: dict[str, bytes],
+    llm: VisionProvider | None,
+    *,
+    max_workers: int | None = None,
+) -> tuple[dict[str, dict[int, dict]], list[str]]:
+    """Схема слотов каждого паттерна по его превью. Возвращает
+    (`pattern_id` -> {индекс слота с нуля -> принятые поля}, заметки).
+    Первая заметка — сводка для провенанса, остальные — отказы.
+
+    Принимает и `Pattern`, и `PatternModel` (нужны только `pattern_id`,
+    слоты и `repeat`): полный разбор зовёт её на дата-классах, дозапрос
+    поверх кеш-хита — на зеркалах из кеша.
+
+    Никогда не бросает: без модели, без промпта, без превью паттерн
+    остаётся без схемы, разбор профиля продолжается, как и у вида
+    раскладки выше."""
+    if llm is None or not patterns:
+        return {}, []
+    try:
+        agent_body = _load_agent_prompt(SCHEMA_AGENT_PATH)
+    except (OSError, ValueError) as exc:
+        return {}, [f"Схема слотов не снималась: промпт не загрузился ({exc})."]
+
+    def _ask(pattern) -> tuple[str, dict[int, dict], list[str], bool]:
+        manifest = slot_manifest(pattern)
+        if not manifest:
+            return pattern.pattern_id, {}, [], False
+        png = png_by_pattern.get(pattern.pattern_id)
+        if png is None:
+            return pattern.pattern_id, {}, [f"{pattern.pattern_id}: превью нет — схема слотов не снималась."], False
+        payload = {"kind": pattern.kind, "slots": manifest}
+        prompt = f"{agent_body}\n\nСлужебные данные:\n{json.dumps(payload, ensure_ascii=False)}"
+        last_exc: Exception | None = None
+        for _attempt in range(_MAX_MODEL_ATTEMPTS):
+            try:
+                raw = llm.ask_image(png, prompt, max_tokens=_SCHEMA_MAX_TOKENS)
+                parsed = json.loads(_strip_markdown_fence(raw))
+            except Exception as exc:  # noqa: BLE001 — сеть/разбор пробуем ещё раз, не роняем профиль
+                last_exc = exc
+                continue
+            if not isinstance(parsed, dict):
+                last_exc = TypeError(f"модель вернула {type(parsed).__name__}, ожидался объект JSON")
+                continue
+            accepted, notes = validate_slot_schema(pattern, parsed)
+            return pattern.pattern_id, accepted, notes, True
+        return pattern.pattern_id, {}, [
+            f"{pattern.pattern_id}: схема слотов не получена после {_MAX_MODEL_ATTEMPTS} попыток ({last_exc})."
+        ], False
+
+    started = time.monotonic()
+    result: dict[str, dict[int, dict]] = {}
+    notes: list[str] = []
+    answered = 0
+    workers = max(1, max_workers if max_workers is not None else _default_schema_max_workers())
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for future in as_completed([pool.submit(_ask, p) for p in patterns]):
+            pattern_id, accepted, pattern_notes, ok = future.result()
+            answered += int(ok)
+            if accepted:
+                result[pattern_id] = accepted
+            notes.extend(pattern_notes)
+
+    described = sum(len(v) for v in result.values())
+    ordinals = sum(1 for v in result.values() for f in v.values() if f.get("ordinal"))
+    fixed = sum(1 for v in result.values() for f in v.values() if f.get("fixed"))
+    summary = (
+        f"Схема слотов: модель ответила по {answered} из {len(patterns)} паттернов за "
+        f"{time.monotonic() - started:.1f}с — описано мест: {described}, из них порядковых "
+        f"номеров: {ordinals}, постоянного текста: {fixed}."
+    )
+    return result, [summary, *sorted(notes)]

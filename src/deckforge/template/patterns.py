@@ -119,6 +119,24 @@ class PatternSlot:
     # слайда-примера — см. `_vertical_anchor`. Без него текст липнет к
     # верху высокой карточки, и три её четверти пустуют.
     anchor: str = "t"
+    # Схема места от модели (`vision_kind.describe_pattern_slots`), снятая
+    # один раз при разборе шаблона по превью слайда-примера. Геометрия не
+    # отличает кружок с номером шага от заголовка карточки, а глаз
+    # отличает. Без модели все поля пустые, и сборка идёт как раньше.
+    # `purpose`: что это за место («номер шага»); `content_hint`: что сюда
+    # писать; `max_words`: сколько слов помещается; `ordinal`: порядковый
+    # номер, текст примера остаётся; `fixed`: постоянный текст шаблона
+    # («Спасибо за внимание»), тоже остаётся как есть.
+    purpose: str | None = None
+    content_hint: str | None = None
+    max_words: int | None = None
+    ordinal: bool = False
+    fixed: bool = False
+
+    @property
+    def keeps_sample_text(self) -> bool:
+        """Место, куда содержание не кладётся: текст примера остаётся."""
+        return self.ordinal or self.fixed
 
 
 @dataclass(frozen=True)
@@ -1663,13 +1681,43 @@ def _lines_that_fit(slot: PatternSlot, canvas: Canvas) -> int:
     return max(1, int(height_in / line_height_in))
 
 
+# Средняя длина русского слова вместе с пробелом, знаков. Переводит
+# `PatternSlot.max_words` от модели в ту же единицу, что `max_chars`.
+CHARS_PER_WORD = 7
+
+_BODY_LIKE_ROLES = ("body", "card_body", "bullet")
+
+
+def slot_char_capacity(slot) -> int:
+    """Вместимость места в знаках с учётом схемы от модели: геометрия
+    меряет рамку, а модель видит, что в рамке под фразу пишут три слова
+    (подпись под иконкой шире своего смысла). Меньшее из двух. Принимает и
+    `PatternSlot`, и его JSON-зеркало из профиля."""
+    if slot.max_words:
+        return min(slot.max_chars, slot.max_words * CHARS_PER_WORD)
+    return slot.max_chars
+
+
+def chars_per_item(slots) -> int:
+    """`Capacity.max_chars_per_item`: самое ёмкое текстовое место под
+    содержание. Места с текстом примера (`keeps_sample_text`) не считаются:
+    содержание в них не ляжет. Одна функция на майнинг и на применение
+    схемы в `profile.py`, чтобы ранжир раскладок видел одно и то же число."""
+    return max(
+        (
+            slot_char_capacity(s) for s in slots
+            if s.role in _BODY_LIKE_ROLES and not (s.ordinal or s.fixed)
+        ),
+        default=0,
+    )
+
+
 def _capacity(
     content: list[ShapeRef], slots: list[PatternSlot], repeat: RepeatSpec | None, grid: Grid,
     canvas: Canvas,
 ) -> Capacity:
-    body_like_slots = [s for s in slots if s.role in ("body", "card_body", "bullet")]
-    body_like = [s.max_chars for s in body_like_slots]
-    max_chars_per_item = max(body_like, default=0)
+    body_like_slots = [s for s in slots if s.role in _BODY_LIKE_ROLES]
+    max_chars_per_item = chars_per_item(slots)
 
     # Сколько пунктов раскладка держит. Слоты с ролью "bullet" считаются
     # штучно — там каждый пункт лежит в своей рамке. Когда таких слотов нет,
