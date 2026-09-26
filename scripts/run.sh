@@ -7,9 +7,18 @@
 # Использование:
 #   ./scripts/run.sh
 #
+# Для постоянного запуска на арендованном сервере (а не разовой проверки)
+# используйте deploy/deckforge-api.service и deploy/deckforge-web.service
+# (systemd, production `next start`) — см. docs/DEPLOY.md. Этот скрипт как
+# был, так и остаётся удобством для разработки (`pnpm dev` — с hot reload).
+#
 # Переменные окружения (необязательные):
 #   API_PORT   — порт FastAPI (по умолчанию 8000)
 #   WEB_PORT   — порт Next.js (по умолчанию 3000)
+#   DECKFORGE_RELOAD — 1 включает `uvicorn --reload` (по умолчанию выключен:
+#     задача Z, найдено ненадёжным при долгом прогоне на сервере — не
+#     подхватывал часть правок и не восстанавливался сам после падения
+#     воркера; для разработки на своей машине включайте явно)
 #   YANDEX_API_KEY / YANDEX_FOLDER_ID — секреты модели (.env, см. .env.example);
 #     без них пайплайн работает запасными вариантами на каждом шаге, не падает.
 set -euo pipefail
@@ -45,9 +54,15 @@ trap cleanup EXIT INT TERM
 # это давно делает веб-часть (`pnpm dev`). 23 сентября 2026 несимметрия
 # стоила полудня: фиксы в Python лежали закоммиченными, сервер крутился со
 # старым кодом, прогоны через интерфейс их не видели, и выглядело это как
-# «починили, а ничего не изменилось».
+# «починили, а ничего не изменилось». Но на арендованном сервере (задача Z)
+# он не нужен (код там не правят между прогонами) и добавляет риск — по
+# умолчанию выключен, включайте через DECKFORGE_RELOAD=1.
+RELOAD_ARGS=()
+if [ "${DECKFORGE_RELOAD:-0}" = "1" ]; then
+  RELOAD_ARGS=(--reload --reload-dir src)
+fi
 echo "==> API: http://127.0.0.1:${API_PORT} (config/app.yaml)"
-uv run uvicorn deckforge.api.app:app --host 127.0.0.1 --port "$API_PORT" --reload --reload-dir src &
+uv run uvicorn deckforge.api.app:app --host 127.0.0.1 --port "$API_PORT" "${RELOAD_ARGS[@]}" &
 API_PID=$!
 
 echo "==> Веб-интерфейс: http://127.0.0.1:${WEB_PORT}"

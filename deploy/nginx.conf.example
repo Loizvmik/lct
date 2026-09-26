@@ -1,0 +1,42 @@
+# Пример конфига nginx для DeckForge на арендованном сервере (задача Z):
+# один внешний адрес (домен или голый IP на порту 80), `/api` уходит на
+# FastAPI (127.0.0.1:8000), всё остальное — на Next.js (127.0.0.1:3000).
+# Соответствует NEXT_PUBLIC_API_BASE="" при сборке web/ (см.
+# deploy/deckforge-web.service и docs/DEPLOY.md) — фронтенд ходит по
+# относительному "/api/...", тому же origin, без CORS.
+#
+# Установка:
+#   sudo cp deploy/nginx.conf.example /etc/nginx/sites-available/deckforge
+#   # замените server_name на реальный домен или IP
+#   sudo ln -s /etc/nginx/sites-available/deckforge /etc/nginx/sites-enabled/
+#   sudo nginx -t && sudo systemctl reload nginx
+
+server {
+    listen 80;
+    server_name _;
+
+    # /api/decks/{id}/export отдаёт готовые .pptx/.pdf — не крошечные, но и
+    # не гигантские (одна колода), 50m с запасом.
+    client_max_body_size 50m;
+
+    location /api/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # /api/jobs/{id}/events — SSE (текстовый поток прогресса задачи):
+        # буферизация nginx иначе держит события у себя и клиент видит их
+        # пачкой в конце вместо потока.
+        proxy_buffering off;
+        proxy_read_timeout 600s;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}

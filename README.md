@@ -10,7 +10,8 @@
 Дальше: [SPEC.md](docs/SPEC.md) — условия задачи, ссылки и уточнения организаторов,
 [ARCHITECTURE.md](docs/ARCHITECTURE.md) — пайплайн и границы слоёв,
 [MODELS.md](docs/MODELS.md) — модели и почему выбраны именно они,
-[AUDIT.md](docs/AUDIT.md) — все 35 проверок аудита.
+[AUDIT.md](docs/AUDIT.md) — все 35 проверок аудита,
+[DEPLOY.md](docs/DEPLOY.md) — развёртывание на арендованном сервере с Ubuntu (защита ЛЦТ).
 
 ## Требования
 
