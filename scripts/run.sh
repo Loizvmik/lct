@@ -57,12 +57,15 @@ trap cleanup EXIT INT TERM
 # «починили, а ничего не изменилось». Но на арендованном сервере (задача Z)
 # он не нужен (код там не правят между прогонами) и добавляет риск — по
 # умолчанию выключен, включайте через DECKFORGE_RELOAD=1.
-RELOAD_ARGS=()
+# Пустой массив под `set -u` в bash 3.2 (macOS) считается несвязанной
+# переменной, поэтому флаг собирается строкой, а не массивом.
+RELOAD_ARGS=""
 if [ "${DECKFORGE_RELOAD:-0}" = "1" ]; then
-  RELOAD_ARGS=(--reload --reload-dir src)
+  RELOAD_ARGS="--reload --reload-dir src"
 fi
 echo "==> API: http://127.0.0.1:${API_PORT} (config/app.yaml)"
-uv run uvicorn deckforge.api.app:app --host 127.0.0.1 --port "$API_PORT" "${RELOAD_ARGS[@]}" &
+# shellcheck disable=SC2086
+uv run uvicorn deckforge.api.app:app --host 127.0.0.1 --port "$API_PORT" $RELOAD_ARGS &
 API_PID=$!
 
 echo "==> Веб-интерфейс: http://127.0.0.1:${WEB_PORT}"
