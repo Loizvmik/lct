@@ -24,7 +24,7 @@ from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.report import AuditReport
 from deckforge.audit.visual import run_visual
-from deckforge.compose.builder import build_deck, count_embedded_photos
+from deckforge.compose.builder import LADDER_TITLES, build_deck, count_embedded_photos, ladder_counts
 from deckforge.pattern.intent import intents_from_outline
 from deckforge.plan.contracts import plan_contracts
 from deckforge.plan.outline import build_outline, load_content_pack, outline_to_dict
@@ -32,6 +32,7 @@ from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_ph
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import GenerationStyle, Variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.workflow.repair import repairer_for
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
@@ -350,7 +351,12 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
     out.append(f"  режим: {mode.value} (точка after_write, осталось {budget.remaining():.0f}с)")
 
     step_started = time.monotonic()
-    built_path = build_deck(deck, profile, args.template, variant, user_photos=ctx["user_photos"])
+    # Лестница сборки (задача U): слайд, чей клон отклонён, сперва чинится
+    # текстом под контракт раскладки, модель зовёт починка, не сборка.
+    repairer = repairer_for(
+        budget, profile, _build_role_provider("writer"), ctx["sources"], variant, total=len(deck.slides),
+    )
+    built_path = build_deck(deck, profile, args.template, variant, user_photos=ctx["user_photos"], repair=repairer)
     built_at = time.monotonic()
     path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-t13.pptx"
     shutil.copy2(built_path, path)
@@ -373,6 +379,11 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
         f"сборка {built_at - step_started:.1f}с, аудит {audited_at - built_at:.1f}с"
     )
     out.append(f"  раскладки: {', '.join(s.pattern_id or '-' for s in deck.slides)}")
+    rungs = ladder_counts(deck)
+    out.append(
+        "  лестница сборки: " + ", ".join(f"{LADDER_TITLES[r]} {n}" for r, n in rungs.items())
+        + f" (вызовов модели на сокращение {repairer.calls}, принято {repairer.accepted})"
+    )
     # Сводка верности шаблону на вариант; печать, не решение пайплайна, и
     # она не должна ронять генерацию.
     try:

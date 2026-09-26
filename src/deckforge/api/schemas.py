@@ -83,6 +83,9 @@ class JobResponse(BaseModel):
     # другую раскладку» (`Finding.repair == "structural"`), автопочинка их
     # не трогает.
     structural: dict[str, list[dict]] | None = None
+    # Задача U: по вариантам сколько слайдов какой ступенью лестницы сборки
+    # собрано (клон, запасная раскладка, сокращение, разбиение, с нуля).
+    ladder: dict[str, dict[str, int]] | None = None
 
 
 class FindingModel(BaseModel):

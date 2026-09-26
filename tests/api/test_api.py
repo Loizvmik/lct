@@ -60,6 +60,17 @@ def test_one_job_returns_one_presentation_of_its_style(client: TestClient, deck_
     assert budget["shared_stages"] == {"parse": "переиспользовано"}
     assert [e["checkpoint"] for e in budget["mode_history"]] == ["after_outline", "after_write", "after_compose"]
 
+def test_snapshot_counts_slides_per_build_ladder_rung(job_result: dict) -> None:
+    """Задача U: в снимке задания сколько слайдов какой ступенью лестницы
+    собрано; после задачи Q задание несёт один стиль, и счётчик один."""
+    ladder = job_result["ladder"]
+    assert set(ladder) == {job_result["style"]}
+    for counts in ladder.values():
+        assert list(counts) == ["clone", "adapt", "shorten", "split", "scratch"]
+        assert sum(counts.values()) >= 10
+
+
+def test_three_variants_are_returned(client: TestClient, deck_id: str) -> None:
     response = client.get(f"/api/decks/{deck_id}/variants")
     assert response.status_code == 200, response.text
     variants = response.json()

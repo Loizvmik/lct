@@ -174,7 +174,10 @@ def _parse_slide(data: dict, contract: SlideContract) -> SlideSpec:
     data = {k: v for k, v in data.items() if k != "layout_id"}
     data["kind"] = contract.kind
     slide = slide_spec_from_dict(data, contract.slide_id)
-    return replace(slide, pattern_id=contract.pattern_id, blocks=[_clean_block(b) for b in slide.blocks])
+    return replace(
+        slide, pattern_id=contract.pattern_id, alternatives=contract.alternatives,
+        blocks=[_clean_block(b) for b in slide.blocks],
+    )
 
 
 _MARKUP_RE = re.compile(r"\*\*|__")
@@ -291,7 +294,54 @@ def _ask_repair(
 
 
 def _answer_view(slide: SlideSpec) -> dict:
-    return {k: v for k, v in slide_spec_to_dict(slide).items() if k not in ("index", "findings", "pattern_id", "kind")}
+    hidden = ("index", "findings", "pattern_id", "kind", "alternatives")
+    return {k: v for k, v in slide_spec_to_dict(slide).items() if k not in hidden}
+
+
+def shorten_to_contract(
+    slide: SlideSpec, contract: SlideContract, llm: LLMProvider, sources: list[SourceDoc], problems: list[str],
+    *, total: int = 0, style: str | None = None,
+) -> SlideSpec | None:
+    """Структурная починка (раздел 13.2, ступень 3 лестницы сборки): клон
+    раскладки отклонил текст на реальных метриках шрифта, и модель один раз
+    переписывает слайд под контракт этого места. Тот же ремонтный вызов,
+    что после письма (`_ask_repair`), через тот же общий предел
+    одновременных вызовов (`_MODEL_SLOTS`), поэтому починка трёх стилей не
+    упирается в 429.
+
+    `problems`: почему сборка отклонила клон, плюс нарушения контракта,
+    если текст его и так нарушал. Флаг `layout_rejected` в запросе говорит
+    модели, что в пределы контракта надо уложиться с запасом.
+
+    Возвращает слайд с той же раскладкой, запасными, фото и заметками, или
+    `None`: модель не ответила, ответ не прошёл схему или не стал ближе к
+    контракту."""
+    _meta, prompt_body = _load_agent_prompt(AGENT_PATH_WRITER)
+    source_text = "\n\n".join(f"### {s.name}\n{s.text}" for s in sources)
+    payload = {
+        "contract": contract.to_prompt(),
+        "sources": source_text,
+        "position": {"index": contract.slide_id, "total": total},
+        "layout_rejected": True,
+    }
+    if style:
+        payload["style"] = style
+    before = contract_problems(slide, contract)
+    repaired, _reason = _ask_repair(
+        prompt_body, payload, contract, llm, _answer_view(slide), [*problems, *before],
+    )
+    if repaired is None or slide_spec_problems(repaired):
+        return None
+    after = contract_problems(repaired, contract)
+    if before and len(after) >= len(before):
+        return None
+    repaired = _with_photo(repaired, contract)
+    visual = repaired.visual if repaired.visual is not None else slide.visual
+    return replace(
+        repaired, index=slide.index, pattern_id=slide.pattern_id, alternatives=slide.alternatives,
+        visual=visual, speaker_notes=repaired.speaker_notes or slide.speaker_notes,
+        source_note=repaired.source_note or slide.source_note,
+    )
 
 
 def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> SlideSpec:
@@ -322,6 +372,7 @@ def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> Sl
     return SlideSpec(
         index=contract.slide_id, kind=contract.kind, headline=headline, blocks=blocks,
         source_note=source_note, findings=[finding], pattern_id=contract.pattern_id,
+        alternatives=contract.alternatives,
         speaker_notes="Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
     )
 
@@ -329,7 +380,7 @@ def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> Sl
 def _divider_slide(contract: SlideContract) -> SlideSpec:
     return SlideSpec(
         index=contract.slide_id, kind=contract.kind, headline=contract.divider_label or "",
-        pattern_id=contract.pattern_id,
+        pattern_id=contract.pattern_id, alternatives=contract.alternatives,
     )
 
 
@@ -489,7 +540,8 @@ def _repick_changed(deck: DeckSpec, profile, style: str) -> DeckSpec:
         if pid is None:
             continue
         kind = next(p.kind for p in profile.patterns if p.pattern_id == pid)
-        slides[i] = replace(slide, pattern_id=pid, kind=kind)
+        # Запасные планировщика были того вида, который слайд потерял.
+        slides[i] = replace(slide, pattern_id=pid, kind=kind, alternatives=())
         ids[i] = pid
     return replace(deck, slides=slides)
 
