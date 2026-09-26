@@ -31,12 +31,13 @@ from deckforge.plan.outline import build_outline, load_content_pack, outline_to_
 from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import GenerationStyle, Variant
-from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
+from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, WriteClock, write_slides
 from deckforge.workflow.repair import repairer_for
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
 from deckforge.render.soffice import to_pngs
+from deckforge.provider.scheduler import ScheduledProvider, default_scheduler
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
 from deckforge.workflow.budget import RunBudget, load_policy
@@ -239,7 +240,12 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     outline_path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__outline.json"
     outline_path.write_text(json.dumps(outline_to_dict(outline), ensure_ascii=False, indent=2), encoding="utf-8")
-    writer_max_workers = args.writer_max_workers if args.writer_max_workers is not None else _writer_max_workers()
+    # Пул писателя не меньше лимита планировщика (задача W): одному стилю
+    # достаются все слоты, трём стилям очередь делит их по остатку бюджета.
+    writer_max_workers = (
+        args.writer_max_workers if args.writer_max_workers is not None
+        else max(_writer_max_workers(), default_scheduler().limit)
+    )
 
     # Общие стадии позади. Первая контрольная точка каждого прогона, дальше
     # стили идут параллельно, каждый целиком (раскладки, текст, сборка,
@@ -278,6 +284,14 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             f"  [{style.value}] {part['elapsed_seconds']:.1f}с из {part['budget_seconds']:.0f}с ({verdict}), "
             f"режим {part['mode']}, по стадиям: {part['stage_seconds']}{reused}"
         )
+        print(
+            f"    вызовов модели {part['model_calls']}, ожидание очереди {part['queue_wait_seconds']:.0f}с, "
+            f"по ролям: {part['calls_by_role']}"
+        )
+        if part["time_skipped"]:
+            print(f"    пропущено по времени: {part['time_skipped']}")
+        if part["warnings"]:
+            print(f"    потолок бюджета: {'; '.join(part['warnings'])}")
     print(
         "\nПолный аудит по картинке всех слайдов (C01-C11) запускается отдельно на "
         "готовом .pptx:\n"
@@ -332,10 +346,24 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
         f"{unique} разных на {len(assignments)} слайдов"
     )
 
-    deck = write_slides(
-        ctx["outline"], contracts, ctx["sources"], profile, _build_role_provider("writer"),
-        max_workers=ctx["writer_max_workers"], agent_max_steps=_writer_agent_max_steps(), style=variant,
+    # Задача W: писатель в бюджете стиля, те же отметки, что у задания API.
+    policy = budget.policy
+    clock = WriteClock(
+        deadline=budget.deadline_at(reserve=policy.compose_export_reserve_seconds),
+        call_seconds=lambda: budget.median_call_seconds("writer", policy.writer_call_seconds),
+        cutoff=budget.deadline_at(reserve=policy.export_reserve_seconds),
     )
+    writer = _build_role_provider("writer")
+    if writer is not None:
+        writer = ScheduledProvider(writer, role="writer", budget=budget, reserve=policy.compose_export_reserve_seconds)
+    deck = write_slides(
+        ctx["outline"], contracts, ctx["sources"], profile, writer,
+        max_workers=ctx["writer_max_workers"], agent_max_steps=_writer_agent_max_steps(), style=variant,
+        clock=clock,
+    )
+    late = int(deck.meta.get("time_fallbacks", "0") or 0)
+    if late:
+        budget.warn(f"{late} слайд(ов) собраны запасным вариантом: время на текст вышло")
     written_at = time.monotonic()
     budget.record("write", written_at - planned_at)
     meta = deck.meta

@@ -86,6 +86,11 @@ class JobResponse(BaseModel):
     # Задача U: по вариантам сколько слайдов какой ступенью лестницы сборки
     # собрано (клон, запасная раскладка, сокращение, разбиение, с нуля).
     ladder: dict[str, dict[str, int]] | None = None
+    # Задача W: итог готового задания ("done" или "done_with_warnings",
+    # если сработал жёсткий потолок бюджета) и перечень того, что сделано
+    # запасным путём. `status` при этом "done": интерфейс ждёт ровно его.
+    outcome: Literal["done", "done_with_warnings"] | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 class FindingModel(BaseModel):
