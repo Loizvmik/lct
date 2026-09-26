@@ -185,6 +185,64 @@ _COLLAGE_GAP_PX = 6
 _COLLAGE_LABEL_HEIGHT_PX = 18
 
 
+SlideScore = dict[str, "int | str"]
+"""Оценки одного слайда по PPTEval: подмножество ключей `content`/`design`
+(int 1-5) и `why` (str, одна фраза) — какие из них реально пришли валидными
+в ответе модели, те и есть; `_parse_scores` тихо отбрасывает остальное
+(докстрока `_parse_scores`), поэтому ловить отсутствие ключа нужно через
+`.get`, не через прямой индекс."""
+
+DeckScore = dict[str, "int | str"]
+"""То же самое, но для колоды целиком: ключи `coherence` (int 1-5) и `why`."""
+
+_SLIDE_SCORE_NUM_KEYS: tuple[str, ...] = ("content", "design")
+_DECK_SCORE_NUM_KEYS: tuple[str, ...] = ("coherence",)
+
+
+def _parse_scores(raw_scores: object, num_keys: tuple[str, ...]) -> dict[str, int | str] | None:
+    """Оценки PPTEval — необязательная надстройка над да/нет-вопросами
+    (задача G, бриф: «оценки необязательные, вне диапазона отбрасываются,
+    ошибки не роняют аудит»). В отличие от `_parse_answer` эта функция
+    НИКОГДА не бросает исключение — она часть того же ответа модели, что и
+    C01-C11, и не должна превращать валидный (для да/нет-вопросов) ответ в
+    находку `C00` только из-за того, что модель поставила оценку вне
+    диапазона 1-5 или написала `why` не строкой. Возвращает `None`, если ни
+    одного валидного поля не нашлось — вызывающий код тогда просто не
+    записывает оценку за эту единицу (слайд/колоду), как и было бы, если
+    бы модель вовсе не прислала `scores`."""
+    if not isinstance(raw_scores, dict):
+        return None
+    out: dict[str, int | str] = {}
+    for key in num_keys:
+        value = raw_scores.get(key)
+        if isinstance(value, bool):
+            continue  # bool — подкласс int в Python, но это не оценка 1-5
+        if isinstance(value, int) and 1 <= value <= 5:
+            out[key] = value
+    why = raw_scores.get("why")
+    if isinstance(why, str) and why.strip():
+        out["why"] = why.strip()
+    return out or None
+
+
+def _extract_scores(raw: str | None, num_keys: tuple[str, ...]) -> dict[str, int | str] | None:
+    """Достаёт `data["scores"]` из сырого ответа модели независимо от
+    `_parse_answer` (см. её докстроку про C01-C11) — тот же сырой текст
+    несёт оба: обязательные да/нет-ключи и необязательный `scores`. Любая
+    ошибка разбора здесь (не JSON, не объект) молча даёт `None` — оценки не
+    обязаны быть в ответе, а C00 за них уже не начисляется (это сделала бы
+    `_parse_answer`, если бы упала на обязательных ключах)."""
+    if raw is None:
+        return None
+    try:
+        data = json.loads(_strip_markdown_fence(raw))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    return _parse_scores(data.get("scores"), num_keys)
+
+
 @dataclass
 class VisualAuditResult:
     """Результат визуального аудита колоды — обёртка над `list[Finding]`,
@@ -202,6 +260,17 @@ class VisualAuditResult:
     slides_checked: int = 0
     model_calls: int = 0
     elapsed_seconds: float = 0.0
+    # Задача G (PPTEval: Content/Design/Coherence 1-5 с обоснованием) —
+    # необязательная надстройка поверх C01-C11: слайд, за который модель не
+    # прислала валидную оценку (докстрока `_parse_scores`), просто не несёт
+    # записи в `slide_scores`, `deck_score` остаётся `None`, а средние —
+    # `None`, если считать не по чему. Пустая надстройка не портит основной
+    # результат (`findings`/`skipped_reason`) — те же гарантии, что и у
+    # самого визуального аудита при недоступности модели.
+    slide_scores: dict[int, "SlideScore"] = field(default_factory=dict)
+    deck_score: "DeckScore | None" = None
+    content_avg: float | None = None
+    design_avg: float | None = None
 
     def __iter__(self):
         return iter(self.findings)
@@ -441,7 +510,13 @@ def _ask_and_parse_with_retry(
     ответа) по одному и тому же запросу — первый успешный разбор
     возвращается сразу, последняя ошибка/сырой ответ возвращаются, только
     если ВСЕ попытки не удались (вызывающий код превращает их в один
-    `Finding(check_id="C00")`, не в один на попытку)."""
+    `Finding(check_id="C00")`, не в один на попытку).
+
+    Сырой текст ответа (`raw`) возвращается ВСЕГДА, когда модель хоть
+    что-то ответила — не только при неудаче. Это нужно задаче G (оценки
+    PPTEval, `_extract_scores`): `scores` лежит в том же JSON-объекте, что и
+    C01-C11, и вызывающему коду нужен сырой текст успешного ответа тоже, а
+    не только текст ответа, который не прошёл валидацию схемой."""
     last_exc: Exception | None = None
     last_raw: str | None = None
     for _attempt in range(_MAX_MODEL_ATTEMPTS):
@@ -451,36 +526,38 @@ def _ask_and_parse_with_retry(
             last_exc, last_raw = exc, None
             continue
         try:
-            return _parse_answer(raw, expected_keys), None, None
+            return _parse_answer(raw, expected_keys), None, raw
         except Exception as exc:  # noqa: BLE001 — см. докстроку модуля, "Невалидный ответ модели — находка, не исключение"
             last_exc, last_raw = exc, raw
     return None, last_exc, last_raw
 
 
 def _run_one_slide(vlm, agent_body: str, index: int, total: int, spec: DeckSpec,
-                    png_path: Path, slide: SlideSpec, pairs: list, source_text: str) -> list[Finding]:
+                    png_path: Path, slide: SlideSpec, pairs: list, source_text: str,
+                    ) -> tuple[list[Finding], "SlideScore | None"]:
     prompt = _build_slide_prompt(agent_body, index, total, spec, slide, pairs, source_text)
     png_bytes = Path(png_path).read_bytes()
     answers, exc, raw = _ask_and_parse_with_retry(
         lambda: vlm.ask_image(png_bytes, prompt, max_tokens=_PER_SLIDE_MAX_TOKENS), PER_SLIDE_CHECK_IDS,
     )
     if answers is None:
-        return [_malformed_finding(index, exc, raw)]
-    return _findings_from_answers(index, answers)
+        return [_malformed_finding(index, exc, raw)], None
+    return _findings_from_answers(index, answers), _extract_scores(raw, _SLIDE_SCORE_NUM_KEYS)
 
 
-def _run_deck_level(vlm, agent_body: str, spec: DeckSpec, pngs: list[Path], pairs: list) -> list[Finding]:
+def _run_deck_level(vlm, agent_body: str, spec: DeckSpec, pngs: list[Path], pairs: list,
+                     ) -> tuple[list[Finding], "DeckScore | None"]:
     try:
         collage = _build_collage(pngs)
     except Exception as exc:  # noqa: BLE001 — сборка коллажа сама (не сеть) не должна обрывать остальной аудит
-        return [_malformed_finding(None, exc, None)]
+        return [_malformed_finding(None, exc, None)], None
     prompt = _build_deck_prompt(agent_body, spec, pairs)
     answers, exc, raw = _ask_and_parse_with_retry(
         lambda: vlm.ask_image(collage, prompt, max_tokens=_DECK_LEVEL_MAX_TOKENS), DECK_LEVEL_CHECK_IDS,
     )
     if answers is None:
-        return [_malformed_finding(None, exc, raw)]
-    return _findings_from_answers(None, answers)
+        return [_malformed_finding(None, exc, raw)], None
+    return _findings_from_answers(None, answers), _extract_scores(raw, _DECK_SCORE_NUM_KEYS)
 
 
 def run_visual(
@@ -529,6 +606,8 @@ def run_visual(
     total = len(pairs)
 
     findings: list[Finding] = []
+    slide_scores: dict[int, SlideScore] = {}
+    deck_score: DeckScore | None = None
     calls = 0
 
     if total:
@@ -541,14 +620,34 @@ def run_visual(
             }
             for future in as_completed(futures):
                 calls += 1
-                findings.extend(future.result())
+                slide_index = futures[future]
+                slide_findings, slide_score = future.result()
+                findings.extend(slide_findings)
+                if slide_score is not None:
+                    slide_scores[slide_index] = slide_score
 
         calls += 1
-        findings.extend(_run_deck_level(vlm, agent_body, spec, pngs, pairs))
+        deck_findings, deck_score = _run_deck_level(vlm, agent_body, spec, pngs, pairs)
+        findings.extend(deck_findings)
 
     findings.sort(key=lambda f: (f.slide_index if f.slide_index is not None else -1, f.check_id, f.message))
 
     return VisualAuditResult(
         findings=findings, skipped_reason=None, slides_checked=total,
         model_calls=calls, elapsed_seconds=time.monotonic() - started,
+        slide_scores=slide_scores, deck_score=deck_score,
+        content_avg=_axis_average(slide_scores, "content"),
+        design_avg=_axis_average(slide_scores, "design"),
     )
+
+
+def _axis_average(slide_scores: dict[int, "SlideScore"], axis: str) -> float | None:
+    """Среднее по оси (`content`/`design`) среди слайдов, которые реально
+    получили валидную оценку этой оси — не среди ВСЕХ слайдов колоды: часть
+    слайдов может остаться без оценки (ответ модели не прислал `scores`,
+    докстрока `_parse_scores`), и делить сумму на общее число слайдов
+    занизило бы среднее теми, кто вообще не участвовал в оценке."""
+    values = [s[axis] for s in slide_scores.values() if isinstance(s.get(axis), int)]
+    if not values:
+        return None
+    return sum(values) / len(values)
