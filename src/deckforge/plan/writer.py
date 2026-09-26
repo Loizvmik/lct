@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import json
 import re
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
@@ -137,13 +138,23 @@ def _run_tool_call(call: dict, profile, contract: SlideContract, source_text: st
     return {"error": f"неизвестный инструмент {name!r}, доступны: {', '.join(_TOOL_NAMES)}"}
 
 
+# Одновременных вызовов писателя на весь процесс, у всех стилей вместе.
+# С задачи P три стиля пишут текст параллельно, каждый своим пулом; живой
+# прогон 27 сентября 2026 (VK Education, 3 стиля по 4 потока) получил 429
+# Too Many Requests на восьми слайдах visual из двенадцати, и они ушли в
+# запасной вариант. Очередь за общим пределом дешевле запасного слайда.
+WRITER_GLOBAL_CONCURRENCY = 6
+_MODEL_SLOTS = threading.BoundedSemaphore(WRITER_GLOBAL_CONCURRENCY)
+
+
 def _complete(llm: LLMProvider, messages: list[dict], schema: dict, max_tokens: int) -> str:
     """Вызов модели с поднятым потолком бюджета; провайдер без `budget_cap`
     (тестовые заглушки) зовётся по-старому."""
-    try:
-        return llm.complete(messages, schema=schema, max_tokens=max_tokens, budget_cap=WRITER_BUDGET_CAP)
-    except TypeError:
-        return llm.complete(messages, schema=schema, max_tokens=max_tokens)
+    with _MODEL_SLOTS:
+        try:
+            return llm.complete(messages, schema=schema, max_tokens=max_tokens, budget_cap=WRITER_BUDGET_CAP)
+        except TypeError:
+            return llm.complete(messages, schema=schema, max_tokens=max_tokens)
 
 
 def _why(exc: BaseException) -> str:
@@ -174,7 +185,10 @@ def _write_with_agent_loop(
     модель вправе ответить вызовом инструментов; любой другой объект
     трактуется как финальный слайд. Возвращает `(слайд, причина_отказа)`."""
     conversation: list[dict] = []
-    for step in range(1, max(1, max_steps) + 1):
+    grace_used = False
+    step = 0
+    while step < max(1, max_steps):
+        step += 1
         is_final_step = step >= max_steps
         turn_payload = dict(payload)
         if is_final_step and max_steps > 1:
@@ -206,6 +220,18 @@ def _write_with_agent_loop(
             ]
             conversation.append({"role": "assistant", "content": raw})
             conversation.append({"role": "user", "content": json.dumps({"tool_results": results}, ensure_ascii=False)})
+            continue
+        if is_final_step and isinstance(tool_calls, list) and tool_calls and not grace_used:
+            # Модель на последнем шаге всё равно позвала инструмент (живой
+            # прогон 27 сентября 2026: слайд ушёл в запасной вариант с
+            # «неизвестные поля ['tool_calls']»). Один добавочный круг с
+            # прямым отказом дешевле запасного слайда.
+            grace_used = True
+            step -= 1
+            conversation.append({"role": "assistant", "content": raw})
+            conversation.append({"role": "user", "content": json.dumps(
+                {"error": "инструменты больше недоступны, пришли финальный JSON слайда"}, ensure_ascii=False,
+            )})
             continue
         try:
             return _parse_slide(data, contract), None

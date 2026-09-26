@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from deckforge.pattern.forms import FormPart, Limit, list_item_limit, pattern_form
+from deckforge.pattern.forms import MIN_HEADLINE_CHARS, FormPart, Limit, list_item_limit, pattern_form
 from deckforge.pattern.style import load_style
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 
@@ -147,9 +147,11 @@ def _headline_spec(form) -> TextSpec:
     limit = form.headline
     # Предел в словах без предела знаков у заголовка встречается у схемы
     # от модели; ниже трёх слов вывод не сформулировать.
-    return TextSpec(
-        target_words=max(2, limit.target_words), max_words=max(3, limit.max_words), max_chars=limit.max_chars,
-    )
+    # Предел ниже `MIN_HEADLINE_CHARS` поднимается до него: вывод короче
+    # не написать, а раскладки с такой рамкой планировщик и так штрафует
+    # (`scoring.short_headline`), сюда они попадают только без выбора.
+    chars = max(limit.max_chars, MIN_HEADLINE_CHARS) if limit.max_chars else 0
+    return TextSpec(target_words=max(2, limit.target_words), max_words=max(3, limit.max_words), max_chars=chars)
 
 
 def _slot(part: FormPart, count: int, *, required: bool = True) -> SlotContract:

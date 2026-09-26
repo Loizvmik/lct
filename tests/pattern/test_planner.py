@@ -163,3 +163,15 @@ def test_intent_items_come_from_the_outline_first():
     intents = intents_from_outline(outline)
     assert [i.items for i in intents] == [0, 4, 2, 4]
     assert isinstance(intents[0], SlideIntent) and intents[0].is_hero
+
+
+def test_a_headline_frame_too_short_for_a_conclusion_loses_to_a_normal_one():
+    """Рамка заголовка на 9 знаков (подпись у VK Education): писатель
+    заведомо нарушит контракт, раскладка берётся, только если другой нет."""
+    tiny = bullets("tiny", source=30)
+    tiny.slots[0] = headline(max_chars=9)
+    prof = profile(section("cover", source=1), tiny, bullets("normal", source=31), section("end", source=90))
+
+    plan = plan_patterns(_outline(["title", "problem", "closing"]), prof, "dense")
+
+    assert plan[1].pattern_id == "normal"

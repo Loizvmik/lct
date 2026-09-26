@@ -394,3 +394,21 @@ def test_cover_and_closing_slides_are_never_dropped():
 def test_short_decks_are_left_alone():
     slides = _deck_with_repeated_fact()[:4]
     assert _drop_thin_duplicates(slides) is slides
+
+
+def test_a_tool_call_on_the_final_step_gets_one_more_turn_not_a_fallback(PROFILE):
+    """Живой прогон 27 сентября 2026: модель на последнем шаге снова позвала
+    инструмент, и слайд ушёл в запасной вариант."""
+    outline = _outline(3)
+    contracts = _contracts(PROFILE, outline)
+
+    class _Stubborn(LLMProvider):
+        def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+            payload = json.loads(messages[1]["content"])
+            if len(messages) <= 4:
+                return json.dumps({"tool_calls": [{"tool": "check_number", "args": {"query": "1"}}]})
+            return json.dumps(_compliant_answer(payload["contract"]), ensure_ascii=False)
+
+    deck = write_slides(outline, contracts, [], PROFILE, llm=_Stubborn(), max_workers=1)
+
+    assert not any("запасным вариантом" in f for s in deck.slides for f in s.findings)

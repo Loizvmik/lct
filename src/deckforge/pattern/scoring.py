@@ -19,7 +19,7 @@ from __future__ import annotations
 import math
 
 from deckforge.pattern.candidates import capacity_units
-from deckforge.pattern.forms import PatternForm, list_item_limit
+from deckforge.pattern.forms import MIN_HEADLINE_CHARS, PatternForm, list_item_limit
 from deckforge.pattern.intent import SlideIntent
 from deckforge.pattern.style import StylePolicy
 
@@ -51,6 +51,15 @@ def overflow(intent: SlideIntent, form: PatternForm, style: StylePolicy) -> floa
     floor = style.min_words_per_item
     word_gap = max(0.0, (floor - per_unit) / floor) if per_unit and floor else 0.0
     return unit_gap + word_gap
+
+
+def short_headline(form: PatternForm) -> float:
+    """0..1: насколько рамка заголовка примера короче заголовка-вывода.
+    Такую раскладку можно взять, но писатель заголовок в неё не уложит."""
+    limit = form.headline
+    if limit is None or not limit.max_chars:
+        return 0.0
+    return max(0.0, (MIN_HEADLINE_CHARS - limit.max_chars) / MIN_HEADLINE_CHARS)
 
 
 def matches(token: str, form: PatternForm) -> bool:
@@ -106,6 +115,7 @@ def static_cost(
     cost = w("overflow") * overflow(intent, form, style)
     cost += w("style_mismatch") * style_mismatch(intent, form, style)
     cost += w("density_mismatch") * density_mismatch(pattern, style)
+    cost += w("short_headline") * short_headline(form)
     cost -= w("pattern_quality") * float(pattern.score)
     cost -= w("decor") * style.decor_weight * decor_richness(form)
     if (
