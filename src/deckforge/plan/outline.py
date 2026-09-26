@@ -15,6 +15,7 @@ prompt` там). Код здесь читает файл, вызывает мо�
 падение (тот же принцип, что и у `name_palette_roles_report`)."""
 from __future__ import annotations
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +23,8 @@ from pathlib import Path
 import yaml
 
 from deckforge.provider.base import LLMProvider
+
+logger = logging.getLogger(__name__)
 
 AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "outline-writer" / "AGENT.md"
 
@@ -79,6 +82,8 @@ class Outline:
     slides: list[OutlineSlide]
     title: str = ""
     language: str = "ru"
+    generation_origin: str = "model"
+    generation_error: str | None = None
 
 
 class OutlineGenerationError(RuntimeError):
@@ -126,41 +131,75 @@ def _clamp_target(target_slides: int | None, brief: str = "", sources: list[Sour
     return max(MIN_SLIDES, min(MAX_SLIDES, n))
 
 
-def _fallback_outline(n: int) -> list[OutlineSlide]:
+def _fallback_intents(title: str, brief: str, sources: list[SourceDoc]) -> list[str]:
+    """Extract concrete, source-backed topics for the deterministic outline.
+
+    The previous fallback used internal labels such as ``Тема и цель
+    презентации``.  Those labels were deliberately rejected later by the
+    coverage validator, so a provider hiccup guaranteed a second failure.
+    Fallback headings now come from the user's own title and materials.
+    """
+    material = "\n".join([brief, *(source.text for source in sources)])
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[\n.!?]+", material):
+        value = re.sub(r"^\s*(?:[-•–—]|\d+[.)])\s*", "", raw)
+        value = " ".join(value.split()).strip(" —–-:;")
+        if len(value) < 12:
+            continue
+        if len(value) > 96:
+            shortened = value[:96].rsplit(" ", 1)[0]
+            value = (shortened or value[:96]).rstrip(" ,:;")
+        key = value.casefold()
+        if key not in seen:
+            seen.add(key)
+            candidates.append(value)
+    if title.strip():
+        candidates.insert(0, title.strip())
+    return candidates
+
+
+def _fallback_outline(
+    n: int, *, title: str = "", brief: str = "", sources: list[SourceDoc] | None = None,
+) -> list[OutlineSlide]:
     """Детерминированный скелет структуры — используется без модели и при
     любом сбое вызова: не заглушка "пустая колода", а полноценная валидная
     структура (титул, повестка, контекст/проблема, данные, решение, кейс,
     риски, дорожная карта, итог), урезанная/растянутая до `n` штатным
     `_clamp_slide_count`."""
-    skeleton = [
-        OutlineSlide(kind="title", intent="Тема и цель презентации"),
-        OutlineSlide(kind="agenda", intent="О чём пойдёт речь"),
-        OutlineSlide(kind="context", intent="Контекст задачи"),
-        OutlineSlide(kind="problem", intent="В чём проблема"),
-        OutlineSlide(kind="data", intent="Что показывает измерение"),
-        OutlineSlide(kind="solution", intent="Что предлагается сделать"),
-        OutlineSlide(kind="how_it_works", intent="Как это работает"),
-        OutlineSlide(kind="case", intent="Результат пилота/проверки"),
-        OutlineSlide(kind="risks", intent="Риски и как их снимаем"),
-        OutlineSlide(kind="roadmap", intent="Что нужно для раскатки"),
-        OutlineSlide(kind="ask", intent="О чём просим комитет/аудиторию"),
-        OutlineSlide(kind="closing", intent="Итог и следующий шаг"),
+    topics = _fallback_intents(title, brief, sources or [])
+    deck_title = title.strip() or (topics[0] if topics else "Основная тема презентации")
+    middle_topics = [topic for topic in topics if topic.casefold() != deck_title.casefold()]
+    if not middle_topics:
+        middle_topics = [f"Ключевой аспект: {deck_title}"]
+    middle_kinds = [
+        "agenda", "context", "problem", "data", "solution", "how_it_works",
+        "case", "risks", "roadmap", "ask",
     ]
-    return _clamp_slide_count(skeleton, n)
+    skeleton = [OutlineSlide(kind="title", intent=deck_title)]
+    for index, kind in enumerate(middle_kinds):
+        topic = middle_topics[index % len(middle_topics)]
+        if index >= len(middle_topics):
+            topic = f"{topic}: аспект {index + 1}"
+        skeleton.append(OutlineSlide(kind=kind, intent=topic))
+    skeleton.append(OutlineSlide(kind="closing", intent=f"Выводы: {deck_title}"))
+    return _clamp_slide_count(skeleton, n, title=deck_title)
 
 
-def _clamp_slide_count(slides: list[OutlineSlide], target: int) -> list[OutlineSlide]:
+def _clamp_slide_count(
+    slides: list[OutlineSlide], target: int, *, title: str = "",
+) -> list[OutlineSlide]:
     """Гарантирует структурные инварианты AGENT.md ("первый слайд —
     титульный, последний — итоговый") и объём ТЗ (`MIN_SLIDES`..
     `MAX_SLIDES`) КОДОМ, а не доверием модели — тот же принцип, что и
     остальной проект: модель предлагает, код проверяет."""
     slides = list(slides)
     if not slides:
-        slides = [OutlineSlide(kind="title", intent="Тема презентации")]
+        slides = [OutlineSlide(kind="title", intent=title or "Основная тема презентации")]
     if slides[0].kind != "title":
-        slides.insert(0, OutlineSlide(kind="title", intent="Тема и цель презентации"))
+        slides.insert(0, OutlineSlide(kind="title", intent=title or "Основная тема презентации"))
     if slides[-1].kind != "closing":
-        slides.append(OutlineSlide(kind="closing", intent="Итог и следующий шаг"))
+        slides.append(OutlineSlide(kind="closing", intent=f"Выводы: {title}" if title else "Выводы презентации"))
 
     requested = max(MIN_SLIDES, min(MAX_SLIDES, target))
     if len(slides) > requested:
@@ -171,7 +210,8 @@ def _clamp_slide_count(slides: list[OutlineSlide], target: int) -> list[OutlineS
     i = 0
     while len(slides) < requested:
         kind = filler_kinds[i % len(filler_kinds)]
-        slides.insert(-1, OutlineSlide(kind=kind, intent="Дополнительный контекст"))
+        suffix = f": {title}" if title else " по теме"
+        slides.insert(-1, OutlineSlide(kind=kind, intent=f"Дополнительные сведения{suffix}"))
         i += 1
 
     return slides
@@ -236,7 +276,11 @@ def build_outline(
     if llm is None:
         if not allow_fallback:
             raise OutlineGenerationError("модель структуры не подключена")
-        return Outline(slides=_fallback_outline(n), title=title, language=language)
+        reason = "модель структуры не подключена"
+        return Outline(
+            slides=_fallback_outline(n, title=title, brief=brief, sources=sources),
+            title=title, language=language, generation_origin="fallback", generation_error=reason,
+        )
 
     _meta, prompt_body = _load_agent_prompt()
     payload = {
@@ -292,11 +336,19 @@ def build_outline(
     except Exception as exc:
         if not allow_fallback:
             raise OutlineGenerationError(f"не удалось получить структуру презентации: {exc}") from exc
-        slides = _fallback_outline(n)
+        reason = f"{type(exc).__name__}: {str(exc)[:240]}"
+        logger.warning("outline generation fell back: %s", reason)
+        slides = _fallback_outline(n, title=title, brief=brief, sources=sources)
+        origin = "fallback"
     else:
-        slides = _clamp_slide_count(slides, n)
+        slides = _clamp_slide_count(slides, n, title=title)
+        reason = None
+        origin = "model"
 
-    return Outline(slides=slides, title=title, language=language)
+    return Outline(
+        slides=slides, title=title, language=language,
+        generation_origin=origin, generation_error=reason,
+    )
 
 
 # ---------------------------------------------------------------------------

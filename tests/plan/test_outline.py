@@ -8,6 +8,8 @@ from deckforge.plan.outline import (
     MAX_SLIDES, MIN_SLIDES, OUTLINE_KINDS, Outline, OutlineSlide, SourceDoc,
     build_outline, load_content_pack,
 )
+from deckforge.plan.coverage import validate_deck_content
+from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec
 from deckforge.provider.base import LLMProvider
 
 CONTENT_PACK = Path("fixtures/content-packs/queue-latency")
@@ -88,9 +90,39 @@ def test_build_outline_drops_hallucinated_kind_not_in_closed_list():
 
 
 def test_build_outline_falls_back_on_network_failure():
-    outline = build_outline("бриф", [], profile=None, llm=_FakeLLM(RuntimeError("сеть недоступна")), target_slides=12)
+    outline = build_outline(
+        "Объяснить студентам порядок подготовки текста.", [], profile=None,
+        llm=_FakeLLM(RuntimeError("сеть недоступна")), target_slides=12,
+        title="Как подготовить текст к публикации",
+    )
     assert MIN_SLIDES <= len(outline.slides) <= MAX_SLIDES
     assert outline.slides[0].kind == "title"
+    assert outline.slides[0].intent == "Как подготовить текст к публикации"
+    assert outline.generation_origin == "fallback"
+    assert "сеть недоступна" in (outline.generation_error or "")
+    forbidden = {"тема и цель презентации", "контекст задачи", "итог и следующий шаг"}
+    assert not {slide.intent.casefold() for slide in outline.slides} & forbidden
+
+
+def test_fallback_outline_is_accepted_by_the_downstream_content_validator():
+    title = "Как подготовить текст к публикации"
+    brief = "Объяснить студентам порядок набора, правки и вычитки текста."
+    outline = build_outline(
+        brief, [], profile=None, llm=_FakeLLM(RuntimeError("временный сбой")),
+        target_slides=8, title=title,
+    )
+    deck = DeckSpec(title=title, language="ru", slides=[
+        SlideSpec(
+            index=index, kind="bullets", headline=slide.intent,
+            blocks=[BulletBlock(items=[f"Содержательное пояснение для слайда {index + 1}"])],
+            generation_origin="fallback",
+        )
+        for index, slide in enumerate(outline.slides)
+    ])
+
+    report = validate_deck_content(deck, [brief])
+
+    assert report["headline_only_slides"] == []
 
 
 def test_build_outline_falls_back_on_malformed_json():

@@ -89,6 +89,8 @@ def _outline_dict(outline) -> dict:
     return {
         "title": outline.title,
         "language": outline.language,
+        "generation_origin": outline.generation_origin,
+        "generation_error": outline.generation_error,
         "slides": [
             {"index": index, "kind": slide.kind, "intent": slide.intent, "needs": list(slide.needs)}
             for index, slide in enumerate(outline.slides)
@@ -364,6 +366,8 @@ async def _run_job(
         coverage = await asyncio.to_thread(validate_deck_content, deck, [brief, *sources])
         _write_json(job.dir / "deck-spec.json", deck_spec_to_dict(deck))
         report.update({
+            "outline_origin": outline.generation_origin,
+            "outline_error": outline.generation_error,
             "slide_count": len(deck.slides),
             "slide_origins": [
                 {"index": slide.index, "origin": slide.generation_origin, "error": slide.generation_error}
@@ -428,7 +432,7 @@ async def _run_job(
         if not job.variants:
             raise RuntimeError("Ни один собранный вариант не удалось подготовить к выдаче.")
 
-        warnings = bool(variant_errors) or any(
+        warnings = outline.generation_origin == "fallback" or bool(variant_errors) or any(
             slide.generation_origin in ("fallback", "degraded") for slide in deck.slides
         ) or any(
             slide.generation_origin == "degraded"
