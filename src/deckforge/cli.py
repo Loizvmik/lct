@@ -34,7 +34,7 @@ from deckforge.provider.yandex import YandexProvider
 from deckforge.render.soffice import to_pngs
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
-from deckforge.workflow.budget import RunBudget, load_policy
+from deckforge.workflow.budget import RunBudget, RunMode, load_policy
 from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[2] / "config" / "app.yaml"
@@ -66,15 +66,20 @@ def _rerank(deck, profile, variants, budget: RunBudget | None = None) -> tuple[d
     """Задача D: модель выбирает раскладку из трёх, отобранных кодом, для
     airy и visual. Возвращает `(вариант -> {номер слайда -> pattern_id},
     заметки)`. Выключено в конфиге, нет ключа или конфиг не читается —
-    пустой выбор, варианты собираются чисто детерминированно."""
+    пустой выбор, варианты собираются чисто детерминированно.
+
+    Задача L: идёт ли rerank вообще, решает режим прогона (`budget.mode_
+    spec().rerank`), зафиксированный на контрольной точке `after_write`
+    (см. `_cmd_generate`) — не отдельный порог этой функции."""
     try:
         settings = Settings.load(APP_YAML_PATH)
     except Exception:
         return {}, []
     if not settings.plan.rerank_variants:
         return {}, []
-    if budget is not None and not budget.check("rerank"):
-        return {}, [f"переранжирование пропущено бюджетом прогона: {budget.skipped['rerank']}"]
+    if budget is not None and not budget.mode_spec().rerank:
+        mode_name = budget.mode.value if budget.mode is not None else RunMode.FULL.value
+        return {}, [f"переранжирование пропущено режимом прогона {mode_name}"]
     llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
     notes: list[str] = []
     chosen = rerank_patterns(
@@ -233,6 +238,11 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     budget.record("write", written_at - outlined_at)
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
 
+    # Задача L: первая контрольная точка режима — решает, идёт ли rerank
+    # раскладок ниже. Держится до следующей точки (`after_compose`).
+    mode_after_write = budget.decide_mode("after_write")
+    print(f"Режим прогона: {mode_after_write.value} (точка after_write, осталось {budget.remaining():.0f}с)")
+
     # Task 20: распределение фотографий контент-пакета по слайдам — ПОСЛЕ
     # текста (нужны уже написанные заголовки/содержание, см. `plan.photos.
     # assign_photos`) и ДО `apply_variant`/`build_deck` (`_compatible_kinds`
@@ -346,11 +356,20 @@ def _cmd_generate(args: argparse.Namespace) -> int:
                         "сборки — требует разбора."
                     )
 
+    # Вторая контрольная точка — после сборки всех вариантов, перед аудитом
+    # по картинке: столько же rerank уже позади, время потрачено, остаток
+    # может отличаться от точки after_write (см. докстроку `RunBudget.
+    # decide_mode`).
+    mode_after_compose = budget.decide_mode("after_compose")
+    print(f"Режим прогона: {mode_after_compose.value} (точка after_compose, осталось {budget.remaining():.0f}с)")
+
     if visual_target is not None:
         _visual_stage(budget, visual_target, visual_variant, sources)
 
+    summary = budget.summary()
     print(f"\nВсего: {time.monotonic() - started:.1f}с (бюджет {budget.deadline_seconds:.0f}с)")
-    print(f"  по стадиям: {budget.summary()['stage_seconds']}")
+    print(f"  режим: {summary['mode']} (точка {summary['mode_checkpoint']})")
+    print(f"  по стадиям: {summary['stage_seconds']}")
     print(
         "\nПолный аудит по картинке всех слайдов (C01-C11) запускается отдельно на "
         "готовом .pptx:\n"
@@ -372,7 +391,9 @@ def _visual_stage(budget: RunBudget, target, variant, sources) -> None:
     if outcome.result is None:
         print(f"\nАудит по картинке рискованных слайдов не выполнялся: {outcome.skipped_reason}")
         return
-    slides = ", ".join(f"{pos + 1} ({score:.1f})" for pos, score in outcome.picked)
+    slides = ", ".join(
+        f"{pos + 1} (техн. {tech:.1f}, смысл. {sem:.1f})" for pos, tech, sem in outcome.picked
+    )
     print(
         f"\n[{variant.value}] аудит по картинке рискованных слайдов: {slides}; "
         f"{outcome.result.model_calls} вызовов модели за {outcome.seconds:.1f}с"

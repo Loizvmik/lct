@@ -16,7 +16,7 @@ from fastapi.testclient import TestClient
 from deckforge.api import jobs
 from deckforge.plan.outline import load_content_pack
 from deckforge.provider.base import VisionProvider
-from deckforge.workflow.budget import BudgetPolicy, RunBudget
+from deckforge.workflow.budget import BudgetPolicy, ModeSpec, RunBudget, RunMode
 
 from .conftest import CONTENT_PACK, _poll_job
 
@@ -42,10 +42,15 @@ def fake_vlm() -> _FakeVision:
 
 @pytest.fixture(scope="module")
 def budget_job(client: TestClient, template_id: str, store, fake_vlm: _FakeVision):
-    policy = BudgetPolicy(
-        budget_seconds=10_000, rerank_min_remaining=120, visual_audit_min_remaining=75,
-        visual_audit_max_slides=3, visual_audit_min_risk=0.0,
-    )
+    # Задача L: `visual_audit_max_slides` (3, как раньше) теперь строка режима
+    # FULL, не плоское поле политики. Бюджет огромный (10_000с) — обе
+    # контрольные точки увидят щедрый остаток и зафиксируют FULL.
+    modes = {
+        RunMode.FULL: ModeSpec(min_remaining=120, rerank=True, visual_audit_max_slides=3),
+        RunMode.FAST: ModeSpec(min_remaining=75, rerank=False, visual_audit_max_slides=1),
+        RunMode.EMERGENCY: ModeSpec(min_remaining=0, rerank=False, visual_audit_max_slides=0),
+    }
+    policy = BudgetPolicy(budget_seconds=10_000, modes=modes, visual_audit_min_risk=0.0)
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(jobs, "_build_visual_auditor", lambda: fake_vlm)
         mp.setattr(jobs, "_new_budget", lambda: RunBudget.from_policy(policy))
@@ -72,6 +77,11 @@ def test_pipeline_with_fake_model_runs_visual_audit(budget_job, fake_vlm: _FakeV
     for stage in ("parse", "outline", "write", "compose", "audit", "export", "visual_audit"):
         assert stage in budget["stage_seconds"], budget
     assert budget["skipped"] == {}
+    # Задача L: бюджет огромный, латентность обычная — обе контрольные точки
+    # обязаны сойтись на FULL (тест брифа: "одинаковые входы... дают FULL").
+    assert budget["mode"] == "full", budget
+    assert budget["mode_checkpoint"] == "after_compose", budget
+    assert [entry["mode"] for entry in budget["mode_history"]] == ["full", "full"]
 
     # Находки модели лежат в том же отчёте варианта dense, что и детерминированные.
     variants = client.get(f"/api/decks/{snapshot['deck_id']}/variants").json()
@@ -96,8 +106,9 @@ def test_visual_audit_skipped_when_budget_exhausted(budget_job, fake_vlm: _FakeV
             return self.now
 
     clock = _Clock()
-    job.budget = RunBudget.from_policy(BudgetPolicy(budget_seconds=300, visual_audit_min_remaining=75), clock=clock)
-    clock.now = 260.0  # осталось 40с из 300
+    job.budget = RunBudget.from_policy(BudgetPolicy(budget_seconds=300), clock=clock)
+    clock.now = 260.0  # осталось 40с из 300 — ниже порога FAST (75), режим EMERGENCY
+    job.budget.decide_mode("after_compose")
     with pytest.MonkeyPatch.context() as mp:
         mp.setattr(jobs, "_build_visual_auditor", lambda: fake_vlm)
         asyncio.run(jobs._visual_audit_dense(job, job.profile, []))

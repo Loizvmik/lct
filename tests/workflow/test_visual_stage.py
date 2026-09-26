@@ -12,7 +12,7 @@ from deckforge.audit.findings import Finding
 from deckforge.audit.visual import PER_SLIDE_CHECK_IDS, run_visual, run_visual_batch
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec
 from deckforge.provider.base import VisionProvider
-from deckforge.workflow.budget import BudgetPolicy, RunBudget
+from deckforge.workflow.budget import BudgetPolicy, ModeSpec, RunBudget, RunMode
 from deckforge.workflow.visual_stage import run_visual_stage
 
 
@@ -121,12 +121,23 @@ def test_run_visual_batch_garbage_is_c00_for_each_slide(tmp_path: Path):
 
 
 def _stage(tmp_path: Path, clock: _Clock, vlm, *, batch: bool = False, elapsed: float = 0.0, n: int = 6):
+    # Задача L: `visual_audit_max_slides` теперь живёт в таблице режимов, не
+    # плоским полем политики — FULL здесь несёт то же число (2), что раньше
+    # было `visual_audit_max_slides` напрямую, FAST/EMERGENCY — дефолтные
+    # пороги 75/0, тот же порог, что раньше был `visual_audit_min_remaining`.
+    modes = {
+        RunMode.FULL: ModeSpec(min_remaining=120, rerank=True, visual_audit_max_slides=2),
+        RunMode.FAST: ModeSpec(min_remaining=75, rerank=False, visual_audit_max_slides=1),
+        RunMode.EMERGENCY: ModeSpec(min_remaining=0, rerank=False, visual_audit_max_slides=0),
+    }
     budget = RunBudget.from_policy(
-        BudgetPolicy(budget_seconds=300, visual_audit_min_remaining=75, visual_audit_max_slides=2,
-                     visual_audit_min_risk=1.0, visual_audit_batch=batch),
+        BudgetPolicy(budget_seconds=300, modes=modes, visual_audit_min_risk=1.0, visual_audit_batch=batch),
         clock=clock,
     )
     clock.now += elapsed
+    # Контрольная точка `after_compose` (задача L) — стадия сама больше не
+    # спрашивает бюджет, только читает уже решённый режим.
+    budget.decide_mode("after_compose")
     rendered: list[int] = []
 
     def render() -> list[Path]:
@@ -144,7 +155,7 @@ def test_stage_runs_on_top_risky_slides_within_budget(tmp_path: Path):
     vlm = _FakeVision()
     budget, outcome, rendered = _stage(tmp_path, _Clock(), vlm)
     assert outcome.result is not None
-    assert [pos for pos, _ in outcome.picked] == [5, 1]  # с нуля + critical, затем с нуля
+    assert [pos for pos, _tech, _sem in outcome.picked] == [5, 1]  # с нуля + critical, затем с нуля
     assert {f.slide_index for f in outcome.findings} == {1, 5}
     assert rendered == [1]
     assert "visual_audit" in budget.stage_seconds

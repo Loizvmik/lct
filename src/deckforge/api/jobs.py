@@ -87,15 +87,16 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
 
 def _rerank(deck: DeckSpec, profile: TemplateProfile, budget: RunBudget | None = None) -> dict[Variant, dict[int, str]]:
     """Тот же шаг, что `cli._rerank`: модель выбирает раскладку из трёх для
-    airy и visual. Выключено в конфиге, нет ключа или бюджету прогона не
-    хватает времени: пустой выбор, раскладку выбирает код."""
+    airy и visual. Выключено в конфиге, нет ключа или режим прогона (задача
+    L, зафиксирован на контрольной точке `after_write`) rerank не
+    разрешает: пустой выбор, раскладку выбирает код."""
     try:
         settings = Settings.load(APP_YAML_PATH)
     except Exception:
         return {}
     if not settings.plan.rerank_variants:
         return {}
-    if budget is not None and not budget.check("rerank"):
+    if budget is not None and not budget.mode_spec().rerank:
         return {}
     llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
     chosen = rerank_patterns(
@@ -358,6 +359,11 @@ async def _run_job(
             template_path=template.path,
         )
 
+        # Задача L: первая контрольная точка режима прогона — фиксирует,
+        # идёт ли ниже rerank раскладок моделью. Держится до точки
+        # `after_compose` (см. докстроку `RunBudget.decide_mode`).
+        job.budget.decide_mode("after_write")
+
         # План презентации на диск рядом с результатом. Командная строка
         # это делала всегда, интерфейс — нет, и разбирать жалобу «слайд
         # выглядит плохо» приходилось по собранному .pptx, где уже не видно
@@ -376,13 +382,18 @@ async def _run_job(
         # стадии compose: для интерфейса это одна стадия «вёрстка».
         rerank_started = job.budget.clock()
         preferred_by_variant = await asyncio.to_thread(_rerank, deck, profile, job.budget)
-        if "rerank" not in job.budget.skipped:
-            job.budget.record("rerank", job.budget.clock() - rerank_started)
+        job.budget.record("rerank", job.budget.clock() - rerank_started)
         async with asyncio.TaskGroup() as tg:
             for variant in Variant:
                 tg.create_task(_compose_variant(
                     job, variant, deck, profile, template.path, preferred_by_variant.get(variant),
                 ))
+
+        # Задача L: вторая контрольная точка — после сборки всех вариантов,
+        # перед аудитом/экспортом/аудитом по картинке. Держится до конца
+        # прогона (следующей точки нет — это последняя необязательная
+        # стадия пайплайна).
+        job.budget.decide_mode("after_compose")
 
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
         # случайные номера, и найти «тот самый, который только что собрали»
@@ -499,16 +510,20 @@ async def _visual_audit_dense(job: JobRecord, profile: TemplateProfile, sources:
     except Exception as exc:  # noqa: BLE001: необязательная стадия не вправе ронять готовую колоду
         job.visual_audit = {"ran": False, "skipped_reason": f"аудит по картинке упал: {exc}"}
         return
-    job.visual_audit = outcome.summary()
-    if outcome.result is None:
-        return
-    state.visual_findings = outcome.findings
-    state.set_findings(deterministic)
+    summary = outcome.summary()
+    job.visual_audit = summary
+    if outcome.result is not None:
+        state.visual_findings = outcome.findings
+        state.set_findings(deterministic)
+    # HTML dense-варианта перерисовывается в любом случае (не только когда
+    # модель реально ответила): итоговый снимок бюджета (стадия visual_audit
+    # уже посчитана `run_visual_stage`) и причина пропуска, если аудит не
+    # пошёл, тоже часть отчёта задачи L, не только оценки модели.
     if state.html_path is not None:
         try:
             await asyncio.to_thread(
                 to_html_report, state.deck_spec, profile, state.pptx_path, state.html_path,
-                visual=outcome.result,
+                visual=outcome.result, budget=job.budget.summary(), risky_slides=summary.get("risk"),
             )
         except Exception:  # noqa: BLE001: HTML без оценок лучше, чем упавшее задание
             pass
@@ -517,7 +532,15 @@ async def _visual_audit_dense(job: JobRecord, profile: TemplateProfile, sources:
 async def _export_variant(job: JobRecord, variant_name: str, profile: TemplateProfile) -> None:
     state = job.variants[variant_name]
     out_dir = job.dir / variant_name
-    bundle = await asyncio.to_thread(export_bundle, state.pptx_path, profile, out_dir, deck_spec=state.deck_spec)
+    # Задача L: режим прогона уже решён (`decide_mode("after_compose")` в
+    # `_run_job` идёт до этой стадии) — снимок бюджета попадает в HTML сразу,
+    # список рискованных слайдов (`risky_slides`) допишет только `_visual_
+    # audit_dense`, перерисовав HTML dense-варианта заново, когда аудит
+    # реально пройдёт.
+    budget_summary = job.budget.summary() if job.budget is not None else None
+    bundle = await asyncio.to_thread(
+        export_bundle, state.pptx_path, profile, out_dir, deck_spec=state.deck_spec, budget=budget_summary,
+    )
     state.pdf_path = bundle.pdf
     state.html_path = bundle.html
     state.preview_pngs = bundle.pngs
