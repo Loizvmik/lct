@@ -22,8 +22,8 @@ from PIL import Image
 
 from deckforge.audit.visual import (
     CHECK_IDS, DECK_LEVEL_CHECK_IDS, PER_SLIDE_CHECK_IDS, VisualAuditResult,
-    _build_collage, _findings_from_answers, _load_agent_prompt, _parse_answer, _supports_vision,
-    run_visual,
+    _build_collage, _extract_scores, _findings_from_answers, _load_agent_prompt, _parse_answer, _parse_scores,
+    _supports_vision, run_visual,
 )
 from deckforge.compose.builder import Variant, build_deck
 from deckforge.plan.outline import SourceDoc
@@ -207,6 +207,61 @@ def test_parse_answer_rejects_non_bool_ok():
 def test_parse_answer_rejects_top_level_non_object():
     with pytest.raises(ValueError, match="объект"):
         _parse_answer(json.dumps([1, 2, 3]), ("C01",))
+
+
+# ---------------------------------------------------------------------------
+# _parse_scores / _extract_scores — оценки PPTEval (задача G), необязательные
+# ---------------------------------------------------------------------------
+
+
+def test_parse_scores_accepts_valid_values():
+    assert _parse_scores({"content": 4, "design": 3, "why": "ок"}, ("content", "design")) == {
+        "content": 4, "design": 3, "why": "ок",
+    }
+
+
+def test_parse_scores_drops_out_of_range_int():
+    assert _parse_scores({"content": 7}, ("content",)) is None
+
+
+def test_parse_scores_drops_non_int_value():
+    assert _parse_scores({"content": "четыре"}, ("content",)) is None
+
+
+def test_parse_scores_drops_bool_value():
+    """`bool` — подкласс `int` в Python; `True`/`False` не оценка 1-5."""
+    assert _parse_scores({"content": True}, ("content",)) is None
+
+
+def test_parse_scores_drops_non_string_why():
+    result = _parse_scores({"content": 4, "why": 123}, ("content",))
+    assert result == {"content": 4}
+
+
+def test_parse_scores_returns_none_for_non_dict_input():
+    assert _parse_scores("не объект", ("content",)) is None
+    assert _parse_scores(None, ("content",)) is None
+
+
+def test_parse_scores_returns_none_when_nothing_valid():
+    assert _parse_scores({"content": -1, "why": ""}, ("content",)) is None
+
+
+def test_extract_scores_reads_scores_key_from_raw_answer():
+    raw = json.dumps({"C01": {"ok": True}, "scores": {"content": 5, "design": 5, "why": "идеально"}})
+    assert _extract_scores(raw, ("content", "design")) == {"content": 5, "design": 5, "why": "идеально"}
+
+
+def test_extract_scores_returns_none_when_scores_key_missing():
+    raw = json.dumps({"C01": {"ok": True}})
+    assert _extract_scores(raw, ("content", "design")) is None
+
+
+def test_extract_scores_returns_none_on_unparseable_raw():
+    """Невалидный JSON не должен ронять извлечение оценок — та же честная
+    деградация, что и у остального модуля (докстрока `_extract_scores`)."""
+    assert _extract_scores("не json вовсе", ("content",)) is None
+    assert _extract_scores(None, ("content",)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +483,122 @@ def test_visual_audit_result_is_iterable_and_sized():
     result = VisualAuditResult(findings=[])
     assert len(result) == 0
     assert list(result) == []
+
+
+# ---------------------------------------------------------------------------
+# Оценки PPTEval (задача G) — необязательные, вне диапазона отбрасываются
+# ---------------------------------------------------------------------------
+
+
+class _ScoredProvider(VisionProvider):
+    """Всегда отвечает "всё хорошо" на да/нет-вопросы плюс валидные оценки —
+    слайд получает content/design, коллаж получает coherence."""
+
+    def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+        keys = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])["answer_only_keys"]
+        payload = {k: {"ok": True} for k in keys}
+        if set(keys) == set(PER_SLIDE_CHECK_IDS):
+            payload["scores"] = {"content": 4, "design": 3, "why": "ясно, но тесно"}
+        else:
+            payload["scores"] = {"coherence": 5, "why": "переходы логичны"}
+        return json.dumps(payload)
+
+
+def test_run_visual_collects_slide_and_deck_scores():
+    spec = _tiny_spec(2)
+    pngs = [_tiny_png(), _tiny_png((0, 0, 99))]
+    try:
+        result = run_visual(pngs, spec, PROFILE, _ScoredProvider(), max_workers=2)
+        assert result.slide_scores == {
+            0: {"content": 4, "design": 3, "why": "ясно, но тесно"},
+            1: {"content": 4, "design": 3, "why": "ясно, но тесно"},
+        }
+        assert result.deck_score == {"coherence": 5, "why": "переходы логичны"}
+        assert result.content_avg == 4.0
+        assert result.design_avg == 3.0
+    finally:
+        for p in pngs:
+            p.unlink(missing_ok=True)
+
+
+class _NoScoreProvider(VisionProvider):
+    """Отвечает валидно на да/нет-вопросы, но вообще не присылает `scores` —
+    честный случай "модель не оценила", не ошибка."""
+
+    def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+        keys = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])["answer_only_keys"]
+        return json.dumps({k: {"ok": True} for k in keys})
+
+
+def test_run_visual_without_scores_key_leaves_scores_empty():
+    spec = _tiny_spec(1)
+    pngs = [_tiny_png()]
+    try:
+        result = run_visual(pngs, spec, PROFILE, _NoScoreProvider(), max_workers=1)
+        assert result.skipped_reason is None
+        assert result.slide_scores == {}
+        assert result.deck_score is None
+        assert result.content_avg is None
+        assert result.design_avg is None
+    finally:
+        pngs[0].unlink(missing_ok=True)
+
+
+class _GarbageScoreProvider(VisionProvider):
+    """Да/нет-ответы валидны, но `scores` — мусор разных сортов: оценка вне
+    диапазона 1-5, оценка строкой вместо числа, `why` не строкой. Ни одна
+    ось не должна попасть в результат, а сам аудит не должен упасть или
+    получить находку C00 — это не невалидный ОТВЕТ (да/нет-часть в порядке),
+    это невалидная ОЦЕНКА (бриф задачи G, тот же принцип, что и у C00)."""
+
+    def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+        keys = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])["answer_only_keys"]
+        payload = {k: {"ok": True} for k in keys}
+        if set(keys) == set(PER_SLIDE_CHECK_IDS):
+            payload["scores"] = {"content": 9, "design": "плохо", "why": 12345}
+        else:
+            payload["scores"] = {"coherence": 0, "why": ""}
+        return json.dumps(payload)
+
+
+def test_run_visual_drops_out_of_range_or_malformed_scores_without_failing_audit():
+    spec = _tiny_spec(1)
+    pngs = [_tiny_png()]
+    try:
+        result = run_visual(pngs, spec, PROFILE, _GarbageScoreProvider(), max_workers=1)
+        assert result.skipped_reason is None
+        assert list(result) == []  # да/нет-ответы валидны -> ни одной находки C00
+        assert result.slide_scores == {}  # ни content (вне 1-5), ни design (не int) не прошли
+        assert result.deck_score is None  # coherence=0 вне диапазона, why="" пусто
+        assert result.content_avg is None
+        assert result.design_avg is None
+    finally:
+        pngs[0].unlink(missing_ok=True)
+
+
+def test_run_visual_partial_scores_average_only_over_slides_that_have_them():
+    """Один слайд из двух получил оценку — среднее считается по одному, не
+    делится на два (докстрока `_axis_average`: "не среди ВСЕХ слайдов")."""
+
+    class _PartialProvider(VisionProvider):
+        def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+            payload_keys = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])
+            keys = payload_keys["answer_only_keys"]
+            payload = {k: {"ok": True} for k in keys}
+            if set(keys) == set(PER_SLIDE_CHECK_IDS) and payload_keys["slide_index_1based"] == 1:
+                payload["scores"] = {"content": 2, "design": 2, "why": "первый слайд слабый"}
+            return json.dumps(payload)
+
+    spec = _tiny_spec(2)
+    pngs = [_tiny_png(), _tiny_png((0, 0, 55))]
+    try:
+        result = run_visual(pngs, spec, PROFILE, _PartialProvider(), max_workers=1)
+        assert result.slide_scores == {0: {"content": 2, "design": 2, "why": "первый слайд слабый"}}
+        assert result.content_avg == 2.0
+        assert result.design_avg == 2.0
+    finally:
+        for p in pngs:
+            p.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

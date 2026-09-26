@@ -9,6 +9,7 @@
 и соседей)."""
 from __future__ import annotations
 
+from deckforge.audit.visual import VisualAuditResult
 from deckforge.export.html import to_html
 
 
@@ -60,6 +61,49 @@ def test_html_slide_count_matches_pptx(DECK, PROFILE, PPTX, tmp_path):
     text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html").read_text(encoding="utf-8")
     n_slides = len(Presentation(str(PPTX)).slides)
     assert text.count('<section class="slide"') == n_slides * 2  # экран + печать (см. докстроку html.py)
+
+
+def test_html_without_visual_argument_has_no_score_markup(DECK, PROFILE, PPTX, tmp_path):
+    """Старое поведение буквально: без `visual` (по умолчанию) экспорт не
+    знает про PPTEval вовсе — та же честная деградация, что и у остальных
+    необязательных надстроек проекта."""
+    text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html").read_text(encoding="utf-8")
+    # CSS-правила `.slide-score`/`#deck-score` — часть статичного шаблона
+    # документа и присутствуют всегда (as-is стиль на случай, если аудит
+    # прогонят позже и пересоберут те же слайды); проверяем отсутствие
+    # именно РАЗМЕТКИ (элементов), а не факта упоминания класса в CSS.
+    assert 'class="slide-score"' not in text
+    assert 'id="deck-score"' not in text
+
+
+def test_html_shows_ppteval_scores_when_visual_result_is_passed(DECK, PROFILE, PPTX, tmp_path):
+    """Задача G: оценка того слайда, чей `headline` совпал с индексом
+    `slide_scores` (`DECK.slides[1]` — "Где уходит время"), должна попасть в
+    бейдж рядом с этим слайдом, а сводка по колоде — куда-то в документ
+    целиком."""
+    visual = VisualAuditResult(
+        slide_scores={1: {"content": 4, "design": 3, "why": "ясно, но тесно"}},
+        deck_score={"coherence": 5, "why": "переходы логичны"},
+        content_avg=4.0,
+        design_avg=3.0,
+    )
+    text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html", visual=visual).read_text(encoding="utf-8")
+    assert 'class="slide-score"' in text
+    assert "ясно, но тесно" in text
+    assert 'id="deck-score"' in text
+    assert "содержание 4.0" in text
+    assert "дизайн 3.0" in text
+    assert "связность 5" in text
+
+
+def test_html_score_badge_appears_only_for_the_matched_slide(DECK, PROFILE, PPTX, tmp_path):
+    """Слайд без записи в `slide_scores` не получает бейдж вовсе — только
+    тот, чей индекс реально сопоставился (`_match_spec_slide`)."""
+    visual = VisualAuditResult(slide_scores={1: {"content": 5, "design": 5, "why": "образцовый слайд"}})
+    text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html", visual=visual).read_text(encoding="utf-8")
+    # Ровно два бейджа на слайд 1 (экранная версия + печатная — та же
+    # причина, что и у `test_html_slide_count_matches_pptx`).
+    assert text.count('class="slide-score"') == 2
 
 
 def test_html_carries_speaker_notes(DECK, PROFILE, PPTX, tmp_path):
