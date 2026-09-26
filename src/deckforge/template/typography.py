@@ -499,6 +499,12 @@ def _is_mono(family: str) -> bool:
     return any(marker in lowered for marker in _MONO_FONT_MARKERS)
 
 
+def is_mono_family(family: str) -> bool:
+    """Моноширинная ли гарнитура по имени; наружу для `patterns` (слайд с
+    примером кода не раскладка)."""
+    return _is_mono(family)
+
+
 # Хвосты начертания, отбрасываемые при нормализации имени гарнитуры (брифом,
 # п.5 повторного код-ревью, список токенов — дословно из его текста):
 # "Thin, ExtraLight, Light, Regular, Medium, SemiBold, Demi, Bold,

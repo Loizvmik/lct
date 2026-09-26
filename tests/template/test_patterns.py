@@ -10,7 +10,7 @@ from __future__ import annotations
 import io
 import zipfile
 
-from conftest import ALL_TEMPLATES
+from conftest import ALL_TEMPLATES, TEMPLATES_DIR
 from lxml import etree
 
 from deckforge.ooxml.geometry import Box, Canvas
@@ -801,4 +801,26 @@ def test_an_asset_sheet_slide_is_not_mined_as_a_pattern(profile_fixture):
     for name in ALL_TEMPLATES:
         for pattern in profile_fixture(name).patterns:
             assert len(pattern.decor) <= _MAX_DECOR_SHAPES, (name, pattern.pattern_id, len(pattern.decor))
+
+
+def test_a_code_sample_slide_is_not_mined_as_a_pattern(profile_fixture):
+    """VK Education, слайд «Оформление кода»: жёлтый Consolas на чёрной
+    плашке. Как раскладка two_col он принимал любые два столбца текста, и
+    наш текст ложился моноширинным по чёрному (живой прогон 27 сентября
+    2026). Ни один паттерн не снят со слайда с моноширинным текстом."""
+    from deckforge.template.patterns import _is_code_sample
+    from deckforge.ooxml.package import PptxPackage
+    from deckforge.ooxml.walk import walk_shapes
+
+    profile = profile_fixture("Шаблон презентации VK Education.pptx")
+    mined = {n for p in profile.patterns for n in p.source_slide_index}
+    with PptxPackage.open(TEMPLATES_DIR / "Шаблон презентации VK Education.pptx") as pkg:
+        canvas = pkg.canvas()
+        code_slides = {
+            int(name.split("slide")[-1].split(".")[0])
+            for name in pkg.names() if name.startswith("ppt/slides/slide") and name.endswith(".xml")
+            if any(_is_code_sample(r.element) for r in walk_shapes(pkg.xml(name), canvas))
+        }
+    assert code_slides, "в шаблоне есть слайд с примером кода: тест не о чем"
+    assert not (code_slides & mined), code_slides & mined
 

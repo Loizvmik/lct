@@ -66,7 +66,7 @@ from deckforge.template.grid import TITLE_PH_TYPES, Grid, cluster
 # та же p:bg-цепочка не должна разъезжаться в двух местах).
 from deckforge.template import layouts as _layouts
 from deckforge.template.theme import ThemeInfo, pick_primary_master, read_theme
-from deckforge.template.typography import TypeScale
+from deckforge.template.typography import TypeScale, is_mono_family
 
 # --- контракт данных (бриф, интерфейс Task 7) -------------------------------
 
@@ -476,6 +476,14 @@ def _mine_slide(
         # держит: самая насыщенная из трёх учебных шаблонов — около 30 фигур.
         return None
 
+    if any(_is_code_sample(ref.element) for ref in content):
+        # Слайд «Оформление кода» VK Education: жёлтый Consolas на чёрной
+        # плашке. Как раскладка two_col он подходил под любые два столбца
+        # текста, и наш текст ложился моноширинным по чёрному (живой прогон
+        # 27 сентября 2026, слайды 2 и 11). Кода в презентациях по брифу
+        # нет, такой слайд-пример не раскладка.
+        return None
+
     tiers = [_tier_info(ref, canvas, scale, theme) for ref in content]
 
     repeat, repeat_roles_by_index = _find_repeat(content, tiers)
@@ -832,6 +840,28 @@ def _dominant_color(element, theme: ThemeInfo) -> str | None:
         if isinstance(resolved, Color):
             return resolved.hex
     return None
+
+
+def _is_code_sample(element) -> bool:
+    """Текстовый шейп, набранный моноширинной гарнитурой (по имени, тот же
+    список маркеров, что у `typography`): пример кода, не место под текст."""
+    tx_body = element.find(qn("p:txBody"))
+    if tx_body is None:
+        return False
+    chars_total = 0
+    chars_mono = 0
+    for r in tx_body.iter(qn("a:r")):
+        t_el = r.find(qn("a:t"))
+        chars = len((t_el.text or "").strip()) if t_el is not None else 0
+        if not chars:
+            continue
+        chars_total += chars
+        r_pr = r.find(qn("a:rPr"))
+        latin = r_pr.find(qn("a:latin")) if r_pr is not None else None
+        family = latin.get("typeface") if latin is not None else None
+        if family and is_mono_family(family):
+            chars_mono += chars
+    return chars_total > 0 and chars_mono / chars_total >= 0.5
 
 
 def _shape_dominant_size(element, canvas: Canvas) -> float | None:
