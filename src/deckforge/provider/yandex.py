@@ -1,5 +1,6 @@
 from __future__ import annotations
 import base64, json, logging, time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from typing import Any, Callable
 import httpx
 from .base import LLMProvider, VisionProvider, Msg
@@ -104,6 +105,15 @@ MAX_TOKENS_BUDGET_CAP = 7168
 # чужую нужду.
 WRITER_BUDGET_CAP = 16384
 
+# Задача W: HTTP-запрос уходит в отдельный поток, а вызывающий ждёт его не
+# дольше остатка дедлайна. Проверено 26 сентября 2026 на локальном сервере,
+# отдающем ответ по байту в секунду: `httpx.post(..., timeout=2.0)` вернул
+# ответ через 10.1с. Таймаут httpx ограничивает каждое ожидание сокета по
+# отдельности, а не весь ответ, поэтому медленно капающий ответ держит
+# вызов сколько угодно. Брошенный запрос дочитывается в фоне (его всё
+# равно ограничивает таймаут чтения), результат выбрасывается.
+_HTTP_POOL = ThreadPoolExecutor(max_workers=32, thread_name_prefix="yandex-http")
+
 
 class YandexProvider(LLMProvider, VisionProvider):
     """OpenAI-совместимый клиент Yandex AI Studio.
@@ -111,6 +121,10 @@ class YandexProvider(LLMProvider, VisionProvider):
     Модель проверяется реестром в конструкторе: запрос к модели вне ТЗ
     не должен уйти в сеть ни разу.
     """
+
+    # Задача W: `complete`/`ask_image` принимают `deadline_seconds` на
+    # конкретный вызов (планировщик режет его по остатку бюджета задания).
+    accepts_call_deadline = True
 
     def __init__(
         self,
@@ -151,10 +165,11 @@ class YandexProvider(LLMProvider, VisionProvider):
 
     def complete(self, messages: list[Msg], *, schema: dict | None = None,
                  max_tokens: int = 4096, temperature: float = 0.3,
-                 budget_cap: int = MAX_TOKENS_BUDGET_CAP) -> str:
+                 budget_cap: int = MAX_TOKENS_BUDGET_CAP, deadline_seconds: float | None = None) -> str:
         # Дедлайн отсчитывается от начала вызова и действует на всё, что
         # происходит внутри — HTTP-ретраи и эскалации бюджета max_tokens.
-        deadline_at = self._now() + self._deadline_seconds
+        # `deadline_seconds` может его только укоротить (задача W).
+        deadline_at = self._now() + self._call_deadline(deadline_seconds)
         if schema is not None:
             # Yandex AI Studio требует system-сообщение первым в списке messages
             # (проверено живым запросом, HTTP 400 "System message must be at the
@@ -224,10 +239,16 @@ class YandexProvider(LLMProvider, VisionProvider):
                 ) from exc
         return content
 
-    def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+    def _call_deadline(self, deadline_seconds: float | None) -> float:
+        if deadline_seconds is None:
+            return self._deadline_seconds
+        return max(0.0, min(self._deadline_seconds, deadline_seconds))
+
+    def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024,
+                  deadline_seconds: float | None = None) -> str:
         if not self.card.vision:
             raise RuntimeError(f"{self.card.id} не мультимодальна, vision-аудит ей недоступен")
-        deadline_at = self._now() + self._deadline_seconds
+        deadline_at = self._now() + self._call_deadline(deadline_seconds)
         url = "data:image/png;base64," + base64.b64encode(png).decode()
         body = {
             "model": self.model_uri, "max_tokens": max_tokens, "temperature": 0.0,
@@ -270,7 +291,7 @@ class YandexProvider(LLMProvider, VisionProvider):
                 )
             request_timeout = min(self._timeout, remaining)
             attempt_counter[0] += 1
-            response = self._client.post(ENDPOINT, json=body, timeout=request_timeout)
+            response = self._post_bounded(body, request_timeout)
             if response.status_code in _RETRY_STATUS and attempt < attempts - 1:
                 remaining = deadline_at - self._now()
                 if remaining <= 0:
@@ -284,6 +305,18 @@ class YandexProvider(LLMProvider, VisionProvider):
             response.raise_for_status()
             return response.json()
         raise RuntimeError("недостижимо")
+
+    def _post_bounded(self, body: dict, seconds: float) -> httpx.Response:
+        """Один HTTP-запрос, который вызывающий ждёт не дольше `seconds`
+        по часам, как бы сервер ни отдавал ответ (см. `_HTTP_POOL`)."""
+        future = _HTTP_POOL.submit(self._client.post, ENDPOINT, json=body, timeout=seconds)
+        try:
+            return future.result(timeout=seconds)
+        except FutureTimeout:
+            future.cancel()
+            raise httpx.ReadTimeout(
+                f"ответ модели не пришёл целиком за {seconds:.1f}с, запрос брошен",
+            ) from None
 
     def _deadline_error(
         self, remaining: float, network_attempts: int, tried_budgets: list[int], reason: str

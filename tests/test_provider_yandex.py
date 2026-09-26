@@ -546,3 +546,56 @@ def test_a_request_without_a_schema_is_not_retried(monkeypatch):
 
     assert out == "обычный текст ответа"
     assert len(captured) == 1
+
+
+# --- Задача W: дедлайн вызова обрывает сам HTTP-запрос ---
+
+
+def _trickling_server(seconds: int):
+    """Локальный сервер, который отдаёт тело ответа по байту в секунду:
+    каждое ожидание сокета короче таймаута httpx, а весь ответ дольше."""
+    import socket
+    import threading
+    import time
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+
+    def serve():
+        conn, _ = sock.accept()
+        conn.recv(65536)
+        conn.sendall(f"HTTP/1.1 200 OK\r\nContent-Length: {seconds}\r\n\r\n".encode())
+        try:
+            for _ in range(seconds):
+                time.sleep(1.0)
+                conn.sendall(b" ")
+        except OSError:
+            pass
+        conn.close()
+        sock.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{sock.getsockname()[1]}/"
+
+
+def test_call_deadline_cuts_a_trickling_http_response(monkeypatch):
+    """Таймаут httpx ограничивает каждое ожидание сокета, а не весь ответ:
+    без обрыва по часам такой ответ держал бы вызов 8с при дедлайне 2с."""
+    import time
+
+    monkeypatch.setattr(yandex_module, "ENDPOINT", _trickling_server(8))
+    provider = YandexProvider(model="qwen3.6-35b-a3b", api_key="x", folder_id="y", deadline_seconds=30.0)
+
+    started = time.monotonic()
+    with pytest.raises((httpx.TimeoutException, RuntimeError)):
+        provider.complete([{"role": "user", "content": "Скажи ОК"}], max_tokens=300, deadline_seconds=2.0)
+
+    assert time.monotonic() - started < 4.0
+
+
+def test_per_call_deadline_only_shortens_the_provider_deadline():
+    provider = _offline_provider()
+    assert provider._call_deadline(None) == provider._deadline_seconds
+    assert provider._call_deadline(5.0) == 5.0
+    assert provider._call_deadline(10_000.0) == provider._deadline_seconds

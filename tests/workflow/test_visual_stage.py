@@ -237,3 +237,59 @@ def test_stage_lock_prevents_lost_updates_on_shared_budget(tmp_path: Path):
     # без потерянных обновлений `stage_seconds["visual_audit"]` есть и не
     # ушёл в отрицательное/нулевое значение молчаливой потерей записи.
     assert budget.stage_seconds.get("visual_audit", 0.0) > 0.0
+
+
+# --- Задача W: число слайдов по остатку времени на момент стадии ---
+
+
+def _timed_stage(tmp_path: Path, *, elapsed: float, call_seconds: float, past_calls: list[float] = ()):
+    modes = {
+        RunMode.FULL: ModeSpec(min_remaining=120, rerank=True, visual_audit_max_slides=3),
+        RunMode.FAST: ModeSpec(min_remaining=75, rerank=False, visual_audit_max_slides=1),
+        RunMode.EMERGENCY: ModeSpec(min_remaining=0, rerank=False, visual_audit_max_slides=0),
+    }
+    clock = _Clock()
+    budget = RunBudget.from_policy(
+        BudgetPolicy(
+            budget_seconds=300, modes=modes, visual_audit_min_risk=1.0,
+            visual_audit_reserve_seconds=45.0, visual_audit_call_seconds=call_seconds,
+        ),
+        clock=clock,
+    )
+    for seconds in past_calls:
+        budget.record_call("visual_audit", seconds, 0.0, ok=True)
+    budget.decide_mode("after_compose")  # остаток 300: FULL, до 3 слайдов
+    clock.now += elapsed  # сборка и экспорт затянулись после точки
+    vlm = _FakeVision()
+    spec = _spec(6, from_scratch={1, 2, 3, 4, 5})
+    outcome = run_visual_stage(budget, spec, [], vlm, lambda: _pngs(tmp_path, 6), sources=None)
+    return budget, outcome, vlm
+
+
+def test_stage_takes_fewer_slides_when_little_time_is_left(tmp_path: Path):
+    """Режим разрешил 3 слайда, но к стадии осталось 120с: (120 - 45) / 60
+    = 1 слайд."""
+    _budget, outcome, vlm = _timed_stage(tmp_path, elapsed=180, call_seconds=60.0)
+    assert outcome.allowed_by_time == 1
+    assert len(outcome.picked) == 1
+    assert outcome.summary()["allowed_by_time"] == 1
+
+
+def test_stage_uses_the_median_of_this_runs_calls(tmp_path: Path):
+    """После первых вызовов оценка берётся по ним, а не из конфига."""
+    _budget, outcome, _vlm = _timed_stage(tmp_path, elapsed=180, call_seconds=60.0, past_calls=[20.0, 25.0, 30.0])
+    assert outcome.allowed_by_time == 3
+
+
+def test_stage_is_skipped_by_time_before_any_call(tmp_path: Path):
+    budget, outcome, vlm = _timed_stage(tmp_path, elapsed=250, call_seconds=25.0)
+    assert outcome.result is None and vlm.prompts == []
+    assert outcome.skipped_reason.startswith("по времени")
+    assert budget.summary()["time_skipped"], "пропуск по времени виден в снимке"
+
+
+def test_stage_calls_are_counted_in_the_budget(tmp_path: Path):
+    budget, outcome, vlm = _timed_stage(tmp_path, elapsed=0, call_seconds=25.0)
+    assert outcome.result is not None
+    summary = budget.summary()
+    assert summary["calls_by_role"]["visual_audit"]["calls"] == len(vlm.prompts)

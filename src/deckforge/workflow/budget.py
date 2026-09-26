@@ -35,6 +35,8 @@
 бюджете задания (задание их честно ждало), а снимок помечает её в
 `shared_stages` как «переиспользовано»."""
 from __future__ import annotations
+import statistics
+import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -113,6 +115,19 @@ class BudgetPolicy:
     # режим вообще разрешает смотреть (`ModeSpec.visual_audit_max_slides`).
     visual_audit_min_risk: float = 1.0
     visual_audit_batch: bool = False
+    # Задача W, резервы под обязательные стадии (см. `config/app.yaml`).
+    # Аудит по картинке: вызов не начинается, если после него останется
+    # меньше этого.
+    visual_audit_reserve_seconds: float = 45.0
+    # Писатель: повтор и ремонт не начинаются, если после них не останется
+    # времени на сборку, аудит и экспорт.
+    compose_export_reserve_seconds: float = 60.0
+    # Жёсткий потолок: за столько до конца бюджета письмо обрывается, и
+    # задание идёт к сборке и экспорту с тем, что есть.
+    export_reserve_seconds: float = 30.0
+    # Оценка вызова до первого замера в задании.
+    visual_audit_call_seconds: float = 25.0
+    writer_call_seconds: float = 20.0
 
 
 @dataclass
@@ -137,10 +152,48 @@ class RunBudget:
     mode_history: list[dict] = field(default_factory=list)
     # Стадии, полученные готовыми от другого задания (см. `mark_reused`).
     reused: dict[str, str] = field(default_factory=dict)
+    # Задача W: вызовы модели этого задания (роль, секунды вызова, секунды
+    # в очереди планировщика, успех), пропуски по времени (причина ->
+    # сколько раз) и предупреждения жёсткого потолка. Пишутся из потоков
+    # писателя и аудита, поэтому под `_lock`.
+    calls: list[tuple[str, float, float, bool]] = field(default_factory=list)
+    time_skips: dict[str, int] = field(default_factory=dict)
+    warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self._started = self.clock()
         self._stopped: float | None = None
+        self._lock = threading.Lock()
+
+    def record_call(self, role: str, seconds: float, waited: float, *, ok: bool) -> None:
+        """Один вызов модели через планировщик (`provider.scheduler`)."""
+        with self._lock:
+            self.calls.append((role, max(seconds, 0.0), max(waited, 0.0), ok))
+
+    def note_time_skip(self, what: str) -> None:
+        """Шаг не сделан, потому что задание упёрлось в свой бюджет."""
+        with self._lock:
+            self.time_skips[what] = self.time_skips.get(what, 0) + 1
+
+    def warn(self, text: str) -> None:
+        """Предупреждение жёсткого потолка: задание закончено, но не всё
+        сделано как обычно (слайды запасным вариантом, пропущенные стадии)."""
+        with self._lock:
+            if text not in self.warnings:
+                self.warnings.append(text)
+
+    def median_call_seconds(self, role: str | None, default: float) -> float:
+        """Медиана длительности вызовов этого задания (роли `role`, или всех
+        при `None`); до первого вызова `default` из конфига."""
+        with self._lock:
+            seconds = [sec for r, sec, _w, ok in self.calls if ok and (role is None or r == role)]
+        return statistics.median(seconds) if seconds else default
+
+    def deadline_at(self, *, reserve: float = 0.0) -> float:
+        """Момент по `time.monotonic()`, когда до конца бюджета останется
+        `reserve` секунд: потокам писателя нужна абсолютная отметка, а не
+        бюджет с его подменяемыми часами."""
+        return time.monotonic() + self.remaining() - reserve
 
     @classmethod
     def from_policy(cls, policy: BudgetPolicy, *, clock: Callable[[], float] = time.monotonic) -> RunBudget:
@@ -175,6 +228,7 @@ class RunBudget:
         экспорт). Ноль значит «шаг не запускать». Метод пропал при
         слиянии задач Q и U (27 сентября 2026)."""
         return max(0.0, min(wanted, self.remaining() - reserve))
+
     def decide_mode(self, checkpoint: str) -> RunMode:
         """Контрольная точка пайплайна: `"after_outline"` перед раскладками
         и текстом, `"after_write"` перед сборкой, `"after_compose"` перед
@@ -225,6 +279,24 @@ class RunBudget:
         }
         if self.reused:
             out["shared_stages"] = dict(self.reused)
+        with self._lock:
+            calls = list(self.calls)
+            skips = dict(self.time_skips)
+            warnings = list(self.warnings)
+        by_role: dict[str, dict] = {}
+        for role, sec, waited, _ok in calls:
+            entry = by_role.setdefault(role, {"calls": 0, "seconds": 0.0, "queue_wait_seconds": 0.0})
+            entry["calls"] += 1
+            entry["seconds"] += sec
+            entry["queue_wait_seconds"] += waited
+        out["model_calls"] = len(calls)
+        out["queue_wait_seconds"] = round(sum(w for _r, _s, w, _o in calls), 1)
+        out["calls_by_role"] = {
+            role: {k: (round(v, 1) if isinstance(v, float) else v) for k, v in entry.items()}
+            for role, entry in by_role.items()
+        }
+        out["time_skipped"] = skips
+        out["warnings"] = warnings
         return out
 
 
@@ -250,4 +322,9 @@ def load_policy(app_yaml_path) -> BudgetPolicy:
         modes=modes or dict(DEFAULT_MODES),
         visual_audit_min_risk=run.visual_audit_min_risk,
         visual_audit_batch=run.visual_audit_batch,
+        visual_audit_reserve_seconds=run.visual_audit_reserve_seconds,
+        compose_export_reserve_seconds=run.compose_export_reserve_seconds,
+        export_reserve_seconds=run.export_reserve_seconds,
+        visual_audit_call_seconds=run.visual_audit_call_seconds,
+        writer_call_seconds=run.writer_call_seconds,
     )

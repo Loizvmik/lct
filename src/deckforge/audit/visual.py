@@ -56,6 +56,7 @@ slide`/`_run_deck_level`) и превращается в один finding `check
 должна обрывать проверку оставшихся слайдов)."""
 from __future__ import annotations
 import json
+import math
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -73,6 +74,7 @@ from deckforge.plan.spec import (
     BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock,
 )
 from deckforge.provider.base import VisionProvider
+from deckforge.provider.scheduler import ScheduledProvider
 from deckforge.template.profile import TemplateProfile
 
 AGENT_PATH = Path(__file__).resolve().parents[3] / "agents" / "content-auditor" / "AGENT.md"
@@ -283,6 +285,10 @@ class VisualAuditResult:
 def _supports_vision(vlm) -> bool:
     if vlm is None:
         return False
+    # Обёртка планировщика (задача W) сама ничего не умеет, смотрим на
+    # провайдера под ней.
+    if isinstance(vlm, ScheduledProvider):
+        vlm = vlm.inner
     card = getattr(vlm, "card", None)
     if card is not None and hasattr(card, "vision"):
         return bool(card.vision)
@@ -727,6 +733,22 @@ def _run_deck_level(vlm, agent_body: str, spec: DeckSpec, pngs: list[Path], pair
     if answers is None:
         return [_malformed_finding(None, exc, raw)], None
     return _findings_from_answers(None, answers), _extract_scores(raw, _DECK_SCORE_NUM_KEYS)
+
+
+def slides_within_time(max_slides: int, remaining: float, reserve: float, call_seconds: float) -> int:
+    """Сколько рискованных слайдов успеет аудит по картинке (задача W):
+    `min(N режима, floor((remaining - reserve) / call_seconds))`. Режим
+    решается на контрольной точке раньше, а до аудита доходит уже меньше
+    времени: сборка и экспорт могли затянуться. Оценка вызова берётся по
+    прошлым вызовам этого задания, до первого из конфига."""
+    if max_slides <= 0:
+        return 0
+    spare = remaining - reserve
+    if spare <= 0:
+        return 0
+    if call_seconds <= 0:
+        return max_slides
+    return max(0, min(max_slides, math.floor(spare / call_seconds)))
 
 
 def run_visual(

@@ -23,6 +23,7 @@ from deckforge.plan.outline import SourceDoc
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, SlideSpec
 from deckforge.plan.writer import shorten_to_contract
 from deckforge.provider.base import LLMProvider
+from deckforge.provider.scheduler import ScheduledProvider, scheduled
 from deckforge.workflow.budget import RunMode
 
 # Вызовов починки на колоду одного стиля. Каждый вызов идёт посреди
@@ -75,9 +76,11 @@ class SlideRepairer:
 
     Лимит двойной: число вызовов (`max_calls`) и дедлайн по часам
     (`deadline`, `time.monotonic()`), после которого починка не начинается:
-    лучше слайд с нуля, чем колода позже пяти минут. Одновременность
-    вызовов модели ограничивает писатель (`plan.writer._MODEL_SLOTS`, общий
-    на процесс), здесь её не ограничиваем второй раз."""
+    лучше слайд с нуля, чем колода позже пяти минут. Задача W: вызов не
+    начинается и тогда, когда до дедлайна меньше оценки одного вызова
+    (`call_seconds`, медиана вызовов задания), а сам вызов идёт через
+    планировщик процесса (`provider.scheduler`) в бюджете задания с
+    резервом `reserve` на аудит и экспорт после сборки."""
     profile: object
     llm: LLMProvider | None
     sources: list[SourceDoc]
@@ -85,6 +88,9 @@ class SlideRepairer:
     max_calls: int = DEFAULT_MAX_CALLS
     deadline: float | None = None
     total: int = 0
+    budget: object = None
+    reserve: float = 0.0
+    call_seconds: float = 0.0
     calls: int = 0
     accepted: int = 0
     log: list[str] = field(default_factory=list)
@@ -97,13 +103,17 @@ class SlideRepairer:
             if self.calls >= self.max_calls:
                 self.log.append(f"Слайд {slide_spec.index}: лимит сокращений ({self.max_calls}) исчерпан.")
                 return None
-            if self.deadline is not None and time.monotonic() >= self.deadline:
+            if self.deadline is not None and time.monotonic() + self._estimate() >= self.deadline:
                 self.log.append(f"Слайд {slide_spec.index}: время на сокращение текста вышло.")
                 return None
             self.calls += 1
         started = time.monotonic()
+        llm = (
+            ScheduledProvider(self.llm, role="repair", budget=self.budget, reserve=self.reserve)
+            if self.budget is not None else scheduled(self.llm, role="repair")
+        )
         result = repair_slide(
-            slide_spec, pattern_id, problems, profile=self.profile, llm=self.llm, sources=self.sources,
+            slide_spec, pattern_id, problems, profile=self.profile, llm=llm, sources=self.sources,
             style=self.style, total=self.total,
         )
         with self._lock:
@@ -114,10 +124,16 @@ class SlideRepairer:
             )
         return result
 
+    def _estimate(self) -> float:
+        if self.budget is not None and hasattr(self.budget, "median_call_seconds"):
+            return self.budget.median_call_seconds("repair", self.call_seconds)
+        return self.call_seconds
+
 
 # Секунд на все сокращения одной колоды: четыре вызова по 10-15 секунд.
 REPAIR_WANTED_SECONDS = 60.0
-# Сколько оставить после сборки на обязательные стадии (аудит, экспорт).
+# Сколько оставить после сборки на обязательные стадии (аудит, экспорт),
+# если бюджет не задаёт своё (`BudgetPolicy.export_reserve_seconds`).
 REPAIR_RESERVE_SECONDS = 20.0
 
 
@@ -129,11 +145,17 @@ def repairer_for(
     разбиению и сборке с нуля, это секунды, а не десятки секунд. Бюджет
     только читается (`mode`, `allowance`), решений о режиме здесь нет."""
     seconds = REPAIR_WANTED_SECONDS
+    reserve = REPAIR_RESERVE_SECONDS
+    call_seconds = 0.0
     if budget is not None:
-        seconds = budget.allowance(REPAIR_WANTED_SECONDS, reserve=REPAIR_RESERVE_SECONDS)
+        policy = getattr(budget, "policy", None)
+        reserve = getattr(policy, "export_reserve_seconds", REPAIR_RESERVE_SECONDS)
+        call_seconds = getattr(policy, "writer_call_seconds", 0.0)
+        seconds = budget.allowance(REPAIR_WANTED_SECONDS, reserve=reserve)
         if budget.mode is RunMode.EMERGENCY:
             seconds = 0.0
     return SlideRepairer(
         profile=profile, llm=llm if seconds > 0 else None, sources=sources, style=style,
-        deadline=time.monotonic() + seconds, total=total,
+        deadline=time.monotonic() + seconds, total=total, budget=budget, reserve=reserve,
+        call_seconds=call_seconds,
     )
