@@ -414,7 +414,10 @@ def test_run_visual_without_pptx_path_keeps_old_where_behavior(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Режимы N рискованных слайдов (задача M): FULL 8 / FAST 4 / EMERGENCY 0
+# Режимы N рискованных слайдов (задача M): FULL 6 / FAST 3 / EMERGENCY 0 —
+# бриф просил 8/4, живой прогон на VK Education + queue-latency (реальный
+# писатель и реальная модель аудита) показал 169.5с на 8 слайдов при 4
+# потоках у dense (порог брифа — 90с), N снижен.
 # ---------------------------------------------------------------------------
 
 
@@ -422,8 +425,8 @@ def test_config_modes_carry_task_m_slide_counts():
     from deckforge.workflow.budget import RunMode, load_policy
 
     policy = load_policy(Path("config/app.yaml"))
-    assert policy.modes[RunMode.FULL].visual_audit_max_slides == 8
-    assert policy.modes[RunMode.FAST].visual_audit_max_slides == 4
+    assert policy.modes[RunMode.FULL].visual_audit_max_slides == 6
+    assert policy.modes[RunMode.FAST].visual_audit_max_slides == 3
     assert policy.modes[RunMode.EMERGENCY].visual_audit_max_slides == 0
 
 

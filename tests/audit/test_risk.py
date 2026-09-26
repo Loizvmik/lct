@@ -159,10 +159,42 @@ def test_semantic_risk_is_capped():
 def test_pick_risky_slides_orders_by_sum_and_breaks_ties_by_semantic():
     """При равной сумме вперёд идёт слайд с большим семантическим баллом
     (бриф задачи L)."""
-    # Слайд 1: чистый клон (0 технических), заголовок-тема (1 семантический) -> сумма 1.0
-    topic_only = _slide(1, headline="Итоги", source_note="s")
-    # Слайд 2: с нуля (1 технический), заголовок-вывод (0 семантических) -> сумма 1.0
-    scratch_only = _slide(2, cloned=False, headline="Выручка выросла на 30%", source_note="s")
-    spec = DeckSpec(title="t", language="ru", slides=[topic_only, scratch_only])
+    # Слайд 1: чистый клон (0 технических), заголовок-тема и повтор
+    # заголовка (2 семантических) -> сумма 2.0
+    note_dup = "Слайд 1: заголовок похож на слайд 4 ('X') — возможно, один и тот же факт другими словами."
+    topic_only = _slide(1, headline="Итоги", notes=(note_dup,), source_note="s")
+    # Слайд 2: клон с фото (2 технических по формуле раздела 17),
+    # заголовок-вывод (0 семантических) -> сумма 2.0
+    photo_only = _slide(2, visual=Visual(kind="photo"), headline="Выручка выросла на 30%", source_note="s")
+    spec = DeckSpec(title="t", language="ru", slides=[topic_only, photo_only])
     picked = pick_risky_slides(spec, [], max_slides=2, min_score=1.0)
+    assert [(t, s) for _pos, t, s in picked] == [(0.0, 2.0), (2.0, 0.0)]
     assert [pos for pos, _t, _s in picked] == [0, 1]  # семантический балл выше — слайд 0 (topic_only) первым
+
+
+def test_risk_weights_follow_the_architecture_formula():
+    """Раздел 17 архитектуры: с нуля 5, структурная находка 4, ужатый
+    кегль 3, таблица или график 2, фото 2."""
+    base = risk_score(_slide(), [])
+    assert risk_score(_slide(cloned=False), []) - base == 5.0
+    structural = Finding(
+        check_id="D01", severity="minor", slide_index=0, shape_ref=None,
+        message="m", box=None, fixable=False, fix_hint="h", repair="structural",
+    )
+    none = Finding(
+        check_id="D01", severity="minor", slide_index=0, shape_ref=None,
+        message="m", box=None, fixable=False, fix_hint="h", repair="none",
+    )
+    assert risk_score(_slide(), [structural]) - risk_score(_slide(), [none]) == 4.0
+    shrunk = "Слайд 1: текст слота «body» усечён — не влезает даже кеглем подписи (12.0pt)."
+    assert risk_score(_slide(notes=(shrunk,)), []) - base == 3.0
+    table = Visual(kind="table", table=TableVisual(rows=[["a", "b"], ["1", "2"]]))
+    assert risk_score(_slide(visual=table), []) - base == 2.0
+    assert risk_score(_slide(visual=Visual(kind="photo")), []) - base == 2.0
+
+
+def test_too_many_items_for_the_example_counts_as_structural():
+    """Клон отказал, потому что элементов больше, чем единиц повтора:
+    в файле этого не видно, но по смыслу это структурная ошибка."""
+    note = "Слайд 1: клон слайда-примера №3 (раскладка 'p1') не принят — элементов больше, чем единиц повтора в примере."
+    assert risk_score(_slide(notes=(note,)), []) - risk_score(_slide(), []) == 4.0

@@ -22,7 +22,15 @@
 
 Обязательные стадии (разбор, структура, текст, сборка, детерминированный
 аудит, экспорт) идут всегда: без них нет файла, а файл важнее уложиться в
-срок — режимы на них не влияют."""
+срок — режимы на них не влияют.
+
+Задача N: лимит ТЗ считается на ОДНУ презентацию, а три варианта идут
+параллельно. Общие стадии (разбор, структура, текст) пишутся в бюджет
+прогона, а всё после текста (rerank, переписывание под вариант, сборка,
+аудит, аудит по картинке, экспорт) — в бюджет своего варианта
+(`RunBudget.for_variant`): дедлайн варианта — это бюджет минус то, что уже
+съели общие стадии, свои часы, свои контрольные точки и свой режим.
+Медленный вариант больше не переводит соседей в режим попроще."""
 from __future__ import annotations
 import time
 from dataclasses import dataclass, field
@@ -121,16 +129,43 @@ class RunBudget:
     # Все решения по контрольным точкам подряд — для отчёта (HTML/cli):
     # человеку важно видеть не только итоговый режим, но и где он менялся.
     mode_history: list[dict] = field(default_factory=list)
+    # Задача N: бюджеты вариантов, заведённые `for_variant`. У бюджета
+    # варианта этот словарь пуст.
+    variants: dict[str, "RunBudget"] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._started = self.clock()
+        self._stopped: float | None = None
 
     @classmethod
     def from_policy(cls, policy: BudgetPolicy, *, clock: Callable[[], float] = time.monotonic) -> RunBudget:
         return cls(deadline_seconds=policy.budget_seconds, policy=policy, clock=clock)
 
+    def for_variant(self, name: str) -> "RunBudget":
+        """Бюджет одного варианта: дедлайн — остаток общего бюджета на
+        момент вызова (300с минус общие стадии), часы идут от этого момента.
+        Звать сразу после общих стадий, для всех вариантов подряд: тогда у
+        всех один и тот же дедлайн, а стадии и режим у каждого свои."""
+        child = RunBudget(deadline_seconds=max(self.remaining(), 0.0), policy=self.policy, clock=self.clock)
+        self.variants[name] = child
+        return child
+
+    def allowance(self, wanted: float, *, reserve: float) -> float:
+        """Сколько секунд дать необязательному шагу с собственным бюджетом
+        (переписывание под вариант, задача N): не больше `wanted` и не
+        больше остатка минус `reserve` на обязательные стадии после него
+        (сборка, аудит, экспорт). Ноль значит «шаг не запускать»."""
+        return max(0.0, min(wanted, self.remaining() - reserve))
+
+    def stop(self) -> None:
+        """Остановить часы: вариант доделан, и его время в снимке не должно
+        расти, пока соседи ещё работают."""
+        if self._stopped is None:
+            self._stopped = self.clock()
+
     def elapsed(self) -> float:
-        return self.clock() - self._started
+        end = self._stopped if self._stopped is not None else self.clock()
+        return end - self._started
 
     def remaining(self) -> float:
         """Сколько секунд осталось; отрицательное число значит, что бюджет
@@ -172,7 +207,11 @@ class RunBudget:
         self.stage_seconds[stage] = self.stage_seconds.get(stage, 0.0) + max(seconds, 0.0)
 
     def summary(self) -> dict:
-        return {
+        """Снимок для отчёта и интерфейса. У прогона с вариантами
+        `stage_seconds` — только общие стадии (они же перечислены в
+        `shared_stages`), а время, стадии и режим каждого варианта лежат в
+        `variants`."""
+        out = {
             "budget_seconds": self.deadline_seconds,
             "elapsed_seconds": round(self.elapsed(), 1),
             "stage_seconds": {k: round(v, 1) for k, v in self.stage_seconds.items()},
@@ -181,6 +220,26 @@ class RunBudget:
             "mode_checkpoint": self.mode_checkpoint,
             "mode_history": [dict(entry) for entry in self.mode_history],
         }
+        if self.variants:
+            out["shared_stages"] = list(self.stage_seconds)
+            out["variants"] = {name: child.summary() for name, child in self.variants.items()}
+        return out
+
+    def variant_summary(self, name: str) -> dict:
+        """Снимок одного варианта для его HTML-отчёта: режим и стадии
+        варианта плюс общие стадии, помеченные в `shared_stages`, чтобы
+        человек видел, куда ушли все пять минут этой презентации."""
+        child = self.variants.get(name)
+        if child is None:
+            return self.summary()
+        out = child.summary()
+        shared = {k: round(v, 1) for k, v in self.stage_seconds.items()}
+        out["stage_seconds"] = {**shared, **out["stage_seconds"]}
+        out["shared_stages"] = list(shared)
+        out["budget_seconds"] = self.deadline_seconds
+        out["elapsed_seconds"] = round(self.elapsed(), 1)
+        out["variant_seconds"] = round(child.elapsed(), 1)
+        return out
 
 
 def load_policy(app_yaml_path) -> BudgetPolicy:

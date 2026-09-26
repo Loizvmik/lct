@@ -28,11 +28,12 @@ from pptx import Presentation
 from pptx.util import Inches, Pt
 
 from deckforge.audit.config import AuditConfig
-from deckforge.audit.deterministic import Finding, run_deterministic
+from deckforge.audit.deterministic import Finding, run_deterministic, slide_fill_ratio
 from deckforge.compose.builder import Variant, build_deck
 from deckforge.compose.charts import ChartSpec, Series, add_chart
+from deckforge.compose.clone import CLONE_MARK_PREFIX, mark_slide
 from deckforge.compose.tables import TableSpec, add_table
-from deckforge.ooxml.geometry import Box
+from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import BulletBlock, DeckSpec, SlideSpec
@@ -842,3 +843,94 @@ def test_T03_accepts_the_templates_own_decor_colours(blank_deck):
     ids = _ids(run_deterministic(blank_deck.save_as("decor-colour.pptx"), PROFILE, CONFIG))
 
     assert "T03" not in ids, "цвет декора самого шаблона не должен считаться чужим"
+
+
+# ---------------------------------------------------------------------------
+# Задача R: D05 относительно паттерна, локальные и структурные находки
+# ---------------------------------------------------------------------------
+
+
+def _mark_as_clone(pattern_id: str):
+    def _fn(slide):
+        mark_slide(slide, CLONE_MARK_PREFIX + pattern_id)
+    return _fn
+
+
+def _profile_with_density(pattern_id: str, density: float) -> TemplateProfile:
+    return PROFILE.model_copy(update={"patterns": [
+        p.model_copy(update={"source_density": density}) if p.pattern_id == pattern_id else p
+        for p in PROFILE.patterns
+    ]})
+
+
+def test_D05_compares_a_clone_with_its_example(deck_with):
+    """Клон судится по заполненности своего примера, а не по коридору
+    25-75%: чистая колода заполнена на ~21%, глобальный порог (без
+    тестового послабления до 0.15) её штрафует, пример с той же
+    плотностью нет. Пример заметно плотнее даёт находку с обеими цифрами,
+    ещё плотнее структурную."""
+    path = deck_with(_mark_as_clone("slide9"))
+    prs = Presentation(str(path))
+    canvas = Canvas(width_emu=prs.slide_width, height_emu=prs.slide_height)
+    ratio = slide_fill_ratio(prs.slides[0], canvas, PROFILE)
+    assert ratio < _LOADED.density.fill_ratio_min
+
+    same = run_deterministic(path, _profile_with_density("slide9", ratio), _LOADED)
+    assert "D05" not in _ids(same)
+
+    moderate = [f for f in run_deterministic(path, _profile_with_density("slide9", ratio + 0.3), _LOADED)
+                if f.check_id == "D05"]
+    assert len(moderate) == 1
+    assert f"{ratio:.0%}" in moderate[0].message and f"{ratio + 0.3:.0%}" in moderate[0].message
+    assert moderate[0].repair == "none"
+
+    far = [f for f in run_deterministic(path, _profile_with_density("slide9", ratio + 0.5), _LOADED)
+           if f.check_id == "D05"]
+    assert len(far) == 1 and far[0].repair == "structural"
+
+
+def test_D05_without_clone_mark_keeps_the_global_corridor(clean_deck_path):
+    """Слайд без метки клона судится прежним коридором, какой бы ни была
+    плотность примеров в профиле."""
+    profile = _profile_with_density("slide9", 0.21)
+    assert "D05" in _ids(run_deterministic(clean_deck_path, profile, _LOADED))
+
+
+def test_L02_small_overlap_is_local_and_large_one_is_structural(deck_with):
+    def make(overlap_in):
+        def _fn(slide):
+            for i, text in enumerate(("AB", "CD")):
+                left = Inches(0.3 + i * (1.5 - overlap_in))
+                box = slide.shapes.add_textbox(left, Inches(2.0), Inches(1.5), Inches(1.0))
+                run = box.text_frame.paragraphs[0].add_run()
+                run.text = text
+                run.font.size = Pt(54)
+        return _fn
+
+    small = [f for f in run_deterministic(deck_with(make(0.2)), PROFILE, CONFIG) if f.check_id == "L02"]
+    large = [f for f in run_deterministic(deck_with(make(0.8)), PROFILE, CONFIG) if f.check_id == "L02"]
+    assert small and all(f.repair == "local" and f.fixable for f in small)
+    assert large and all(f.repair == "structural" and not f.fixable for f in large)
+
+
+def test_too_much_text_findings_are_structural(deck_with):
+    def _fn(slide):
+        box = slide.shapes.add_textbox(Inches(0.3), Inches(1.3), Inches(3.5), Inches(3.5))
+        tf = box.text_frame
+        tf.word_wrap = True
+        for i in range(8):
+            p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
+            run = p.add_run()
+            run.text = f"Пункт номер {i}"
+            run.font.size = Pt(14)
+            _make_bulleted(p)
+    findings = run_deterministic(deck_with(_fn), PROFILE, CONFIG)
+    d01 = [f for f in findings if f.check_id == "D01"]
+    assert d01 and d01[0].repair == "structural"
+
+
+def test_local_findings_keep_the_local_repair(deck_with):
+    """Кегль вне шкалы: локальная находка, её чинит автопочинка."""
+    path = deck_with(lambda s: _add_text(s, 0.3, 1.3, 3.0, 1.5, "Кегль не по шкале", size_pt=37, family="Play"))
+    t02 = [f for f in run_deterministic(path, PROFILE, CONFIG) if f.check_id == "T02"]
+    assert t02 and all(f.repair == "local" for f in t02)

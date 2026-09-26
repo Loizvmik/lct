@@ -87,6 +87,7 @@ def to_html(
     deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
     *, visual: "VisualAuditResult | AuditReport | None" = None,
     budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
+    fidelity: "FidelityReport | None" = None,
 ) -> Path:
     """Собирает `out` — единый `.html` без внешних запросов. Возвращает `out`
     (интерфейс брифа); подробности деградаций — `to_html_report` ниже, для
@@ -103,9 +104,13 @@ def to_html(
     summary()` и `workflow.visual_stage.VisualStageOutcome.summary()["risk"]`
     (позиция слайда -> {technical, semantic, total}), тоже необязательные —
     отчёт без бюджета (например, вызов из старого кода/теста) остаётся
-    рабочим, просто без блока режима."""
+    рабочим, просто без блока режима.
+
+    `fidelity` — задача T: `audit.fidelity.FidelityReport` (метрики верности
+    шаблону), тоже необязательный — см. `_fidelity_html`."""
     return to_html_report(
         deck_spec, profile, pptx_path, out, visual=visual, budget=budget, risky_slides=risky_slides,
+        fidelity=fidelity,
     ).path
 
 
@@ -113,6 +118,7 @@ def to_html_report(
     deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
     *, visual: "VisualAuditResult | AuditReport | None" = None,
     budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
+    fidelity: "FidelityReport | None" = None,
 ) -> HtmlExportResult:
     pptx_path = Path(pptx_path)
     out = Path(out)
@@ -148,7 +154,7 @@ def to_html_report(
     document = _wrap_document(
         deck_spec, profile, canvas, slides_html, fonts_css,
         deck_score=deck_score, content_avg=content_avg, design_avg=design_avg,
-        budget=budget, risky_slides=risky_slides,
+        budget=budget, risky_slides=risky_slides, fidelity=fidelity,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(document, encoding="utf-8")
@@ -1041,10 +1047,24 @@ def _run_budget_html(budget: dict | None, risky_slides: dict[int, dict] | None) 
     return f'<div id="run-budget">{_esc(text)}</div>'
 
 
+def _fidelity_html(fidelity: "FidelityReport | None") -> str:
+    """Задача T: блок «Верность шаблону» (`audit.fidelity.FidelityReport`) —
+    отдельная функция, а не правка `_deck_score_html`/`_run_budget_html`,
+    намеренно: параллельная задача M добавляет в тот же отчёт свой блок
+    (оценки аудита по картинке), и оба блока не должны задевать один и тот
+    же код. Тот же принцип честной видимости, что и у соседних блоков —
+    пустая строка, если отчёт не передан (старый вызывающий код/тесты не
+    обязаны знать про эту задачу)."""
+    if fidelity is None:
+        return ""
+    return f'<div id="template-fidelity" title="{_esc(fidelity.summary)}">{_esc(fidelity.summary)}</div>'
+
+
 def _wrap_document(
     deck_spec: DeckSpec, profile: TemplateProfile, canvas: Canvas, slides_html: list[str], fonts_css: str,
     *, deck_score: dict | None = None, content_avg: float | None = None, design_avg: float | None = None,
     budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
+    fidelity: "FidelityReport | None" = None,
 ) -> str:
     width_px = round(canvas.width_in * 96)
     height_px = round(canvas.height_in * 96)
@@ -1054,6 +1074,7 @@ def _wrap_document(
     lang = (deck_spec.language or "ru")[:2]
     deck_score_html = _deck_score_html(deck_score, content_avg, design_avg)
     run_budget_html = _run_budget_html(budget, risky_slides)
+    fidelity_html = _fidelity_html(fidelity)
 
     return f"""<!DOCTYPE html>
 <html lang="{_esc(lang)}">
@@ -1127,6 +1148,16 @@ body.overview #deck-score {{ display: block; }}
   padding: 4px 10px; border-radius: 12px;
 }}
 body.overview #run-budget {{ display: block; }}
+/* Задача T: «Верность шаблону» — под режимом прогона, тот же приём (виден
+   только в обзоре, пуст, если отчёт не передан). */
+#template-fidelity {{
+  display: none; position: fixed; left: 16px; top: 76px; z-index: 10;
+  max-width: min(70vw, 640px);
+  font: 12px var(--font-fallback); color: #fff; background: rgba(0,0,0,.55);
+  padding: 4px 10px; border-radius: 12px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}}
+body.overview #template-fidelity {{ display: block; }}
 .block {{ position: absolute; }}
 .text-frame {{ position: absolute; inset: 0; display: flex; flex-direction: column; justify-content: flex-start; }}
 .text-frame p, .text-frame li {{ margin: 0 0 .25em 0; padding: 0; }}
@@ -1178,7 +1209,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 }}
 @media print {{
   html, body {{ background: #fff; }}
-  #hud, #help, #deck-score, #run-budget {{ display: none !important; }}
+  #hud, #help, #deck-score, #run-budget, #template-fidelity {{ display: none !important; }}
   body.overview #grid {{ display: none !important; }}
   #viewport {{ position: static; display: block; }}
   #stage {{ display: none; }}
@@ -1197,6 +1228,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 </div></div>
 {deck_score_html}
 {run_budget_html}
+{fidelity_html}
 <div id="grid"></div>
 <div class="print-pages" aria-hidden="true">
 {slides_joined}

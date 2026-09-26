@@ -9,6 +9,9 @@ decks` опираются на этот модуль, см. его докстр�
 `apply_fixes` работает НАД РЕЗУЛЬТАТОМ `run_deterministic`, тестировать его
 без настоящих находок того же аудита было бы проверкой другого контракта."""
 from __future__ import annotations
+from dataclasses import replace
+
+from pptx import Presentation
 from pptx.dml.color import RGBColor
 from pptx.util import Inches, Pt
 
@@ -35,15 +38,58 @@ def test_apply_fixes_moves_out_of_bounds_shape_back_onto_the_slide(deck_with):
     assert "L01" not in _ids(run_deterministic(path, PROFILE, CONFIG))
 
 
+def _run_sizes(path) -> list[float]:
+    """Кегли run'ов тестовой надписи (последняя фигура слайда, её добавил
+    `deck_with`), без заголовка и списка чистой колоды."""
+    prs = Presentation(str(path))
+    shape = list(prs.slides[0].shapes)[-1]
+    return [run.font.size.pt for p in shape.text_frame.paragraphs for run in p.runs if run.font.size is not None]
+
+
 def test_apply_fixes_shrinks_text_that_overflows_its_frame(deck_with):
-    path = deck_with(lambda s: _add_text(s, 0.3, 1.3, 2.0, 0.3, ("слово " * 5).strip(), size_pt=24, family="Play"))
+    # Рамка 0.5″: пять слов кеглем 24pt не влезают, ступенью caption шкалы
+    # влезают. До задачи R рамка была 0.3″, и тест проходил только потому,
+    # что починка опускала кегль до глобальных 8pt, ниже caption шаблона.
+    path = deck_with(lambda s: _add_text(s, 0.3, 1.3, 2.0, 0.5, ("слово " * 5).strip(), size_pt=24, family="Play"))
     findings = _findings_by_check(path, "L03")
     assert findings, "фикстура обязана воспроизводить L03"
+    assert findings[0].repair == "local"
 
     result = apply_fixes(path, PROFILE, findings, {"f0": findings[0]})
     assert result.applied == ["f0"]
 
     assert "L03" not in _ids(run_deterministic(path, PROFILE, CONFIG))
+    assert min(_run_sizes(path)) >= PROFILE.min_font_pt() - 0.05
+
+
+def test_apply_fixes_leaves_structural_overflow_alone(deck_with):
+    """Текст, который не влезает и ступенью caption, структурная находка:
+    автопочинка его не трогает (ужать ниже caption значило бы спрятать
+    брак), находка остаётся в отчёте."""
+    path = deck_with(lambda s: _add_text(s, 0.3, 1.3, 2.0, 0.3, ("слово " * 5).strip(), size_pt=24, family="Play"))
+    findings = _findings_by_check(path, "L03")
+    assert findings and findings[0].repair == "structural"
+    assert not findings[0].fixable
+
+    result = apply_fixes(path, PROFILE, findings, {"f0": findings[0]})
+    assert result.skipped == ["f0"] and not result.changed
+    assert _run_sizes(path) == [24.0]
+    assert "L03" in _ids(run_deterministic(path, PROFILE, CONFIG))
+
+
+def test_shrink_floor_is_the_template_caption_step(deck_with):
+    """Нижняя граница кегля у автопочинки равна ступени caption шкалы
+    шаблона, а не глобальным 8pt: даже если находку насильно отдать в
+    починку как локальную, кегль не опускается ниже caption."""
+    path = deck_with(lambda s: _add_text(s, 0.3, 1.3, 2.0, 0.3, ("слово " * 5).strip(), size_pt=24, family="Play"))
+    finding = replace(_findings_by_check(path, "L03")[0], repair="local")
+
+    result = apply_fixes(path, PROFILE, [finding], {"f0": finding})
+    assert result.applied == ["f0"]
+    caption = PROFILE.min_font_pt()
+    assert caption == PROFILE.type_scale_pt("caption")
+    assert caption > 8.0
+    assert _run_sizes(path) == [round(caption, 1)]
 
 
 def test_apply_fixes_snaps_off_scale_font_to_the_type_scale(deck_with):

@@ -10,12 +10,16 @@
 - детерминированный аудит нашёл что-то на этом слайде;
 - текст близок к вместимости: сборка ужимала кегль или усекала текст;
 - на слайде таблица, график или фото: их смысл код не проверяет вовсе;
-- автопочинка что-то на слайде меняла.
+- автопочинка что-то на слайде меняла;
+- на слайде есть структурная находка (задача R): её не чинит автопочинка,
+  и слайд уходит в отчёт как требующий другого текста или раскладки.
 
 Функции здесь чистые: ни диска, ни модели, только спецификация слайда и
-находки. Веса подобраны так, чтобы одна сильная примета (находка уровня
-major, таблица) давала балл около 1, а слайд, чистый по всем приметам,
-получал 0 и в аудит не шёл.
+находки. Веса приметам даёт формула раздела 17 архитектуры: сборка с нуля
+5, структурная находка 4, ужатый кегль 3, таблица или график 2, фото 2.
+Приметы вне формулы (находки аудита по тяжести, автопочинка) остались с
+прежними весами. Слайд, чистый по всем приметам, получает 0 и в аудит не
+идёт.
 
 Задача L добавляет вторую, СЕМАНТИЧЕСКУЮ оценку (`semantic_risk`) рядом с
 технической (`risk_score`): техническая — про то, как слайд собрался
@@ -51,11 +55,20 @@ _SEVERITY_WEIGHT = {"critical": 2.0, "major": 1.0, "minor": 0.3}
 # должен перевешивать всё остальное.
 _FINDINGS_CAP = 3.0
 
-_FROM_SCRATCH_WEIGHT = 1.0
-_CAPACITY_WEIGHT = 1.0
-_TABLE_CHART_WEIGHT = 1.0
-_PHOTO_WEIGHT = 0.5
+# Раздел 17 архитектуры: from_scratch 5, structural_repair 4, font_reduced 3,
+# table_or_chart 2, photo 2.
+_FROM_SCRATCH_WEIGHT = 5.0
+_STRUCTURAL_WEIGHT = 4.0
+_CAPACITY_WEIGHT = 3.0
+_TABLE_CHART_WEIGHT = 2.0
+_PHOTO_WEIGHT = 2.0
 _AUTOFIX_WEIGHT = 0.5
+
+# Заметка сборки `compose.builder._try_clone`: у содержания больше
+# элементов, чем единиц повтора у примера. В готовом файле этого не видно,
+# и детерминированный аудит такую находку дать не может, но по смыслу это
+# та же структурная ошибка «слишком много элементов» (раздел 13.2).
+_TOO_MANY_ITEMS_MARKER = "элементов больше, чем единиц"
 
 
 def _built_from_scratch(slide: SlideSpec) -> bool:
@@ -66,13 +79,22 @@ def _near_capacity(slide: SlideSpec) -> bool:
     return any(any(m in note.lower() for m in _CAPACITY_NOTE_MARKERS) for note in slide.findings)
 
 
+def _needs_structural_repair(slide: SlideSpec, findings: list[Finding]) -> bool:
+    return any(f.repair == "structural" for f in findings) or any(
+        _TOO_MANY_ITEMS_MARKER in note for note in slide.findings
+    )
+
+
 def risk_score(slide_spec: SlideSpec, findings: Iterable[Finding], *, autofixed: bool = False) -> float:
     """Балл риска одного слайда. `findings`: находки детерминированного
     аудита ЭТОГО слайда (вызывающий код отбирает их по `slide_index`);
     `autofixed`: меняла ли автопочинка что-то на слайде."""
+    findings = list(findings)
     score = 0.0
     if _built_from_scratch(slide_spec):
         score += _FROM_SCRATCH_WEIGHT
+    if _needs_structural_repair(slide_spec, findings):
+        score += _STRUCTURAL_WEIGHT
     score += min(_FINDINGS_CAP, sum(_SEVERITY_WEIGHT.get(f.severity, 0.0) for f in findings))
     if _near_capacity(slide_spec):
         score += _CAPACITY_WEIGHT

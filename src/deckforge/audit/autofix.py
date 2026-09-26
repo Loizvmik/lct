@@ -22,6 +22,12 @@ L06, L07, T01, T02, T03, T05, T06, I05) — `SUPPORTED_CHECKS` ниже. Нах�
 починке, возвращается в `skipped` как есть: `apply_fixes` никогда не
 делает вид, что починила то, чего не коснулась.
 
+Автопочинка трогает только локальные находки (`Finding.repair == "local"`,
+раздел 13 архитектуры). Структурные (текст не влезает даже минимальным
+кеглем, блок наполовину под соседом, много текста) возвращаются в
+`skipped`: ужать такой текст до нечитаемого значит спрятать брак, а не
+исправить его. Их список уходит в отчёт и в снимок задания.
+
 Каждая починка — эвристика, не идеальное решение вёрстки (это работа
 `compose.builder`, не аудита): цель — снять СИМПТОМ, из-за которого
 сработала проверка (фигура ушла на просроченный кегль/цвет/место), чтобы
@@ -50,10 +56,11 @@ SUPPORTED_CHECKS = frozenset({
     "T01", "T02", "T03", "T05", "T06", "I05",
 })
 
-# Нижний пол кегля при пошаговом уменьшении (L03/L04) — тот же порядок
-# величины, что "caption"/"micro" ступеней типовой шкалы; ниже это уже не
-# текст, а шум.
-_MIN_FONT_PT = 8.0
+# Нижний пол кегля при пошаговом уменьшении (L03/L04) не константа, а
+# ступень caption шкалы шаблона (`TemplateProfile.min_font_pt`, раздел 14
+# архитектуры): та же граница, ниже которой не ужимает сборка. Текст, не
+# влезающий и на ней, аудит помечает структурной находкой, и сюда он не
+# доходит.
 
 
 @dataclass
@@ -236,7 +243,8 @@ def _shrink_text(shape, profile: TemplateProfile) -> bool:
     которой замеренный текст (`compose.textfit.measure` — тот же замер, что
     и `compose.builder._shrink_sequence` использует при УКЛАДКЕ, не своя
     отдельная оценка) укладывается в доступную высоту рамки; если ни одна
-    ступень не помогла — падает до `_MIN_FONT_PT`. Один кегль на всю фигуру
+    ступень не помогла, ставит минимальную (`TemplateProfile.min_font_pt`).
+    Один кегль на всю фигуру
     (не по run'ам отдельно) — `measure()` меряет фигуру целиком, и разнобой
     кеглей внутри одной текстовой рамки сам по себе нарушал бы T02/шкалу."""
     if not shape.has_text_frame:
@@ -254,20 +262,21 @@ def _shrink_text(shape, profile: TemplateProfile) -> bool:
 
     width_in = shape.width / 914400
     available_h_in = shape.height / 914400
+    floor_pt = profile.min_font_pt()
     steps = sorted({profile.denorm_pt(v) for v in profile.type_scale.steps.values() if v}, reverse=True)
-    candidates = [s for s in steps if s < current_pt - 0.1]
+    candidates = sorted({max(floor_pt, s) for s in steps if s < current_pt - 0.1}, reverse=True)
 
-    chosen = _MIN_FONT_PT
+    chosen = floor_pt
     for candidate in candidates:
-        candidate = max(_MIN_FONT_PT, candidate)
         metrics = measure(full_text, family, candidate, width_in)
         if metrics.height_in <= available_h_in:
             chosen = candidate
             break
     else:
-        # Ни одна ступень шкалы не влезла — минимальный читаемый кегль,
-        # честно худший случай, а не тихий отказ чинить вовсе.
-        chosen = _MIN_FONT_PT
+        # Ни одна ступень шкалы не влезла: минимальная ступень шаблона.
+        # Сюда доходит только малое переполнение (сильное аудит пометил
+        # структурным), так что остаток помещается в полстроки.
+        chosen = floor_pt
 
     if chosen >= current_pt - 0.1:
         return False
@@ -436,6 +445,10 @@ def apply_fixes(
     prs = Presentation(str(pptx_path))
     for finding_id, finding in finding_ids.items():
         fixer = _FIXERS.get(finding.check_id)
+        if finding.repair != "local":
+            # Структурная находка (или сведения без починки): точечный патч
+            # спрятал бы её, а не исправил. Решает писатель или планировщик.
+            fixer = None
         if fixer is None or finding.slide_index is None or not finding.shape_ref:
             result.skipped.append(finding_id)
             continue

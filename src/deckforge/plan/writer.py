@@ -69,14 +69,17 @@ from deckforge.plan.factcheck import check_number_in_sources
 from deckforge.plan.normalize import normalize_deck
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
-    SLIDE_KINDS, BulletBlock, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
+    SLIDE_KINDS, BulletBlock, CardBlock, DeckSpec, QuoteBlock, SlideSpec, TextBlock,
+    slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
 )
 from deckforge.plan.variants import Variant, rerank_candidates
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.yandex import WRITER_BUDGET_CAP
+from deckforge.template.patterns import keeps_sample_text, slot_char_capacity
 
 AGENT_PATH_WRITER = Path(__file__).resolve().parents[3] / "agents" / "slide-writer" / "AGENT.md"
 AGENT_PATH_PICKER = Path(__file__).resolve().parents[3] / "agents" / "pattern-picker" / "AGENT.md"
+AGENT_PATH_REALIZER = Path(__file__).resolve().parents[3] / "agents" / "slide-realizer" / "AGENT.md"
 
 # Живой прогон обязательной проверки задачи (девять презентаций, отчёт
 # задачи): на старте 3072 эскалация до потолка `MAX_TOKENS_BUDGET_CAP`=6144
@@ -1118,6 +1121,7 @@ def _rerank_candidate_card(pattern, rank: int) -> dict:
 
 def _rerank_one(
     variant: Variant, slide: SlideSpec, candidate_ids: list[str], profile, prompt_body: str, llm: LLMProvider,
+    text_will_be_rewritten: bool = False,
 ) -> tuple[str, str | None]:
     """Один вызов модели на слайд. Возвращает `(pattern_id, причина сбоя)`:
     при любом сбое — первого кандидата кода и причину, иначе `None`. Не
@@ -1130,6 +1134,9 @@ def _rerank_one(
         "variant": variant.value,
         "slide": slide_view,
         "candidates": [_rerank_candidate_card(by_id[pid], rank) for rank, pid in enumerate(candidate_ids, 1)],
+        # Задача N: при `prefer_decor` кандидаты отобраны без оглядки на
+        # длину текста, и модели надо знать, что его перепишут.
+        "text_will_be_rewritten": text_will_be_rewritten,
     }
     messages = [
         {"role": "system", "content": prompt_body},
@@ -1152,7 +1159,7 @@ def _rerank_one(
 def rerank_patterns(
     deck: DeckSpec, profile, variants, llm: LLMProvider | None,
     *, max_workers: int = DEFAULT_RERANK_MAX_WORKERS, budget_seconds: float = DEFAULT_RERANK_BUDGET_SECONDS,
-    notes: list[str] | None = None,
+    notes: list[str] | None = None, prefer_decor: bool = False,
 ) -> dict[tuple[Variant, int], str]:
     """Раскладки, выбранные моделью: `(вариант, номер слайда в варианте) ->
     pattern_id`, готово к передаче в `apply_variant(..., preferred=...)`.
@@ -1170,14 +1177,18 @@ def rerank_patterns(
     вкуса дороже, чем их потерять. Без модели шаг ничего не делает.
 
     `notes` (если передан) получает по строке на каждый слайд, где модель
-    не ответила или ответила не по правилам, — для отчёта командной строки."""
+    не ответила или ответила не по правилам, — для отчёта командной строки.
+
+    `prefer_decor` — тот же флаг, с которым потом позовут `apply_variant`
+    (задача N): кандидаты обязаны совпасть с теми, из которых выбирает
+    сборка, иначе выбор модели там не найдётся и молча пропадёт."""
     if llm is None:
         return {}
     wanted = [v for v in RERANK_VARIANTS if v in set(variants)]
     jobs = [
         (variant, index, slide, ids)
         for variant in wanted
-        for index, slide, ids in rerank_candidates(deck, profile, variant)
+        for index, slide, ids in rerank_candidates(deck, profile, variant, prefer_decor=prefer_decor)
     ]
     if not jobs:
         return {}
@@ -1187,7 +1198,7 @@ def rerank_patterns(
     pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
     try:
         futures = {
-            pool.submit(_rerank_one, variant, slide, ids, profile, prompt_body, llm): (variant, index, ids)
+            pool.submit(_rerank_one, variant, slide, ids, profile, prompt_body, llm, prefer_decor): (variant, index, ids)
             for variant, index, slide, ids in jobs
         }
         deadline = time.monotonic() + budget_seconds
@@ -1216,3 +1227,314 @@ def rerank_patterns(
         # а ответ уже никому не нужен.
         pool.shutdown(wait=False, cancel_futures=True)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Задача N: текст под вариант (`realize_for_variant`)
+# ---------------------------------------------------------------------------
+
+# Варианты, чей текст переписывается под выбранную раскладку. `dense`
+# остаётся с полным текстом на вместительной раскладке: он эталон
+# содержания, два других его подают.
+REALIZE_VARIANTS = (Variant.visual, Variant.airy)
+
+# Запасные дефолты, если вызывающий код не передал своих (`config/app.yaml`,
+# `plan.realize_*`, обоснование там).
+DEFAULT_REALIZE_MAX_WORKERS = 4
+DEFAULT_REALIZE_BUDGET_SECONDS = 60.0
+
+# Сколько секунд варианта оставить после переписывания на обязательное:
+# сборка (~3с), аудит (<1с), экспорт с рендером soffice (15-30с в API).
+# Живой прогон 27 сентября 2026: после текста вариантам осталось 98с, и
+# шаг в 60с поместился с запасом в 35с.
+REALIZE_RESERVE_SECONDS = 40.0
+
+# Места раскладки, куда ложится основной текст слайда. Заголовок, подписи и
+# показатели не в счёт: заголовок-вывод реализация сохраняет дословно, а у
+# показателей длину задаёт число, не рамка.
+_REALIZE_TEXT_ROLES = ("body", "bullet", "card_body", "quote")
+
+# Виды слайда без основного текста под рамку: обложка, картинка, показатели,
+# таблица. Переписывать там нечего, и вызов модели был бы пустой тратой.
+_NO_REALIZE_KINDS = frozenset({"section", "image", "kpi", "kpi_caption", "table"})
+
+# Число в тексте: целое или дробное, с запятой или точкой. Разряды через
+# пробел («1 200») склеиваются заранее (`_numbers_of`), знак процента не
+# различается: «4%» и «4 %» один и тот же факт.
+_NUMBER_RE = re.compile(r"\d+(?:[.,]\d+)?")
+_THOUSANDS_RE = re.compile(r"(?<=\d)[   ](?=\d{3}(?!\d))")
+
+
+def _numbers_of(text: str) -> set[str]:
+    """Числа текста в одном написании (запятая как точка, без разрядных
+    пробелов). Нужен ровно один ответ на вопрос «все ли числа исходника
+    дошли до переписанного текста», а не разбор единиц измерения."""
+    text = _THOUSANDS_RE.sub("", text or "")
+    return {m.group(0).replace(",", ".") for m in _NUMBER_RE.finditer(text)}
+
+
+def _slide_body_text(slide: SlideSpec) -> str:
+    """Весь текст слайда, в котором живут факты: блоки, подзаголовок,
+    подпись визуала, строка источника. Заголовок не входит: он сохраняется
+    дословно и так."""
+    parts = [slide.subhead or "", slide.source_note or ""]
+    if slide.visual is not None and slide.visual.caption:
+        parts.append(slide.visual.caption)
+    for block in slide.blocks:
+        if isinstance(block, TextBlock):
+            parts.append(block.text)
+        elif isinstance(block, BulletBlock):
+            parts.extend(block.items)
+        elif isinstance(block, CardBlock):
+            for card in block.items:
+                parts.extend((card.title, card.body))
+        elif isinstance(block, QuoteBlock):
+            parts.extend((block.text, block.author or ""))
+        else:  # показатели: значение и подпись несут факт так же, как текст
+            for item in getattr(block, "items", []) or []:
+                parts.extend((getattr(item, "value", ""), getattr(item, "label", "")))
+    return "\n".join(p for p in parts if p)
+
+
+def _pattern_of(slide: SlideSpec, profile):
+    return next((p for p in profile.patterns if p.pattern_id == slide.pattern_id), None)
+
+
+def _layout_places(pattern) -> list[dict]:
+    """Текстовые места раскладки, куда реально ляжет содержание: без мест
+    с текстом примера (номера шагов, постоянные подписи шаблона), с
+    вместимостью по схеме слотов (`slot_char_capacity`: меньшее из рамки и
+    числа слов, которое для места назвала модель разбора)."""
+    places: list[dict] = []
+    for slot in pattern.slots:
+        if slot.role not in _REALIZE_TEXT_ROLES or slot.max_chars <= 0 or keeps_sample_text(slot):
+            continue
+        capacity = slot_char_capacity(slot)
+        places.append({
+            "role": slot.role, "max_chars": capacity, "target_chars": target_of(capacity),
+            "max_words": slot.max_words, "purpose": slot.purpose, "content_hint": slot.content_hint,
+        })
+    return places
+
+
+def _is_repeated(pattern) -> bool:
+    return pattern.repeat is not None and pattern.repeat.count >= 2
+
+
+def _content_pieces(slide: SlideSpec, pattern) -> list[str]:
+    """Куски текста так, как их разложит сборка (`compose.blocks.
+    _assign_block`): карточка в свою ячейку, абзац в своё место, список —
+    по пункту в ячейку, если раскладка построена на повторе, иначе одним
+    куском в одно место. Цитата — одним куском."""
+    repeated = _is_repeated(pattern)
+    pieces: list[str] = []
+    for block in slide.blocks:
+        if isinstance(block, TextBlock) and block.text.strip():
+            pieces.append(block.text)
+        elif isinstance(block, BulletBlock):
+            items = [i for i in block.items if i.strip()]
+            if repeated and len(items) >= 2:
+                pieces.extend(items)
+            elif items:
+                pieces.append("\n".join(items))
+        elif isinstance(block, CardBlock):
+            pieces.extend(card.body for card in block.items if card.body.strip())
+        elif isinstance(block, QuoteBlock) and block.text.strip():
+            pieces.append(block.text)
+    return pieces
+
+
+def layout_overflow(slide: SlideSpec, profile) -> list[dict]:
+    """Где текст слайда не влезает в контракт выбранной раскладки
+    (`slide.pattern_id`). Пустой список: влезает, или мерить нечего (нет
+    раскладки, вид без основного текста).
+
+    Две проверки, обе без сборки: доля заполнения места по знакам больше
+    единицы, и замер высоты текста в рамке (`measure_fit`, та же
+    единственная мерка текста в проекте, что у писателя). Куски и места
+    сопоставляются от длинного к ёмкому: сборка тоже кладёт содержание в
+    самое ёмкое свободное место. Кусков больше, чем мест у раскладки без
+    повтора, — тоже переполнение: лишний кусок сборка потеряет."""
+    if not slide.pattern_id or slide.kind in _NO_REALIZE_KINDS:
+        return []
+    pattern = _pattern_of(slide, profile)
+    if pattern is None:
+        return []
+    places = sorted(_layout_places(pattern), key=lambda pl: -pl["max_chars"])
+    pieces = sorted(_content_pieces(slide, pattern), key=len, reverse=True)
+    if not places or not pieces:
+        return []
+    if _is_repeated(pattern):
+        # Повтор разворачивается под число кусков: мест столько, сколько
+        # единиц держит раскладка (`Capacity.max_items`), каждое с ячейку.
+        places = [places[0]] * max(pattern.capacity.max_items, 1)
+    problems: list[dict] = []
+    for i, piece in enumerate(pieces):
+        if i >= len(places):
+            problems.append({"text": piece[:60], "chars": len(piece), "problem": "лишний кусок: места под него нет"})
+            continue
+        place = places[i]
+        if len(piece) > place["max_chars"]:
+            problems.append({
+                "text": piece[:60], "chars": len(piece), "max_chars": place["max_chars"], "role": place["role"],
+                "problem": "длиннее места",
+            })
+            continue
+        fit = measure_fit(piece, place["role"], profile, pattern.kind, layout_id=pattern.pattern_id)
+        # Одна строка, не влезшая по высоте, — рамка ниже строки кегля
+        # (подпись на VK Tech: 12 знаков «не влезают» в место на 16).
+        # Короче её не перепишешь, и вызов модели ушёл бы впустую.
+        if not fit.get("fits", True) and fit.get("lines", 0) > 1:
+            problems.append({
+                "text": piece[:60], "chars": len(piece), "max_chars": place["max_chars"], "role": place["role"],
+                "problem": f"не влезает по высоте рамки на {fit.get('overflow_in', 0)} дюйма",
+            })
+    return problems
+
+
+def _overflow_chars(slide: SlideSpec, profile) -> int:
+    """Сколько знаков не влезает в сумме: мера «стало ли лучше» после
+    переписывания. Лишний кусок считается целиком."""
+    return sum(max(p["chars"] - p.get("max_chars", 0), 1) for p in layout_overflow(slide, profile))
+
+
+def _realize_contract(pattern) -> dict:
+    return {
+        "layout_id": pattern.pattern_id,
+        "kind": pattern.kind,
+        "places": _layout_places(pattern),
+        "repeat_count": pattern.repeat.count if _is_repeated(pattern) else 0,
+        "max_items": pattern.capacity.max_items,
+        "max_chars_per_item": pattern.capacity.max_chars_per_item,
+        "target_chars_per_item": target_of(pattern.capacity.max_chars_per_item),
+    }
+
+
+def _realize_one(
+    slide: SlideSpec, variant: Variant, profile, prompt_body: str, llm: LLMProvider,
+) -> tuple[SlideSpec, str]:
+    """Один вызов модели на слайд. Возвращает `(слайд, исход)`: при любом
+    отказе исходный слайд и причину. Не бросает.
+
+    Инвариант смысла проверяет код, не модель: каждое число исходного
+    текста обязано найтись в новом (`_numbers_of`). Нет хотя бы одного —
+    ответ отброшен целиком, остаётся старый текст на новой раскладке
+    (переполнение тогда увидят сборка и аудит, как раньше). Заголовок,
+    строка источника, визуал, вид слайда и раскладка остаются прежними:
+    модель переписывает только текст мест. Число, которое уже стоит в
+    заголовке, на слайде есть и так, в `must_keep` оно не идёт.
+
+    Второе условие приёма: у ответа не больше кусков, чем мест у раскладки.
+    Лишний кусок сборка молча выбросит (`compose.blocks._drop`), и это была
+    бы та же потеря факта, только мимо проверки чисел: живой прогон 27
+    сентября 2026 принял шесть абзацев на раскладку с тремя местами."""
+    pattern = _pattern_of(slide, profile)
+    in_headline = _numbers_of(slide.headline)
+    must_keep = sorted(_numbers_of(_slide_body_text(slide)) - in_headline)
+    slide_view = {
+        k: v for k, v in slide_spec_to_dict(slide).items()
+        if k not in ("findings", "pattern_id", "index", "speaker_notes", "visual")
+    }
+    payload = {
+        "variant": variant.value,
+        "slide": slide_view,
+        "layout": _realize_contract(pattern),
+        "overflow": layout_overflow(slide, profile),
+        "must_keep": must_keep,
+    }
+    messages = [
+        {"role": "system", "content": prompt_body},
+        {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+    ]
+    try:
+        data = json.loads(_complete(llm, messages, _SLIDE_SCHEMA, WRITER_MAX_TOKENS))
+        if not isinstance(data, dict):
+            return slide, "отброшен: ответ не объект"
+        data = {k: v for k, v in data.items() if k not in ("layout_id", "visual", "speaker_notes")}
+        data["kind"], data["headline"] = slide.kind, slide.headline
+        realized = slide_spec_from_dict(data, slide.index)
+    except Exception as exc:  # отказ модели не портит слайд: остаётся старый текст
+        return slide, f"не удался: {_why(exc)}"
+    realized = replace(
+        realized, pattern_id=slide.pattern_id, visual=slide.visual,
+        # Строка источника — не текст места, её не сокращают: живой прогон
+        # 27 сентября 2026 терял в ней числа выборки при переписывании.
+        source_note=slide.source_note,
+        # Полный текст плотного варианта уходит докладчику: на слайде его
+        # сократили, а сказать вслух его всё ещё можно.
+        speaker_notes=slide.speaker_notes or "\n".join(_content_pieces(slide, pattern)),
+    )
+    if slide_spec_problems(realized):
+        return slide, "отброшен: слайд не прошёл проверку схемы"
+    lost = sorted(set(must_keep) - _numbers_of(_slide_body_text(realized)))
+    if lost:
+        return slide, f"отброшен: потеряны числа {', '.join(lost)}"
+    if any("лишний кусок" in p["problem"] for p in layout_overflow(realized, profile)):
+        return slide, "отброшен: кусков больше, чем мест у раскладки"
+    if _overflow_chars(realized, profile) >= _overflow_chars(slide, profile):
+        return slide, "отброшен: переполнение не уменьшилось"
+    realized.findings = [
+        *slide.findings,
+        f"Слайд {slide.index}: текст переписан под раскладку {slide.pattern_id} варианта {variant.value}.",
+    ]
+    return realized, "принят"
+
+
+def realize_for_variant(
+    deck: DeckSpec, variant: Variant, profile, llm: LLMProvider | None,
+    *, max_workers: int = DEFAULT_REALIZE_MAX_WORKERS, budget_seconds: float = DEFAULT_REALIZE_BUDGET_SECONDS,
+) -> DeckSpec:
+    """Переписывает текст слайдов варианта под контракт раскладки, которую
+    ему уже выбрал `apply_variant` (задача N). `deck` — колода ВАРИАНТА, не
+    общая: у каждого слайда проставлен `pattern_id`.
+
+    Зачем: текст пишется один раз под плотный вариант, 140-200 знаков на
+    пункт, а нарядные раскладки VK Education держат 36-84. Клон такой
+    раскладки отклонялся по переполнению, и visual выходил белыми листами.
+    Модель зовётся только на слайдах, где текст не влезает
+    (`layout_overflow`), по вызову на слайд, параллельно; весь шаг ограничен
+    `budget_seconds`, что не успело, остаётся со старым текстом.
+
+    Числа исходного текста — инвариант смысла: ответ, где хоть одного нет,
+    отбрасывается (`_realize_one`). Итог шага пишется в `DeckSpec.meta`
+    (`realize_*`) для отчёта. `dense` и колода без модели возвращаются как
+    есть."""
+    if variant not in REALIZE_VARIANTS or llm is None:
+        return deck
+    jobs = [(i, slide) for i, slide in enumerate(deck.slides) if layout_overflow(slide, profile)]
+    meta = dict(deck.meta)
+    meta["realize_overflowing"] = str(len(jobs))
+    meta["realize_accepted"] = "0"
+    if not jobs:
+        return replace(deck, meta=meta)
+    _meta, prompt_body = _load_agent_prompt(AGENT_PATH_REALIZER)
+
+    slides = list(deck.slides)
+    log: list[tuple[int, str]] = []
+    accepted = 0
+    started = time.monotonic()
+    pool = ThreadPoolExecutor(max_workers=max(1, max_workers))
+    try:
+        futures = {pool.submit(_realize_one, slide, variant, profile, prompt_body, llm): i for i, slide in jobs}
+        deadline = started + budget_seconds
+        pending = set(futures)
+        while pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, pending = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            for future in done:
+                i = futures[future]
+                realized, outcome = future.result()
+                slides[i] = realized
+                accepted += outcome == "принят"
+                log.append((i, outcome))
+        for future in pending:
+            log.append((futures[future], f"не уложился в бюджет шага ({budget_seconds:.0f}с)"))
+    finally:
+        # Тот же приём, что у `rerank_patterns`: отстающих не ждать.
+        pool.shutdown(wait=False, cancel_futures=True)
+    meta["realize_accepted"] = str(accepted)
+    meta["realize_seconds"] = f"{time.monotonic() - started:.1f}"
+    meta["realize_log"] = "; ".join(f"{i}: {outcome}" for i, outcome in sorted(log))
+    return replace(deck, slides=slides, meta=meta)

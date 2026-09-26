@@ -9,6 +9,7 @@
 и соседей)."""
 from __future__ import annotations
 
+from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.visual import VisualAuditResult
 from deckforge.export.html import to_html
 
@@ -113,3 +114,21 @@ def test_html_carries_speaker_notes(DECK, PROFILE, PPTX, tmp_path):
     странице заметок .pptx, которую в браузере не открыть."""
     text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html").read_text(encoding="utf-8")
     assert DECK.slides[0].speaker_notes in text
+
+
+def test_html_without_fidelity_argument_has_no_fidelity_markup(DECK, PROFILE, PPTX, tmp_path):
+    """Задача T: та же честная деградация, что и у PPTEval (см. `test_html_
+    without_visual_argument_has_no_score_markup`) — без `fidelity` (по
+    умолчанию) блок «Верность шаблону» отсутствует в разметке."""
+    text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html").read_text(encoding="utf-8")
+    assert 'id="template-fidelity"' not in text
+
+
+def test_html_shows_fidelity_summary_when_passed(DECK, PROFILE, PPTX, tmp_path):
+    """Задача T: `audit.fidelity.template_fidelity` на том же PPTX/DECK,
+    переданный в `to_html`, попадает в документ отдельным блоком (см.
+    `_fidelity_html`, не трогает разметку PPTEval/бюджета)."""
+    report = template_fidelity(PPTX, DECK, PROFILE)
+    text = to_html(DECK, PROFILE, PPTX, tmp_path / "deck.html", fidelity=report).read_text(encoding="utf-8")
+    assert 'id="template-fidelity"' in text
+    assert report.summary in text

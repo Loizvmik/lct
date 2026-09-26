@@ -4,8 +4,10 @@
 
 Работа идёт в фоне через `asyncio.TaskGroup` (брифом дословно): три
 варианта вёрстки не зависят друг от друга ни на этапе сборки, ни на этапе
-аудита, ни на этапе выгрузки — каждый такой этап запускает три задачи
-`TaskGroup`'ом и ждёт все разом, а не по очереди. Сами шаги пайплайна
+аудита, ни на этапе выгрузки. С задачи N каждый вариант после текста идёт
+своей задачей `TaskGroup` целиком (`_run_variant`: rerank, переписывание
+под вариант, сборка, аудит, экспорт) в собственном бюджете времени, а не
+этап за этапом с ожиданием самого медленного соседа. Сами шаги пайплайна
 (`TemplateProfile.from_file`, `build_outline`, `write_slides`, `build_deck`,
 `run_deterministic`, `export_bundle`) — синхронный, блокирующий код (диск,
 subprocess `soffice`, CPU); каждый вызов уходит в `asyncio.to_thread`, чтобы
@@ -22,35 +24,44 @@ import asyncio
 import json
 import hashlib
 import shutil
-import threading
 import zipfile
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from io import BytesIO
 from pathlib import Path
+from types import SimpleNamespace
 from uuid import uuid4
 
 from deckforge.audit.autofix import SUPPORTED_CHECKS, apply_fixes
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
+from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.findings import Finding
 from deckforge.compose.builder import build_deck
 from deckforge.export.bundle import export_bundle
 from deckforge.plan.outline import SourceDoc, build_outline
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, rerank_patterns, write_slides
+from deckforge.plan.writer import (
+    AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, REALIZE_RESERVE_SECONDS, RERANK_VARIANTS, REALIZE_VARIANTS,
+    realize_for_variant, rerank_patterns, write_slides,
+)
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
 from deckforge.export.html import to_html_report
-from deckforge.workflow.budget import RunBudget, load_policy
+from deckforge.workflow.budget import RunBudget, RunMode, load_policy
 from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 
 STAGES: tuple[str, ...] = ("parse", "outline", "write", "compose", "audit", "export")
+
+# Задача N: стадии, общие для трёх вариантов. Их секунды идут в бюджет
+# прогона; всё после текста каждый вариант считает в своём бюджете
+# (`RunBudget.for_variant`), и снимок задания показывает их по вариантам.
+SHARED_STAGES: tuple[str, ...] = ("parse", "outline", "write")
 
 
 class JobError(ValueError):
@@ -86,11 +97,16 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
         return None
 
 
-def _rerank(deck: DeckSpec, profile: TemplateProfile, budget: RunBudget | None = None) -> dict[Variant, dict[int, str]]:
+def _rerank(
+    deck: DeckSpec, profile: TemplateProfile, budget: RunBudget | None = None,
+    *, variants: list[Variant] | None = None, prefer_decor: bool = False,
+) -> dict[Variant, dict[int, str]]:
     """Тот же шаг, что `cli._rerank`: модель выбирает раскладку из трёх для
     airy и visual. Выключено в конфиге, нет ключа или режим прогона (задача
     L, зафиксирован на контрольной точке `after_write`) rerank не
-    разрешает: пустой выбор, раскладку выбирает код."""
+    разрешает: пустой выбор, раскладку выбирает код. Задача N: зовётся на
+    один вариант, в его бюджете (`variants`), с тем же `prefer_decor`, что
+    потом уйдёт в `apply_variant`."""
     try:
         settings = Settings.load(APP_YAML_PATH)
     except Exception:
@@ -101,14 +117,31 @@ def _rerank(deck: DeckSpec, profile: TemplateProfile, budget: RunBudget | None =
         return {}
     llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
     chosen = rerank_patterns(
-        deck, profile, list(Variant), llm,
+        deck, profile, variants if variants is not None else list(Variant), llm,
         max_workers=settings.llm.pattern_picker_max_workers,
-        budget_seconds=settings.llm.pattern_picker_step_budget_seconds,
+        budget_seconds=settings.llm.pattern_picker_step_budget_seconds, prefer_decor=prefer_decor,
     )
     by_variant: dict[Variant, dict[int, str]] = {}
     for (variant, index), pattern_id in chosen.items():
         by_variant.setdefault(variant, {})[index] = pattern_id
     return by_variant
+
+
+def _realize_settings() -> tuple[bool, int, float]:
+    """`(включено, потоков, бюджет шага)` переписывания под вариант (задача
+    N, `plan.realize_*`). Без читаемого конфига выключено: без конфига нет и
+    ключа модели, переписывать некому."""
+    try:
+        plan = Settings.load(APP_YAML_PATH).plan
+    except Exception:
+        return False, 1, 0.0
+    return plan.realize_variants, plan.realize_max_workers, plan.realize_step_budget_seconds
+
+
+def _build_realizer() -> LLMProvider | None:
+    """Провайдер переписывания под вариант: роль писателя (та же модель
+    пишет и сокращает). Отдельной функцией, чтобы тесты подменяли модель."""
+    return _build_role_provider("writer")
 
 
 def _build_visual_auditor() -> LLMProvider | None:
@@ -190,6 +223,10 @@ class VariantState:
     # вариантов (`VariantSummary`), не только HTML-отчёту.
     content_avg: float | None = None
     design_avg: float | None = None
+    # Задача T: метрики верности шаблону на вариант — снимок
+    # (`dataclasses.asdict(FidelityReport)`) для `api.app._variant_summary`,
+    # посчитан в `_export_variant` рядом с экспортом (см. её докстроку).
+    fidelity: dict | None = None
 
     def set_findings(self, findings: list[Finding]) -> None:
         self.findings = findings + self.visual_findings
@@ -231,6 +268,15 @@ class JobRecord:
             "error": self.error,
             "budget": self.budget.summary() if self.budget is not None else None,
             "visual_audit": self.visual_audit,
+            # Задача R: находки, которые автопочинка не трогает, потому что
+            # нужен другой текст или другая раскладка, по вариантам.
+            "structural": {
+                name: [
+                    {"slide_index": f.slide_index, "check_id": f.check_id, "message": f.message}
+                    for f in state.findings if f.repair == "structural"
+                ]
+                for name, state in self.variants.items()
+            },
         }
 
     def subscribe(self) -> asyncio.Queue:
@@ -253,7 +299,12 @@ class JobRecord:
         друг за другом (кроме аудита и экспорта при autofix=False, где
         граница проходит по первому варианту, дошедшему до экспорта), так
         что время стадии: от входа в неё до входа в следующую."""
-        if self.budget is not None and self.stage is not None and self._stage_started is not None:
+        # Задача N: в бюджет прогона идут только общие стадии; сборку, аудит
+        # и экспорт каждый вариант пишет в свой бюджет сам (`_run_variant`),
+        # а стадия здесь — только метка прогресса для интерфейса.
+        if (
+            self.budget is not None and self.stage in SHARED_STAGES and self._stage_started is not None
+        ):
             self.budget.record(self.stage, self.budget.clock() - self._stage_started)
         self._stage_started = None
 
@@ -264,6 +315,16 @@ class JobRecord:
         if self.budget is not None:
             self._stage_started = self.budget.clock()
         self._notify()
+
+    def reach_stage(self, stage: str) -> None:
+        """Метка прогресса для стадии, до которой дошёл хоть один вариант:
+        варианты идут параллельно каждый в своём темпе, а список стадий в
+        снимке не должен раздуваться дублями или прыгать назад."""
+        if stage in self.stages:
+            return
+        if self.stage in STAGES and STAGES.index(stage) < STAGES.index(self.stage):
+            return
+        self.enter_stage(stage)
 
     def finish(self, *, error: str | None = None) -> None:
         self.close_stage()
@@ -377,11 +438,6 @@ async def _run_job(
             template_path=template.path, fill_repair_max_items=_writer_fill_repair(),
         )
 
-        # Задача L: первая контрольная точка режима прогона — фиксирует,
-        # идёт ли ниже rerank раскладок моделью. Держится до точки
-        # `after_compose` (см. докстроку `RunBudget.decide_mode`).
-        job.budget.decide_mode("after_write")
-
         # План презентации на диск рядом с результатом. Командная строка
         # это делала всегда, интерфейс — нет, и разбирать жалобу «слайд
         # выглядит плохо» приходилось по собранному .pptx, где уже не видно
@@ -395,23 +451,21 @@ async def _run_job(
         except Exception:  # noqa: BLE001 — отладочный артефакт не вправе ронять генерацию
             pass
 
+        # Задача N: общие стадии позади. Дальше три варианта идут
+        # параллельно, каждый целиком (rerank, переписывание, сборка,
+        # аудит, экспорт, аудит по картинке) в своём бюджете: пять минут ТЗ
+        # считаются на одну презентацию, и медленный вариант не должен
+        # отнимать режим у соседей. Бюджеты заводятся все сразу, до старта
+        # задач, чтобы дедлайн у всех был один.
+        job.close_stage()
+        budgets = {variant: job.budget.for_variant(variant.value) for variant in Variant}
+        config = AuditConfig.load()
         job.enter_stage("compose")
-        # Секунды переранжирования пишутся отдельно, но входят и в секунды
-        # стадии compose: для интерфейса это одна стадия «вёрстка».
-        rerank_started = job.budget.clock()
-        preferred_by_variant = await asyncio.to_thread(_rerank, deck, profile, job.budget)
-        job.budget.record("rerank", job.budget.clock() - rerank_started)
         async with asyncio.TaskGroup() as tg:
             for variant in Variant:
-                tg.create_task(_compose_variant(
-                    job, variant, deck, profile, template.path, preferred_by_variant.get(variant),
+                tg.create_task(_run_variant(
+                    job, variant, deck, profile, template.path, source_docs, config, autofix, budgets[variant],
                 ))
-
-        # Задача L: вторая контрольная точка — после сборки всех вариантов,
-        # перед аудитом/экспортом/аудитом по картинке. Держится до конца
-        # прогона (следующей точки нет — это последняя необязательная
-        # стадия пайплайна).
-        job.budget.decide_mode("after_compose")
 
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
         # случайные номера, и найти «тот самый, который только что собрали»
@@ -428,67 +482,92 @@ async def _run_job(
         except Exception:  # noqa: BLE001 — удобство, не вправе ронять генерацию
             pass
 
-        config = AuditConfig.load()
-        if autofix:
-            # autofix=True: экспорт зависит от результата автопочинки
-            # (`_audit_variant` перезаписывает pptx на диске), поэтому все
-            # три варианта должны ДОДЕЛАТЬ аудит, прежде чем хоть один
-            # уйдёт в экспорт — иначе можно экспортировать промежуточное
-            # состояние pptx одного варианта, пока соседний ещё чинится.
-            job.enter_stage("audit")
-            async with asyncio.TaskGroup() as tg:
-                for variant in Variant:
-                    tg.create_task(_audit_variant(job, variant.value, profile, config, autofix))
-
-            job.enter_stage("export")
-            async with asyncio.TaskGroup() as tg:
-                for variant in Variant:
-                    tg.create_task(_export_variant(job, variant.value, profile))
-        else:
-            # autofix=False: `_audit_variant` не трогает pptx на диске, так
-            # что экспорт варианта не зависит от аудита СОСЕДНИХ вариантов —
-            # одна задача на вариант "аудит, затем экспорт" в одном
-            # TaskGroup'е, а не два последовательных TaskGroup'а (лишнее
-            # ожидание самого медленного варианта аудита перед началом
-            # экспорта первого готового).
-            job.enter_stage("audit")
-            export_stage_entered = False
-
-            async def _audit_then_export(variant_name: str) -> None:
-                nonlocal export_stage_entered
-                await _audit_variant(job, variant_name, profile, config, autofix)
-                # Стадия "export" в прогрессе — общая на все три варианта,
-                # выставляем её один раз, когда до экспорта добрался первый
-                # вариант (порядок между вариантами не гарантирован, но сам
-                # список стадий job.stages не должен раздуться дублями).
-                if not export_stage_entered:
-                    export_stage_entered = True
-                    job.enter_stage("export")
-                await _export_variant(job, variant_name, profile)
-
-            async with asyncio.TaskGroup() as tg:
-                for variant in Variant:
-                    tg.create_task(_audit_then_export(variant.value))
-
-        job.close_stage()
-        await _visual_audit_variants(job, profile, source_docs)
         job.finish()
     except* Exception as eg:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
         # не остаться молчаливым "running" навсегда
         job.finish(error="; ".join(str(e) for e in eg.exceptions))
 
 
-async def _compose_variant(
+async def _run_variant(
     job: JobRecord, variant: Variant, deck: DeckSpec, profile: TemplateProfile, template_path: Path,
-    preferred: dict[int, str] | None = None,
+    sources: list[SourceDoc], config: AuditConfig, autofix: bool, budget: RunBudget,
 ) -> None:
-    variant_deck = await asyncio.to_thread(apply_variant, deck, profile, variant, preferred)
+    """Всё, что после текста, для одного варианта в его бюджете (задача N).
+
+    Контрольные точки режима (задача L) те же, но свои у варианта:
+    `after_write` перед rerank и переписыванием, `after_compose` перед
+    аудитом по картинке. Автопочинка правит только `.pptx` своего варианта,
+    поэтому экспорт варианта соседей не ждёт."""
+    budget.decide_mode("after_write")
+    realize_on, realize_workers, realize_budget = _realize_settings()
+    realizer = _build_realizer() if realize_on and variant in REALIZE_VARIANTS else None
+    # Нарядная раскладка без переписывания даст переполнение, поэтому
+    # `prefer_decor` только когда переписывание реально пойдёт: есть модель
+    # и режим не аварийный (в аварийном времени хватает лишь на файл), и
+    # после шага останется время на сборку и экспорт.
+    prefer_decor = (
+        realizer is not None and budget.mode is not RunMode.EMERGENCY
+        and budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS) > 0
+    )
+
+    preferred: dict[int, str] | None = None
+    if variant in RERANK_VARIANTS:
+        started = budget.clock()
+        chosen = await asyncio.to_thread(
+            _rerank, deck, profile, budget, variants=[variant], prefer_decor=prefer_decor,
+        )
+        preferred = chosen.get(variant)
+        budget.record("rerank", budget.clock() - started)
+
+    started = budget.clock()
+    variant_deck = await asyncio.to_thread(
+        apply_variant, deck, profile, variant, preferred, prefer_decor=prefer_decor,
+    )
+    if prefer_decor:
+        realize_started = budget.clock()
+        variant_deck = await asyncio.to_thread(
+            realize_for_variant, variant_deck, variant, profile, realizer,
+            max_workers=realize_workers,
+            budget_seconds=budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS),
+        )
+        budget.record("realize", budget.clock() - realize_started)
+        started = budget.clock()
     built_path = await asyncio.to_thread(build_deck, variant_deck, profile, template_path, variant)
     dest_dir = job.dir / variant.value
     dest_dir.mkdir(parents=True, exist_ok=True)
     dest = dest_dir / "deck.pptx"
     await asyncio.to_thread(shutil.copy2, built_path, dest)
+    # План варианта рядом с его файлом: после переписывания текст у airy и
+    # visual свой, и общий deck.json его уже не показывает.
+    try:
+        (dest_dir / "deck.json").write_text(
+            json.dumps(deck_spec_to_dict(variant_deck), ensure_ascii=False, indent=2), encoding="utf-8",
+        )
+    except Exception:  # noqa: BLE001 — отладочный артефакт не вправе ронять генерацию
+        pass
     job.variants[variant.value] = VariantState(variant=variant, deck_spec=variant_deck, pptx_path=dest)
+    budget.record("compose", budget.clock() - started)
+
+    budget.decide_mode("after_compose")
+
+    job.reach_stage("audit")
+    started = budget.clock()
+    await _audit_variant(job, variant.value, profile, config, autofix)
+    budget.record("audit", budget.clock() - started)
+
+    job.reach_stage("export")
+    started = budget.clock()
+    await _export_variant(job, variant.value, profile)
+    budget.record("export", budget.clock() - started)
+
+    # Задача M: аудит по картинке идёт для КАЖДОГО варианта, не только
+    # dense, как было до неё — содержание одно, но вёрстка своя у каждого
+    # варианта, и вопросы уровня колоды (C09/C11) читают именно её. Идёт в
+    # ТОМ ЖЕ бюджете варианта (задача N), что и остальные необязательные
+    # шаги этой функции — отдельного лока между вариантами не нужно:
+    # `budget` здесь свой на вариант, не общий объект.
+    await _visual_audit_variant(job, variant.value, profile, sources, budget)
+    budget.stop()
 
 
 async def _audit_variant(job: JobRecord, variant_name: str, profile: TemplateProfile, config: AuditConfig, autofix: bool) -> None:
@@ -508,48 +587,33 @@ async def _audit_variant(job: JobRecord, variant_name: str, profile: TemplatePro
     state.set_findings(findings)
 
 
-async def _visual_audit_variants(job: JobRecord, profile: TemplateProfile, sources: list[SourceDoc]) -> None:
-    """Аудит по картинке КАЖДОГО варианта (задача M), не только dense, как
-    было до неё: содержание у трёх вариантов одно, но вёрстка разная, и
-    вопросы уровня колоды (C09/C11, теперь и в этой стадии — см.
-    `workflow.visual_stage`) читают именно её. Три варианта идут
-    ПАРАЛЛЕЛЬНО (тот же приём, что `_compose_variant`/`_audit_variant` в
-    `TaskGroup` выше), а не по очереди — иначе стадия тратила бы втрое
-    больше бюджета (задача H), чем при одном варианте."""
-    if job.budget is None:
-        return
-    job.visual_audit = {}
-    # Общий бюджет прогона у всех трёх вариантов один и тот же объект —
-    # `run_visual_stage` пишет в него секунды стадии (`budget.record`) из
-    # разных потоков (`asyncio.to_thread`) одновременно; без общего лока
-    # это гонка на `stage_seconds[...] += ...` (см. докстроку `lock` у
-    # `run_visual_stage`).
-    lock = threading.Lock()
-    async with asyncio.TaskGroup() as tg:
-        for variant in Variant:
-            if variant.value in job.variants:
-                tg.create_task(_visual_audit_one_variant(job, variant.value, profile, sources, lock))
-
-
-async def _visual_audit_one_variant(
-    job: JobRecord, variant_name: str, profile: TemplateProfile, sources: list[SourceDoc],
-    lock: threading.Lock,
+async def _visual_audit_variant(
+    job: JobRecord, variant_name: str, profile: TemplateProfile, sources: list[SourceDoc], budget: RunBudget,
 ) -> None:
-    """Один вариант — см. докстроку `_visual_audit_variants`. Находки
-    ложатся в тот же список, что и детерминированные; HTML-отчёт варианта
-    перерисовывается с оценками модели. Сбой ЭТОГО варианта не роняет
-    готовую колоду и не задевает соседние (своя задача `TaskGroup`, свой
-    `try`, не общий на всех три сразу)."""
+    """Аудит по картинке ОДНОГО варианта, в ЕГО СОБСТВЕННОМ бюджете
+    (задача N: `budget.for_variant` завёл его в `_run_job`, `_run_variant`
+    передаёт сюда). До задачи M эта стадия шла только для dense — теперь
+    для КАЖДОГО варианта: содержание одно, но вёрстка своя, и вопросы
+    уровня колоды (C09/C11, `workflow.visual_stage`) читают именно её.
+    Три варианта и так идут параллельно (задача N, `TaskGroup` в
+    `_run_job`), и раз бюджет у каждого свой объект — общий лок между
+    вариантами (нужен был бы при ОБЩЕМ `RunBudget`) здесь не нужен.
+
+    Находки ложатся в тот же список, что и детерминированные; HTML-отчёт
+    варианта перерисовывается с оценками модели. Сбой не роняет готовую
+    колоду: стадия необязательная."""
     state = job.variants.get(variant_name)
     if state is None:
         return
+    if job.visual_audit is None:
+        job.visual_audit = {}
     try:
         deterministic = [f for f in state.findings if f not in state.visual_findings]
         outcome = await asyncio.to_thread(
-            run_visual_stage, job.budget, state.deck_spec, deterministic,
+            run_visual_stage, budget, state.deck_spec, deterministic,
             _build_visual_auditor(),
             lambda: list(state.preview_pngs), sources=sources,
-            autofixed_slides=state.autofixed_slides, pptx_path=state.pptx_path, lock=lock,
+            autofixed_slides=state.autofixed_slides, pptx_path=state.pptx_path,
         )
     except Exception as exc:  # noqa: BLE001: необязательная стадия не вправе ронять готовую колоду
         job.visual_audit[variant_name] = {"ran": False, "skipped_reason": f"аудит по картинке упал: {exc}"}
@@ -567,9 +631,14 @@ async def _visual_audit_one_variant(
     # тоже часть отчёта задачи L, не только оценки модели.
     if state.html_path is not None:
         try:
+            # `state.fidelity` — уже снятый слепок (`_export_variant`), не
+            # пересчитывается здесь заново: тот же приём, что и с оценками
+            # PPTEval, — перерисовка HTML не должна повторять дорогую работу.
+            fidelity_obj = SimpleNamespace(**state.fidelity) if state.fidelity else None
             await asyncio.to_thread(
                 to_html_report, state.deck_spec, profile, state.pptx_path, state.html_path,
-                visual=outcome.result, budget=job.budget.summary(), risky_slides=summary.get("risk"),
+                visual=outcome.result, budget=job.budget.variant_summary(variant_name),
+                risky_slides=summary.get("risk"), fidelity=fidelity_obj,
             )
         except Exception:  # noqa: BLE001: HTML без оценок лучше, чем упавшее задание
             pass
@@ -579,13 +648,24 @@ async def _export_variant(job: JobRecord, variant_name: str, profile: TemplatePr
     state = job.variants[variant_name]
     out_dir = job.dir / variant_name
     # Задача L: режим прогона уже решён (`decide_mode("after_compose")` в
-    # `_run_job` идёт до этой стадии) — снимок бюджета попадает в HTML сразу,
+    # `_run_variant` идёт до этой стадии) — снимок бюджета попадает в HTML сразу,
     # список рискованных слайдов (`risky_slides`) допишет только `_visual_
     # audit_dense`, перерисовав HTML dense-варианта заново, когда аудит
     # реально пройдёт.
-    budget_summary = job.budget.summary() if job.budget is not None else None
+    budget_summary = job.budget.variant_summary(variant_name) if job.budget is not None else None
+    # Задача T: метрики верности шаблону — рядом с экспортом (не отдельная
+    # стадия пайплайна), необязательны для готовой колоды: сбой метрики не
+    # должен ронять экспорт (та же честная деградация, что и у остальных
+    # необязательных шагов этого файла).
+    fidelity_report = None
+    try:
+        fidelity_report = await asyncio.to_thread(template_fidelity, state.pptx_path, state.deck_spec, profile)
+        state.fidelity = asdict(fidelity_report)
+    except Exception:  # noqa: BLE001 — метрика необязательна, экспорт не вправе упасть из-за неё
+        state.fidelity = None
     bundle = await asyncio.to_thread(
         export_bundle, state.pptx_path, profile, out_dir, deck_spec=state.deck_spec, budget=budget_summary,
+        fidelity=fidelity_report,
     )
     state.pdf_path = bundle.pdf
     state.html_path = bundle.html
