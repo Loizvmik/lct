@@ -207,3 +207,28 @@ def test_queue_wait_and_calls_land_in_the_run_budget():
     assert summary["calls_by_role"]["writer"]["calls"] == 3
     assert budget.median_call_seconds("writer", 99.0) == pytest.approx(0.05, abs=0.04)
     assert budget.median_call_seconds("visual_audit", 25.0) == 25.0, "до первого вызова роли оценка из конфига"
+
+
+def test_mandatory_writing_beats_optional_audit_of_a_job_with_the_same_clock():
+    """Живой прогон задачи W: у заданий пакета почти одинаковые часы, и
+    аудит по картинке одного (резерв 45с) не должен обгонять письмо
+    другого (резерв 60с): очередь считает время до резерва вызова."""
+    scheduler = ModelScheduler(1)
+    model = _SlowModel(delay=0.01)
+    scheduler.acquire()
+    audit = ScheduledProvider(model, role="visual_audit", budget=_FixedBudget(100.0), reserve=45.0, scheduler=scheduler)
+    writer = ScheduledProvider(model, role="writer", budget=_FixedBudget(101.0), reserve=60.0, scheduler=scheduler)
+
+    first = threading.Thread(target=_ask, args=(audit, "audit"))
+    first.start()
+    while len(scheduler._waiters) < 1:
+        time.sleep(0.005)
+    second = threading.Thread(target=_ask, args=(writer, "writer"))
+    second.start()
+    while len(scheduler._waiters) < 2:
+        time.sleep(0.005)
+    scheduler.release()
+    first.join()
+    second.join()
+
+    assert model.order == ["writer", "audit"]

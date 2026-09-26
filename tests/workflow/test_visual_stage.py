@@ -293,3 +293,22 @@ def test_stage_calls_are_counted_in_the_budget(tmp_path: Path):
     assert outcome.result is not None
     summary = budget.summary()
     assert summary["calls_by_role"]["visual_audit"]["calls"] == len(vlm.prompts)
+
+
+def test_calls_not_started_for_time_leave_no_c00_findings(tmp_path: Path):
+    """Вызов, который планировщик не начал по времени, не сбой модели:
+    находки «модель ответила невалидно» (C00) за него нет, повтора тоже."""
+    from deckforge.provider.scheduler import OutOfTime
+
+    class _NoTime(VisionProvider):
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def ask_image(self, png, prompt, *, max_tokens=1024):
+            self.calls += 1
+            raise OutOfTime("вызов не начат, время до резерва вышло")
+
+    vlm = _NoTime()
+    result = run_visual(_pngs(tmp_path, 3), _spec(3, set()), None, vlm, only_slides={0, 1}, deck_level=True)
+    assert result.findings == []
+    assert vlm.calls == 3, "по одному заходу на слайд и коллаж, без повтора"
