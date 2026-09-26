@@ -558,3 +558,47 @@ def test_cover_does_not_inherit_the_writer_layout():
     inner = SlideSpec(index=3, kind="section", headline="Раздел", pattern_id=smallest.pattern_id)
     assert _choose_kind_and_pattern(inner, PROFILE, Variant.dense)[1] == smallest.pattern_id
 
+
+def _many_cards_deck(n: int) -> DeckSpec:
+    cards = [Card(title=f"Шаг {i}", body="Короткое описание шага") for i in range(n)]
+    return DeckSpec(title="Т", language="ru", slides=[
+        SlideSpec(index=0, kind="cards", headline="Много шагов", blocks=[CardBlock(items=cards)]),
+    ])
+
+
+def test_no_structurally_fitting_layout_is_named_in_findings():
+    """Карточек больше, чем в самой большой сетке шаблона: выбор тот же,
+    что и раньше, но причина видна в находках, с числами."""
+    from deckforge.plan.variants import structural_gap
+
+    most = max(
+        max(p.capacity.max_items, p.repeat.count) for p in PROFILE.patterns
+        if p.repeat is not None and {"card_title", "card_body"} & set(p.repeat.slot_roles)
+    )
+    deck = _many_cards_deck(most + 2)
+
+    assert structural_gap(deck.slides[0], PROFILE) == f"нужно {most + 2} единиц, максимум в шаблоне {most}"
+    for variant in Variant:
+        slides = [s for s in apply_variant(deck, PROFILE, variant).slides if s.blocks]
+        assert sum("раскладка под содержание не найдена" in f for f in slides[0].findings) == 1
+    assert deck.slides[0].findings == [], "находка варианта не должна протекать в исходную колоду"
+
+
+def test_fitting_content_gets_no_layout_gap_finding():
+    deck = _many_cards_deck(2)
+    slide = apply_variant(deck, PROFILE, Variant.dense).slides[0]
+    assert not any("раскладка под содержание не найдена" in f for f in slide.findings)
+
+
+def test_table_without_table_layout_is_named():
+    from deckforge.plan.spec import TableVisual
+    from deckforge.plan.variants import structural_gap
+
+    if any(p.kind == "table" for p in PROFILE.patterns):
+        pytest.skip("в этом шаблоне таблица есть")
+    slide = SlideSpec(
+        index=1, kind="table", headline="Замер",
+        visual=Visual(kind="table", table=TableVisual(rows=[["а", "б"], ["1", "2"]])),
+    )
+    assert structural_gap(slide, PROFILE) == "нужен слот под таблицу, в шаблоне его нет"
+

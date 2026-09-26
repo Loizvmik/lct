@@ -686,6 +686,42 @@ def _choose_kind_and_pattern(
     return best.kind, best.pattern_id
 
 
+def structural_gap(slide: SlideSpec, profile) -> str | None:
+    """Почему ни одна раскладка шаблона не вмещает содержание слайда по
+    структуре, или `None`, если какая-то вмещает.
+
+    `_choose_kind_and_pattern` в этом случае не падает, а берёт лучшее из
+    худшего, и раньше делал это молча: шесть карточек садились на сетку из
+    четырёх, таблица на раскладку без таблицы, и по отчёту было не понять,
+    почему слайд вышел обрезанным. Выбор эта функция не меняет, только
+    называет причину числами."""
+    if profile is None or not profile.patterns:
+        return None
+    for block in slide.blocks:
+        if isinstance(block, CardBlock) and block.items:
+            holders = [
+                p for p in profile.patterns
+                if p.repeat is not None and set(p.repeat.slot_roles) & {"card_title", "card_body"}
+            ]
+            return _units_gap(len(block.items), holders, "карточек")
+        if isinstance(block, KpiBlock) and block.items:
+            holders = [p for p in profile.patterns if p.kind in ("kpi", "kpi_caption")]
+            return _units_gap(len(block.items), holders, "показателей")
+    if slide.visual is not None and slide.visual.table is not None:
+        if not any(p.kind == "table" for p in profile.patterns):
+            return "нужен слот под таблицу, в шаблоне его нет"
+    return None
+
+
+def _units_gap(needed: int, holders: list, what: str) -> str | None:
+    if not holders:
+        return f"нужно {needed} {what}, раскладок под них в шаблоне нет"
+    most = max(max(p.capacity.max_items, p.repeat.count if p.repeat is not None else 0) for p in holders)
+    if needed > most:
+        return f"нужно {needed} единиц, максимум в шаблоне {most}"
+    return None
+
+
 def _is_cover(slide: SlideSpec) -> bool:
     """Обложка: первый слайд героического вида. Списочный слайд на первой
     позиции (тестовые колоды) обложкой не считается."""
@@ -916,7 +952,17 @@ def apply_variant(
         kind, pattern_id = _choose_kind_and_pattern(
             slide, profile, variant, avoid=avoid, history=history, preferred=preferred.get(i),
         )
-        new_slides.append(replace(slide, index=i, kind=kind, pattern_id=pattern_id))
+        placed = replace(slide, index=i, kind=kind, pattern_id=pattern_id)
+        gap = structural_gap(slide, profile)
+        if gap is not None:
+            # Своя копия списка: `replace` делит его с исходным слайдом, и
+            # находка одного варианта попала бы в два других.
+            placed.findings = [
+                *slide.findings,
+                f"Слайд {i}: раскладка под содержание не найдена — {gap}; "
+                f"взята {pattern_id or 'никакая'} ({kind}), часть содержания может не лечь.",
+            ]
+        new_slides.append(placed)
         history = history.with_choice(pattern_id)
 
     return DeckSpec(
