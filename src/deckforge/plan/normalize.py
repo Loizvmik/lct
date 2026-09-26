@@ -55,6 +55,7 @@ def normalize_deck(deck: DeckSpec, profile) -> DeckSpec:
     kinds = {p.kind for p in profile.patterns}
     two_unit_cards = _has_two_unit_card_layout(profile)
     slides = [_normalize_slide(slide, kinds, two_unit_cards) for slide in deck.slides]
+    slides = _diversify_cards(slides, kinds)
     changed = sum(1 for before, after in zip(deck.slides, slides) if before is not after)
     meta = dict(deck.meta)
     if changed:
@@ -81,6 +82,39 @@ def _blockless_as_section(slide: SlideSpec, kinds: set[str]) -> SlideSpec | None
         *slide.findings,
         f"Слайд {slide.index}: содержания нет, только заголовок; собран как разделитель.",
     ])
+
+
+# Сколько карточных слайдов подряд по колоде допустимо до того, как
+# следующий уходит в список по колонкам: у VK Education под четыре
+# карточки с длинным текстом подходит одна раскладка (slide21), и пять
+# карточных слайдов из одиннадцати выходили одинаковыми (27 сентября 2026).
+_MAX_CARD_SLIDES = 2
+
+
+def _diversify_cards(slides: list[SlideSpec], kinds: set[str]) -> list[SlideSpec]:
+    """Третий и дальше карточный слайд колоды становится списком по
+    колонкам (`two_col`, иначе `bullets`): «заголовок карточки: тело» на
+    пункт. Смысл тот же, форма другая, и ранжир получает другие кандидаты."""
+    target = "two_col" if "two_col" in kinds else ("bullets" if "bullets" in kinds else None)
+    if target is None:
+        return slides
+    out: list[SlideSpec] = []
+    seen = 0
+    for slide in slides:
+        cards = [b for b in slide.blocks if isinstance(b, CardBlock)]
+        if slide.kind != "cards" or len(cards) != 1 or len(slide.blocks) != 1:
+            out.append(slide)
+            continue
+        seen += 1
+        if seen <= _MAX_CARD_SLIDES:
+            out.append(slide)
+            continue
+        items = [f"{c.title}: {c.body}" if c.title else c.body for c in cards[0].items]
+        out.append(replace(slide, kind=target, blocks=[BulletBlock(items=items)], findings=[
+            *slide.findings,
+            f"Слайд {slide.index}: карточки заменены списком, в колоде уже {_MAX_CARD_SLIDES} карточных слайда.",
+        ]))
+    return out
 
 
 def _normalize_slide(slide: SlideSpec, kinds: set[str], two_unit_cards: bool) -> SlideSpec:

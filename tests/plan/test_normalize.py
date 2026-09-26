@@ -141,3 +141,18 @@ def test_a_blockless_content_slide_becomes_a_section():
     assert out.slides[0].kind == "section"
     assert any("разделитель" in f for f in out.slides[0].findings)
 
+
+def test_third_cards_slide_becomes_a_two_column_list():
+    """Пять карточных слайдов из одиннадцати садились на одну раскладку
+    slide21 (27 сентября 2026): начиная с третьего карточки идут списком."""
+    from deckforge.plan.normalize import normalize_deck
+    from deckforge.plan.spec import BulletBlock
+
+    profile = _profile(_pattern("cards", 4), _pattern("two_col", roles=("headline", "bullet")))
+    cards = [Card(title=f"Заголовок {i}", body=f"Тело карточки номер {i} с фактом") for i in range(4)]
+    deck = _deck(*[_cards_slide(*cards) for _ in range(4)])
+    out = normalize_deck(deck, profile)
+    assert [s.kind for s in out.slides] == ["cards", "cards", "two_col", "two_col"]
+    third = out.slides[2].blocks[0]
+    assert isinstance(third, BulletBlock) and third.items[0].startswith("Заголовок 0: ")
+

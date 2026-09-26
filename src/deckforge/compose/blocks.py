@@ -281,6 +281,23 @@ def _assign_quote(
 _CARD_BODY_ROLES = ("card_body", "bullet", "body")
 
 
+# Раскладки, чьи единицы повтора это колонки текста, а не карточки с
+# иконкой: в колонку кладётся несколько пунктов.
+_COLUMN_KINDS = frozenset({"two_col", "bullets"})
+
+
+def _chunk_evenly(items: list[str], n: int) -> list[list[str]]:
+    """Делит список на `n` частей как можно ровнее, первые части длиннее."""
+    base, extra = divmod(len(items), n)
+    out: list[list[str]] = []
+    start = 0
+    for i in range(n):
+        size = base + (1 if i < extra else 0)
+        out.append(items[start:start + size])
+        start += size
+    return [c for c in out if c]
+
+
 def _spread_bullets_over_repeat(
     block: BulletBlock, by_role: dict[str, list[PatternSlot]], pattern: Pattern, grid: Grid,
 ) -> list[SlotContent] | None:
@@ -309,17 +326,29 @@ def _spread_bullets_over_repeat(
     items = [i for i in block.items if i.strip()]
     if len(items) < 2 or pattern.repeat is None:
         return None
-    groups = expand_repeat(pattern, len(items), grid)
-    if len(groups) != len(items):
+    native = pattern.repeat.count
+    if native >= 2 and len(items) > native and pattern.kind in _COLUMN_KINDS:
+        # Пунктов больше, чем колонок у двухколоночной раскладки: по
+        # нескольку пунктов в колонку, а не по колонке на пункт. Иначе
+        # раскладка разворачивалась под четыре узкие колонки, клон примера с
+        # двумя колонками отказывал («элементов больше, чем единиц»), и слайд
+        # уходил на сборку с нуля (27 сентября 2026).
+        chunks = _chunk_evenly(items, native)
+    else:
+        chunks = [[item] for item in items]
+    groups = expand_repeat(pattern, len(chunks), grid)
+    if len(groups) != len(chunks):
         return None
 
     result: list[SlotContent] = []
     used: set[int] = set()
-    for item, group in zip(items, groups):
+    for chunk, group in zip(chunks, groups):
         body_slot = _pick_body_slot(_open_slots(group))
         if body_slot is None:
             return None  # единица повтора без места под текст — приём не годится
-        result.append(SlotContent(body_slot, "card_body", [Paragraph(item)]))
+        many = len(chunk) > 1
+        result.append(SlotContent(body_slot, "bullets" if many else "card_body",
+                                  [Paragraph(item, bullet=many) for item in chunk]))
         used.add(id(body_slot))
 
     for slots in by_role.values():

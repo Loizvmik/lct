@@ -505,3 +505,14 @@ def test_subhead_without_its_own_slot_leaves_body_to_the_blocks():
     assert [c.role_hint for c in result] == ["headline", "body"]
     assert [d.role for d in drops] == ["subhead"]
 
+
+def test_more_bullets_than_columns_share_the_columns():
+    """Четыре пункта на двухколоночной раскладке: по два в колонку, а не
+    четыре узкие колонки (клон примера с двумя колонками отказывал, слайд
+    уходил на сборку с нуля, 27 сентября 2026)."""
+    from deckforge.compose.blocks import _chunk_evenly
+
+    assert _chunk_evenly(["а", "б", "в", "г"], 2) == [["а", "б"], ["в", "г"]]
+    assert _chunk_evenly(["а", "б", "в"], 2) == [["а", "б"], ["в"]]
+    assert _chunk_evenly(["а"], 2) == [["а"]]
+
