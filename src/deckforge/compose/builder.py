@@ -1512,7 +1512,7 @@ def place_slide_by_clone(
     kept_decor = expand_decor(pattern, None, grid, filled)
     kept_ids = {id(d) for d in kept_decor}
     bound_slots = {id(content.slot) for content, _ in bound}
-    for slot in _ordinal_slots(pattern, filled):
+    for slot in _sample_text_slots(pattern, filled):
         ref = matched.get(index_of[id(slot)])
         if id(slot) not in bound_slots and ref is not None:
             bound_slots.add(id(slot))
@@ -1590,24 +1590,40 @@ def _native_repeat_contents(pattern: Pattern, contents: list[SlotContent]) -> li
 _ORDINAL_RE = re.compile(r"\d{1,2}\.?")
 
 
-def _ordinal_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
-    """Слоты-номера заполненных единиц повтора: кружок с «1», «2» над
-    карточкой. Майнинг видит в нём слот (`kpi_value`), а содержания под
-    него у карточек нет, и без этой оговорки клон удалял бы кружок как
-    незаполненный слот, оставляя карточку без номера и с дырой на его
-    месте. Номер примера верен как есть: клон оставляет первые единицы
-    повтора по порядку, i-я карточка стоит в i-й единице."""
+def _sample_text_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
+    """Слоты, чей текст примера клон оставляет как есть: номер шага в
+    кружке («1», «2» над карточкой) и постоянный текст шаблона («Спасибо за
+    внимание»). Содержания под них нет по замыслу, и без этой оговорки клон
+    удалял бы их как незаполненные слоты, оставляя карточку без номера и с
+    дырой на его месте.
+
+    Признак берётся из схемы слотов от модели (`PatternSlot.keeps_sample_
+    text`); без модели номер узнаётся по тексту примера (одна-две цифры),
+    как и до схемы. Слот внутри единицы повтора остаётся, только если сама
+    единица заполнена: номер верен как есть, клон оставляет первые единицы
+    повтора по порядку, i-я карточка стоит в i-й единице. Слот вне повтора
+    со схемой остаётся всегда."""
     repeat = pattern.repeat
-    if repeat is None or not filled:
-        return []
-    along = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
-    members = [s for s in pattern.slots if s.role in repeat.slot_roles]
-    units = sorted({round(along(s.box), 3) for s in members})
-    return [
-        s for s in members
-        if s.sample_text and _ORDINAL_RE.fullmatch(s.sample_text.strip())
-        and round(along(s.box), 3) in units and units.index(round(along(s.box), 3)) in filled
-    ]
+    members: list[PatternSlot] = []
+    units: list[float] = []
+    along = None
+    if repeat is not None:
+        along = (lambda b: b.left) if repeat.axis == "x" else (lambda b: b.top)
+        members = [s for s in pattern.slots if s.role in repeat.slot_roles]
+        units = sorted({round(along(s.box), 3) for s in members})
+    member_ids = {id(s) for s in members}
+    kept: list[PatternSlot] = []
+    for slot in pattern.slots:
+        if id(slot) not in member_ids:
+            if slot.keeps_sample_text:
+                kept.append(slot)
+            continue
+        marked = slot.keeps_sample_text or bool(
+            slot.sample_text and _ORDINAL_RE.fullmatch(slot.sample_text.strip())
+        )
+        if marked and units.index(round(along(slot.box), 3)) in filled:
+            kept.append(slot)
+    return kept
 
 
 # Зазор между суженной рамкой текста и графикой справа, доли холста.
@@ -1952,7 +1968,8 @@ def _pattern_from_model(model) -> Pattern:
         PatternSlot(
             role=s.role, box=_box_from_model(s.box), size_pt=s.size_pt, color_hex=s.color_hex,
             align=s.align, max_chars=s.max_chars, wraps=s.wraps, sample_text=s.sample_text,
-            anchor=s.anchor,
+            anchor=s.anchor, purpose=s.purpose, content_hint=s.content_hint,
+            max_words=s.max_words, ordinal=s.ordinal, fixed=s.fixed,
         )
         for s in model.slots
     ]
