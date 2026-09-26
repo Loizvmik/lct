@@ -30,7 +30,7 @@ from deckforge.plan.contracts import plan_contracts
 from deckforge.plan.outline import build_outline, load_content_pack, outline_to_dict
 from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
-from deckforge.plan.variants import Variant
+from deckforge.plan.variants import GenerationStyle, Variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
@@ -163,18 +163,32 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     работать запасными вариантами на каждом шаге, результат хуже по
     содержанию, но пайплайн не падает.
 
-    Задача P поменяла порядок решений: раньше текст писался один раз на три
-    стиля, а стиль потом подбирал раскладку под готовый текст. Теперь общие
-    только разбор и структура; раскладки и текст у каждого стиля свои,
-    текст пишется под свою композицию.
+    Задача Q: один стиль = одна презентация = один бюджет в 300 с.
+    `--style visual` собирает один стиль; без флага три стиля идут тремя
+    независимыми прогонами параллельно, каждый со своим бюджетом, режимом
+    и отчётом. Общие у них только разбор шаблона, структура и
+    распределение фото: они считаются один раз, их секунды входят в
+    бюджет каждого прогона (каждый их ждал), а в отчёте первого стиля
+    они свои, у остальных помечены как переиспользованные. Раскладки и
+    текст у каждого стиля свои, текст пишется под свою композицию.
 
     Полный аудит по картинке всех слайдов (C01-C11) сюда не входит, только
-    вопросы по нескольким рискованным слайдам одного варианта, если бюджет
-    позволяет (`workflow.visual_stage`). Полный аудит остаётся командой
-    `deckforge audit-visual` на готовом файле."""
-    # Бюджет прогона создаётся первым делом: пять минут ТЗ считаются от
-    # начала команды.
-    budget = RunBudget.from_policy(load_policy(APP_YAML_PATH))
+    вопросы по нескольким рискованным слайдам каждого стиля, если бюджет
+    его прогона позволяет (`workflow.visual_stage`). Полный аудит остаётся
+    командой `deckforge audit-visual` на готовом файле."""
+    # Бюджеты прогонов создаются первым делом и все сразу: пять минут ТЗ
+    # считаются от начала команды для каждого стиля.
+    styles = list(dict.fromkeys(GenerationStyle.parse(s) for s in args.styles)) if args.styles else list(GenerationStyle)
+    policy = load_policy(APP_YAML_PATH)
+    budgets = {style: RunBudget.from_policy(policy) for style in styles}
+
+    def record_shared(stage: str, seconds: float) -> None:
+        # Первый стиль считал стадию «сам», остальные получили её готовой.
+        for i, style_budget in enumerate(budgets.values()):
+            style_budget.record(stage, seconds)
+            if i > 0:
+                style_budget.mark_reused(stage)
+
     namer = _build_namer()
     vision = _build_pattern_kind_vlm()
     outline_llm = _build_role_provider("outline")
@@ -184,7 +198,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         args.template, namer=namer, vision=vision, schema=_build_pattern_schema_vlm(),
     )
     parsed_at = time.monotonic()
-    budget.record("parse", parsed_at - started)
+    record_shared("parse", parsed_at - started)
     print(f"{args.template.name}: разобран за {parsed_at - started:.1f}с, паттернов: {len(profile.patterns)}")
 
     brief, sources, meta = load_content_pack(args.content_pack)
@@ -194,7 +208,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         title=meta.get("title", args.content_pack.name), language=meta.get("language", "ru"),
     )
     outlined_at = time.monotonic()
-    budget.record("outline", outlined_at - parsed_at)
+    record_shared("outline", outlined_at - parsed_at)
     print(f"Структура: {len(outline.slides)} слайдов за {outlined_at - parsed_at:.1f}с")
 
     # Фотографии контент-пакета распределяются по пунктам структуры ДО
@@ -217,50 +231,51 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         if photo_report.placed_count == 0:
             print("  ! Ни одна фотография не попала ни на один слайд — см. находки выше.")
     user_photos = {p.name: p.path for p in photos}
-    budget.record("photos", photos_at - outlined_at)
+    record_shared("photos", photos_at - outlined_at)
     intents = intents_from_outline(outline, photo_by_slide)
 
     config = AuditConfig.load()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     outline_path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__outline.json"
     outline_path.write_text(json.dumps(outline_to_dict(outline), ensure_ascii=False, indent=2), encoding="utf-8")
-    variants = [Variant[v] for v in args.variants] if args.variants else list(Variant)
     writer_max_workers = args.writer_max_workers if args.writer_max_workers is not None else _writer_max_workers()
 
-    # Общие стадии позади. Дальше стили идут параллельно, каждый целиком
-    # (раскладки, текст, сборка, аудит) в своём бюджете: лимит ТЗ считается
-    # на одну презентацию. Бюджеты заводятся все сразу, чтобы дедлайн был
-    # один. Печать каждого стиля копится и выводится целиком.
-    budgets = {variant: budget.for_variant(variant.value) for variant in variants}
-    # Вариант, по которому идёт аудит по картинке: dense, если собирается,
-    # иначе первый из заказанных.
-    visual_variant = Variant.dense if Variant.dense in variants else variants[0]
+    # Общие стадии позади. Первая контрольная точка каждого прогона, дальше
+    # стили идут параллельно, каждый целиком (раскладки, текст, сборка,
+    # аудит, аудит по картинке) в своём бюджете. Печать каждого стиля
+    # копится и выводится целиком.
+    for style_budget in budgets.values():
+        style_budget.decide_mode("after_outline")
+    # Содержание первого стиля ещё и под общим именем: `deckforge
+    # audit-visual` берёт .pptx и его план.
+    main_style = styles[0]
     ctx = dict(
         outline=outline, intents=intents, profile=profile, args=args, config=config, user_photos=user_photos,
-        photos=photos, photo_report=photo_report, sources=sources, visual_variant=visual_variant,
+        photos=photos, photo_report=photo_report, sources=sources,
         writer_max_workers=writer_max_workers,
     )
-    with ThreadPoolExecutor(max_workers=len(variants)) as pool:
-        futures = [pool.submit(_generate_variant, variant, budgets[variant], ctx) for variant in variants]
+    with ThreadPoolExecutor(max_workers=len(styles)) as pool:
+        futures = [pool.submit(_generate_variant, style, budgets[style], ctx) for style in styles]
         outputs = [future.result() for future in futures]
     for lines in outputs:
         print("\n".join(lines))
 
-    # Содержание варианта, по которому идёт аудит по картинке, ещё и под
-    # общим именем: `deckforge audit-visual` берёт .pptx и его план.
     debug_path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__deck-t13.json"
-    variant_debug = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{visual_variant.value}-deck.json"
+    variant_debug = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{main_style.value}-deck.json"
     if variant_debug.exists():
         shutil.copy2(variant_debug, debug_path)
         print(f"\nСодержание (для отладки) записано в {debug_path}")
 
-    summary = budget.summary()
-    print(f"\nВсего: {time.monotonic() - started:.1f}с (бюджет {budget.deadline_seconds:.0f}с на презентацию)")
-    print(f"  общие стадии: {summary['stage_seconds']}")
-    for name, part in summary.get("variants", {}).items():
+    # Отчёт по бюджету у каждого стиля свой: лимит ТЗ считается на одну
+    # презентацию, и уложился ли стиль, решает только его собственный прогон.
+    print(f"\nВсего: {time.monotonic() - started:.1f}с на {len(styles)} стил(я/ей) параллельно")
+    for style, style_budget in budgets.items():
+        part = style_budget.summary()
+        verdict = "уложился" if part["elapsed_seconds"] <= part["budget_seconds"] else "НЕ уложился"
+        reused = f", переиспользовано: {', '.join(part['shared_stages'])}" if part.get("shared_stages") else ""
         print(
-            f"  [{name}] {part['elapsed_seconds']:.1f}с после общих стадий, режим {part['mode']}, "
-            f"по стадиям: {part['stage_seconds']}"
+            f"  [{style.value}] {part['elapsed_seconds']:.1f}с из {part['budget_seconds']:.0f}с ({verdict}), "
+            f"режим {part['mode']}, по стадиям: {part['stage_seconds']}{reused}"
         )
     print(
         "\nПолный аудит по картинке всех слайдов (C01-C11) запускается отдельно на "
@@ -401,8 +416,9 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
     out.append(
         f"  режим: {mode_after_compose.value} (точка after_compose, осталось {budget.remaining():.0f}с)"
     )
-    if variant == ctx["visual_variant"]:
-        _visual_stage(budget, (path, deck, findings), variant, ctx["sources"], out)
+    # Аудит по картинке идёт у каждого стиля: это отдельный прогон со
+    # своим бюджетом, как задание API.
+    _visual_stage(budget, (path, deck, findings), variant, ctx["sources"], out)
     budget.stop()
     return out
 
@@ -547,14 +563,17 @@ def build_parser() -> argparse.ArgumentParser:
     parse_cmd.add_argument("-o", "--output", type=Path, required=True, help="Куда записать профиль (JSON)")
     parse_cmd.set_defaults(func=_cmd_parse)
 
-    generate_cmd = sub.add_parser("generate", help="Собрать презентацию (все три варианта) по шаблону и контент-пакету")
+    generate_cmd = sub.add_parser("generate", help="Собрать презентацию по шаблону и контент-пакету (один стиль или три параллельно)")
     generate_cmd.add_argument("template", type=Path, help="Путь к .pptx-шаблону")
     generate_cmd.add_argument("content_pack", type=Path, help="Каталог контент-пакета (brief.md + sources.md)")
     generate_cmd.add_argument("-o", "--output-dir", type=Path, required=True, help="Куда положить собранные .pptx")
     generate_cmd.add_argument("--target-slides", type=int, default=None, help="Целевое число слайдов (иначе — из brief.md)")
     generate_cmd.add_argument(
-        "--variant", dest="variants", action="append", choices=[v.value for v in Variant],
-        help="Собрать только этот вариант (можно повторять); по умолчанию — все три",
+        "--style", "--variant", dest="styles", action="append", choices=[s.value for s in GenerationStyle],
+        help=(
+            "Собрать презентацию этого стиля (можно повторять); по умолчанию три стиля "
+            "тремя независимыми прогонами с общей структурой. --variant: старое имя флага"
+        ),
     )
     generate_cmd.add_argument(
         "--writer-max-workers", type=int, default=None,

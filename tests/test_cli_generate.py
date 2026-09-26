@@ -111,12 +111,22 @@ def test_generate_plans_layouts_per_style_before_the_text(monkeypatch, capsys, t
         cli_module, "_build_role_provider",
         lambda role, **kw: _ContractLLM() if role == "writer" else real_build(role, **kw),
     )
+    outline_calls = []
+    real_outline = cli_module.build_outline
+
+    def _outline(*args, **kwargs):
+        outline_calls.append(1)
+        return real_outline(*args, **kwargs)
+
+    monkeypatch.setattr(cli_module, "build_outline", _outline)
     out_dir = tmp_path / "decks"
 
     exit_code = main([
-        "generate", str(TEMPLATE), str(CONTENT_PACK), "-o", str(out_dir), "--variant", "dense", "--variant", "visual",
+        "generate", str(TEMPLATE), str(CONTENT_PACK), "-o", str(out_dir), "--style", "dense", "--style", "visual",
     ])
     assert exit_code == 0
+    # Задача Q: два стиля = два прогона со своими бюджетами, структура одна.
+    assert len(outline_calls) == 1
 
     assert set(captured) == {cli_module.Variant.dense, cli_module.Variant.visual}
     assert captured[cli_module.Variant.dense] != captured[cli_module.Variant.visual]
@@ -127,5 +137,10 @@ def test_generate_plans_layouts_per_style_before_the_text(monkeypatch, capsys, t
     out = capsys.readouterr().out
     assert "раскладки назначены" in out and "мест в пределах контракта" in out
     assert list(out_dir.glob("*__outline.json"))
-
-
+    reports = {
+        line.split("]")[0].strip(" ["): line for line in out.splitlines()
+        if line.startswith("  [") and "с из 300с" in line
+    }
+    assert set(reports) == {"dense", "visual"}
+    assert "переиспользовано" not in reports["dense"]
+    assert "переиспользовано: parse, outline, photos" in reports["visual"]
