@@ -115,6 +115,23 @@ def test_missing_chart_in_the_answer_is_added_with_a_finding():
     assert any("в ответе модели его не было" in f for f in slide.findings)
 
 
+def test_flat_chart_answer_is_lifted_into_visual_chart():
+    """Живой прогон V1: модель клала ряд прямо в `visual`, иногда с видом
+    графика в `visual.kind`; слайд уходил в запасной вариант."""
+    for kind in ("chart", "bar"):
+        llm = _FakeLLM({
+            "headline": "Охват вырос к IV кварталу",
+            "blocks": [],
+            "visual": {"kind": kind, "categories": ["I", "II", "III", "IV"],
+                       "series": [{"name": "Регистраций", "values": [4100, 6300, 5800, 9400]}],
+                       "unit": "человек", "axis_titles": ["Квартал", "Регистрации"]},
+            "source_note": "Итоги 2026",
+        })
+        slide = _write_one_slide(_contract(TEXT_AREA), PROFILE, "", SOURCE_TEXT, 10, llm, agent_max_steps=1)
+        assert not any("запасным вариантом" in f for f in slide.findings), slide.findings
+        assert slide.visual.chart.axis_titles == ("Квартал", "Регистрации")
+
+
 def test_numbers_of_a_model_made_chart_are_checked_against_the_sources():
     """Без данных в контракте ряд пишет модель, и её числа сверяются с
     источниками: выдуманное число уходит в ремонт."""

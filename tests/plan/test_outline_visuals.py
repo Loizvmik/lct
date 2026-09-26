@@ -78,6 +78,20 @@ def test_sources_without_chartable_series_do_not_force_a_chart():
     assert _chart_slides(outline.slides) == []
 
 
+def test_table_ordered_for_a_required_chart_becomes_a_chart():
+    """Модель заказала таблицу под динамику по кварталам: правило слоя
+    данных главнее, пункт получает график, второго пункта под тот же ряд нет."""
+    slides = [
+        OutlineSlide(kind="title", intent="Итоги"),
+        OutlineSlide(kind="data", intent="Доведение выросло по кварталам", needs=["охват по кварталам"],
+                     form="table"),
+        OutlineSlide(kind="closing", intent="Итог"),
+    ]
+    out = apply_visual_intents(slides, _sources("edu-platform"))
+    assert out[1].form == "chart" and out[1].visual_intent.data_ref == "d1"
+    assert sum(1 for s in out if s.visual_intent is not None and s.visual_intent.data_ref == "d1") == 1
+
+
 def test_table_ordered_by_the_model_gets_the_source_rows():
     slides = [
         OutlineSlide(kind="title", intent="Пилот"),

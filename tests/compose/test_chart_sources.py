@@ -130,3 +130,30 @@ def test_rules_are_not_applied_to_a_single_series_gap():
     plot = frame.chart.plots[0]
     assert plot.gap_width != 0
     assert not frame.chart.value_axis.has_major_gridlines
+
+
+def test_three_series_on_a_two_colour_sample_get_three_colours():
+    """Образец слайда 47 VK Education даёт два цвета, рядов три: третий
+    берётся из палитры профиля и не совпадает на глаз с первым."""
+    profile = _profile(VKE)
+    spec = DeckSpec(title="Итоги", language="ru", slides=[_chart_slide(profile, 0, "slide47")])
+    prs = Presentation(str(build_deck(spec, profile, VKE, Variant.visual)))
+    plot = _charts(prs.slides[0])[0].chart.plots[0]
+    fills = [str(s.format.fill.fore_color.rgb) for s in plot.series]
+    assert len(set(fills)) == 3
+
+
+def test_a_plate_filled_by_the_theme_style_counts_as_background():
+    """Плашка ЛЦТ2026 (слайд 12) залита только `p:style/a:fillRef`: под ней
+    светло, и заголовок и подписи графика на ней не белые."""
+    from lxml import etree
+
+    from deckforge.compose.builder import _shape_solid_fill
+
+    xml = (
+        '<p:sp xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+        'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:spPr><a:ln><a:noFill/></a:ln></p:spPr>'
+        '<p:style><a:fillRef idx="1"><a:schemeClr val="lt1"/></a:fillRef></p:style></p:sp>'
+    )
+    color = _shape_solid_fill(etree.fromstring(xml), {"lt1": "#FFFFFF"}, {"bg1": "lt1"})
+    assert color is not None and color.hex == "#FFFFFF"

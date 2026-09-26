@@ -208,11 +208,38 @@ def _parse_slide(data: dict, contract: SlideContract) -> SlideSpec:
     выбора раскладки отброшены."""
     data = {k: v for k, v in data.items() if k != "layout_id"}
     data["kind"] = contract.kind
+    data = _lift_flat_chart(data, contract)
     slide = slide_spec_from_dict(data, contract.slide_id)
     return replace(
         slide, pattern_id=contract.pattern_id, alternatives=contract.alternatives,
         blocks=[_clean_block(b) for b in slide.blocks],
     )
+
+
+_CHART_FIELDS = ("categories", "series", "unit", "axis_titles", "highlight_index")
+
+
+def _lift_flat_chart(data: dict, contract: SlideContract) -> dict:
+    """Модель кладёт ряд графика прямо в `visual`, без вложенного `chart`
+    (живой прогон V1: оба слайда с графиком ушли в запасной вариант с
+    «неизвестные поля ['axis_titles', 'categories', ...]»). Вид графика
+    плоский ответ назвать не может (`visual.kind` занят словом "chart"),
+    поэтому поля поднимаются только когда вид решён без модели: данными
+    контракта (`visual_data.kind`)."""
+    visual = data.get("visual")
+    source = contract.visual_data or {}
+    kind = source.get("kind")
+    if not isinstance(visual, dict) or visual.get("chart") is not None or not kind or contract.required_visual != "chart":
+        return data
+    flat = {k: visual[k] for k in _CHART_FIELDS if k in visual}
+    if not flat:
+        return data
+    # В `visual.kind` модель пишет и "chart", и вид графика ("bar"): и то и
+    # другое значит график, вид всё равно решён данными.
+    rest = {k: v for k, v in visual.items() if k not in _CHART_FIELDS}
+    rest["kind"] = "chart"
+    base = {"kind": kind, "categories": source.get("categories", []), "series": source.get("series", [])}
+    return {**data, "visual": {**rest, "chart": {**base, **flat}}}
 
 
 _MARKUP_RE = re.compile(r"\*\*|__")

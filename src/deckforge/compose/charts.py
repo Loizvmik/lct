@@ -96,14 +96,17 @@ class ChartSpec:
     axis_titles: tuple[str, str] | None = None
 
 
-def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile, prototype=None):
+def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile, prototype=None,
+              bg_luminance: float | None = None):
     """Строит нативный график в `box` (доли холста) на `slide`. Возвращает
     `GraphicFrame` (`.chart`, `.has_chart` — интерфейс `python-pptx`).
 
     `prototype` (задача V1): образец графика шаблона
     (`profile.chart_prototypes`): его палитра заменяет палитру профиля,
     если в ней хотя бы два цвета, а его сетка, подписи значений, зазор и
-    перекрытие заменяют правила профиля (`profile.chart_rules`)."""
+    перекрытие заменяют правила профиля (`profile.chart_rules`).
+    `bg_luminance`: яркость того, что под рамкой (плашка раскладки), если
+    вызывающий её знает; иначе берётся фон слайда."""
     if spec.kind not in _KIND_TO_XL:
         raise ValueError(f"Неизвестный тип графика {spec.kind!r} — ожидается один из {CHART_KINDS}")
     if not spec.series:
@@ -115,7 +118,9 @@ def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile, protot
     if len(own) >= 2:
         # Рядов больше, чем цветов на картинке образца: следом идут цвета
         # профиля, которых в образце нет, иначе два ряда выйдут одним цветом.
-        extra = [c for c in palette if c.upper() not in {o.upper() for o in own}]
+        # Сравнение по расстоянию, а не по записи: синий образца #0177FF и
+        # синий профиля #0077FF на графике один цвет (живой прогон V1).
+        extra = [c for c in palette if all(_rgb_distance(c, o) >= _DISTINCT_RGB for o in own)]
         palette = own + extra
         palette = [palette[i % len(palette)] for i in range(max(len(palette), len(spec.series)))]
 
@@ -128,7 +133,7 @@ def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile, protot
             chart_data.add_series(series.name, series.values)
         frame = slide.shapes.add_chart(_KIND_TO_XL[spec.kind], left, top, width, height, chart_data)
 
-    _style_chart(slide, frame.chart, spec, profile, palette)
+    _style_chart(slide, frame.chart, spec, profile, palette, bg_luminance)
     rules = rules_of_prototype(prototype) if prototype is not None else getattr(profile, "chart_rules", None)
     apply_chart_rules(frame.chart, spec, rules)
     if getattr(rules, "data_labels", False):
@@ -157,7 +162,9 @@ def _numeric_categories(categories: list[str]) -> list[float]:
         return [float(i + 1) for i in range(len(categories))]
 
 
-def _style_chart(slide, chart, spec: ChartSpec, profile: TemplateProfile, palette: list[str]) -> None:
+def _style_chart(
+    slide, chart, spec: ChartSpec, profile: TemplateProfile, palette: list[str], bg_luminance: float | None = None,
+) -> None:
     family = profile.type_scale.families[0] if profile.type_scale.families else "Arial"
     # `type_scale.steps` нормирован к эталонному холсту 13.333″ —
     # `type_scale_pt` денормирует к РЕАЛЬНОМУ холсту профиля (см. докстроку
@@ -170,7 +177,8 @@ def _style_chart(slide, chart, spec: ChartSpec, profile: TemplateProfile, palett
     # годится вслепую (см. докстроку colorpick.py, "Task 10 отчёт, находка
     # №1"): цвет подбирается по фактической яркости фона МАКЕТА, на который
     # положен `slide`.
-    bg_luminance = slide_background_luminance(slide, profile)
+    if bg_luminance is None:
+        bg_luminance = slide_background_luminance(slide, profile)
     text_hex = best_contrast_text_color_for_luminance(bg_luminance, profile.palette_roles)
 
     chart.font.name = family
@@ -366,6 +374,16 @@ def apply_chart_rules(chart, spec: ChartSpec, rules) -> None:
         chart.value_axis.has_major_gridlines = False
         chart.value_axis.has_minor_gridlines = False
         chart.category_axis.has_major_gridlines = False
+
+
+# Цвета ближе этого (евклидово по RGB 0..255) на графике не различить.
+_DISTINCT_RGB = 60.0
+
+
+def _rgb_distance(a: str, b: str) -> float:
+    pa = [int(a.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    pb = [int(b.lstrip("#")[i:i + 2], 16) for i in (0, 2, 4)]
+    return sum((x - y) ** 2 for x, y in zip(pa, pb)) ** 0.5
 
 
 @dataclass(frozen=True)

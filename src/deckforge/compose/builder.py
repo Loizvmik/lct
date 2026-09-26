@@ -728,7 +728,12 @@ def _place_chart_visual(
         return
     spec = _chart_spec(slide_spec, pattern, chart)
     try:
-        add_chart(slide, box or slot.box, spec, profile, prototype=_chart_prototype(profile, pattern, spec))
+        frame_box = box or slot.box
+        canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
+        add_chart(
+            slide, frame_box, spec, profile, prototype=_chart_prototype(profile, pattern, spec),
+            bg_luminance=_box_background_luminance(slide, frame_box, profile, canvas),
+        )
     except ValueError as exc:
         slide_spec.findings.append(f"Слайд {slide_spec.index}: график не построен ({exc}).")
 
@@ -2216,24 +2221,39 @@ def _fix_cloned_contrast(slide, ref, profile: TemplateProfile, canvas: Canvas, a
             rpr.insert(0, new_fill)
 
 
-def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Canvas) -> float:
+def _shape_solid_fill(element, scheme: dict, clr_map: dict) -> Color | None:
+    """Сплошная заливка фигуры: своя `a:solidFill` или, если своей заливки
+    нет вовсе, цвет из стиля темы (`p:style/a:fillRef`). У ЛЦТ2026 белая
+    плашка под заголовком (слайд 12) залита только стилем, и без этого
+    заголовок и подписи графика на ней красились белым (живой прогон V1)."""
+    sp_pr = element.find(qn("p:spPr"))
+    fill = sp_pr.find(qn("a:solidFill")) if sp_pr is not None else None
+    if fill is None:
+        own_fill = sp_pr is not None and any(
+            sp_pr.find(qn(tag)) is not None for tag in ("a:noFill", "a:gradFill", "a:blipFill", "a:pattFill", "a:grpFill")
+        )
+        ref = element.find(qn("p:style") + "/" + qn("a:fillRef"))
+        if own_fill or ref is None or ref.get("idx") in (None, "0"):
+            return None
+        fill = next(iter(ref), None)
+        if fill is None:
+            return None
+    color = resolve_color(fill, scheme, clr_map)
+    return color if isinstance(color, Color) else None
+
+
+def _box_background_luminance(
+    slide, box: Box, profile: TemplateProfile, canvas: Canvas, *, exclude=None,
+) -> float:
+    """Яркость того, что лежит под рамкой `box`: самая тесная плашка со
+    сплошной заливкой, целиком накрывающая рамку, иначе фон слайда."""
     scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
-
-    def solid(element) -> Color | None:
-        sp_pr = element.find(qn("p:spPr"))
-        fill = sp_pr.find(qn("a:solidFill")) if sp_pr is not None else None
-        color = resolve_color(fill, scheme, clr_map) if fill is not None else None
-        return color if isinstance(color, Color) else None
-
-    own = solid(ref.element)
-    if own is not None:
-        return _relative_luminance(own.hex)
     plates = []
     for other in slide_refs(slide, canvas):
-        if other.element is ref.element or other.kind != "shape" or other.box is None:
+        if other.element is exclude or other.kind != "shape" or other.box is None:
             continue
-        color = solid(other.element)
-        if color is not None and _contains(other.box, ref.box):
+        color = _shape_solid_fill(other.element, scheme, clr_map)
+        if color is not None and _contains(other.box, box):
             plates.append((other.box.width * other.box.height, color))
     if plates:
         return _relative_luminance(min(plates, key=lambda t: t[0])[1].hex)
@@ -2244,6 +2264,13 @@ def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Ca
     if isinstance(bg, Color):
         return _relative_luminance(bg.hex)
     return slide_background_luminance(slide, profile)
+
+
+def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Canvas) -> float:
+    own = _shape_solid_fill(ref.element, profile.theme.scheme, profile.theme.clr_map)
+    if own is not None:
+        return _relative_luminance(own.hex)
+    return _box_background_luminance(slide, ref.box, profile, canvas, exclude=ref.element)
 
 
 def _place_visual_on_clone(

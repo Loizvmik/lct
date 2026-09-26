@@ -486,7 +486,16 @@ def mine_patterns(
         )
         if pattern is not None:
             candidates.append(mark_chart_frames(pattern))
-    return _dedup(candidates)
+    # Задача V1: класс слайда-примера здесь, а не у вызывающего: майнинг
+    # зовут и из дозапроса видов поверх кеша (`profile._reclassify_pattern_
+    # kinds`), и класс, поставленный снаружи, там терялся (живой прогон:
+    # образцы графиков VK Education вышли раскладками содержания).
+    from deckforge.template.chart_rules import find_chart_rules
+    from deckforge.template.prototypes import classify_slides, find_chart_prototypes
+
+    patterns = _dedup(candidates)
+    rules = find_chart_rules(pkg)
+    return classify_slides(patterns, rules, find_chart_prototypes(pkg, canvas, patterns, rules))
 
 
 def _slide_parts(pkg: PptxPackage) -> list[str]:

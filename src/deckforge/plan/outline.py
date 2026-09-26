@@ -381,6 +381,13 @@ def apply_visual_intents(slides: list[OutlineSlide], sources: list[SourceDoc]) -
         best = _best(slide, pool)
         if best is None:
             continue
+        if slide.form == "table" and best.type == "chart" and best.required:
+            # Слой данных главнее формы, которую назвала модель: динамику
+            # по кварталам она заказала таблицей (живой прогон V1, VK
+            # Education), а по правилам типа данных здесь нужен график.
+            slides[i] = replace(slide, form="chart", visual_intent=best)
+            used.add(best.data_ref)
+            continue
         if slide.form == "table" and best.type == "chart":
             best = VisualIntent(
                 type="table", required=False, data_ref=best.data_ref, data=best.data,

@@ -40,7 +40,7 @@ from deckforge.settings import Settings
 from deckforge.template.assets import AssetCatalog, AssetRef, Placement, build_asset_catalog
 from deckforge.template.chart_palette import build_chart_series
 from deckforge.template.chart_rules import ChartRules, find_chart_rules
-from deckforge.template.prototypes import ChartStylePrototype, classify_slides, find_chart_prototypes
+from deckforge.template.prototypes import ChartStylePrototype, find_chart_prototypes
 from deckforge.template.grid import ColumnAxis, Grid, build_grid
 from deckforge.template.layouts import Background, LayoutEntry, PlaceholderSlot, build_layout_catalog
 from deckforge.template.naming import PaletteNote, name_palette_roles_report
@@ -1318,12 +1318,10 @@ class TemplateProfile(BaseModel):
                 )
                 assets = build_asset_catalog(pkg, canvas, layouts)
                 patterns_for_vision = mine_patterns(pkg, canvas, grid, type_scale, assets)
-                # Задача V1: правила оформления графиков, образцы графиков и
-                # класс каждого слайда-примера, до уточнения вида моделью
-                # (она меняет только `kind`, класс остаётся).
+                # Задача V1: правила оформления графиков и образцы графиков
+                # (класс слайда-примера ставит сам `mine_patterns`).
                 chart_rules = find_chart_rules(pkg)
                 chart_prototypes = find_chart_prototypes(pkg, canvas, patterns_for_vision, chart_rules)
-                patterns_for_vision = classify_slides(patterns_for_vision, chart_rules, chart_prototypes)
                 # Task 10 код-ревью, находка №1: словарь карточных форм считается
                 # ПО ДЕКОРУ ГРУПП ПОВТОРА уже намайненных раскладок (`patterns_
                 # for_vision`, объект этого же прохода, до pydantic-сериализации —
