@@ -1577,9 +1577,12 @@ def place_slide_by_clone(
         if id(slot) not in bound_slots and ref is not None and not orphan(slot.box):
             bound_slots.add(id(slot))
             keep.append(ref.element)
-    # Картинка примера вне повтора остаётся оформлением (`_place_visual_on_
-    # clone`), а в колонке пустой единицы она осиротевшая иконка. Место,
-    # куда ляжет фото пользователя, не трогается.
+    # Иконка примера вне повтора остаётся оформлением (`_place_visual_on_
+    # clone`), а в колонке пустой единицы она осиротевшая. Место, куда
+    # ляжет фото пользователя, не трогается. Контентная картинка примера
+    # (роль `image`, самая крупная на слайде-примере) без нашего фото
+    # удаляется: у VK Education это скриншот поста «IT-дайвинг», и он
+    # уезжал в чужую презентацию как своё содержание (27 сентября 2026).
     visual_targets = (
         {id(_visual_slot(pattern, "image")), id(_visual_slot(pattern, "icon"))}
         if slide_spec.visual is not None and slide_spec.visual.kind in ("photo", "icon") else set()
@@ -1590,7 +1593,11 @@ def place_slide_by_clone(
         [
             s for s in pattern.slots
             if id(s) not in bound_slots
-            and (s.role not in _CLONE_PICTURE_ROLES or (orphan(s.box) and id(s) not in visual_targets))
+            and (
+                s.role not in _CLONE_PICTURE_ROLES
+                or (orphan(s.box) and id(s) not in visual_targets)
+                or (s.role == "image" and id(s) not in visual_targets)
+            )
         ],
         canvas, keep=keep, protect=[d.box for d in kept_decor],
     )

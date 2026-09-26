@@ -591,3 +591,36 @@ def test_unit_columns_of_filled_cards_survive_on_slide21(profile, deck):
     assert outcome.reason is None
     lefts = sorted({round(r.box.left, 2) for r in _boxes(prs.slides[-1], canvas) if r.box.top > 0.3})
     assert lefts == [0.05, 0.28, 0.5]
+
+
+def test_example_content_photo_is_removed_when_the_slide_has_no_photo(profile, deck):
+    """Контентная картинка примера (самая крупная, роль `image`) без нашего
+    фото удаляется: скриншот поста «IT-дайвинг» с VK Education уезжал в
+    чужую презентацию (27 сентября 2026). Иконки и декор остаются."""
+    prs, sources = deck
+    pattern = next(
+        (p for p in (builder._pattern_from_model(m) for m in profile.patterns)
+         if any(s.role == "image" for s in p.slots) and p.kind not in ("section", "image")),
+        None,
+    )
+    if pattern is None:
+        pytest.skip("в шаблоне нет содержательной раскладки со слотом под фото")
+    spec = SlideSpec(
+        index=1, kind=pattern.kind, headline="Заголовок без фотографии",
+        blocks=[BulletBlock(items=["Первый тезис слайда", "Второй тезис слайда"])],
+        pattern_id=pattern.pattern_id,
+    )
+    canvas = _canvas(profile)
+    image_slot = next(s for s in pattern.slots if s.role == "image")
+    outcome = builder.place_slide_by_clone(
+        prs, spec, pattern, profile, AuditConfig.load(), sources[pattern.source_slide_index[0]], user_photos=None,
+    )
+    if outcome.reason is not None:
+        pytest.skip(f"клон не принят: {outcome.reason}")
+    slide = prs.slides[-1]
+    leftover = [
+        r for r in slide_refs(slide, canvas)
+        if r.kind == "picture" and r.box is not None and builder._contains(image_slot.box, r.box, 0.02)
+    ]
+    assert not leftover, "картинка примера осталась в слоте под фото"
+
