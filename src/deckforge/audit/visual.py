@@ -65,6 +65,7 @@ from typing import Callable
 
 import yaml
 from PIL import Image, ImageDraw, ImageFont
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from deckforge.audit.findings import Finding, Severity
 from deckforge.plan.outline import SourceDoc
@@ -351,22 +352,169 @@ def _neighbor_context(pairs: list[tuple], index: int) -> dict:
     return ctx
 
 
+# ---------------------------------------------------------------------------
+# Манифест текстовых фигур слайда (задача M: адресность находок)
+# ---------------------------------------------------------------------------
+#
+# ТЗ просит модель называть "конкретное место" словами ("where") — на живых
+# прогонах это часто расплывчато ("в правой карточке"), хотя у слайда УЖЕ
+# есть реальные id фигур (те же, что несёт `audit.deterministic` в своих
+# `shape_ref`, вида "42:TextBox 42"). Манифест отдаёт модели этот же id
+# вместе с ролью по слоту плана (заголовок/буллет/карточка/...) и первыми
+# `_MANIFEST_TEXT_CHARS` знаками текста фигуры — модель может назвать место
+# ЭТИМ id, а не словами, и находка получает `shape_ref`, по которому её
+# видно на превью так же адресно, как детерминированную.
+#
+# Роль по слоту здесь считается НЕ разбором XML раскладки (это протекло бы
+# знание координат/слотов из `template`/`compose` в `audit`, чего граница
+# слоёв не разрешает этому модулю), а сопоставлением текста РЕАЛЬНОЙ фигуры
+# с текстом, который уже лежит в `SlideSpec` (заголовок, буллеты, карточки,
+# KPI, цитата) — план и так знает роль каждого кусочка текста по типу
+# блока, сопоставление лишь находит, какая физическая фигура его несёт.
+_MANIFEST_TEXT_CHARS = 60
+
+# Ведущий буллет-символ/номер, который сборщик (`compose.blocks`) добавляет
+# перед текстом пункта — без снятия сопоставление с "сырым" текстом плана
+# (без буллета) никогда бы не совпало.
+_BULLET_PREFIX_RE = re.compile(r"^[\s\-‐-―•●▪‣*\d]+[\.\)]?\s*")
+
+
+def _normalize_for_match(text: str) -> str:
+    return _BULLET_PREFIX_RE.sub("", text).strip().lower()
+
+
+def _role_candidates(slide: SlideSpec) -> list[tuple[str, str]]:
+    """(роль, текст плана) для каждого кусочка текста, который сборщик мог
+    положить в отдельную фигуру — порядок не важен, сопоставление ищет
+    точное или частичное совпадение (см. `_match_shape_role`)."""
+    out: list[tuple[str, str]] = []
+    if slide.headline:
+        out.append(("headline", slide.headline))
+    if slide.subhead:
+        out.append(("subhead", slide.subhead))
+    if slide.source_note:
+        out.append(("source", slide.source_note))
+    if slide.visual is not None and slide.visual.caption:
+        out.append(("caption", slide.visual.caption))
+    for block in slide.blocks:
+        if isinstance(block, TextBlock):
+            out.append(("body", block.text))
+        elif isinstance(block, BulletBlock):
+            for item in block.items:
+                out.append(("bullet", item))
+        elif isinstance(block, CardBlock):
+            for card in block.items:
+                if card.title:
+                    out.append(("card_title", card.title))
+                out.append(("card_body", card.body))
+        elif isinstance(block, KpiBlock):
+            for kpi in block.items:
+                out.append(("kpi_value", kpi.value))
+                out.append(("kpi_label", kpi.label))
+        elif isinstance(block, QuoteBlock):
+            out.append(("quote", block.text))
+            if block.author:
+                out.append(("quote_author", block.author))
+    return out
+
+
+def _match_shape_role(shape_text: str, candidates: list[tuple[str, str]]) -> str:
+    """Роль ближайшего по тексту кандидата, или `"other"`, если ни один не
+    совпал (декоративная надпись, обрывок, текст, который план не писал)."""
+    norm = _normalize_for_match(shape_text)
+    if not norm:
+        return "other"
+    best_role, best_len = "other", 0
+    for role, cand in candidates:
+        cnorm = _normalize_for_match(cand)
+        if not cnorm:
+            continue
+        if cnorm == norm:
+            return role
+        if (cnorm in norm or norm in cnorm) and len(cnorm) > best_len:
+            best_role, best_len = role, len(cnorm)
+    return best_role
+
+
+def _flatten_text_shapes(shapes) -> list[tuple[str, str]]:
+    """(id фигуры, её текст) по слайду, включая фигуры внутри групп — тот
+    же обход, что и `audit.deterministic._flatten_pptx_shapes`, независимая
+    копия (см. докстроку модуля про то, что маленькие формулы этого рода
+    не делятся между независимыми модулями)."""
+    out: list[tuple[str, str]] = []
+    for shape in shapes:
+        try:
+            if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+                out.extend(_flatten_text_shapes(shape.shapes))
+                continue
+        except Exception:  # noqa: BLE001 — фигура без валидного типа просто не несёт текста
+            continue
+        if not getattr(shape, "has_text_frame", False):
+            continue
+        try:
+            text = shape.text_frame.text.strip()
+            shape_id = str(shape.shape_id)
+        except Exception:  # noqa: BLE001 — повреждённая фигура не адресуема, пропускаем
+            continue
+        if text:
+            out.append((shape_id, text))
+    return out
+
+
+def _open_pptx_slides(pptx_path: Path | None):
+    """Слайды уже собранной колоды для манифеста — `None`, если путь не
+    передан или файл не открылся (честная деградация: манифест просто
+    остаётся пустым, промпт — как до задачи M, докстрока `_build_shape_
+    manifest`). Один вызов `Presentation` на весь аудит варианта, не на
+    слайд: файл шаблона тяжёлый (`slide_tools.try_slide` про то же)."""
+    if pptx_path is None:
+        return None
+    try:
+        from pptx import Presentation
+
+        return Presentation(str(pptx_path)).slides
+    except Exception:  # noqa: BLE001 — манифест необязателен, аудит не должен упасть без него
+        return None
+
+
+def _build_shape_manifest(pptx_slide, slide: SlideSpec) -> tuple[list[dict], dict[str, str]]:
+    """Манифест текстовых фигур слайда для промпта (список словарей
+    `id`/`role`/`text`) и параллельно словарь `id -> role` для разбора
+    ответа (`_findings_from_answers`). `pptx_slide=None` — честно пустые
+    оба (нет .pptx под рукой, как до задачи M)."""
+    if pptx_slide is None:
+        return [], {}
+    candidates = _role_candidates(slide)
+    manifest: list[dict] = []
+    roles: dict[str, str] = {}
+    for shape_id, text in _flatten_text_shapes(pptx_slide.shapes):
+        role = _match_shape_role(text, candidates)
+        manifest.append({"id": shape_id, "role": role, "text": text[:_MANIFEST_TEXT_CHARS]})
+        roles[shape_id] = role
+    return manifest, roles
+
+
 def _build_slide_prompt(
     agent_body: str, index: int, total: int, spec: DeckSpec, slide: SlideSpec,
-    pairs: list[tuple], source_text: str,
+    pairs: list[tuple], source_text: str, manifest: list[dict] | None = None,
 ) -> str:
     payload = {
         "answer_only_keys": list(PER_SLIDE_CHECK_IDS),
         "note": (
             "Это слайд из колоды — отвечай ТОЛЬКО на перечисленные в answer_only_keys "
             "ключи (вопросы 1-8 и 10). Вопросы про колоду целиком (9 и 11) задаются "
-            "отдельным запросом на всю колоду и здесь не нужны."
+            "отдельным запросом на всю колоду и здесь не нужны. shape_manifest перечисляет "
+            "текстовые фигуры слайда (id, роль, первые знаки текста) — если находка "
+            "(ответ «нет») про текст ОДНОЙ из этих фигур, в поле where укажи ТОЛЬКО её id "
+            "строкой, без лишних слов. Если находка не про конкретную текстовую фигуру "
+            "(иконка, картинка, вся раскладка) — опиши место словами, как раньше."
         ),
         "slide_index_1based": index + 1,
         "total_slides": total,
         "deck_title": spec.title,
         "deck_language": spec.language,
         "source_materials": source_text,
+        "shape_manifest": manifest or [],
         **_neighbor_context(pairs, index),
     }
     return f"{agent_body}\n\nСлужебные данные:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -461,16 +609,35 @@ def _parse_answer(raw: str, expected_keys: tuple[str, ...]) -> dict[str, tuple[b
     return result
 
 
-def _findings_from_answers(slide_index: int | None, answers: dict[str, tuple[bool, str | None]]) -> list[Finding]:
+def _findings_from_answers(
+    slide_index: int | None, answers: dict[str, tuple[bool, str | None]],
+    manifest_roles: dict[str, str] | None = None,
+) -> list[Finding]:
+    """`manifest_roles` (задача M) — `id -> роль` фигур манифеста ЭТОГО
+    слайда. Если `where` совпал с одним из этих id, находка получает
+    `shape_ref` (тот же формат `"id:метка"`, что и у `audit.deterministic`)
+    и сообщение с ролью вместо сырого текста модели; иначе — прежнее
+    поведение (`where` как есть, `shape_ref=None`), брифом дословно "иначе
+    как раньше"."""
+    manifest_roles = manifest_roles or {}
     out = []
     for check_id, (ok, where) in answers.items():
         if ok:
             continue
         label = _CHECK_LABEL[check_id]
-        message = f"{label}: {where}" if where else label
+        shape_ref = None
+        message = label
+        if where:
+            key = where.strip()
+            role = manifest_roles.get(key)
+            if role is not None:
+                shape_ref = f"{key}:{role}"
+                message = f"{label} ({role})"
+            else:
+                message = f"{label}: {where}"
         out.append(Finding(
             check_id=check_id, severity=_CHECK_SEVERITY[check_id], slide_index=slide_index,
-            shape_ref=None, message=message, box=None, fixable=False,
+            shape_ref=shape_ref, message=message, box=None, fixable=False,
             fix_hint=_CHECK_FIX_HINT[check_id],
         ))
     return out
@@ -534,15 +701,17 @@ def _ask_and_parse_with_retry(
 
 def _run_one_slide(vlm, agent_body: str, index: int, total: int, spec: DeckSpec,
                     png_path: Path, slide: SlideSpec, pairs: list, source_text: str,
+                    pptx_slide=None,
                     ) -> tuple[list[Finding], "SlideScore | None"]:
-    prompt = _build_slide_prompt(agent_body, index, total, spec, slide, pairs, source_text)
+    manifest, roles = _build_shape_manifest(pptx_slide, slide)
+    prompt = _build_slide_prompt(agent_body, index, total, spec, slide, pairs, source_text, manifest)
     png_bytes = Path(png_path).read_bytes()
     answers, exc, raw = _ask_and_parse_with_retry(
         lambda: vlm.ask_image(png_bytes, prompt, max_tokens=_PER_SLIDE_MAX_TOKENS), PER_SLIDE_CHECK_IDS,
     )
     if answers is None:
         return [_malformed_finding(index, exc, raw)], None
-    return _findings_from_answers(index, answers), _extract_scores(raw, _SLIDE_SCORE_NUM_KEYS)
+    return _findings_from_answers(index, answers, roles), _extract_scores(raw, _SLIDE_SCORE_NUM_KEYS)
 
 
 def _run_deck_level(vlm, agent_body: str, spec: DeckSpec, pngs: list[Path], pairs: list,
@@ -570,6 +739,7 @@ def run_visual(
     max_workers: int = 4,
     only_slides: "set[int] | None" = None,
     deck_level: bool = True,
+    pptx_path: Path | None = None,
 ) -> VisualAuditResult:
     """Одиннадцать недетерминированных проверок (`CHECK_IDS`) готовой
     колоды по картинке каждого слайда — интерфейс брифа дословно
@@ -589,7 +759,12 @@ def run_visual(
     контекста и `total_slides` в промпте берутся по всей колоде, чтобы
     модель видела слайд на его настоящем месте. `deck_level=False`
     пропускает коллаж C09/C11: в пайплайне он не нужен, связность колоды
-    не то, что ловит проверка рискованных слайдов."""
+    не то, что ловит проверка рискованных слайдов.
+
+    `pptx_path` (задача M, адресность находок) — уже собранный `.pptx`
+    этого варианта, откуда строится манифест текстовых фигур каждого
+    слайда (`_build_shape_manifest`); `None` — манифест пустой, промпт и
+    разбор ответа работают как до задачи M."""
     del profile
     started = time.monotonic()
 
@@ -613,6 +788,7 @@ def run_visual(
     source_text = _join_sources(sources)
     pairs = list(zip(pngs, spec.slides))
     total = len(pairs)
+    pptx_slides = _open_pptx_slides(pptx_path)
 
     findings: list[Finding] = []
     slide_scores: dict[int, SlideScore] = {}
@@ -624,6 +800,7 @@ def run_visual(
             futures = {
                 pool.submit(
                     _run_one_slide, vlm, agent_body, i, total, spec, png_path, slide, pairs, source_text,
+                    pptx_slides[i] if pptx_slides is not None and i < len(pptx_slides) else None,
                 ): i
                 for i, (png_path, slide) in enumerate(pairs)
                 if only_slides is None or i in only_slides
@@ -699,17 +876,30 @@ def _build_labeled_collage(items: list[tuple[int, Path]]) -> bytes:
     return buf.getvalue()
 
 
-def _build_batch_prompt(agent_body: str, spec: DeckSpec, positions: list[int], source_text: str) -> str:
+def _build_batch_prompt(
+    agent_body: str, spec: DeckSpec, positions: list[int], source_text: str,
+    manifests: dict[int, list[dict]] | None = None,
+) -> str:
+    manifests = manifests or {}
     payload = {
         "mode": "batch",
         "answer_only_keys": list(PER_SLIDE_CHECK_IDS),
-        "note": "Коллаж из нескольких слайдов, формат ответа описан в разделе про пачку.",
+        "note": (
+            "Коллаж из нескольких слайдов, формат ответа описан в разделе про пачку. "
+            "У каждого слайда в списке slides — свой shape_manifest (id, роль, текст его "
+            "текстовых фигур); если находка (ответ «нет») про текст одной из них, укажи в "
+            "where ЭТОГО слайда только её id, иначе опиши место словами, как раньше."
+        ),
         "total_slides": len(spec.slides),
         "deck_title": spec.title,
         "deck_language": spec.language,
         "source_materials": source_text,
         "slides": [
-            {"index_1based": pos + 1, "headline": spec.slides[pos].headline} for pos in positions
+            {
+                "index_1based": pos + 1, "headline": spec.slides[pos].headline,
+                "shape_manifest": manifests.get(pos, []),
+            }
+            for pos in positions
         ],
     }
     return f"{agent_body}\n\nСлужебные данные:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -744,14 +934,21 @@ def _parse_batch_answer(raw: str, positions: list[int]) -> dict[int, tuple[dict 
 
 def run_visual_batch(
     pngs: list[Path], spec: DeckSpec, vlm, *, only_slides: list[int],
-    sources: list[SourceDoc] | None = None,
+    sources: list[SourceDoc] | None = None, pptx_path: Path | None = None, deck_level: bool = False,
 ) -> VisualAuditResult:
     """Вопросы C01-C08, C10 по нескольким слайдам ОДНИМ вызовом модели на
     коллаже с манифестом «номер слайда -> заголовок». Экономит вызовы, а не
     секунды: параллельные вызовы `run_visual(only_slides=...)` и так идут
     за время одного. Надёжен ли ответ по коллажу, проверено живым прогоном
     (docs/ARCHITECTURE.md, раздел про бюджет), поэтому в пайплайне режим
-    выбирается конфигом (`run.visual_audit_batch`), а не зашит."""
+    выбирается конфигом (`run.visual_audit_batch`), а не зашит.
+
+    `pptx_path` (задача M) — то же, что у `run_visual`: манифест текстовых
+    фигур на слайд для адресности находок, по одному манифесту в каждый
+    элемент `slides` пачки. `deck_level=True` (задача M) добавляет ОДИН
+    отдельный вызов C09/C11 по коллажу ВСЕЙ колоды поверх пачки — тот же
+    вызов, что делает `run_visual(deck_level=True)`, просто с другим
+    источником per-slide находок."""
     started = time.monotonic()
     if vlm is None or not _supports_vision(vlm):
         # Та же честная причина пропуска, что и у `run_visual`.
@@ -761,7 +958,15 @@ def run_visual_batch(
         return VisualAuditResult(elapsed_seconds=time.monotonic() - started)
 
     _meta, agent_body = _load_agent_prompt()
-    prompt = _build_batch_prompt(agent_body, spec, positions, _join_sources(sources))
+    pptx_slides = _open_pptx_slides(pptx_path)
+    manifests: dict[int, list[dict]] = {}
+    roles_by_pos: dict[int, dict[str, str]] = {}
+    for pos in positions:
+        slide_pptx = pptx_slides[pos] if pptx_slides is not None and pos < len(pptx_slides) else None
+        manifest, roles = _build_shape_manifest(slide_pptx, spec.slides[pos])
+        manifests[pos] = manifest
+        roles_by_pos[pos] = roles
+    prompt = _build_batch_prompt(agent_body, spec, positions, _join_sources(sources), manifests)
     try:
         collage = _build_labeled_collage([(p, pngs[p]) for p in positions])
     except Exception as exc:  # noqa: BLE001: сборка коллажа не должна ронять аудит
@@ -793,15 +998,22 @@ def run_visual_batch(
         if answers is None:
             findings.append(_malformed_finding(pos, exc, raw))
             continue
-        findings.extend(_findings_from_answers(pos, answers))
+        findings.extend(_findings_from_answers(pos, answers, roles_by_pos.get(pos)))
         score = _extract_scores(raw, _SLIDE_SCORE_NUM_KEYS)
         if score is not None:
             slide_scores[pos] = score
 
+    deck_score: DeckScore | None = None
+    if deck_level:
+        calls += 1
+        pairs = list(zip(pngs, spec.slides))
+        deck_findings, deck_score = _run_deck_level(vlm, agent_body, spec, pngs, pairs)
+        findings.extend(deck_findings)
+
     findings.sort(key=lambda f: (f.slide_index if f.slide_index is not None else -1, f.check_id, f.message))
     return VisualAuditResult(
         findings=findings, slides_checked=len(positions), model_calls=calls,
-        elapsed_seconds=time.monotonic() - started, slide_scores=slide_scores,
+        elapsed_seconds=time.monotonic() - started, slide_scores=slide_scores, deck_score=deck_score,
         content_avg=_axis_average(slide_scores, "content"),
         design_avg=_axis_average(slide_scores, "design"),
     )

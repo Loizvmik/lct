@@ -22,8 +22,8 @@ from PIL import Image
 
 from deckforge.audit.visual import (
     CHECK_IDS, DECK_LEVEL_CHECK_IDS, PER_SLIDE_CHECK_IDS, VisualAuditResult,
-    _build_collage, _extract_scores, _findings_from_answers, _load_agent_prompt, _parse_answer, _parse_scores,
-    _supports_vision, run_visual,
+    _build_collage, _build_shape_manifest, _build_slide_prompt, _extract_scores, _findings_from_answers,
+    _load_agent_prompt, _parse_answer, _parse_scores, _supports_vision, run_visual,
 )
 from deckforge.compose.builder import Variant, build_deck
 from deckforge.plan.outline import SourceDoc
@@ -282,6 +282,149 @@ def test_findings_from_answers_emits_for_ok_false():
     assert f.slide_index == 2
     assert "только заголовок" in f.message
     assert f.fixable is False
+
+
+# ---------------------------------------------------------------------------
+# Манифест текстовых фигур (задача M: адресность находок) —
+# `_build_shape_manifest`/`_findings_from_answers(manifest_roles=...)`
+# ---------------------------------------------------------------------------
+
+
+def test_findings_from_answers_uses_manifest_id_as_shape_ref():
+    """Модель ответила `where` РОВНО id из манифеста слайда — находка несёт
+    `shape_ref` в том же формате `"id:метка"`, что и `audit.deterministic`."""
+    findings = _findings_from_answers(0, {"C01": (False, "42")}, {"42": "headline"})
+    assert len(findings) == 1
+    assert findings[0].shape_ref == "42:headline"
+    assert "headline" in findings[0].message
+
+
+def test_findings_from_answers_falls_back_to_raw_where_when_id_unknown():
+    """`where` не совпал ни с одним id манифеста (модель описала место
+    словами, как раньше, или манифест пуст) — старое поведение дословно."""
+    findings = _findings_from_answers(0, {"C01": (False, "в правом верхнем углу")}, {"42": "headline"})
+    assert findings[0].shape_ref is None
+    assert "в правом верхнем углу" in findings[0].message
+
+
+def test_build_slide_prompt_carries_shape_manifest_payload():
+    spec = _tiny_spec(1)
+    manifest = [{"id": "7", "role": "bullet", "text": "Пункт один"}]
+    prompt = _build_slide_prompt("тело промпта", 0, 1, spec, spec.slides[0], [], "", manifest)
+    payload = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])
+    assert payload["shape_manifest"] == manifest
+
+
+def test_build_slide_prompt_shape_manifest_defaults_to_empty_list():
+    spec = _tiny_spec(1)
+    prompt = _build_slide_prompt("тело промпта", 0, 1, spec, spec.slides[0], [], "")
+    payload = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])
+    assert payload["shape_manifest"] == []
+
+
+def test_build_shape_manifest_matches_headline_and_bullet_roles():
+    """Роль определяется сопоставлением текста реальной фигуры с текстом
+    плана (заголовок/буллет), не разбором координат раскладки — граница
+    `audit`/`compose`/`template` не нарушена (см. докстроку модуля)."""
+    spec = DeckSpec(
+        title="Колода", language="ru",
+        slides=[SlideSpec(
+            index=0, kind="bullets", headline="Наш главный вывод квартала",
+            blocks=[BulletBlock(items=["Пункт первый про рост", "Пункт второй про удержание"])],
+        )],
+    )
+    built = build_deck(spec, PROFILE, TEMPLATE, Variant.dense)
+    from pptx import Presentation
+
+    slide = Presentation(str(built)).slides[0]
+    manifest, roles = _build_shape_manifest(slide, spec.slides[0])
+    assert any(m["role"] == "headline" for m in manifest), manifest
+    assert any(m["role"] == "bullet" for m in manifest), manifest
+    assert set(roles.values()) >= {"headline", "bullet"}
+    # Первые 60 знаков, не весь текст — манифест не должен раздувать промпт.
+    assert all(len(m["text"]) <= 60 for m in manifest)
+
+
+def test_build_shape_manifest_is_empty_without_pptx_slide():
+    spec = _tiny_spec(1)
+    assert _build_shape_manifest(None, spec.slides[0]) == ([], {})
+
+
+def test_run_visual_sets_shape_ref_when_model_echoes_manifest_id(tmp_path):
+    """Сквозной путь: `run_visual(pptx_path=...)` строит манифест, модель
+    отвечает id этой фигуры в `where`, находка получает `shape_ref`."""
+    spec = DeckSpec(
+        title="Колода", language="ru",
+        slides=[SlideSpec(
+            index=0, kind="bullets", headline="Наш главный вывод",
+            blocks=[BulletBlock(items=["Пункт один"])],
+        )],
+    )
+    built = build_deck(spec, PROFILE, TEMPLATE, Variant.dense)
+    pngs = [_tiny_png()]
+
+    class _EchoManifestIdProvider(VisionProvider):
+        def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+            payload = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])
+            manifest = payload.get("shape_manifest") or []
+            headline_id = next((m["id"] for m in manifest if m["role"] == "headline"), None)
+            keys = payload["answer_only_keys"]
+            answer = {k: {"ok": True} for k in keys}
+            if headline_id is not None and "C01" in answer:
+                answer["C01"] = {"ok": False, "where": headline_id}
+            return json.dumps(answer)
+
+    try:
+        result = run_visual(
+            pngs, spec, PROFILE, _EchoManifestIdProvider(), max_workers=1,
+            pptx_path=built, deck_level=False,
+        )
+    finally:
+        pngs[0].unlink(missing_ok=True)
+    assert result.skipped_reason is None
+    c01 = [f for f in result if f.check_id == "C01"]
+    assert c01, "модель должна была найти headline в манифесте и ответить «нет» по C01"
+    assert c01[0].shape_ref is not None and c01[0].shape_ref.endswith(":headline")
+
+
+def test_run_visual_without_pptx_path_keeps_old_where_behavior(tmp_path):
+    """`pptx_path=None` (по умолчанию) — манифест пуст, `where` остаётся
+    текстом модели как есть, `shape_ref` не проставляется (иначе как
+    раньше, бриф дословно)."""
+    spec = _tiny_spec(1)
+    pngs = [_tiny_png()]
+
+    class _Provider(VisionProvider):
+        def ask_image(self, png: bytes, prompt: str, *, max_tokens: int = 1024) -> str:
+            payload = json.loads(prompt.rsplit("Служебные данные:\n", 1)[1])
+            assert payload["shape_manifest"] == []
+            keys = payload["answer_only_keys"]
+            answer = {k: {"ok": True} for k in keys}
+            if "C01" in answer:
+                answer["C01"] = {"ok": False, "where": "заголовок слишком общий"}
+            return json.dumps(answer)
+
+    try:
+        result = run_visual(pngs, spec, PROFILE, _Provider(), max_workers=1, deck_level=False)
+    finally:
+        pngs[0].unlink(missing_ok=True)
+    c01 = [f for f in result if f.check_id == "C01"]
+    assert c01 and c01[0].shape_ref is None
+    assert "заголовок слишком общий" in c01[0].message
+
+
+# ---------------------------------------------------------------------------
+# Режимы N рискованных слайдов (задача M): FULL 8 / FAST 4 / EMERGENCY 0
+# ---------------------------------------------------------------------------
+
+
+def test_config_modes_carry_task_m_slide_counts():
+    from deckforge.workflow.budget import RunMode, load_policy
+
+    policy = load_policy(Path("config/app.yaml"))
+    assert policy.modes[RunMode.FULL].visual_audit_max_slides == 8
+    assert policy.modes[RunMode.FAST].visual_audit_max_slides == 4
+    assert policy.modes[RunMode.EMERGENCY].visual_audit_max_slides == 0
 
 
 # ---------------------------------------------------------------------------
