@@ -10,7 +10,7 @@ import shutil
 from pathlib import Path
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Порядок важен: сначала более специфичные для macOS/Homebrew пути,
 # shutil.which подстрахует остальные платформы.
@@ -189,14 +189,30 @@ class PlanConfig(BaseModel):
     rerank_variants: bool = True
 
 
+class RunModeConfig(BaseModel):
+    """Одна строка таблицы `run.modes` (задача L, см. `workflow.budget.
+    ModeSpec` — то же самое, только со стороны конфига, а не рантайма)."""
+
+    min_remaining: float
+    rerank: bool
+    visual_audit_max_slides: int
+
+
+def _default_run_modes() -> dict[str, RunModeConfig]:
+    return {
+        "full": RunModeConfig(min_remaining=120.0, rerank=True, visual_audit_max_slides=4),
+        "fast": RunModeConfig(min_remaining=75.0, rerank=False, visual_audit_max_slides=2),
+        "emergency": RunModeConfig(min_remaining=0.0, rerank=False, visual_audit_max_slides=0),
+    }
+
+
 class RunConfig(BaseModel):
-    # Бюджет времени одного прогона и пороги деградации
-    # (`workflow.budget.RunBudget`). Происхождение чисел см. в app.yaml. Со
-    # значениями по умолчанию по той же причине, что и поля `LLMConfig`.
+    # Бюджет времени одного прогона и режимы деградации
+    # (`workflow.budget.RunBudget`/`RunMode`). Происхождение чисел см. в
+    # app.yaml. Со значениями по умолчанию по той же причине, что и поля
+    # `LLMConfig`.
     budget_seconds: float = 300.0
-    rerank_min_remaining: float = 120.0
-    visual_audit_min_remaining: float = 75.0
-    visual_audit_max_slides: int = 4
+    modes: dict[str, RunModeConfig] = Field(default_factory=_default_run_modes)
     visual_audit_min_risk: float = 1.0
     visual_audit_batch: bool = False
 
