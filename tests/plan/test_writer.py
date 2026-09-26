@@ -396,6 +396,13 @@ def test_short_decks_are_left_alone():
     assert _drop_thin_duplicates(slides) is slides
 
 
+def test_a_card_title_repeated_in_markdown_at_the_start_of_the_body_is_cut():
+    from deckforge.plan.writer import _clean_card
+
+    card = _clean_card(Card(title="Текущий процесс", body="**Текущий процесс** 98,5% времени заявки ждут."))
+    assert card == Card(title="Текущий процесс", body="98,5% времени заявки ждут.")
+
+
 def test_a_tool_call_on_the_final_step_gets_one_more_turn_not_a_fallback(PROFILE):
     """Живой прогон 27 сентября 2026: модель на последнем шаге снова позвала
     инструмент, и слайд ушёл в запасной вариант."""

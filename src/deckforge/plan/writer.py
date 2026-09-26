@@ -174,7 +174,33 @@ def _parse_slide(data: dict, contract: SlideContract) -> SlideSpec:
     data = {k: v for k, v in data.items() if k != "layout_id"}
     data["kind"] = contract.kind
     slide = slide_spec_from_dict(data, contract.slide_id)
-    return replace(slide, pattern_id=contract.pattern_id)
+    return replace(slide, pattern_id=contract.pattern_id, blocks=[_clean_block(b) for b in slide.blocks])
+
+
+_MARKUP_RE = re.compile(r"\*\*|__")
+
+
+def _clean_card(card: Card) -> Card:
+    """Модель повторяет заголовок карточки в начале тела, да ещё markdown
+    (живой прогон 27 сентября 2026: «**Текущий процесс** 98,5% ...» под
+    жирным заголовком «Текущий процесс»). Сборка сама ставит заголовок
+    первой строкой, поэтому повтор срезается, разметка убирается."""
+    title = _MARKUP_RE.sub("", card.title).strip()
+    body = _MARKUP_RE.sub("", card.body).strip()
+    if title and body.lower().startswith(title.lower()):
+        rest = body[len(title):].lstrip(" .:—–-")
+        body = rest or body
+    return Card(title=title, body=body)
+
+
+def _clean_block(block):
+    if isinstance(block, CardBlock):
+        return CardBlock(items=[_clean_card(c) for c in block.items])
+    if isinstance(block, BulletBlock):
+        return BulletBlock(items=[_MARKUP_RE.sub("", i) for i in block.items])
+    if isinstance(block, TextBlock):
+        return TextBlock(text=_MARKUP_RE.sub("", block.text))
+    return block
 
 
 def _write_with_agent_loop(

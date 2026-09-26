@@ -90,7 +90,7 @@ class SlotContract:
         if self.title is not None:
             out["label" if self.block == "kpi" else "title"] = self.title.to_dict()
         if self.block == "cards" and not self.title_slot:
-            out["title_note"] = "у карточки нет своего места под заголовок: он встанет жирной первой строкой тела"
+            out["title_note"] = "у карточки нет своего места под заголовок: код сам поставит его жирной первой строкой тела; в тело его не повторяй"
         if self.purpose:
             out["purpose"] = self.purpose
         if self.content_hint:
