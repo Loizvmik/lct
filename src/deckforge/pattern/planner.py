@@ -15,7 +15,7 @@ from dataclasses import dataclass
 
 from deckforge.pattern.candidates import (
     RELAX_TITLES, candidates_for, compatible_kinds, cover_pattern_id, has_fixed_headline, not_plain_content,
-    is_closing_pattern,
+    is_closing_pattern, is_cover_like,
 )
 from deckforge.pattern.forms import PatternForm, forms_of
 from deckforge.pattern.intent import SlideIntent, intents_from_outline, with_dividers
@@ -233,6 +233,8 @@ def repick_pattern(
         if (p.pattern_id in closing_ids and position != last) or (p.pattern_id == cover_id and position != 0):
             continue
         if has_fixed_headline(p) and position != last:
+            continue
+        if is_cover_like(p, profile) and position not in (0, last):
             continue
         if not_plain_content(forms[p.pattern_id]) and not _has_chart(slide):
             # Место под график без графика пустеет: картинку-график и

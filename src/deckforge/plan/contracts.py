@@ -17,7 +17,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-from deckforge.pattern.forms import MIN_HEADLINE_CHARS, FormPart, Limit, list_item_limit, pattern_form
+from deckforge.pattern.forms import MIN_HEADLINE_CHARS, FormPart, Limit, form_of, list_item_limit
 from deckforge.pattern.style import load_style
 from deckforge.template.patterns import CHART_TIER_TEXT
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
@@ -245,7 +245,10 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
     intent = assignment.intent
     pattern = next((p for p in profile.patterns if p.pattern_id == assignment.pattern_id), None) \
         if profile is not None else None
-    form = pattern_form(pattern) if pattern is not None else None
+    # Форма с замером клона (задача V5): предел места тот, что клон примет,
+    # а не площадная оценка профиля, с которой писатель укладывался в
+    # контракт, а клон всё равно отказывал.
+    form = form_of(profile, pattern) if pattern is not None else None
     policy = load_style(style) if style is not None else None
     limits = {}
     if intent.required_visual in ("table", "chart"):
