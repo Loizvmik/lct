@@ -15,7 +15,7 @@ import io
 import re
 import zipfile
 from dataclasses import dataclass, field, replace
-from typing import Callable
+from typing import Callable, Protocol
 from pathlib import Path
 
 from lxml import etree
@@ -52,6 +52,9 @@ from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import walk_shapes
+from deckforge.pattern.forms import forms_of
+from deckforge.pattern.intent import MAX_SLIDES
+from deckforge.pattern.planner import MAX_ALTERNATIVES
 from deckforge.plan.spec import BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 from deckforge.plan.variants import Variant
 from deckforge.settings import Settings
@@ -161,8 +164,18 @@ _ROLE_COLOR = {
 def build_deck(
     spec: DeckSpec, profile: TemplateProfile, template_path: Path, variant: Variant,
     *, user_photos: dict[str, Path] | None = None, clone_examples: bool | None = None,
+    repair: "SlideRepair | None" = None, max_slides: int = MAX_SLIDES,
 ) -> Path:
-    """`clone_examples`: собирать ли слайды клоном слайда-примера
+    """Каждый слайд идёт по лестнице отказов (`_place_with_ladder`,
+    раздел 11 архитектуры): клон раскладки планировщика, клон запасной,
+    сокращение текста (`repair`, если передан: модель зовёт оркестрация,
+    не сборка), разбиение на два (пока колода не длиннее `max_slides`),
+    и только потом сборка с нуля. Разбиение вставляет слайд в
+    `spec.slides` и перенумеровывает хвост; сокращение переписывает текст
+    слайда в `spec` на месте. Сколько слайдов прошло каждую ступень,
+    пишется в `spec.meta["ladder_<ступень>"]` (`ladder_counts`).
+
+    `clone_examples`: собирать ли слайды клоном слайда-примера
     (`compose.clone`, см. `_try_clone`); `None`: как велит
     `compose.clone_examples` в `config/app.yaml`.
 
@@ -213,7 +226,12 @@ def build_deck(
     # `_place_best_candidate` и цикл довыбирает раскладку сам, см. докстроку
     # `_resolve_pattern`).
     history = _SelectionHistory()
-    for slide_spec in spec.slides:
+    forms = forms_of(profile)
+    rungs = dict.fromkeys(LADDER_RUNGS, 0)
+    position = 0
+    while position < len(spec.slides):
+        slide_spec = spec.slides[position]
+        position += 1
         candidates = _resolve_pattern(slide_spec, patterns, profile, variant, history)
         if not candidates:
             slide_spec.findings.append(
@@ -221,14 +239,24 @@ def build_deck(
                 "паттерна этого шаблона — слайд не собран."
             )
             continue
-        pattern, notes = _place_best_candidate(
-            prs, slide_spec, candidates, profile, canvas, audit_config,
-            bullet_char=bullet_char, user_photos=user_photos, image_bytes=image_bytes,
-            source_slides=source_slides,
+        outcome = _place_with_ladder(
+            prs, slide_spec, candidates, profile, canvas, audit_config, forms=forms, repair=repair,
+            room=max_slides - len(spec.slides), bullet_char=bullet_char, user_photos=user_photos,
+            image_bytes=image_bytes, source_slides=source_slides,
         )
-        slide_spec.findings.extend(notes)
+        slide_spec.findings.extend(outcome.notes)
         _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
-        history = history.with_choice(pattern.pattern_id)
+        history = history.with_choice(outcome.pattern.pattern_id)
+        rungs[outcome.rung] += 1
+        if outcome.tail is not None:
+            # Продолжение собирается следующим шагом цикла, своей лестницей.
+            # Разбивать его ещё раз незачем: половина уже влезает по числу
+            # единиц, а второе разбиение съело бы место в колоде.
+            spec.slides.insert(position, outcome.tail)
+            for k in range(position, len(spec.slides)):
+                spec.slides[k].index = k
+    for rung, count in rungs.items():
+        spec.meta[f"ladder_{rung}"] = str(count)
 
     out_path = _output_path(spec, template_path, variant)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +287,7 @@ def _write_speaker_notes(slide, text: str | None) -> None:
 def place_slide(
     prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, audit_config: AuditConfig,
     *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
-    image_bytes: Callable[[str], bytes | None] | None = None,
+    image_bytes: Callable[[str], bytes | None] | None = None, look: "TemplateLook | None" = None,
 ) -> None:
     layout = _find_layout(prs, pattern.layout_id)
     if layout is None:
@@ -1201,7 +1229,13 @@ def _resolve_pattern(
     preferred = next((p for p in ranked if p.pattern_id == slide_spec.pattern_id), None)
     if preferred is None:
         return ranked
-    return [preferred, *(p for p in ranked if p.pattern_id != preferred.pattern_id)]
+    # Запасные планировщика (задача U) сразу за выбранной, в его порядке
+    # стоимости: вторая ступень лестницы берёт их, а не собственный рейтинг
+    # сборки, который считает иначе и не знает про соседей по колоде.
+    by_id = {p.pattern_id: p for p in ranked}
+    backups = [by_id[pid] for pid in slide_spec.alternatives if pid in by_id and pid != preferred.pattern_id]
+    taken = {preferred.pattern_id, *(p.pattern_id for p in backups)}
+    return [preferred, *backups, *(p for p in ranked if p.pattern_id not in taken)]
 
 
 # ---------------------------------------------------------------------------
@@ -1235,6 +1269,12 @@ def _resolve_pattern(
 # по построению `_pattern_rank_key`, не лучше).
 _MAX_LAYOUT_ATTEMPTS = 3
 
+# Клонов на слайд (задача U): раскладка планировщика и до трёх его
+# запасных того же вида (`pattern.planner.MAX_ALTERNATIVES`). Клон стоит
+# миллисекунды и не рисует ничего сам, поэтому бюджет шире, чем у сборки
+# с нуля.
+_MAX_CLONE_ATTEMPTS = 1 + MAX_ALTERNATIVES
+
 
 def _remove_last_slide(prs) -> None:
     """Убирает ПОСЛЕДНИЙ добавленный слайд из колоды — используется ТОЛЬКО
@@ -1256,50 +1296,55 @@ def _place_best_candidate(
     source_slides: dict[int, object] | None = None,
 ) -> tuple[Pattern, list[str]]:
     """Собрали слайд — проверили — не понравилось — взяли другую раскладку
-    и пересобрали (бриф, дословно). Пробует кандидатов `candidates` по
-    порядку (уже отранжированы `_resolve_pattern`/`_ranked_candidates` —
-    от предпочтительного к худшему), не больше `_MAX_LAYOUT_ATTEMPTS`:
-    укладывает слайд НА РЕАЛЬНЫЙ `prs`, гонит по нему `audit_slide_layout`
-    (пять проверок уровня "ошибка" — см. докстроку раздела), и
+    и пересобрали (бриф, дословно). Клон идёт первым для всех кандидатов
+    (`_clone_candidates`), и только если ни один клон не собрался или не
+    прошёл аудит, кандидаты собираются с нуля (`_scratch_candidates`).
+    Сборка с нуля теряет группы, градиенты и форму фото примера, поэтому
+    клон второй раскладки лучше нуля первой. `source_slides` пусто: только
+    сборка с нуля, как было до клонирования.
 
-    - если находок нет — оставляет слайд как есть, возвращает эту
-      раскладку;
-    - если находки есть — откатывает слайд (`_remove_last_slide`), логирует
-      причину отказа и пробует следующего кандидата;
-    - если В ПРЕДЕЛАХ БЮДЖЕТА не нашлось кандидата без находок — заново
-      укладывает того, у кого находок оказалось МЕНЬШЕ ВСЕГО (бриф: "потом
-      берётся кандидат с наименьшим числом ошибок") — слайд НИКОГДА не
-      остаётся несобранным (бриф: "пустого слайда быть не должно никогда").
-
-    Возвращает `(выбранная_раскладка, лог_попыток)` — лог уходит в
-    `slide_spec.findings` вызывающим кодом (`build_deck`): "это пойдёт на
-    защиту как доказательство, что аудит встроен, а не приделан" (бриф).
-
-    `source_slides`: слайды-примеры шаблона по номеру (`build_deck`
-    берёт их до очистки колоды). Клон идёт первым для ВСЕХ кандидатов
-    (`_try_clone`), и только если ни один клон не собрался или не прошёл
-    тот же аудит, кандидаты собираются с нуля. Сборка с нуля теряет
-    группы, градиенты и форму фото примера, поэтому клон второй раскладки
-    лучше нуля первой. `None`/пусто: только сборка с нуля, как было до
-    клонирования."""
-    tried = candidates[:_MAX_LAYOUT_ATTEMPTS]
+    Это лестница без ступеней, которым нужна модель или место в колоде
+    (сокращение текста и разбиение слайда): её полный вариант
+    `_place_with_ladder`. Возвращает `(выбранная_раскладка, лог_попыток)`,
+    лог уходит в `slide_spec.findings` вызывающим кодом."""
     notes: list[str] = []
-    best: tuple[int, Pattern, list[str]] | None = None  # (число находок, паттерн, коды находок)
+    cloned = _clone_candidates(
+        prs, slide_spec, candidates, profile, canvas, audit_config, notes,
+        bullet_char=bullet_char, user_photos=user_photos, source_slides=source_slides,
+    )
+    if cloned is not None:
+        return cloned[0], notes
+    pattern = _scratch_candidates(
+        prs, slide_spec, candidates, profile, canvas, audit_config, notes,
+        bullet_char=bullet_char, user_photos=user_photos, image_bytes=image_bytes,
+    )
+    return pattern, notes
 
-    # Заполненность клона (D05) не повод его отклонять: сборка с нуля на том
-    # же содержании даёт тот же белый лист, только без оформления шаблона.
-    # Но и принимать первый пустоватый клон, когда следующий кандидат лёг
-    # бы плотнее, незачем (наблюдение 8.1: два коротких пункта на две
-    # колонки). Клон ниже порога запоминается с его заполненностью, перебор
-    # идёт дальше; первый клон не ниже порога принимается сразу, а если
-    # таких нет, берётся самый заполненный из принятых. Героический слайд
-    # (титул, разделитель: один заголовок без блоков и визуала) пуст по
-    # замыслу, и его заполненность не судится вовсе: иначе выбор раскладки
-    # разделителя решали бы доли процента разницы в длине заголовка.
+
+def _clone_candidates(
+    prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
+    audit_config: AuditConfig, notes: list[str], *, bullet_char: str, user_photos: dict[str, Path] | None,
+    source_slides: dict[int, object] | None,
+) -> tuple[Pattern, int] | None:
+    """Клон каждого из первых `_MAX_CLONE_ATTEMPTS` кандидатов по порядку.
+    Возвращает `(раскладка, её номер в списке)` принятого клона (слайд
+    остаётся в колоде) или `None`, если не принят ни один (слайда нет).
+
+    Заполненность клона (D05) не повод его отклонять: сборка с нуля на том
+    же содержании даёт тот же белый лист, только без оформления шаблона.
+    Но и принимать первый пустоватый клон, когда следующий кандидат лёг
+    бы плотнее, незачем (наблюдение 8.1: два коротких пункта на две
+    колонки). Клон ниже порога запоминается с его заполненностью, перебор
+    идёт дальше; первый клон не ниже порога принимается сразу, а если
+    таких нет, берётся самый заполненный из принятых. Героический слайд
+    (титул, разделитель: один заголовок без блоков и визуала) пуст по
+    замыслу, и его заполненность не судится вовсе: иначе выбор раскладки
+    разделителя решали бы доли процента разницы в длине заголовка."""
+    tried = candidates[:_MAX_CLONE_ATTEMPTS]
     heroic = not slide_spec.blocks and slide_spec.visual is None
     fill_min = 0.0 if heroic else audit_config.density.fill_ratio_min
-    underfilled: list[tuple[float, Pattern]] = []
-    for pattern in tried:
+    underfilled: list[tuple[float, int, Pattern]] = []
+    for position, pattern in enumerate(tried):
         cloned = _try_clone(
             prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
             bullet_char=bullet_char, user_photos=user_photos,
@@ -1309,15 +1354,15 @@ def _place_best_candidate(
         clone_notes, fill = cloned
         if fill >= fill_min:
             notes.extend(clone_notes)
-            return pattern, notes
+            return pattern, position
         _remove_last_slide(prs)
-        underfilled.append((fill, pattern))
+        underfilled.append((fill, position, pattern))
         notes.append(
             f"Слайд {slide_spec.index}: клон раскладки {pattern.pattern_id!r} заполнен на {fill:.0%} "
             f"(порог {fill_min:.0%}) — ищем раскладку плотнее."
         )
     if underfilled:
-        fill, pattern = max(underfilled, key=lambda item: item[0])
+        fill, position, pattern = max(underfilled, key=lambda item: (item[0], -item[1]))
         rebuilt = _try_clone(
             prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
             bullet_char=bullet_char, user_photos=user_photos,
@@ -1329,13 +1374,31 @@ def _place_best_candidate(
                 f"Слайд {slide_spec.index}: слайд заполнен на {fill:.0%}: содержания мало для любой "
                 f"раскладки (выбран самый заполненный клон, {pattern.pattern_id!r})."
             )
-            return pattern, notes
+            return pattern, position
+    return None
 
+
+def _scratch_candidates(
+    prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
+    audit_config: AuditConfig, notes: list[str], *, bullet_char: str, user_photos: dict[str, Path] | None,
+    image_bytes: Callable[[str], bytes | None] | None, look: "TemplateLook | None" = None,
+) -> Pattern:
+    """Сборка с нуля, последняя ступень: пробует кандидатов по порядку, не
+    больше `_MAX_LAYOUT_ATTEMPTS`, укладывает слайд на реальный `prs` и
+    гонит по нему `audit_slide_layout`;
+
+    - находок нет: слайд остаётся, возвращается эта раскладка;
+    - находки есть: слайд откатывается (`_remove_last_slide`), причина в
+      лог, следующий кандидат;
+    - без находок никто: заново укладывается тот, у кого находок меньше
+      всего (бриф: «пустого слайда быть не должно никогда»)."""
+    tried = candidates[:_MAX_LAYOUT_ATTEMPTS]
+    best: tuple[int, Pattern, list[str]] | None = None  # (число находок, паттерн, коды находок)
     for attempt, pattern in enumerate(tried, start=1):
         trial_spec = replace(slide_spec, findings=[])
         place_slide(
             prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char,
-            user_photos=user_photos, image_bytes=image_bytes,
+            user_photos=user_photos, image_bytes=image_bytes, look=look,
         )
         errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index)
         if not errors:
@@ -1345,7 +1408,7 @@ def _place_best_candidate(
                     f"{attempt}/{len(tried)} (без находок уровня ошибки)."
                 )
             notes.extend(trial_spec.findings)
-            return pattern, notes
+            return pattern
         ids = sorted({f.check_id for f in errors})
         notes.append(
             f"Слайд {slide_spec.index}: раскладка {pattern.pattern_id!r} отклонена (попытка "
@@ -1359,7 +1422,7 @@ def _place_best_candidate(
     trial_spec = replace(slide_spec, findings=[])
     place_slide(
         prs, trial_spec, best_pattern, profile, audit_config, bullet_char=bullet_char,
-        user_photos=user_photos, image_bytes=image_bytes,
+        user_photos=user_photos, image_bytes=image_bytes, look=look,
     )
     notes.append(
         f"Слайд {slide_spec.index}: ни один из {len(tried)} проверенных кандидатов не прошёл аудит "
@@ -1367,7 +1430,212 @@ def _place_best_candidate(
         f"({best_errors}: {', '.join(best_ids)})."
     )
     notes.extend(trial_spec.findings)
-    return best_pattern, notes
+    return best_pattern
+
+
+# ---------------------------------------------------------------------------
+# Лестница отказов (раздел 11 архитектуры): сборка с нуля последней
+# ---------------------------------------------------------------------------
+
+# Ступени в порядке лестницы. `clone`: принят клон раскладки планировщика;
+# `adapt`: клон запасной раскладки того же вида; `shorten`: текст сокращён
+# под контракт раскладки и клон принят; `split`: слайд разделён на два и
+# клон принят; `scratch`: сборка с нуля.
+LADDER_RUNGS = ("clone", "adapt", "shorten", "split", "scratch")
+LADDER_TITLES = {
+    "clone": "клон выбранной раскладки",
+    "adapt": "клон запасной раскладки",
+    "shorten": "текст сокращён под раскладку",
+    "split": "слайд разделён на два",
+    "scratch": "сборка с нуля",
+}
+
+
+class SlideRepair(Protocol):
+    """Структурная починка слайда, которую сборка сама сделать не может:
+    ей нужна модель, а `compose/` модель не вызывает. Реализация живёт в
+    оркестрации (`workflow.repair.SlideRepairer`), сборка получает её
+    готовой и только решает, когда звать.
+
+    `shorten`: слайд с тем же смыслом, переписанный под контракт раскладки
+    `pattern_id`, или `None`, если починка недоступна (нет модели, кончился
+    лимит вызовов) или не удалась. `problems`: почему клон отклонён, для
+    модели."""
+
+    def shorten(self, slide_spec: SlideSpec, pattern_id: str, problems: list[str]) -> SlideSpec | None: ...
+
+
+@dataclass
+class LadderOutcome:
+    """Итог лестницы одного слайда. `tail`: вторая половина разделённого
+    слайда, её собирает следующий шаг цикла `build_deck`."""
+    pattern: Pattern
+    notes: list[str]
+    rung: str
+    tail: SlideSpec | None = None
+
+
+# Блоки, чьи единицы делит разбиение слайда: карточки, пункты, показатели.
+_SPLITTABLE_BLOCKS = (CardBlock, BulletBlock, KpiBlock)
+
+
+def _main_units(slide_spec: SlideSpec) -> tuple[int, int] | None:
+    """(номер блока, число единиц) самого длинного списочного блока слайда
+    или `None`, если таких блоков нет."""
+    best: tuple[int, int] | None = None
+    for i, block in enumerate(slide_spec.blocks):
+        if isinstance(block, _SPLITTABLE_BLOCKS) and (best is None or len(block.items) > best[1]):
+            best = (i, len(block.items))
+    return best
+
+
+def _units_capacity(candidates: list[Pattern], forms: dict) -> int:
+    """Сколько единиц держит самая вместительная из раскладок-кандидатов:
+    та же форма (`pattern.forms`), по которой планировщик считал
+    вместимость и контракт назначал число единиц."""
+    return max((forms[p.pattern_id].units for p in candidates if p.pattern_id in forms), default=0)
+
+
+def split_slide(slide_spec: SlideSpec, capacity: int) -> tuple[SlideSpec, SlideSpec] | None:
+    """Делит слайд с переполненным списком на два с тем же заголовком
+    (раздел 11.1): шесть карточек при раскладке на четыре становятся 3 + 3,
+    а не произвольной вёрсткой с нуля. Вводные блоки, картинка и сноска
+    остаются на первой половине; вторая помечена «продолжение» в заметках
+    докладчика, не в заголовке: заголовок-вывод один на оба слайда.
+
+    `None`: делить нечего или две половины всё равно не влезут."""
+    found = _main_units(slide_spec)
+    if found is None or capacity < 1:
+        return None
+    at, units = found
+    if units <= capacity or units > 2 * capacity:
+        return None
+    first_n = (units + 1) // 2
+    block = slide_spec.blocks[at]
+    head_block = replace(block, items=list(block.items[:first_n]))
+    tail_block = replace(block, items=list(block.items[first_n:]))
+    head = replace(
+        slide_spec, blocks=[head_block if i == at else b for i, b in enumerate(slide_spec.blocks)], findings=[],
+    )
+    notes = f"Продолжение слайда «{slide_spec.headline}»."
+    if slide_spec.speaker_notes:
+        notes = f"{notes} {slide_spec.speaker_notes}"
+    tail = replace(
+        slide_spec, index=slide_spec.index + 1, blocks=[tail_block], visual=None,
+        speaker_notes=notes, findings=[],
+    )
+    return head, tail
+
+
+def _adopt(slide_spec: SlideSpec, other: SlideSpec) -> None:
+    """Переносит содержание `other` в `slide_spec` на месте: колода
+    (`DeckSpec.slides`) держит именно этот объект, и отчёт, аудит и HTML
+    должны видеть тот текст, что лёг на слайд."""
+    for name in ("headline", "subhead", "blocks", "visual", "source_note", "speaker_notes"):
+        setattr(slide_spec, name, getattr(other, name))
+
+
+def _place_with_ladder(
+    prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
+    audit_config: AuditConfig, *, forms: dict, repair: SlideRepair | None, room: int, bullet_char: str,
+    user_photos: dict[str, Path] | None, image_bytes: Callable[[str], bytes | None] | None,
+    source_slides: dict[int, object] | None, look: "TemplateLook | None" = None,
+) -> LadderOutcome:
+    """Лестница отказов одного слайда (раздел 11): 1) клон раскладки
+    планировщика; 2) клон запасной раскладки того же вида (запасные
+    планировщика идут в `candidates` сразу за выбранной, `_resolve_pattern`);
+    3) сокращение текста под контракт раскладки (`repair.shorten`, один
+    вызов модели) и снова клон; 4) разбиение слайда на два, если единиц
+    больше, чем держит лучшая раскладка, и в колоде есть место (`room`);
+    5) только потом сборка с нуля.
+
+    Переполнение по числу единиц идёт сразу на ступень 4: сокращение под
+    контракт на K единиц выбросило бы лишние карточки вместе с фактами, а
+    разбиение сохраняет всё. Героический слайд (титул, разделитель) не
+    чинится: у него один заголовок, чинить в нём нечего.
+
+    Каждая ступень пишет находку, какая сработала; счётчик по ступеням
+    копит `build_deck`."""
+    notes: list[str] = []
+    cloned = _clone_candidates(
+        prs, slide_spec, candidates, profile, canvas, audit_config, notes,
+        bullet_char=bullet_char, user_photos=user_photos, source_slides=source_slides,
+    )
+    if cloned is not None:
+        pattern, position = cloned
+        rung = "clone" if position == 0 else "adapt"
+        return LadderOutcome(pattern, notes + [_rung_note(slide_spec, rung, pattern)], rung)
+
+    heroic = not slide_spec.blocks and slide_spec.visual is None
+    can_clone = any(_clone_source(p, source_slides) for p in candidates[:_MAX_CLONE_ATTEMPTS])
+    capacity = _units_capacity(candidates[:_MAX_CLONE_ATTEMPTS], forms)
+    found = _main_units(slide_spec)
+    overflow = found is not None and capacity >= 1 and found[1] > capacity
+
+    if can_clone and not heroic and not overflow and repair is not None:
+        problems = [n.split(": ", 1)[-1] for n in notes]
+        try:
+            shortened = repair.shorten(slide_spec, candidates[0].pattern_id, problems)
+        except Exception as exc:  # noqa: BLE001: починка необязательна, сборка слайда важнее
+            shortened = None
+            notes.append(f"Слайд {slide_spec.index}: сокращение текста упало ({type(exc).__name__}: {exc}).")
+        if shortened is not None:
+            shortened = replace(shortened, index=slide_spec.index, findings=[])
+            cloned = _clone_candidates(
+                prs, shortened, candidates, profile, canvas, audit_config, notes,
+                bullet_char=bullet_char, user_photos=user_photos, source_slides=source_slides,
+            )
+            if cloned is not None:
+                _adopt(slide_spec, shortened)
+                pattern = cloned[0]
+                return LadderOutcome(pattern, notes + [_rung_note(slide_spec, "shorten", pattern)], "shorten")
+            notes.append(f"Слайд {slide_spec.index}: сокращённый текст клон тоже не принял, дальше по лестнице.")
+
+    if can_clone and overflow:
+        halves = split_slide(slide_spec, capacity) if room >= 1 else None
+        if halves is None:
+            why = "колода уже на пределе числа слайдов" if room < 1 else "две половины всё равно не влезут"
+            notes.append(
+                f"Слайд {slide_spec.index}: нужно {found[1]} единиц, у лучшей раскладки максимум "
+                f"{capacity}; разделить нельзя: {why}."
+            )
+        else:
+            head, tail = halves
+            cloned = _clone_candidates(
+                prs, head, candidates, profile, canvas, audit_config, notes,
+                bullet_char=bullet_char, user_photos=user_photos, source_slides=source_slides,
+            )
+            if cloned is not None:
+                _adopt(slide_spec, head)
+                pattern = cloned[0]
+                notes.append(
+                    f"Слайд {slide_spec.index}: нужно {found[1]} единиц, у лучшей раскладки максимум "
+                    f"{capacity} — слайд разделён на два ({len(head.blocks[found[0]].items)} + "
+                    f"{len(tail.blocks[0].items)}), продолжение следующим слайдом."
+                )
+                return LadderOutcome(
+                    pattern, notes + [_rung_note(slide_spec, "split", pattern)], "split", tail=tail,
+                )
+
+    pattern = _scratch_candidates(
+        prs, slide_spec, candidates, profile, canvas, audit_config, notes,
+        bullet_char=bullet_char, user_photos=user_photos, image_bytes=image_bytes, look=look,
+    )
+    return LadderOutcome(pattern, notes + [_rung_note(slide_spec, "scratch", pattern)], "scratch")
+
+
+def _rung_note(slide_spec: SlideSpec, rung: str, pattern: Pattern) -> str:
+    return (
+        f"Слайд {slide_spec.index}: лестница сборки — сработала ступень «{LADDER_TITLES[rung]}» "
+        f"(раскладка {pattern.pattern_id!r})."
+    )
+
+
+def ladder_counts(spec: DeckSpec) -> dict[str, int]:
+    """Сколько слайдов колоды прошло каждую ступень лестницы: из
+    `DeckSpec.meta`, куда их пишет `build_deck`. Для снимка задания,
+    печати CLI и HTML-отчёта."""
+    return {rung: int(spec.meta.get(f"ladder_{rung}", "0") or 0) for rung in LADDER_RUNGS}
 
 
 # ---------------------------------------------------------------------------
@@ -1463,7 +1731,12 @@ def _try_clone(
             ], fill
         _remove_last_slide(prs)
         ids = sorted({f.check_id for f in errors})
-        reason = f"аудит нашёл {len(errors)} ошибок уровня ошибки: {', '.join(ids)}"
+        # Текст первой находки нужен ступени сокращения (`repair.shorten`):
+        # модель должна знать, какое место не вместило текст, а не только код.
+        reason = (
+            f"аудит нашёл {len(errors)} ошибок уровня ошибки: {', '.join(ids)} "
+            f"({errors[0].message[:200]})"
+        )
     notes.append(
         f"Слайд {slide_spec.index}: клон слайда-примера №{number} (раскладка {pattern.pattern_id!r}) "
         f"не принят — {reason}."
