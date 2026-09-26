@@ -408,6 +408,7 @@ def _visual_stage(budget: RunBudget, target, variant, sources) -> None:
     outcome = run_visual_stage(
         budget, variant_deck, findings, _build_vlm(),
         lambda: to_pngs(path, path.parent / f"{path.stem}__risk-preview"), sources=sources,
+        pptx_path=path,
     )
     if outcome.result is None:
         print(f"\nАудит по картинке рискованных слайдов не выполнялся: {outcome.skipped_reason}")
@@ -467,7 +468,9 @@ def _cmd_audit_visual(args: argparse.Namespace) -> int:
             )
 
     max_workers = args.max_workers if args.max_workers is not None else 4
-    vis_result = run_visual(pngs, spec, profile, vlm, sources=sources, max_workers=max_workers)
+    vis_result = run_visual(
+        pngs, spec, profile, vlm, sources=sources, max_workers=max_workers, pptx_path=args.pptx,
+    )
     if vis_result.skipped_reason:
         print(f"Модельный аудит по картинке: не выполнялся — {vis_result.skipped_reason}")
     else:
