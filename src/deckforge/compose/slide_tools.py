@@ -37,8 +37,10 @@ from deckforge.audit.deterministic import audit_slide_layout, slide_fill_ratio
 from deckforge.compose.builder import (
     _clear_sample_slides, _pattern_from_model, _remove_last_slide, place_slide,
 )
+from deckforge.compose.fit_check import target_of
 from deckforge.ooxml.geometry import Canvas
 from deckforge.plan.spec import SlideSpec
+from deckforge.template.patterns import slot_char_capacity
 from deckforge.template.profile import TemplateProfile
 
 # Роли слотов, по которым видно, что раскладка умеет держать. Названия — те
@@ -80,7 +82,16 @@ def _slot_guide(pattern) -> list[dict]:
         if key in seen:
             continue
         seen.add(key)
-        guide.append({"purpose": slot.purpose, "content_hint": slot.content_hint, "max_words": slot.max_words})
+        # Предел без цели писатель читает как «чем короче, тем безопаснее»:
+        # так на прогонах и выходил пункт в 20 знаков в блоке на 250.
+        # Цель — те же 0,8 предела, по которым код потом решает, дописывать
+        # ли слайд (`fit_check.main_slot_fill`).
+        max_chars = slot_char_capacity(slot) or None
+        guide.append({
+            "purpose": slot.purpose, "content_hint": slot.content_hint,
+            "max_chars": max_chars, "max_words": slot.max_words,
+            "target_chars": target_of(max_chars), "target_words": target_of(slot.max_words),
+        })
     return guide
 
 
@@ -108,6 +119,7 @@ def list_layouts(profile: TemplateProfile, *, kind: str | None = None) -> list[d
             "max_items": cap.max_items,
             "max_bullets": cap.max_bullets,
             "max_chars_per_item": cap.max_chars_per_item,
+            "target_chars_per_item": target_of(cap.max_chars_per_item),
             "max_rows": cap.max_rows,
             "max_cols": cap.max_cols,
             "max_series": cap.max_series,

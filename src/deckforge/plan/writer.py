@@ -63,9 +63,10 @@ from pathlib import Path
 
 import yaml
 
-from deckforge.compose.fit_check import measure_fit
+from deckforge.compose.fit_check import main_slot_fill, measure_fit, target_of
 from deckforge.compose.slide_tools import list_layouts, try_slide
 from deckforge.plan.factcheck import check_number_in_sources
+from deckforge.plan.normalize import normalize_deck
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
     SLIDE_KINDS, BulletBlock, DeckSpec, SlideSpec, slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
@@ -195,17 +196,21 @@ def _kind_capacity(kind: str, profile) -> dict:
     builder` уже обрабатывает любое расхождение содержания с раскладкой)."""
     candidates = [p.capacity for p in profile.patterns if p.kind == kind]
     if not candidates:
-        return dict(_FALLBACK_CAPACITY)
+        return {
+            **_FALLBACK_CAPACITY,
+            "target_chars_per_item": target_of(_FALLBACK_CAPACITY["max_chars_per_item"]),
+        }
 
     def _max_positive(values: list[int], default: int) -> int:
         positive = [v for v in values if v > 0]
         return max(positive) if positive else default
 
+    max_chars = _max_positive([c.max_chars_per_item for c in candidates], _FALLBACK_CAPACITY["max_chars_per_item"])
     return {
         "max_items": _max_positive([c.max_items for c in candidates], _FALLBACK_CAPACITY["max_items"]),
-        "max_chars_per_item": _max_positive(
-            [c.max_chars_per_item for c in candidates], _FALLBACK_CAPACITY["max_chars_per_item"],
-        ),
+        "max_chars_per_item": max_chars,
+        # Цель рядом с пределом: см. `compose.slide_tools._slot_guide`.
+        "target_chars_per_item": target_of(max_chars),
         "max_bullets": _max_positive([c.max_bullets for c in candidates], _FALLBACK_CAPACITY["max_bullets"]),
         "max_series": _max_positive([c.max_series for c in candidates], _FALLBACK_CAPACITY["max_series"]),
         "max_rows": _max_positive([c.max_rows for c in candidates], _FALLBACK_CAPACITY["max_rows"]),
@@ -379,7 +384,11 @@ def _run_tool_call(
     args = call.get("args") if isinstance(call.get("args"), dict) else {}
     try:
         if name == "measure_fit":
-            return measure_fit(str(args.get("text", "")), str(args.get("role", "")), profile, desired_kind)
+            layout_id = args.get("layout_id")
+            return measure_fit(
+                str(args.get("text", "")), str(args.get("role", "")), profile, desired_kind,
+                layout_id=str(layout_id) if layout_id else None,
+            )
         if name == "check_number":
             return check_number_in_sources(str(args.get("query", "")), source_text)
         # Оба инструмента ниже (Task 23) требуют файла шаблона: черновик
@@ -560,6 +569,7 @@ def _ask_slide_writer(
 def _write_one_slide(
     index: int, item, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
     *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, template_path: Path | None = None,
+    fill_repair_max_items: int | None = None, repair_log: list[dict] | None = None,
 ) -> SlideSpec:
     """Пишет ОДИН слайд — вынесено из `write_slides` в отдельную функцию,
     чтобы её можно было независимо запускать в пуле потоков (слайды друг от
@@ -622,9 +632,85 @@ def _write_one_slide(
         reason = "модель не подключена (нет ключа) — текст слайдов не писался вовсе"
 
     if slide is None:
-        slide = _fallback_slide(desired_kind, index, item.intent, item.needs, reason=reason)
+        return _validate_chosen_layout(
+            _fallback_slide(desired_kind, index, item.intent, item.needs, reason=reason), profile,
+        )
 
-    return _validate_chosen_layout(slide, profile)
+    slide = _validate_chosen_layout(slide, profile)
+    if fill_repair_max_items is not None and llm is not None:
+        slide = _repair_underfill(
+            prompt_body, payload, slide, profile, llm, max_items=fill_repair_max_items, log=repair_log,
+        )
+    return slide
+
+
+# Виды, где крупное текстовое место и не должно быть заполнено: обложка,
+# картинка, показатели, цитата, таблица. Длину их текста задаёт смысл.
+_NO_FILL_REPAIR_KINDS = frozenset({"section", "image", "kpi", "kpi_caption", "quote", "table"})
+
+# Ремонт идёт, когда место заполнено меньше этой доли цели.
+FILL_REPAIR_SHARE_OF_TARGET = 0.5
+
+
+def _repair_underfill(
+    prompt_body: str, payload: dict, slide: SlideSpec, profile, llm: LLMProvider,
+    *, max_items: int = 0, log: list[dict] | None = None,
+) -> SlideSpec:
+    """Один добавочный вызов «допиши до объёма», если крупнейшее текстовое
+    место слайда заполнено меньше чем на половину цели.
+
+    Правило объёма стоит в задании писателя, но модель его нарушает молча:
+    прогоны 23–26 сентября 2026 давали пункты по 20 знаков в блоках на 250.
+    Тот же приём, что ремонт невалидного JSON: код меряет, показывает
+    модели число и просит один раз. Не больше одного круга; ответ хуже
+    исходного (невалиден, длиннее предела, не прибавил заполнения)
+    отбрасывается, и остаётся исходный слайд. Отказ модели здесь не
+    превращает слайд в запасной: у нас уже есть хороший ответ.
+
+    `max_items` > 0 ограничивает ремонт слайдами с малым числом элементов
+    (`_content_units`), если на колоде он окажется дорог по времени."""
+    if slide.kind in _NO_FILL_REPAIR_KINDS:
+        return slide
+    if slide.visual is not None and slide.visual.kind in ("table", "chart"):
+        return slide
+    if max_items and _content_units(slide) > max_items:
+        return slide
+    before = main_slot_fill(slide, profile, layout_id=slide.pattern_id)
+    if before is None or before["fill"] >= FILL_REPAIR_SHARE_OF_TARGET * before["target_fill"]:
+        return slide
+
+    started = time.monotonic()
+    answer = {k: v for k, v in slide_spec_to_dict(slide).items() if k not in ("index", "findings", "pattern_id")}
+    if slide.pattern_id:
+        answer["layout_id"] = slide.pattern_id
+    request = dict(payload)
+    request["previous_answer"] = answer
+    request["fill_request"] = {
+        "role": before["role"], "chars": before["chars"],
+        "target_chars": before["target_chars"], "max_chars": before["max_chars"],
+    }
+    messages = [
+        {"role": "system", "content": prompt_body},
+        {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
+    ]
+    outcome = "отброшен"
+    result = slide
+    try:
+        repaired = slide_spec_from_dict(json.loads(_complete(llm, messages, _SLIDE_SCHEMA, WRITER_MAX_TOKENS)), slide.index)
+    except Exception as exc:  # отказ ремонта не портит уже хороший слайд
+        repaired, outcome = None, f"не удался: {_why(exc)}"
+    if repaired is not None and not slide_spec_problems(repaired):
+        repaired = _validate_chosen_layout(repaired, profile)
+        after = main_slot_fill(repaired, profile, layout_id=repaired.pattern_id)
+        if after is not None and before["fill"] < after["fill"] and after["chars"] <= after["max_chars"]:
+            result = replace(repaired, findings=[*slide.findings, *repaired.findings])
+            outcome = "принят"
+    if log is not None:
+        log.append({
+            "index": slide.index, "seconds": round(time.monotonic() - started, 1), "outcome": outcome,
+            "fill_before": before["fill"],
+        })
+    return result
 
 
 def _validate_chosen_layout(slide: SlideSpec, profile) -> SlideSpec:
@@ -653,7 +739,7 @@ def _validate_chosen_layout(slide: SlideSpec, profile) -> SlideSpec:
 def write_slides(
     outline: Outline, sources: list[SourceDoc], profile, llm: LLMProvider | None,
     *, max_workers: int = DEFAULT_WRITER_MAX_WORKERS, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT,
-    template_path: Path | None = None,
+    template_path: Path | None = None, fill_repair_max_items: int | None = None,
 ) -> DeckSpec:
     """Пишет текст всех слайдов ПАРАЛЛЕЛЬНО (см. `DEFAULT_WRITER_MAX_
     WORKERS` — до `max_workers` одновременных вызовов модели), не по
@@ -671,17 +757,29 @@ def write_slides(
        и раньше, до параллельности: `_ask_slide_writer` ловит любую ошибку
        вызова и возвращает `None`, дальше в ход идёт `_fallback_slide`);
        здесь это свойство только ПЕРЕЖИВАЕТ переезд в пул потоков, не
-       создаётся заново."""
+       создаётся заново.
+
+    `fill_repair_max_items` включает ремонт недобора (`_repair_underfill`):
+    `None` — выключен (тесты с очередью заготовленных ответов считают
+    вызовы), 0 — для всех слайдов, N — для слайдов не больше чем с N
+    элементами. Сколько слайдов ремонтировалось и сколько секунд это
+    стоило, пишется в `DeckSpec.meta`.
+
+    После письма содержание вырождается под раскладки шаблона (`plan.
+    normalize.normalize_deck`): одна карточка становится абзацем, пара
+    коротких пунктов с числами — показателями."""
     _meta, prompt_body = _load_agent_prompt(AGENT_PATH_WRITER)
     source_text = "\n\n".join(f"### {s.name}\n{s.text}" for s in sources)
     total = len(outline.slides)
 
     slides: list[SlideSpec | None] = [None] * total
+    repair_log: list[dict] = []
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as pool:
         futures = {
             pool.submit(
                 _write_one_slide, index, item, profile, prompt_body, source_text, total, llm,
                 agent_max_steps=agent_max_steps, template_path=template_path,
+                fill_repair_max_items=fill_repair_max_items, repair_log=repair_log,
             ): index
             for index, item in enumerate(outline.slides)
         }
@@ -692,7 +790,12 @@ def write_slides(
     ordered_slides: list[SlideSpec] = slides  # type: ignore[assignment] — каждый индекс заполнен ровно один раз выше
     ordered_slides = _drop_thin_duplicates(ordered_slides)
     _flag_repeated_headlines(ordered_slides)
-    return DeckSpec(title=outline.title, language=outline.language, slides=ordered_slides)
+    deck = DeckSpec(title=outline.title, language=outline.language, slides=ordered_slides)
+    if repair_log:
+        deck.meta["fill_repairs"] = str(len(repair_log))
+        deck.meta["fill_repairs_accepted"] = str(sum(1 for r in repair_log if r["outcome"] == "принят"))
+        deck.meta["fill_repair_seconds"] = f"{sum(r['seconds'] for r in repair_log):.1f}"
+    return normalize_deck(deck, profile)
 
 
 # Слово короче этой длины (предлоги, союзы, частицы — «и», «на», «за») не

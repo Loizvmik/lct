@@ -140,6 +140,17 @@ def _writer_agent_max_steps() -> int:
         return AGENT_MAX_STEPS_DEFAULT
 
 
+def _writer_fill_repair() -> int | None:
+    """Ремонт недобора (`plan.writer._repair_underfill`): `None` — выключен,
+    иначе предел числа элементов слайда (0 — без предела). Без читаемого
+    конфига включён для всех слайдов, как в `config/app.yaml`."""
+    try:
+        llm = Settings.load(APP_YAML_PATH).llm
+    except Exception:
+        return 0
+    return llm.slide_writer_fill_repair_max_items if llm.slide_writer_fill_repair else None
+
+
 def _cmd_parse(args: argparse.Namespace) -> int:
     namer = _build_namer()
     vision = _build_pattern_kind_vlm()
@@ -227,11 +238,18 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     deck = write_slides(
         outline, sources, profile, writer_llm,
         max_workers=writer_max_workers, agent_max_steps=_writer_agent_max_steps(),
-        template_path=args.template,
+        template_path=args.template, fill_repair_max_items=_writer_fill_repair(),
     )
     written_at = time.monotonic()
     budget.record("write", written_at - outlined_at)
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
+    if "fill_repairs" in deck.meta:
+        print(
+            f"  дописано до объёма: {deck.meta['fill_repairs_accepted']} из {deck.meta['fill_repairs']} слайдов, "
+            f"вызовы ремонта заняли {deck.meta['fill_repair_seconds']}с суммарно"
+        )
+    if "normalized_slides" in deck.meta:
+        print(f"  содержание приведено к раскладке: {deck.meta['normalized_slides']} слайдов")
 
     # Task 20: распределение фотографий контент-пакета по слайдам — ПОСЛЕ
     # текста (нужны уже написанные заголовки/содержание, см. `plan.photos.
@@ -318,6 +336,9 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         slide_findings = [s for v in variant_deck.slides for s in v.findings]
         if slide_findings:
             print(f"  находки сборки (усечения/переполнения): {len(slide_findings)}")
+        for f in slide_findings:
+            if "раскладка под содержание не найдена" in f:
+                print(f"  ! {f}")
 
         # Task 22: сколько фотографий контент-пакета РЕАЛЬНО легло на
         # слайды ЭТОГО варианта — считано по байтам уже сохранённого

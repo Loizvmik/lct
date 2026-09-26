@@ -104,3 +104,16 @@ def test_trying_a_slide_surfaces_what_the_code_did_to_the_text(PROFILE):
     verdict = try_slide(spec, layout["layout_id"], PROFILE, _template(PROFILE))
 
     assert verdict["findings"] or verdict["notes"], "про невлезающий текст обязано быть сказано"
+
+
+def test_layout_catalog_gives_a_target_not_only_a_limit(PROFILE):
+    """Предел без цели читается как «чем короче, тем безопаснее». Цель —
+    0,8 предела, округлённая."""
+    for row in list_layouts(PROFILE):
+        cap = row["max_chars_per_item"]
+        assert row["target_chars_per_item"] == (round(cap * 0.8) if cap else None)
+        for place in row["places"]:
+            if place["max_chars"]:
+                assert place["target_chars"] == round(place["max_chars"] * 0.8)
+            if place["max_words"]:
+                assert place["target_words"] == round(place["max_words"] * 0.8)

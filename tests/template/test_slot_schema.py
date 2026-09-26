@@ -260,7 +260,12 @@ def test_list_layouts_gives_writer_slot_descriptions(tmp_path, monkeypatch):
 
     rows = list_layouts(profile)
 
-    assert any(
-        row["places"] == [{"purpose": "заголовок слайда", "content_hint": "вывод", "max_words": 8}]
-        for row in rows
-    )
+    described = [
+        place for row in rows for place in row["places"]
+        if place["purpose"] == "заголовок слайда" and place["content_hint"] == "вывод"
+    ]
+    assert described
+    place = described[0]
+    assert place["max_words"] == 8 and place["target_words"] == 6
+    assert place["max_chars"] <= 8 * 7
+    assert place["target_chars"] == round(place["max_chars"] * 0.8)

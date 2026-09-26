@@ -137,6 +137,15 @@ def _writer_agent_max_steps() -> int:
         return AGENT_MAX_STEPS_DEFAULT
 
 
+def _writer_fill_repair() -> int | None:
+    """Ремонт недобора, тот же приём, что `cli._writer_fill_repair`."""
+    try:
+        llm = Settings.load(APP_YAML_PATH).llm
+    except Exception:
+        return 0
+    return llm.slide_writer_fill_repair_max_items if llm.slide_writer_fill_repair else None
+
+
 def _artifacts_root() -> Path:
     try:
         settings = Settings.load(APP_YAML_PATH)
@@ -355,7 +364,7 @@ async def _run_job(
         deck = await asyncio.to_thread(
             write_slides, outline, source_docs, profile, writer_llm,
             max_workers=_writer_max_workers(), agent_max_steps=_writer_agent_max_steps(),
-            template_path=template.path,
+            template_path=template.path, fill_repair_max_items=_writer_fill_repair(),
         )
 
         # План презентации на диск рядом с результатом. Командная строка
