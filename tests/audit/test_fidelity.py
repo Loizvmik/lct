@@ -65,18 +65,23 @@ def test_fidelity_on_scratch_deck_reports_zero_clone_rate_and_notes_why():
     assert any("клон" in note for note in report.notes)
 
 
-def test_density_delta_is_none_without_source_density_field():
-    """Параллельная задача R ещё не добавила `source_density` к паттернам —
-    метрика честно пропускается с пометкой, остальные метрики считаются как
-    обычно (одна недостающая метрика не роняет отчёт)."""
+def test_density_delta_is_computed_against_the_pattern_source_density():
+    """У паттернов есть `source_density` (задача R): дельта плотности
+    считается как число; когда поля нет ни у одного паттерна, метрика честно
+    пропускается с пометкой, а соседние метрики не страдают."""
     spec = DeckSpec(title="Клон", language="ru", slides=[_cards_spec(2)])
     pptx_path = build_deck(spec, EDU_PROFILE, EDU_TEMPLATE, Variant.dense, clone_examples=True)
 
     report = template_fidelity(pptx_path, spec, EDU_PROFILE)
+    assert report.density_delta is not None
+    assert report.native_clone_rate == 1.0
 
-    assert report.density_delta is None
-    assert any("source_density" in note for note in report.notes)
-    assert report.native_clone_rate == 1.0  # соседняя метрика не пострадала
+    stripped = EDU_PROFILE.model_copy(update={
+        "patterns": [p.model_copy(update={"source_density": None}) for p in EDU_PROFILE.patterns],
+    })
+    report_without = template_fidelity(pptx_path, spec, stripped)
+    assert report_without.density_delta is None
+    assert any("source_density" in note for note in report_without.notes)
 
 
 def test_pattern_diversity_is_none_without_pattern_ids():
