@@ -34,6 +34,8 @@ from deckforge.provider.yandex import YandexProvider
 from deckforge.render.soffice import to_pngs
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
+from deckforge.workflow.budget import RunBudget, load_policy
+from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[2] / "config" / "app.yaml"
 
@@ -60,7 +62,7 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
         return None
 
 
-def _rerank(deck, profile, variants) -> tuple[dict, list[str]]:
+def _rerank(deck, profile, variants, budget: RunBudget | None = None) -> tuple[dict, list[str]]:
     """Задача D: модель выбирает раскладку из трёх, отобранных кодом, для
     airy и visual. Возвращает `(вариант -> {номер слайда -> pattern_id},
     заметки)`. Выключено в конфиге, нет ключа или конфиг не читается —
@@ -71,6 +73,8 @@ def _rerank(deck, profile, variants) -> tuple[dict, list[str]]:
         return {}, []
     if not settings.plan.rerank_variants:
         return {}, []
+    if budget is not None and not budget.check("rerank"):
+        return {}, [f"переранжирование пропущено бюджетом прогона: {budget.skipped['rerank']}"]
     llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
     notes: list[str] = []
     chosen = rerank_patterns(
@@ -172,15 +176,17 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     вариантами на каждом шаге (`build_outline`/`write_slides` без `llm`) —
     результат хуже по содержанию, но пайплайн не падает.
 
-    НЕ зовёт модельный аудит по картинке (C01-C11, `audit.visual.
-    run_visual`) — ТЗ отводит пять минут на ГЕНЕРАЦИЮ колоды, а не на
-    генерацию вместе с модельной проверкой смысла (живой замер задачи,
-    `task-12-report.md`: 302.8с генерация + 152.8с аудит по картинке =
-    455.6с, почти вдвое дольше бюджета). Аудит по картинке — отдельный шаг,
-    `deckforge audit-visual`, который человек запускает на уже готовом
-    файле (см. её docstring); эта функция честно печатает, что он не
-    выполнялся и как его запустить — молчаливая тишина хуже отсутствия
-    (то же правило, что и `VisualAuditResult.skipped_reason`)."""
+    Полный аудит по картинке всех слайдов (C01-C11) сюда не входит: замер
+    `task-12-report.md` дал 302.8с генерации плюс 152.8с такого аудита,
+    почти вдвое больше пяти минут ТЗ. Задача H вернула в генерацию его
+    часть: вопросы C01-C08, C10 по нескольким самым рискованным слайдам
+    одного варианта (`workflow.visual_stage`), и только если бюджет прогона
+    (`workflow.budget.RunBudget`, `run:` в app.yaml) это позволяет. Не
+    пошла стадия: печатается причина. Полный аудит остаётся отдельной
+    командой `deckforge audit-visual` на готовом файле."""
+    # Бюджет прогона создаётся первым делом: пять минут ТЗ считаются от
+    # начала команды.
+    budget = RunBudget.from_policy(load_policy(APP_YAML_PATH))
     namer = _build_namer()
     vision = _build_pattern_kind_vlm()
     outline_llm = _build_role_provider("outline")
@@ -189,6 +195,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     started = time.monotonic()
     profile = TemplateProfile.from_file(args.template, namer=namer, vision=vision)
     parsed_at = time.monotonic()
+    budget.record("parse", parsed_at - started)
     print(f"{args.template.name}: разобран за {parsed_at - started:.1f}с, паттернов: {len(profile.patterns)}")
 
     brief, sources, meta = load_content_pack(args.content_pack)
@@ -198,6 +205,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         title=meta.get("title", args.content_pack.name), language=meta.get("language", "ru"),
     )
     outlined_at = time.monotonic()
+    budget.record("outline", outlined_at - parsed_at)
     print(f"Структура: {len(outline.slides)} слайдов за {outlined_at - parsed_at:.1f}с")
 
     # Текст слайдов пишется ПАРАЛЛЕЛЬНО (max_workers — config/app.yaml,
@@ -211,6 +219,7 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         template_path=args.template,
     )
     written_at = time.monotonic()
+    budget.record("write", written_at - outlined_at)
     print(f"Текст слайдов написан за {written_at - outlined_at:.1f}с")
 
     # Task 20: распределение фотографий контент-пакета по слайдам — ПОСЛЕ
@@ -253,13 +262,21 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     variants = [Variant[v] for v in args.variants] if args.variants else list(Variant)
 
     rerank_started = time.monotonic()
-    preferred_by_variant, rerank_notes = _rerank(deck, profile, variants)
+    preferred_by_variant, rerank_notes = _rerank(deck, profile, variants, budget)
+    budget.record("rerank", time.monotonic() - rerank_started)
+    if not preferred_by_variant:
+        for note in rerank_notes:
+            print(f"  ! {note}")
     if preferred_by_variant:
         picked = sum(len(v) for v in preferred_by_variant.values())
         print(f"Раскладки airy/visual уточнены моделью: {picked} слайдов за {time.monotonic() - rerank_started:.1f}с")
         for note in rerank_notes:
             print(f"  ! {note}")
 
+    # Вариант, по которому идёт аудит по картинке: dense, если собирается,
+    # иначе первый из заказанных (содержание у вариантов одно).
+    visual_variant = Variant.dense if Variant.dense in variants else variants[0]
+    visual_target = None
     for variant in variants:
         step_started = time.monotonic()
         variant_deck = apply_variant(deck, profile, variant, preferred=preferred_by_variant.get(variant))
@@ -269,6 +286,10 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         shutil.copy2(built_path, path)
         findings = run_deterministic(path, profile, config)
         audited_at = time.monotonic()
+        budget.record("compose", built_at - step_started)
+        budget.record("audit", audited_at - built_at)
+        if variant == visual_variant:
+            visual_target = (path, variant_deck, findings)
 
         by_severity: dict[str, int] = {}
         for f in findings:
@@ -314,16 +335,42 @@ def _cmd_generate(args: argparse.Namespace) -> int:
                         "сборки — требует разбора."
                     )
 
-    print(f"\nВсего: {time.monotonic() - started:.1f}с")
+    if visual_target is not None:
+        _visual_stage(budget, visual_target, visual_variant, sources)
+
+    print(f"\nВсего: {time.monotonic() - started:.1f}с (бюджет {budget.deadline_seconds:.0f}с)")
+    print(f"  по стадиям: {budget.summary()['stage_seconds']}")
     print(
-        "\nМодельный аудит по картинке (C01-C11) НЕ выполнялся — вынесен из генерации "
-        "(ТЗ отводит 5 минут на генерацию колоды, не на генерацию вместе с модельной "
-        "проверкой смысла; см. .superpowers/sdd/task-12-report.md). Запустите его отдельно "
-        "на готовом .pptx из этого прогона:\n"
+        "\nПолный аудит по картинке всех слайдов (C01-C11) запускается отдельно на "
+        "готовом .pptx:\n"
         f"  deckforge audit-visual {args.template} <один из .pptx выше> {debug_path} "
         f"--content-pack {args.content_pack}"
     )
     return 0
+
+
+def _visual_stage(budget: RunBudget, target, variant, sources) -> None:
+    """Аудит по картинке рискованных слайдов одного варианта в рамках
+    бюджета прогона (задача H, `workflow.visual_stage`). Превью рендерятся,
+    только если стадия реально пойдёт."""
+    path, variant_deck, findings = target
+    outcome = run_visual_stage(
+        budget, variant_deck, findings, _build_vlm(),
+        lambda: to_pngs(path, path.parent / f"{path.stem}__risk-preview"), sources=sources,
+    )
+    if outcome.result is None:
+        print(f"\nАудит по картинке рискованных слайдов не выполнялся: {outcome.skipped_reason}")
+        return
+    slides = ", ".join(f"{pos + 1} ({score:.1f})" for pos, score in outcome.picked)
+    print(
+        f"\n[{variant.value}] аудит по картинке рискованных слайдов: {slides}; "
+        f"{outcome.result.model_calls} вызовов модели за {outcome.seconds:.1f}с"
+    )
+    report = AuditReport.merge(findings, outcome.result)
+    print(f"  находок модели: {report.visual_count}, всего в отчёте: {len(report.findings)}")
+    for f in outcome.findings:
+        where = f"слайд {f.slide_index + 1}" if f.slide_index is not None else "колода"
+        print(f"  [{f.severity}] {f.check_id} ({where}): {f.message}")
 
 
 def _cmd_audit_visual(args: argparse.Namespace) -> int:

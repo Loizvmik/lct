@@ -43,6 +43,9 @@ from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
+from deckforge.export.html import to_html_report
+from deckforge.workflow.budget import RunBudget, load_policy
+from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 
@@ -82,14 +85,17 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
         return None
 
 
-def _rerank(deck: DeckSpec, profile: TemplateProfile) -> dict[Variant, dict[int, str]]:
+def _rerank(deck: DeckSpec, profile: TemplateProfile, budget: RunBudget | None = None) -> dict[Variant, dict[int, str]]:
     """Тот же шаг, что `cli._rerank`: модель выбирает раскладку из трёх для
-    airy и visual. Выключено в конфиге или нет ключа — пустой выбор."""
+    airy и visual. Выключено в конфиге, нет ключа или бюджету прогона не
+    хватает времени: пустой выбор, раскладку выбирает код."""
     try:
         settings = Settings.load(APP_YAML_PATH)
     except Exception:
         return {}
     if not settings.plan.rerank_variants:
+        return {}
+    if budget is not None and not budget.check("rerank"):
         return {}
     llm = _build_role_provider("pattern_picker", deadline_seconds=settings.llm.pattern_picker_deadline_seconds)
     chosen = rerank_patterns(
@@ -101,6 +107,17 @@ def _rerank(deck: DeckSpec, profile: TemplateProfile) -> dict[Variant, dict[int,
     for (variant, index), pattern_id in chosen.items():
         by_variant.setdefault(variant, {})[index] = pattern_id
     return by_variant
+
+
+def _build_visual_auditor() -> LLMProvider | None:
+    """Провайдер роли `content_audit` для аудита по картинке. Отдельной
+    функцией, чтобы тесты подменяли только его, не трогая роли, которые
+    пишут текст."""
+    return _build_role_provider("content_audit")
+
+
+def _new_budget() -> RunBudget:
+    return RunBudget.from_policy(load_policy(APP_YAML_PATH))
 
 
 def _writer_max_workers() -> int:
@@ -149,10 +166,17 @@ class VariantState:
     pdf_path: Path | None = None
     html_path: Path | None = None
     autofixed_count: int = 0
+    # Позиции слайдов (с нуля), на которых автопочинка что-то меняла: одна
+    # из примет риска для аудита по картинке (`audit.risk`).
+    autofixed_slides: set[int] = field(default_factory=set)
+    # Находки аудита по картинке живут отдельно от детерминированных: после
+    # ручной починки (`fix_deck`) детерминированный аудит пересчитывается, а
+    # модель заново не спрашивают, и её находки иначе бы пропали.
+    visual_findings: list[Finding] = field(default_factory=list)
 
     def set_findings(self, findings: list[Finding]) -> None:
-        self.findings = findings
-        self.finding_index = {finding_id(f): f for f in findings}
+        self.findings = findings + self.visual_findings
+        self.finding_index = {finding_id(f): f for f in self.findings}
 
 
 @dataclass
@@ -166,7 +190,13 @@ class JobRecord:
     error: str | None = None
     profile: TemplateProfile | None = None
     variants: dict[str, VariantState] = field(default_factory=dict)
+    # Бюджет прогона (`workflow.budget.RunBudget`): его же часы меряют
+    # секунды каждой стадии для интерфейса и лога. `visual_audit`:
+    # сводка стадии аудита по картинке (`VisualStageOutcome.summary`).
+    budget: RunBudget | None = None
+    visual_audit: dict | None = None
     _subscribers: list[asyncio.Queue] = field(default_factory=list)
+    _stage_started: float | None = None
 
     def snapshot(self) -> dict:
         # deck_id == job_id (см. докстроку модуля) — колода этого задания
@@ -180,6 +210,8 @@ class JobRecord:
             "job_id": self.job_id, "template_id": self.template_id, "status": self.status,
             "stage": self.stage, "stages": list(self.stages), "deck_id": self.job_id,
             "error": self.error,
+            "budget": self.budget.summary() if self.budget is not None else None,
+            "visual_audit": self.visual_audit,
         }
 
     def subscribe(self) -> asyncio.Queue:
@@ -197,12 +229,25 @@ class JobRecord:
         for queue in list(self._subscribers):
             queue.put_nowait(snap)
 
+    def close_stage(self) -> None:
+        """Записать секунды текущей стадии в бюджет. Стадии идут строго
+        друг за другом (кроме аудита и экспорта при autofix=False, где
+        граница проходит по первому варианту, дошедшему до экспорта), так
+        что время стадии: от входа в неё до входа в следующую."""
+        if self.budget is not None and self.stage is not None and self._stage_started is not None:
+            self.budget.record(self.stage, self.budget.clock() - self._stage_started)
+        self._stage_started = None
+
     def enter_stage(self, stage: str) -> None:
+        self.close_stage()
         self.stage = stage
         self.stages.append(stage)
+        if self.budget is not None:
+            self._stage_started = self.budget.clock()
         self._notify()
 
     def finish(self, *, error: str | None = None) -> None:
+        self.close_stage()
         self.status = "error" if error else "done"
         self.error = error
         self._notify()
@@ -288,6 +333,10 @@ async def _run_job(
     *, job: JobRecord, template: TemplateRecord, brief: str, sources: list[str], title: str | None,
     language: str, target_slides: int | None, autofix: bool,
 ) -> None:
+    # Бюджет прогона создаётся первым делом: пять минут ТЗ считаются от
+    # начала генерации, всё, что было до (загрузка и разбор шаблона),
+    # в него не входит.
+    job.budget = _new_budget()
     try:
         job.enter_stage("parse")
         profile = template.profile  # уже разобран при загрузке шаблона (POST /api/templates)
@@ -323,7 +372,12 @@ async def _run_job(
             pass
 
         job.enter_stage("compose")
-        preferred_by_variant = await asyncio.to_thread(_rerank, deck, profile)
+        # Секунды переранжирования пишутся отдельно, но входят и в секунды
+        # стадии compose: для интерфейса это одна стадия «вёрстка».
+        rerank_started = job.budget.clock()
+        preferred_by_variant = await asyncio.to_thread(_rerank, deck, profile, job.budget)
+        if "rerank" not in job.budget.skipped:
+            job.budget.record("rerank", job.budget.clock() - rerank_started)
         async with asyncio.TaskGroup() as tg:
             for variant in Variant:
                 tg.create_task(_compose_variant(
@@ -384,6 +438,8 @@ async def _run_job(
                 for variant in Variant:
                     tg.create_task(_audit_then_export(variant.value))
 
+        job.close_stage()
+        await _visual_audit_dense(job, profile, source_docs)
         job.finish()
     except* Exception as eg:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
         # не остаться молчаливым "running" навсегда
@@ -413,7 +469,46 @@ async def _audit_variant(job: JobRecord, variant_name: str, profile: TemplatePro
             if result.changed:
                 findings = await asyncio.to_thread(run_deterministic, state.pptx_path, profile, config)
             state.autofixed_count = len(result.applied)
+            state.autofixed_slides = {
+                fixable[fid].slide_index for fid in result.applied
+                if fid in fixable and fixable[fid].slide_index is not None
+            }
     state.set_findings(findings)
+
+
+async def _visual_audit_dense(job: JobRecord, profile: TemplateProfile, sources: list[SourceDoc]) -> None:
+    """Аудит по картинке рискованных слайдов варианта dense, если бюджет
+    прогона позволяет (`workflow.visual_stage`). Превью уже отрисованы
+    экспортом. Находки ложатся в тот же список, что и детерминированные;
+    HTML-отчёт dense перерисовывается с оценками модели. Любой сбой здесь
+    не роняет готовую колоду: стадия необязательная."""
+    state = job.variants.get(Variant.dense.value)
+    if state is None or job.budget is None:
+        return
+    try:
+        deterministic = [f for f in state.findings if f not in state.visual_findings]
+        outcome = await asyncio.to_thread(
+            run_visual_stage, job.budget, state.deck_spec, deterministic,
+            _build_visual_auditor(),
+            lambda: list(state.preview_pngs), sources=sources,
+            autofixed_slides=state.autofixed_slides,
+        )
+    except Exception as exc:  # noqa: BLE001: необязательная стадия не вправе ронять готовую колоду
+        job.visual_audit = {"ran": False, "skipped_reason": f"аудит по картинке упал: {exc}"}
+        return
+    job.visual_audit = outcome.summary()
+    if outcome.result is None:
+        return
+    state.visual_findings = outcome.findings
+    state.set_findings(deterministic)
+    if state.html_path is not None:
+        try:
+            await asyncio.to_thread(
+                to_html_report, state.deck_spec, profile, state.pptx_path, state.html_path,
+                visual=outcome.result,
+            )
+        except Exception:  # noqa: BLE001: HTML без оценок лучше, чем упавшее задание
+            pass
 
 
 async def _export_variant(job: JobRecord, variant_name: str, profile: TemplateProfile) -> None:

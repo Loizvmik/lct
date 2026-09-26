@@ -51,6 +51,10 @@ class JobResponse(BaseModel):
     stages: list[Stage]
     deck_id: str | None
     error: str | None = None
+    # Задача H: бюджет прогона (секунды по стадиям, пропущенные стадии и
+    # почему) и сводка аудита по картинке рискованных слайдов.
+    budget: dict | None = None
+    visual_audit: dict | None = None
 
 
 class FindingModel(BaseModel):

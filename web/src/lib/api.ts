@@ -47,6 +47,19 @@ export interface JobResponse {
   stages: Stage[];
   deck_id: string | null;
   error: string | null;
+  budget?: {
+    budget_seconds: number;
+    elapsed_seconds: number;
+    stage_seconds: Record<string, number>;
+    skipped: Record<string, string>;
+  } | null;
+  visual_audit?: {
+    ran: boolean;
+    skipped_reason: string | null;
+    slides?: number[];
+    findings?: number;
+    seconds?: number;
+  } | null;
 }
 
 export interface FindingBox {
