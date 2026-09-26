@@ -1625,6 +1625,9 @@ class _Ladder:
     # (заполненность, номер кандидата, раскладка).
     underfilled: list[tuple[float, int, Pattern]] = field(default_factory=list)
     tried: set[str] = field(default_factory=set)
+    # Главная причина первого отказа: по ней выбран путь политики. Позже
+    # набегают причины отказа запасных, но путь они уже не меняют.
+    main: Failure | None = None
 
     @property
     def heroic(self) -> bool:
@@ -1651,7 +1654,7 @@ class _Ladder:
         labels = list(dict.fromkeys(f.label for f in self.failures))
         if labels:
             spec.meta["failure_codes"] = ",".join(labels)
-            spec.meta["failure_primary"] = primary(self.failures).label
+            spec.meta["failure_primary"] = (self.main or primary(self.failures)).label
         return LadderOutcome(pattern, self.notes + [_rung_note(spec, rung, pattern)], rung, tail=tail)
 
     def rung_of(self, pattern: Pattern) -> str:
@@ -1876,7 +1879,7 @@ def _place_with_ladder(
     if first is not None:
         return ladder.done("clone", first)
     can_clone = any(_clone_source(p, source_slides) for p in candidates[:_MAX_CLONE_ATTEMPTS])
-    main = primary(ladder.failures)
+    main = ladder.main = primary(ladder.failures)
     if not can_clone or main is None:
         ladder.path.append("scratch")
         return ladder.scratch()
