@@ -4,7 +4,7 @@
 `profile.palette.roles`, см. `template/profile.py`).
 
 Один реальный прогон генерации на весь модуль (`conftest.job_result`/
-`deck_id`) — `test_three_variants_are_returned` и `test_fix_applies_only_
+`deck_id`) — `test_one_job_returns_one_presentation_of_its_style` и `test_fix_applies_only_
 the_selected_findings` работают над результатом ОДНОЙ и той же колоды,
 поднятой `test_generation_reports_progress_by_stage`/`deck_id` фикстурой."""
 from __future__ import annotations
@@ -48,18 +48,44 @@ def test_generation_reports_progress_by_stage(job_result: dict) -> None:
     assert job_result["stages"] == STAGES_IN_ORDER
 
 
-def test_three_variants_are_returned(client: TestClient, deck_id: str) -> None:
+def test_one_job_returns_one_presentation_of_its_style(client: TestClient, deck_id: str, job_result: dict) -> None:
+    """Задача Q: одно задание = одна презентация одного стиля, бюджет
+    одним значением, без разбивки по вариантам."""
+    assert job_result["style"] == "dense"
+    assert job_result["mode"] in ("full", "fast", "emergency")
+    assert job_result["seconds"] > 0
+    budget = job_result["budget"]
+    assert "variants" not in budget
+    # Разбор сделан при загрузке шаблона; структуру задание считало само.
+    assert budget["shared_stages"] == {"parse": "переиспользовано"}
+    assert [e["checkpoint"] for e in budget["mode_history"]] == ["after_outline", "after_write", "after_compose"]
+
     response = client.get(f"/api/decks/{deck_id}/variants")
     assert response.status_code == 200, response.text
     variants = response.json()
-    assert len(variants) == 3
-    assert {v["variant"] for v in variants} == {"dense", "airy", "visual"}
+    assert [v["variant"] for v in variants] == ["dense"]
     assert all(v["preview_pngs"] for v in variants)
     assert all(v["slide_count"] >= 10 for v in variants)
     for v in variants:
         for finding in v["findings"]:
             assert finding["id"]
             assert finding["severity"] in ("critical", "major", "minor")
+
+
+def test_jobs_list_shows_style_stage_mode_and_seconds(client: TestClient, deck_id: str) -> None:
+    listed = {j["job_id"]: j for j in client.get("/api/jobs").json()}
+    entry = listed[deck_id]
+    assert entry["style"] == "dense" and entry["status"] == "done"
+    assert entry["stage"] == "export" and entry["mode"] and entry["seconds"] > 0
+    assert entry["batch_id"] is None
+    assert client.get("/api/jobs", params={"batch_id": "нет-такого"}).json() == []
+
+
+def test_unknown_style_is_rejected(client: TestClient, template_id: str) -> None:
+    response = client.post("/api/decks", json={"template_id": template_id, "brief": "x", "style": "bold"})
+    assert response.status_code == 422
+    response = client.post("/api/decks/batch", json={"template_id": template_id, "brief": "x", "styles": []})
+    assert response.status_code == 422
 
 
 def test_fix_applies_only_the_selected_findings(client: TestClient, deck_id: str) -> None:
@@ -73,7 +99,7 @@ def test_fix_applies_only_the_selected_findings(client: TestClient, deck_id: str
     if before is None:
         import pytest
 
-        pytest.skip("ни один из трёх вариантов не содержит автопочинимой находки (autofix=False у фикстуры)")
+        pytest.skip("презентация задания не содержит автопочинимой находки (autofix=False у фикстуры)")
     variant = before["variant"]
 
     response = client.post(f"/api/decks/{deck_id}/fix", json={"variant": variant, "finding_ids": [chosen_id]})
@@ -100,6 +126,8 @@ def test_export_pptx_is_downloadable(client: TestClient, deck_id: str) -> None:
     response = client.get(f"/api/decks/{deck_id}/export", params={"format": "pptx", "variant": "dense"})
     assert response.status_code == 200
     assert response.content[:2] == b"PK"  # .pptx — ZIP-контейнер
+    # Без `variant` отдаётся стиль задания.
+    assert client.get(f"/api/decks/{deck_id}/export", params={"format": "pptx"}).content == response.content
 
 
 def test_export_unknown_format_is_rejected(client: TestClient, deck_id: str) -> None:

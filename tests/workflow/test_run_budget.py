@@ -128,32 +128,37 @@ def test_load_policy_falls_back_to_defaults(tmp_path: Path):
     assert load_policy(tmp_path / "missing.yaml") == BudgetPolicy()
 
 
-def test_each_variant_gets_the_budget_left_after_shared_stages():
-    """Задача N: пять минут считаются на одну презентацию. Общие стадии
-    съедают часть бюджета прогона; дальше у каждого варианта свои часы,
-    свой режим и свои стадии, а медленный сосед режим не отнимает."""
+def test_each_job_has_its_own_budget_and_mode():
+    """Задача Q: три стиля идут тремя заданиями, у каждого полный бюджет
+    300 с от своего старта. Медленное задание уходит в режим попроще, а
+    быстрое сосед этим не задевает; остановленные часы не растут."""
+    clock = _Clock()
+    fast, slow = _budget(clock, budget_seconds=300), _budget(clock, budget_seconds=300)
+    assert fast.deadline_seconds == slow.deadline_seconds == 300
+
+    clock.now += 20
+    fast.decide_mode("after_outline")
+    slow.decide_mode("after_outline")
+    clock.now += 30
+    fast.decide_mode("after_write")
+    fast.stop()
+    clock.now += 160  # slow ещё пишет текст
+    assert slow.decide_mode("after_write") is RunMode.FAST  # 300 - 210 = 90 < 120
+    assert fast.mode is RunMode.FULL
+    assert fast.elapsed() == 50.0
+    assert [e["checkpoint"] for e in slow.mode_history] == ["after_outline", "after_write"]
+    assert "variants" not in slow.summary()
+
+
+def test_reused_stage_keeps_its_seconds_and_is_marked_in_summary():
+    """Структура, посчитанная соседним заданием пакета, всё равно стоила
+    этому заданию времени ожидания; снимок помечает её отдельно."""
     clock = _Clock()
     budget = _budget(clock, budget_seconds=300)
-    clock.now += 100
-    budget.record("write", 100)
-    fast, slow = budget.for_variant("dense"), budget.for_variant("visual")
-    assert fast.deadline_seconds == slow.deadline_seconds == 200
-
-    fast.decide_mode("after_write")
-    fast.record("compose", 10)
-    clock.now += 10
-    fast.stop()
-    clock.now += 100  # visual всё ещё работает
-    slow.record("realize", 110)
-    assert slow.decide_mode("after_compose") is RunMode.FAST  # 200 - 110 = 90 < 120
-    assert fast.mode is RunMode.FULL
-
+    assert "shared_stages" not in budget.summary()
+    budget.record("outline", 25)
+    budget.mark_reused("parse")
+    budget.mark_reused("outline")
     summary = budget.summary()
-    assert summary["shared_stages"] == ["write"]
-    assert summary["stage_seconds"] == {"write": 100.0}
-    assert summary["variants"]["dense"]["elapsed_seconds"] == 10.0  # часы остановлены
-    assert summary["variants"]["visual"]["elapsed_seconds"] == 110.0
-    assert summary["variants"]["visual"]["stage_seconds"] == {"realize": 110.0}
-    view = budget.variant_summary("dense")
-    assert view["stage_seconds"] == {"write": 100.0, "compose": 10.0}
-    assert view["shared_stages"] == ["write"] and view["variant_seconds"] == 10.0
+    assert summary["stage_seconds"] == {"outline": 25.0}
+    assert summary["shared_stages"] == {"parse": "переиспользовано", "outline": "переиспользовано"}

@@ -24,13 +24,16 @@
 аудит, экспорт) идут всегда: без них нет файла, а файл важнее уложиться в
 срок — режимы на них не влияют.
 
-Задача N: лимит ТЗ считается на ОДНУ презентацию, а три варианта идут
-параллельно. Общие стадии (разбор, структура, текст) пишутся в бюджет
-прогона, а всё после текста (rerank, переписывание под вариант, сборка,
-аудит, аудит по картинке, экспорт) — в бюджет своего варианта
-(`RunBudget.for_variant`): дедлайн варианта — это бюджет минус то, что уже
-съели общие стадии, свои часы, свои контрольные точки и свой режим.
-Медленный вариант больше не переводит соседей в режим попроще."""
+Задача Q: одна задача генерации = одна презентация = один стиль = один
+`RunBudget` на 300 с. Три стиля идут тремя независимыми заданиями, у
+каждого свои часы, свои контрольные точки и свой режим, поэтому медленный
+стиль не переводит соседей в режим попроще. Бюджеты «на вариант внутри
+прогона» (`for_variant`) больше не нужны и убраны. Контрольных точек три:
+`after_outline`, `after_write`, `after_compose`. Стадию, которую задание
+не считало само, а получило готовой (разбор шаблона, общая структура
+пакета из трёх стилей), отмечает `mark_reused`: её секунды остаются в
+бюджете задания (задание их честно ждало), а снимок помечает её в
+`shared_stages` как «переиспользовано»."""
 from __future__ import annotations
 import time
 from dataclasses import dataclass, field
@@ -79,6 +82,9 @@ class ModeSpec:
 # Порядок проверки на контрольной точке: от щедрого к отчаянному — первый
 # режим, чей `min_remaining` не больше остатка времени, и есть ответ.
 _MODE_ORDER: tuple[RunMode, ...] = (RunMode.FULL, RunMode.FAST, RunMode.EMERGENCY)
+
+# Пометка стадии, полученной готовой от другого задания (`mark_reused`).
+REUSED_NOTE = "переиспользовано"
 
 # Дефолты дублируют `config/app.yaml` (`run.modes`), чтобы бюджет работал и
 # там, где конфиг не читается (тесты на чужом дереве, воркер без
@@ -129,9 +135,8 @@ class RunBudget:
     # Все решения по контрольным точкам подряд — для отчёта (HTML/cli):
     # человеку важно видеть не только итоговый режим, но и где он менялся.
     mode_history: list[dict] = field(default_factory=list)
-    # Задача N: бюджеты вариантов, заведённые `for_variant`. У бюджета
-    # варианта этот словарь пуст.
-    variants: dict[str, "RunBudget"] = field(default_factory=dict)
+    # Стадии, полученные готовыми от другого задания (см. `mark_reused`).
+    reused: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self._started = self.clock()
@@ -141,25 +146,15 @@ class RunBudget:
     def from_policy(cls, policy: BudgetPolicy, *, clock: Callable[[], float] = time.monotonic) -> RunBudget:
         return cls(deadline_seconds=policy.budget_seconds, policy=policy, clock=clock)
 
-    def for_variant(self, name: str) -> "RunBudget":
-        """Бюджет одного варианта: дедлайн — остаток общего бюджета на
-        момент вызова (300с минус общие стадии), часы идут от этого момента.
-        Звать сразу после общих стадий, для всех вариантов подряд: тогда у
-        всех один и тот же дедлайн, а стадии и режим у каждого свои."""
-        child = RunBudget(deadline_seconds=max(self.remaining(), 0.0), policy=self.policy, clock=self.clock)
-        self.variants[name] = child
-        return child
-
-    def allowance(self, wanted: float, *, reserve: float) -> float:
-        """Сколько секунд дать необязательному шагу с собственным бюджетом
-        (переписывание под вариант, задача N): не больше `wanted` и не
-        больше остатка минус `reserve` на обязательные стадии после него
-        (сборка, аудит, экспорт). Ноль значит «шаг не запускать»."""
-        return max(0.0, min(wanted, self.remaining() - reserve))
+    def mark_reused(self, stage: str) -> None:
+        """Стадию не считало это задание: её результат (разбор шаблона,
+        общая структура пакета стилей) пришёл готовым. Время ожидания всё
+        равно пишется через `record`, пометка нужна отчёту."""
+        self.reused[stage] = REUSED_NOTE
 
     def stop(self) -> None:
-        """Остановить часы: вариант доделан, и его время в снимке не должно
-        расти, пока соседи ещё работают."""
+        """Остановить часы: задание доделано, и его время в снимке не
+        должно расти, пока соседние задания ещё работают."""
         if self._stopped is None:
             self._stopped = self.clock()
 
@@ -173,8 +168,9 @@ class RunBudget:
         return self.deadline_seconds - self.elapsed()
 
     def decide_mode(self, checkpoint: str) -> RunMode:
-        """Контрольная точка пайплайна (задача L: `"after_write"` перед
-        rerank/сборкой, `"after_compose"` перед аудитом по картинке).
+        """Контрольная точка пайплайна: `"after_outline"` перед раскладками
+        и текстом, `"after_write"` перед сборкой, `"after_compose"` перед
+        аудитом по картинке.
         Решение считается ЗДЕСЬ, по остатку времени НА МОМЕНТ ВЫЗОВА, и
         фиксируется в `self.mode` до следующего вызова — код между точками
         обязан читать `mode_spec()`, не спрашивать бюджет заново."""
@@ -203,14 +199,13 @@ class RunBudget:
 
     def record(self, stage: str, seconds: float) -> None:
         """Время стадии копится, а не перезаписывается: стадия может идти
-        кусками (аудит трёх вариантов, экспорт вперемешку)."""
+        кусками (аудит до и после автопочинки)."""
         self.stage_seconds[stage] = self.stage_seconds.get(stage, 0.0) + max(seconds, 0.0)
 
     def summary(self) -> dict:
-        """Снимок для отчёта и интерфейса. У прогона с вариантами
-        `stage_seconds` — только общие стадии (они же перечислены в
-        `shared_stages`), а время, стадии и режим каждого варианта лежат в
-        `variants`."""
+        """Снимок для отчёта и интерфейса: одно задание, один бюджет.
+        `shared_stages` есть, только если задание получило какую-то стадию
+        готовой (`mark_reused`), со значением «переиспользовано»."""
         out = {
             "budget_seconds": self.deadline_seconds,
             "elapsed_seconds": round(self.elapsed(), 1),
@@ -220,25 +215,8 @@ class RunBudget:
             "mode_checkpoint": self.mode_checkpoint,
             "mode_history": [dict(entry) for entry in self.mode_history],
         }
-        if self.variants:
-            out["shared_stages"] = list(self.stage_seconds)
-            out["variants"] = {name: child.summary() for name, child in self.variants.items()}
-        return out
-
-    def variant_summary(self, name: str) -> dict:
-        """Снимок одного варианта для его HTML-отчёта: режим и стадии
-        варианта плюс общие стадии, помеченные в `shared_stages`, чтобы
-        человек видел, куда ушли все пять минут этой презентации."""
-        child = self.variants.get(name)
-        if child is None:
-            return self.summary()
-        out = child.summary()
-        shared = {k: round(v, 1) for k, v in self.stage_seconds.items()}
-        out["stage_seconds"] = {**shared, **out["stage_seconds"]}
-        out["shared_stages"] = list(shared)
-        out["budget_seconds"] = self.deadline_seconds
-        out["elapsed_seconds"] = round(self.elapsed(), 1)
-        out["variant_seconds"] = round(child.elapsed(), 1)
+        if self.reused:
+            out["shared_stages"] = dict(self.reused)
         return out
 
 

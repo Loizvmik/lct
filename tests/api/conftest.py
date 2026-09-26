@@ -2,9 +2,9 @@
 
 Один реальный прогон всего пайплайна (`POST /api/templates` -> `POST /api/
 decks` -> дождаться job -> `deck_id`) на МОДУЛЬ, не на тест — генерация не
-бесплатна (сборка трёх вариантов + детерминированный аудит + PDF/PNG-рендер
-`soffice` на каждый), и `test_three_variants_are_returned`/`test_fix_
-applies_only_the_selected_findings` работают над ОДНОЙ и той же уже готовой
+бесплатна (сборка + детерминированный аудит + PDF/PNG-рендер `soffice`), и
+`test_one_job_returns_one_presentation_of_its_style`/`test_fix_applies_
+only_the_selected_findings` работают над ОДНОЙ и той же уже готовой
 колодой, а не гоняют генерацию заново каждая.
 
 Без ключа/сети (`YANDEX_API_KEY` не в окружении процесса `pytest` — `.env`
@@ -103,7 +103,7 @@ def job_result(client: TestClient, template_id: str) -> dict:
     response = client.post("/api/decks", json={
         "template_id": template_id, "brief": brief, "sources": [s.text for s in sources],
         "title": meta.get("title", "queue-latency"), "language": meta.get("language", "ru"),
-        "target_slides": 12, "autofix": False,
+        "target_slides": 12, "autofix": False, "style": "dense",
     })
     assert response.status_code == 200, response.text
     job_id = response.json()["job_id"]

@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 
 Stage = Literal["parse", "outline", "write", "compose", "audit", "export"]
 JobStatus = Literal["running", "done", "error"]
+Style = Literal["dense", "airy", "visual"]
 
 
 class TemplateUploadResponse(BaseModel):
@@ -25,7 +26,9 @@ class ProfileResponse(BaseModel):
     profile: dict
 
 
-class DeckCreateRequest(BaseModel):
+class DeckInput(BaseModel):
+    """Поля, общие для одного задания и пакета стилей."""
+
     template_id: str
     brief: str
     sources: list[str] = Field(default_factory=list)
@@ -39,8 +42,23 @@ class DeckCreateRequest(BaseModel):
     autofix: bool = True
 
 
+class DeckCreateRequest(DeckInput):
+    # Задача Q: одно задание = одна презентация одного стиля.
+    style: Style = "dense"
+
+
 class DeckCreateResponse(BaseModel):
     job_id: str
+
+
+class DeckBatchRequest(DeckInput):
+    # Несколько стилей одним запросом: по заданию на стиль, структура общая.
+    styles: list[Style] = Field(default_factory=lambda: ["dense", "airy", "visual"], min_length=1)
+
+
+class DeckBatchResponse(BaseModel):
+    batch_id: str
+    job_ids: list[str]
 
 
 class JobResponse(BaseModel):
@@ -51,11 +69,17 @@ class JobResponse(BaseModel):
     stages: list[Stage]
     deck_id: str | None
     error: str | None = None
+    # Задача Q: стиль задания, пакет (если создано вместе с соседями),
+    # режим и секунды задания на верхнем уровне для списка заданий.
+    style: Style = "dense"
+    batch_id: str | None = None
+    mode: str | None = None
+    seconds: float | None = None
     # Задача H: бюджет прогона (секунды по стадиям, пропущенные стадии и
     # почему) и сводка аудита по картинке рискованных слайдов.
     budget: dict | None = None
     visual_audit: dict | None = None
-    # Задача R: по вариантам список находок «требует переписать текст или
+    # Задача R: по стилю задания список находок «требует переписать текст или
     # другую раскладку» (`Finding.repair == "structural"`), автопочинка их
     # не трогает.
     structural: dict[str, list[dict]] | None = None

@@ -2,14 +2,16 @@
 весь пайплайн (`parse -> outline -> write -> compose -> audit -> export`)
 в фоновую задачу, публикующую прогресс по этапам.
 
-Работа идёт в фоне через `asyncio.TaskGroup` (брифом дословно): три
-варианта вёрстки не зависят друг от друга ни на этапе сборки, ни на этапе
-аудита, ни на этапе выгрузки. С задачи P каждый стиль после структуры идёт
-своей задачей `TaskGroup` целиком (`_run_variant`: раскладки на всю колоду,
-контракты, текст под них, сборка, аудит, экспорт) в собственном бюджете
-времени, а не этап за этапом с ожиданием самого медленного соседа. Текст
-пишется под раскладку своего стиля, поэтому общий у стилей только разбор и
-структура. Сами шаги пайплайна
+С задачи Q одно задание = одна презентация = один стиль (`dense`, `airy`
+или `visual`) = один бюджет в 300 с на всё задание: разбор (готовый, из
+загрузки шаблона), структура, раскладки на всю колоду, контракты, текст
+под них, сборка, аудит, экспорт, аудит по картинке. Три стиля одной
+кнопкой интерфейса это три задания (`JobStore.create_batch`), которые
+идут параллельно, каждое со своим прогрессом, режимом и бюджетом.
+Структуру задания пакета считают один раз (`OutlineShare`): первое
+задание зовёт модель, остальные ждут тот же результат и помечают стадию
+как переиспользованную. Текст у каждого стиля свой, потому что пишется
+под свою композицию. Сами шаги пайплайна
 (`TemplateProfile.from_file`, `build_outline`, `write_slides`, `build_deck`,
 `run_deterministic`, `export_bundle`) — синхронный, блокирующий код (диск,
 subprocess `soffice`, CPU); каждый вызов уходит в `asyncio.to_thread`, чтобы
@@ -44,7 +46,7 @@ from deckforge.pattern.intent import intents_from_outline
 from deckforge.plan.contracts import plan_contracts
 from deckforge.plan.outline import Outline, SourceDoc, build_outline, outline_to_dict
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
-from deckforge.plan.variants import Variant
+from deckforge.plan.variants import GenerationStyle, Variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, write_slides
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
@@ -59,11 +61,10 @@ APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 
 STAGES: tuple[str, ...] = ("parse", "outline", "write", "compose", "audit", "export")
 
-# Стадии, общие для трёх стилей. Их секунды идут в бюджет прогона; всё
-# после структуры (раскладки, текст под них, сборка, аудит, экспорт) каждый
-# стиль считает в своём бюджете (`RunBudget.for_variant`). С задачи P текст
-# пишется под раскладку своего стиля, поэтому стадия `write` у каждого своя
-# и в интерфейсе отмечается по первому стилю, который до неё дошёл.
+# Стадии, которые задание может получить готовыми: разбор шаблона сделан
+# при загрузке, структуру пакета стилей считает одно задание на всех. Их
+# секунды пишет `JobRecord.close_stage`; остальные стадии пишет
+# `_run_variant` сам, с разбивкой (`plan` отдельно от `write`).
 SHARED_STAGES: tuple[str, ...] = ("parse", "outline")
 
 
@@ -191,17 +192,22 @@ class JobRecord:
     job_id: str
     template_id: str
     dir: Path
+    # Задача Q: стиль этой презентации и пакет, если задание создано вместе
+    # с соседями одной кнопкой (`create_batch`); `None` у одиночного.
+    style: str = GenerationStyle.dense.value
+    batch_id: str | None = None
     status: str = "running"
     stage: str | None = None
     stages: list[str] = field(default_factory=list)
     error: str | None = None
     profile: TemplateProfile | None = None
+    # Результат задания под ключом его стиля: с задачи Q запись одна, но
+    # эндпоинты `variants`/`fix`/`export` адресуют её по имени стиля.
     variants: dict[str, VariantState] = field(default_factory=dict)
-    # Бюджет прогона (`workflow.budget.RunBudget`): его же часы меряют
+    # Бюджет задания (`workflow.budget.RunBudget`): его же часы меряют
     # секунды каждой стадии для интерфейса и лога. `visual_audit`:
-    # сводка стадии аудита по картинке (`VisualStageOutcome.summary`) ПО
-    # КАЖДОМУ варианту (задача M) — `{вариант: сводка}`, не одна сводка на
-    # всю колоду, как было, пока аудитом накрывали только dense.
+    # сводка стадии аудита по картинке (`VisualStageOutcome.summary`) под
+    # ключом стиля, та же форма `{стиль: сводка}`, что читает интерфейс.
     budget: RunBudget | None = None
     visual_audit: dict[str, dict] | None = None
     _subscribers: list[asyncio.Queue] = field(default_factory=list)
@@ -215,11 +221,17 @@ class JobRecord:
         # `template_id` нужен интерфейсу (Task 16, п.1): вернувшись на экран
         # брифа с экрана вариантов/аудита, генерировать заново по уже
         # разобранному шаблону, не загружая .pptx повторно.
+        budget = self.budget.summary() if self.budget is not None else None
         return {
             "job_id": self.job_id, "template_id": self.template_id, "status": self.status,
             "stage": self.stage, "stages": list(self.stages), "deck_id": self.job_id,
             "error": self.error,
-            "budget": self.budget.summary() if self.budget is not None else None,
+            "style": self.style, "batch_id": self.batch_id,
+            # Задача Q: режим и секунды задания на верхнем уровне снимка,
+            # чтобы список заданий не разбирал бюджет целиком.
+            "mode": budget["mode"] if budget else None,
+            "seconds": budget["elapsed_seconds"] if budget else None,
+            "budget": budget,
             "visual_audit": self.visual_audit,
             # Задача R: находки, которые автопочинка не трогает, потому что
             # нужен другой текст или другая раскладка, по вариантам.
@@ -249,12 +261,10 @@ class JobRecord:
 
     def close_stage(self) -> None:
         """Записать секунды текущей стадии в бюджет. Стадии идут строго
-        друг за другом (кроме аудита и экспорта при autofix=False, где
-        граница проходит по первому варианту, дошедшему до экспорта), так
-        что время стадии: от входа в неё до входа в следующую."""
-        # Задача N: в бюджет прогона идут только общие стадии; сборку, аудит
-        # и экспорт каждый вариант пишет в свой бюджет сам (`_run_variant`),
-        # а стадия здесь — только метка прогресса для интерфейса.
+        друг за другом, так что время стадии: от входа в неё до входа в
+        следующую."""
+        # Здесь пишутся только разбор и структура; стадии после них
+        # `_run_variant` пишет сам, а стадия здесь только метка прогресса.
         if (
             self.budget is not None and self.stage in SHARED_STAGES and self._stage_started is not None
         ):
@@ -270,9 +280,8 @@ class JobRecord:
         self._notify()
 
     def reach_stage(self, stage: str) -> None:
-        """Метка прогресса для стадии, до которой дошёл хоть один вариант:
-        варианты идут параллельно каждый в своём темпе, а список стадий в
-        снимке не должен раздуваться дублями или прыгать назад."""
+        """Метка прогресса без дублей и без шагов назад: `fix_deck` и
+        повторные вызовы стадий не должны раздувать список в снимке."""
         if stage in self.stages:
             return
         if self.stage in STAGES and STAGES.index(stage) < STAGES.index(self.stage):
@@ -284,6 +293,31 @@ class JobRecord:
         self.status = "error" if error else "done"
         self.error = error
         self._notify()
+
+
+class OutlineShare:
+    """Структура, общая для заданий одного пакета стилей (задача Q).
+
+    Первое задание, дошедшее до структуры, запускает её расчёт, остальные
+    ждут тот же результат. Входы у заданий пакета одинаковые (бриф,
+    источники, шаблон), поэтому и структура одна; текст каждый стиль всё
+    равно пишет свой, под свою композицию. Расчёт закрыт `asyncio.shield`:
+    если одно задание отменят, соседи свою структуру всё равно получат.
+    Проверка и запуск идут без `await` между ними, поэтому в одном цикле
+    событий гонки за «кто первый» нет. Ошибка расчёта достаётся каждому
+    ждущему заданию, и каждое честно падает с ней."""
+
+    def __init__(self) -> None:
+        self._task: asyncio.Future | None = None
+        self._owner: str | None = None
+
+    async def get(self, job_id: str, compute) -> tuple[Outline, bool]:
+        """Структура и признак «получена готовой» (не этим заданием)."""
+        if self._task is None:
+            self._owner = job_id
+            self._task = asyncio.ensure_future(compute())
+        outline = await asyncio.shield(self._task)
+        return outline, self._owner != job_id
 
 
 class JobStore:
@@ -332,18 +366,56 @@ class JobStore:
     def create_job(
         self, *, template_id: str, brief: str, sources: list[str], title: str | None,
         language: str, target_slides: int | None, autofix: bool,
+        style: str | GenerationStyle = GenerationStyle.dense,
+        batch_id: str | None = None, outline_share: OutlineShare | None = None,
     ) -> JobRecord:
+        """Одно задание, одна презентация одного стиля. Без `outline_share`
+        задание считает структуру само."""
         template = self.get_template(template_id)
+        try:
+            chosen = GenerationStyle.parse(style)
+        except ValueError as exc:
+            raise JobError(str(exc)) from exc
         job_id = uuid4().hex
         job_dir = self.root / "decks" / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
-        job = JobRecord(job_id=job_id, template_id=template_id, dir=job_dir, profile=template.profile)
+        job = JobRecord(
+            job_id=job_id, template_id=template_id, dir=job_dir, profile=template.profile,
+            style=chosen.value, batch_id=batch_id,
+        )
         self.jobs[job_id] = job
         asyncio.create_task(_run_job(
             job=job, template=template, brief=brief, sources=sources, title=title,
             language=language, target_slides=target_slides, autofix=autofix,
+            outline_share=outline_share if outline_share is not None else OutlineShare(),
         ))
         return job
+
+    def create_batch(
+        self, *, styles: list[str | GenerationStyle] | None = None, **job_args,
+    ) -> tuple[str, list[JobRecord]]:
+        """Несколько стилей одним запросом: по заданию на стиль, все
+        параллельно и каждое в своём бюджете. Общая у них только структура
+        (один `OutlineShare` на пакет): входы одинаковые, и платить за один
+        и тот же вызов модели трижды незачем. Стили проверяются до создания
+        первого задания, чтобы опечатка не оставляла пакет наполовину."""
+        wanted = styles if styles else list(GenerationStyle)
+        try:
+            chosen = list(dict.fromkeys(GenerationStyle.parse(s) for s in wanted))
+        except ValueError as exc:
+            raise JobError(str(exc)) from exc
+        self.get_template(job_args["template_id"])
+        batch_id = uuid4().hex
+        share = OutlineShare()
+        jobs = [
+            self.create_job(style=style, batch_id=batch_id, outline_share=share, **job_args)
+            for style in chosen
+        ]
+        return batch_id, jobs
+
+    def list_jobs(self, batch_id: str | None = None) -> list[JobRecord]:
+        """Задания в порядке создания; с `batch_id` только задания пакета."""
+        return [job for job in self.jobs.values() if batch_id is None or job.batch_id == batch_id]
 
     def get_job(self, job_id: str) -> JobRecord:
         job = self.jobs.get(job_id)
@@ -364,27 +436,34 @@ class JobStore:
 
 async def _run_job(
     *, job: JobRecord, template: TemplateRecord, brief: str, sources: list[str], title: str | None,
-    language: str, target_slides: int | None, autofix: bool,
+    language: str, target_slides: int | None, autofix: bool, outline_share: OutlineShare,
 ) -> None:
-    # Бюджет прогона создаётся первым делом: пять минут ТЗ считаются от
+    # Бюджет задания создаётся первым делом: пять минут ТЗ считаются от
     # начала генерации, всё, что было до (загрузка и разбор шаблона),
     # в него не входит.
     job.budget = _new_budget()
+    style = GenerationStyle.parse(job.style)
     try:
         job.enter_stage("parse")
         profile = template.profile  # уже разобран при загрузке шаблона (POST /api/templates)
         job.profile = profile
+        job.budget.mark_reused("parse")
 
         job.enter_stage("outline")
-        outline_llm = _build_role_provider("outline")
         source_docs = [SourceDoc(name=f"source-{i + 1}.md", text=text) for i, text in enumerate(sources)]
-        outline = await asyncio.to_thread(
-            build_outline, brief, source_docs, profile, outline_llm, target_slides,
-            title=title or "Презентация", language=language,
-        )
 
-        # Структура на диск рядом с результатом: она общая для трёх стилей,
-        # а план каждого стиля (раскладки и текст) ляжет в `<стиль>/deck.json`.
+        async def compute_outline() -> Outline:
+            return await asyncio.to_thread(
+                build_outline, brief, source_docs, profile, _build_role_provider("outline"), target_slides,
+                title=title or "Презентация", language=language,
+            )
+
+        outline, reused = await outline_share.get(job.job_id, compute_outline)
+        if reused:
+            job.budget.mark_reused("outline")
+
+        # Структура на диск рядом с результатом задания; план стиля
+        # (раскладки и текст) ляжет в `<стиль>/deck.json`.
         try:
             (job.dir / "outline.json").write_text(
                 json.dumps(outline_to_dict(outline), ensure_ascii=False, indent=2), encoding="utf-8",
@@ -392,21 +471,15 @@ async def _run_job(
         except Exception:  # noqa: BLE001 — отладочный артефакт не вправе ронять генерацию
             pass
 
-        # Общие стадии позади. Дальше три стиля идут параллельно, каждый
-        # целиком (раскладки, текст под них, сборка, аудит, экспорт, аудит
-        # по картинке) в своём бюджете: пять минут ТЗ считаются на одну
-        # презентацию, и медленный стиль не должен отнимать режим у соседей.
-        # Бюджеты заводятся все сразу, до старта задач, чтобы дедлайн у всех
-        # был один.
+        # Первая контрольная точка: сколько осталось на раскладки, текст и
+        # всё после них, если структура (своя или общая) шла долго.
         job.close_stage()
-        budgets = {variant: job.budget.for_variant(variant.value) for variant in Variant}
+        job.budget.decide_mode("after_outline")
         config = AuditConfig.load()
         job.enter_stage("write")
-        async with asyncio.TaskGroup() as tg:
-            for variant in Variant:
-                tg.create_task(_run_variant(
-                    job, variant, outline, profile, template.path, source_docs, config, autofix, budgets[variant],
-                ))
+        await _run_variant(
+            job, style, outline, profile, template.path, source_docs, config, autofix, job.budget,
+        )
 
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
         # случайные номера, и найти «тот самый, который только что собрали»
@@ -424,22 +497,22 @@ async def _run_job(
             pass
 
         job.finish()
-    except* Exception as eg:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
+    except Exception as exc:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
         # не остаться молчаливым "running" навсегда
-        job.finish(error="; ".join(str(e) for e in eg.exceptions))
+        job.budget.stop()
+        job.finish(error=str(exc) or type(exc).__name__)
 
 
 async def _run_variant(
     job: JobRecord, variant: Variant, outline: Outline, profile: TemplateProfile, template_path: Path,
     sources: list[SourceDoc], config: AuditConfig, autofix: bool, budget: RunBudget,
 ) -> None:
-    """Всё после структуры для одного стиля в его бюджете: раскладки на всю
-    колоду (`pattern.plan_patterns`, миллисекунды, без модели), контракты,
-    текст под них, сборка, аудит, экспорт.
+    """Всё после структуры для стиля задания, в бюджете задания: раскладки
+    на всю колоду (`pattern.plan_patterns`, миллисекунды, без модели),
+    контракты, текст под них, сборка, аудит, экспорт, аудит по картинке.
 
-    Контрольные точки режима (задача L) свои у стиля: `after_write` после
-    текста, `after_compose` перед аудитом по картинке. Автопочинка правит
-    только `.pptx` своего стиля, поэтому экспорт соседей не ждёт."""
+    Контрольные точки режима после структуры: `after_write` после текста,
+    `after_compose` перед аудитом по картинке."""
     started = budget.clock()
     _assignments, contracts = await asyncio.to_thread(
         plan_contracts, intents_from_outline(outline), profile, variant,
@@ -487,12 +560,9 @@ async def _run_variant(
     await _export_variant(job, variant.value, profile)
     budget.record("export", budget.clock() - started)
 
-    # Задача M: аудит по картинке идёт для КАЖДОГО варианта, не только
-    # dense, как было до неё — содержание одно, но вёрстка своя у каждого
-    # варианта, и вопросы уровня колоды (C09/C11) читают именно её. Идёт в
-    # ТОМ ЖЕ бюджете варианта (задача N), что и остальные необязательные
-    # шаги этой функции — отдельного лока между вариантами не нужно:
-    # `budget` здесь свой на вариант, не общий объект.
+    # Аудит по картинке идёт у каждого стиля: вёрстка своя, и вопросы
+    # уровня колоды (C09/C11) читают именно её. Бюджет у задания свой
+    # объект, общего лока с соседними заданиями не нужно.
     await _visual_audit_variant(job, variant.value, profile, sources, budget)
     budget.stop()
 
@@ -517,14 +587,10 @@ async def _audit_variant(job: JobRecord, variant_name: str, profile: TemplatePro
 async def _visual_audit_variant(
     job: JobRecord, variant_name: str, profile: TemplateProfile, sources: list[SourceDoc], budget: RunBudget,
 ) -> None:
-    """Аудит по картинке ОДНОГО варианта, в ЕГО СОБСТВЕННОМ бюджете
-    (задача N: `budget.for_variant` завёл его в `_run_job`, `_run_variant`
-    передаёт сюда). До задачи M эта стадия шла только для dense — теперь
-    для КАЖДОГО варианта: содержание одно, но вёрстка своя, и вопросы
-    уровня колоды (C09/C11, `workflow.visual_stage`) читают именно её.
-    Три варианта и так идут параллельно (задача N, `TaskGroup` в
-    `_run_job`), и раз бюджет у каждого свой объект — общий лок между
-    вариантами (нужен был бы при ОБЩЕМ `RunBudget`) здесь не нужен.
+    """Аудит по картинке презентации задания, в бюджете задания (задача Q:
+    один `RunBudget` на задание, соседние стили идут своими заданиями со
+    своими бюджетами, поэтому общий лок не нужен). Вопросы уровня колоды
+    (C09/C11, `workflow.visual_stage`) читают вёрстку этого стиля.
 
     Находки ложатся в тот же список, что и детерминированные; HTML-отчёт
     варианта перерисовывается с оценками модели. Сбой не роняет готовую
@@ -564,7 +630,7 @@ async def _visual_audit_variant(
             fidelity_obj = SimpleNamespace(**state.fidelity) if state.fidelity else None
             await asyncio.to_thread(
                 to_html_report, state.deck_spec, profile, state.pptx_path, state.html_path,
-                visual=outcome.result, budget=job.budget.variant_summary(variant_name),
+                visual=outcome.result, budget=budget.summary(),
                 risky_slides=summary.get("risk"), fidelity=fidelity_obj,
             )
         except Exception:  # noqa: BLE001: HTML без оценок лучше, чем упавшее задание
@@ -579,7 +645,7 @@ async def _export_variant(job: JobRecord, variant_name: str, profile: TemplatePr
     # список рискованных слайдов (`risky_slides`) допишет только `_visual_
     # audit_dense`, перерисовав HTML dense-варианта заново, когда аудит
     # реально пройдёт.
-    budget_summary = job.budget.variant_summary(variant_name) if job.budget is not None else None
+    budget_summary = job.budget.summary() if job.budget is not None else None
     # Задача T: метрики верности шаблону — рядом с экспортом (не отдельная
     # стадия пайплайна), необязательны для готовой колоды: сбой метрики не
     # должен ронять экспорт (та же честная деградация, что и у остальных

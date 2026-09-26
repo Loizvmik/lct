@@ -2,19 +2,24 @@
 
 - `POST /api/templates` — загрузка .pptx, `template_id` + `TemplateProfile`.
 - `GET /api/templates/{id}/profile` — дизайн-система (тот же профиль).
-- `POST /api/decks` — `{template_id, brief, sources, target_slides, autofix}`,
-  возвращает `job_id`; вся генерация — фоновая задача (`api.jobs`).
+- `POST /api/decks` — `{template_id, brief, sources, target_slides, autofix,
+  style}`, возвращает `job_id`: одно задание = одна презентация одного
+  стиля в своём бюджете 300 с (задача Q); генерация — фоновая задача.
+- `POST /api/decks/batch` — то же с `styles` (по умолчанию все три):
+  по заданию на стиль, параллельно, структура считается один раз;
+  возвращает `batch_id` и `job_ids`.
+- `GET /api/jobs` — список заданий (стиль, стадия, режим, секунды),
+  `?batch_id=` оставляет только задания пакета.
 - `GET /api/jobs/{id}` — прогресс по этапам (снимок), `GET /api/jobs/{id}/
   events` — тот же прогресс потоком SSE (Step 2 брифа: "клиент читает их
   через SSE").
-- `GET /api/decks/{id}/variants` — три варианта с превью-PNG и находками
-  аудита (координаты рамки — доли холста, как несёт `Finding.box`).
+- `GET /api/decks/{id}/variants` — презентация задания (список из одной
+  записи со стилем задания) с превью-PNG и находками аудита.
 - `POST /api/decks/{id}/fix` — применяет выбранные исправления и
   пересобирает (`api.jobs.fix_deck`).
 - `GET /api/decks/{id}/export` — скачивание готового файла
-  (`?format=pptx|pdf|html&variant=dense|airy|visual`; `variant` — не из
-  буквального перечня брифа, но без него нечем выбрать ИЗ ТРЁХ вариантов,
-  какой именно экспортировать: по умолчанию `dense`).
+  (`?format=pptx|pdf|html`, `variant` необязателен: по умолчанию стиль
+  задания).
 
 Файлы (шаблоны, собранные колоды, превью) отдаются как есть через
 `StaticFiles` (`/artifacts/...`) — интерфейсу нужны URL картинок для тега
@@ -69,6 +74,14 @@ def _variant_summary(store: JobStore, state: VariantState) -> schemas.VariantSum
         autofixed_count=state.autofixed_count,
         content_avg=state.content_avg, design_avg=state.design_avg,
         fidelity=state.fidelity,
+    )
+
+
+def _job_args(request: schemas.DeckInput) -> dict:
+    return dict(
+        template_id=request.template_id, brief=request.brief, sources=request.sources,
+        title=request.title, language=request.language, target_slides=request.target_slides,
+        autofix=request.autofix,
     )
 
 
@@ -128,14 +141,26 @@ def create_app(store: JobStore | None = None) -> FastAPI:
         request: schemas.DeckCreateRequest, store: JobStore = Depends(get_store),
     ) -> schemas.DeckCreateResponse:
         try:
-            job = store.create_job(
-                template_id=request.template_id, brief=request.brief, sources=request.sources,
-                title=request.title, language=request.language, target_slides=request.target_slides,
-                autofix=request.autofix,
-            )
+            job = store.create_job(style=request.style, **_job_args(request))
         except JobError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return schemas.DeckCreateResponse(job_id=job.job_id)
+
+    @app.post("/api/decks/batch", response_model=schemas.DeckBatchResponse)
+    async def create_deck_batch(
+        request: schemas.DeckBatchRequest, store: JobStore = Depends(get_store),
+    ) -> schemas.DeckBatchResponse:
+        try:
+            batch_id, jobs = store.create_batch(styles=list(request.styles), **_job_args(request))
+        except JobError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return schemas.DeckBatchResponse(batch_id=batch_id, job_ids=[job.job_id for job in jobs])
+
+    @app.get("/api/jobs", response_model=list[schemas.JobResponse])
+    async def list_jobs(
+        batch_id: str | None = Query(None), store: JobStore = Depends(get_store),
+    ) -> list[schemas.JobResponse]:
+        return [schemas.JobResponse(**job.snapshot()) for job in store.list_jobs(batch_id)]
 
     @app.get("/api/jobs/{job_id}", response_model=schemas.JobResponse)
     async def get_job(job_id: str, store: JobStore = Depends(get_store)) -> schemas.JobResponse:
@@ -162,8 +187,8 @@ def create_app(store: JobStore | None = None) -> FastAPI:
     @app.get("/api/decks/{deck_id}/variants", response_model=list[schemas.VariantSummary])
     async def get_variants(deck_id: str, store: JobStore = Depends(get_store)) -> list[schemas.VariantSummary]:
         job = _deck_or_404(store, deck_id)
-        # Порядок вариантов стабилен (Variant enum: dense, airy, visual) —
-        # интерфейс сравнивает их бок о бок в одном и том же порядке всегда.
+        # С задачи Q в задании одна презентация; список оставлен, чтобы
+        # экран аудита и старые клиенты читали ту же форму ответа.
         return [_variant_summary(store, job.variants[name]) for name in ("dense", "airy", "visual") if name in job.variants]
 
     @app.post("/api/decks/{deck_id}/fix", response_model=schemas.FixResponse)
@@ -185,10 +210,11 @@ def create_app(store: JobStore | None = None) -> FastAPI:
     async def export(
         deck_id: str,
         format: str = Query(..., pattern="^(pptx|pdf|html)$"),
-        variant: str = Query("dense", pattern="^(dense|airy|visual)$"),
+        variant: str | None = Query(None, pattern="^(dense|airy|visual)$"),
         store: JobStore = Depends(get_store),
     ) -> FileResponse:
         job = _deck_or_404(store, deck_id)
+        variant = variant or job.style
         state = job.variants.get(variant)
         if state is None:
             raise HTTPException(status_code=404, detail=f"Варианта {variant!r} нет в колоде {deck_id!r}.")
