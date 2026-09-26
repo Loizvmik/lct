@@ -377,6 +377,30 @@ def _cmd_audit_visual(args: argparse.Namespace) -> int:
         )
 
     report = AuditReport.merge(det_findings, vis_result)
+
+    # Задача G (PPTEval): средние по content/design печатаются, только если
+    # хоть один слайд реально получил оценку — иначе "среднее 0.0" выглядело
+    # бы как честный вердикт там, где модель просто не прислала `scores`
+    # (см. докстроку `_axis_average` в `audit.visual`).
+    if report.content_avg is not None or report.design_avg is not None or report.deck_score:
+        content = f"{report.content_avg:.1f}" if report.content_avg is not None else "—"
+        design = f"{report.design_avg:.1f}" if report.design_avg is not None else "—"
+        coherence = report.deck_score.get("coherence") if report.deck_score else None
+        print(
+            f"\nОценки PPTEval (1-5): содержание {content}, дизайн {design}, "
+            f"связность колоды {coherence if coherence is not None else '—'}"
+        )
+        deck_why = report.deck_score.get("why") if report.deck_score else None
+        if deck_why:
+            print(f"  связность: {deck_why}")
+        for idx in sorted(report.slide_scores):
+            score = report.slide_scores[idx]
+            why = score.get("why")
+            print(
+                f"  слайд {idx}: содержание {score.get('content', '—')}, "
+                f"дизайн {score.get('design', '—')}" + (f" — {why}" if why else "")
+            )
+
     print(
         f"\nСводный отчёт: {len(report.findings)} находок "
         f"(детерминированных: {report.deterministic_count}, визуальных: {report.visual_count})"

@@ -43,6 +43,17 @@ class AuditReport:
     visual_skipped_reason: str | None = None
     deterministic_count: int = 0
     visual_count: int = 0
+    # Задача G (PPTEval): оценки 1-5 переносятся из `VisualAuditResult` как
+    # есть, не пересчитываются здесь заново — `merge` только сводит, а не
+    # решает, что считать оценкой (тот же принцип, что и с
+    # `visual_skipped_reason` выше). Плоский список находок (не
+    # `VisualAuditResult`) не несёт оценок вовсе — интерфейс брифа
+    # (`run_visual(...) -> list[Finding]`) старше самих оценок и о них не
+    # знает, поэтому в этом случае поля остаются пустыми/`None`, честно.
+    slide_scores: dict[int, dict] = field(default_factory=dict)
+    deck_score: dict | None = None
+    content_avg: float | None = None
+    design_avg: float | None = None
 
     @classmethod
     def merge(
@@ -54,15 +65,27 @@ class AuditReport:
         if isinstance(visual, VisualAuditResult):
             vis_findings = list(visual.findings)
             skipped_reason = visual.skipped_reason
+            slide_scores = dict(visual.slide_scores)
+            deck_score = visual.deck_score
+            content_avg = visual.content_avg
+            design_avg = visual.design_avg
         else:
             vis_findings = list(visual)
             skipped_reason = None
+            slide_scores = {}
+            deck_score = None
+            content_avg = None
+            design_avg = None
 
         return cls(
             findings=_stable_sort(det + vis_findings),
             visual_skipped_reason=skipped_reason,
             deterministic_count=len(det),
             visual_count=len(vis_findings),
+            slide_scores=slide_scores,
+            deck_score=deck_score,
+            content_avg=content_avg,
+            design_avg=design_avg,
         )
 
     def by_severity(self) -> dict[str, int]:
