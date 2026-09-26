@@ -27,6 +27,7 @@ from lxml import etree
 from PIL import Image
 from pptx.opc.packuri import PackURI
 
+from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import NS, qn
 from deckforge.ooxml.walk import ShapeRef, walk_shapes
@@ -551,6 +552,74 @@ def _lvl1_size(list_style) -> float | None:
     if def_rpr is not None and def_rpr.get("sz"):
         return int(def_rpr.get("sz")) / 100
     return None
+
+
+def _fill_of(owner) -> object | None:
+    """`a:solidFill` уровня 1 или первого run внутри `owner` (txBody или
+    стиль списка), `None`, если цвета там нет."""
+    if owner is None:
+        return None
+    fill = owner.find(".//" + qn("a:lvl1pPr") + "/" + qn("a:defRPr") + "/" + qn("a:solidFill"))
+    if fill is None:
+        fill = owner.find(".//" + qn("a:rPr") + "/" + qn("a:solidFill"))
+    return fill
+
+
+def _placeholder_body(root, ph_type: str, ph_idx: str | None):
+    """txBody плейсхолдера того же idx (или типа) в лейауте или мастере."""
+    found = None
+    for el in root.iter(qn("p:ph")):
+        if ph_idx is not None and el.get("idx") == ph_idx:
+            found = el
+            break
+        el_type = el.get("type", "body")
+        same = el_type == ph_type or (el_type in _TITLE_PH_TYPES and ph_type in _TITLE_PH_TYPES)
+        if found is None and same:
+            found = el
+    if found is None:
+        return None
+    return found.getparent().getparent().getparent().find(qn("p:txBody"))
+
+
+def inherited_text_color(slide, shape_element, scheme: dict, clr_map: dict) -> str | None:
+    """Цвет, которым PowerPoint нарисует первый run фигуры: свой `a:rPr`,
+    свой `a:lstStyle`, плейсхолдер лейаута (по idx, затем по типу), мастер,
+    стили текста мастера. Тот же порядок наследования, что у
+    `inherited_text_size`.
+
+    Нужен сборке с нуля: заголовки VK Education цвета не пишут, берут его
+    из мастера (синий), профиль видит у слота `color_hex=None`, и слайд с
+    нуля выходил с чёрным заголовком рядом с синими у клонов."""
+    def resolved(fill) -> str | None:
+        color = resolve_color(fill, scheme, clr_map) if fill is not None else None
+        return color.hex if isinstance(color, Color) else None
+
+    tx_body = shape_element.find(qn("p:txBody"))
+    run = tx_body.find(".//" + qn("a:r")) if tx_body is not None else None
+    r_pr = run.find(qn("a:rPr")) if run is not None else None
+    own = resolved(r_pr.find(qn("a:solidFill")) if r_pr is not None else None)
+    if own:
+        return own
+    lst = tx_body.find(qn("a:lstStyle")) if tx_body is not None else None
+    own = resolved(_fill_of(lst))
+    if own:
+        return own
+    ph = shape_element.find(".//" + qn("p:nvPr") + "/" + qn("p:ph"))
+    if ph is None:
+        return None
+    ph_type, ph_idx = ph.get("type", "body"), ph.get("idx")
+    layout = slide.slide_layout
+    master = layout.slide_master
+    for owner, by_idx in ((layout, True), (master, False)):
+        body = _placeholder_body(owner._element, ph_type, ph_idx if by_idx else None)  # noqa: SLF001
+        color = resolved(_fill_of(body))
+        if color:
+            return color
+    styles = master._element.find(qn("p:txStyles"))  # noqa: SLF001
+    if styles is None:
+        return None
+    style = styles.find(qn("p:titleStyle") if ph_type in _TITLE_PH_TYPES else qn("p:bodyStyle"))
+    return resolved(_fill_of(style))
 
 
 def allow_wrap(shape_element) -> bool:

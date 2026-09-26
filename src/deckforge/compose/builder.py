@@ -11,6 +11,7 @@ python-pptx (рисование) одновременно — блоки кон�
 """
 from __future__ import annotations
 import hashlib
+from collections import Counter
 import io
 import re
 import zipfile
@@ -37,7 +38,7 @@ from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
     CLONE_MARK_PREFIX, allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
-    inherited_text_size, mark_slide, match_slots, native_table, prune_unfilled, remove_in_box,
+    inherited_text_color, inherited_text_size, mark_slide, match_slots, native_table, prune_unfilled, remove_in_box,
     remove_sample_frames, remove_stray_text, replace_picture, sample_slides_by_number,
     set_native_table_geometry, set_shape_box, set_table_text_size, set_text_size, shape_text, slide_refs,
     table_cell_styles, template_row_heights_emu, text_style,
@@ -197,7 +198,8 @@ def build_deck(
         clone_examples = _clone_examples_enabled()
     # Примеры запоминаются ДО очистки: после неё их нет в `prs.slides`, но
     # части пакета живут в памяти, и клон берёт фигуры и связи прямо из них.
-    source_slides = sample_slides_by_number(prs) if clone_examples else {}
+    samples = sample_slides_by_number(prs)
+    source_slides = samples if clone_examples else {}
     _clear_sample_slides(prs)
     # Картинки декора берутся из САМОГО шаблона — один открытый zip на всю
     # презентацию, с памятью на уже прочитанные части: одна и та же иконка
@@ -216,6 +218,9 @@ def build_deck(
     canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
     audit_config = AuditConfig.load()
     patterns = [_pattern_from_model(m) for m in profile.patterns]
+    # Облик заголовков шаблона для сборки с нуля (задача U): снимается с
+    # примеров, даже если клон выключен, это чтение, а не сборка.
+    look = template_look(profile, patterns, samples, canvas)
     # Task 18: история выбора раскладки растёт по ходу цикла — вход штрафа
     # за повтор (`_diversity_penalty`, см. докстроку `_SelectionHistory`).
     # Большинство слайдов приходят с уже проставленным `slide_spec.
@@ -242,7 +247,7 @@ def build_deck(
         outcome = _place_with_ladder(
             prs, slide_spec, candidates, profile, canvas, audit_config, forms=forms, repair=repair,
             room=max_slides - len(spec.slides), bullet_char=bullet_char, user_photos=user_photos,
-            image_bytes=image_bytes, source_slides=source_slides,
+            image_bytes=image_bytes, source_slides=source_slides, look=look,
         )
         slide_spec.findings.extend(outcome.notes)
         _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
@@ -318,13 +323,20 @@ def place_slide(
     decor = expand_decor(
         pattern, _repeat_item_count(slide_spec), grid, filled_repeat_units(pattern, contents),
     )
+    if look is not None:
+        # Сборка с нуля в стиле шаблона (задача U): разбросанные по слотам
+        # примера подписи встают в один ряд по сетке и получают плашку
+        # карточки шаблона, если она у раскладки есть.
+        contents, plaques = _align_scattered_units(contents, pattern, grid)
+        if plaques:
+            decor = [*decor, *plaques]
     apply_decor(slide, decor, canvas_width_emu, canvas_height_emu, image_bytes)
     # `_local_background_is_dark` ищет охватывающую плашку декора ПОД
     # слотом (см. её докстроку) — обязана видеть УЖЕ развёрнутые позиции
     # плашек (`decor`, не статический `pattern.decor`), иначе контраст
     # карточки №2 может посчитаться от плашки, стоявшей там на
     # исходном, ненамайненном слайде-примере.
-    effective_pattern = pattern if decor is pattern.decor else replace(pattern, decor=decor)
+    effective_pattern = pattern if decor is pattern.decor else replace(pattern, decor=list(decor))
 
     # Источник истины для фона под слотом — МАКЕТ, на который слайд реально
     # ставится (`profile.layouts`, разобран надёжно: наследование от
@@ -378,12 +390,19 @@ def place_slide(
         # Контраст — от фона НЕПОСРЕДСТВЕННО под этим слотом (плашка декора,
         # если слот на ней стоит, иначе фон макета) — см.
         # `_local_background_luminance`.
+        bg_luminance = _local_background_luminance(content.slot.box, effective_pattern, layout_bg_luminance)
+        color_hex = None
+        if look is not None:
+            content, color_hex = look.restyle(content, profile, bg_luminance, audit_config.template.min_contrast_large)
         _draw_slot(
             slide, slide_spec, content, profile, family, bullet_char, canvas_width_emu, canvas_height_emu,
-            _local_background_luminance(content.slot.box, effective_pattern, layout_bg_luminance),
+            bg_luminance, color_hex=color_hex,
         )
 
-    _place_visual(slide, slide_spec, pattern, profile, user_photos, sole_content=_only_frame_text(contents))
+    _place_visual(
+        slide, slide_spec, pattern, profile, user_photos, sole_content=_only_frame_text(contents),
+        min_photo_width=_MIN_SCRATCH_PHOTO_WIDTH if look is not None else 0.0,
+    )
     _remove_empty_placeholders(slide)
 
 
@@ -508,7 +527,7 @@ def _visual_slot(pattern: Pattern, role: str) -> PatternSlot | None:
 
 def _place_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile,
-    user_photos: dict[str, Path] | None = None, *, sole_content: bool = False,
+    user_photos: dict[str, Path] | None = None, *, sole_content: bool = False, min_photo_width: float = 0.0,
 ) -> None:
     visual = slide_spec.visual
     if visual is None:
@@ -519,7 +538,10 @@ def _place_visual(
     elif visual.kind == "chart" and visual.chart is not None:
         _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart)
     elif visual.kind in ("photo", "icon"):
-        _place_picture_visual(slide, slide_spec, pattern, profile, visual.kind, user_photos)
+        _place_picture_visual(
+            slide, slide_spec, pattern, profile, visual.kind, user_photos,
+            min_width=min_photo_width if visual.kind == "photo" else 0.0,
+        )
 
 
 def _place_table_visual(
@@ -742,7 +764,7 @@ def _contain_box(
 
 def _place_picture_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, kind: str,
-    user_photos: dict[str, Path] | None = None,
+    user_photos: dict[str, Path] | None = None, *, min_width: float = 0.0,
 ) -> None:
     slot = (
         _visual_slot(pattern, "image") if kind == "photo" else _visual_slot(pattern, "icon")
@@ -772,7 +794,8 @@ def _place_picture_visual(
             )
         return  # раскладка не несёт визуального слота вовсе — для ассета шаблона это не находка
 
-    left, top, width, height = _emu_visual_box(slot.box, profile)
+    box = _at_least_wide(slot.box, min_width, _grid_from_model(profile.grid)) if min_width > 0 else slot.box
+    left, top, width, height = _emu_visual_box(box, profile)
 
     if user_photo_path is not None:
         try:
@@ -1539,7 +1562,7 @@ def _place_with_ladder(
     prs, slide_spec: SlideSpec, candidates: list[Pattern], profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, *, forms: dict, repair: SlideRepair | None, room: int, bullet_char: str,
     user_photos: dict[str, Path] | None, image_bytes: Callable[[str], bytes | None] | None,
-    source_slides: dict[int, object] | None, look: "TemplateLook | None" = None,
+    source_slides: dict[int, object] | None, look: TemplateLook | None = None,
 ) -> LadderOutcome:
     """Лестница отказов одного слайда (раздел 11): 1) клон раскладки
     планировщика; 2) клон запасной раскладки того же вида (запасные
@@ -2379,6 +2402,171 @@ def _grid_from_model(model) -> Grid:
 
 
 # ---------------------------------------------------------------------------
+# Сборка с нуля в стиле шаблона (задача U)
+# ---------------------------------------------------------------------------
+
+# Фото на слайде с нуля не уже этой доли холста, если у раскладки есть
+# место под картинку: живой прогон задачи P положил фото в значок 0,06
+# холста, и слайд читался как слайд без фото.
+_MIN_SCRATCH_PHOTO_WIDTH = 0.25
+
+# Роли, которые на слайде с нуля пишутся не мельче кегля body шкалы:
+# подписи примера бывают 12pt, а наш текст длиннее подписи.
+_BODY_ROLES = frozenset({"body", "bullets", "card_body", "caption"})
+
+# Роли единиц, которые выравниваются в ряд, и предел ширины «подписи»:
+# широкое место (главный абзац на всю ширину) единицей ряда не считается.
+_UNIT_ROLES = frozenset({"body", "bullets", "card_body"})
+_UNIT_MAX_WIDTH = 0.5
+_ROW_TOLERANCE = 0.02
+
+
+@dataclass(frozen=True)
+class TemplateLook:
+    """Как шаблон набирает заголовок: цвета по убыванию частоты и кегль
+    (реальный, в пунктах этого холста), снятые с заголовков слайдов-
+    примеров с учётом наследования от лейаута и мастера. Клон получает
+    это даром, а сборка с нуля раньше брала `on_surface` палитры (чёрный)
+    и нормированный кегль профиля: у VK Education это 48 чёрным рядом с
+    синими 36 у клонов."""
+    headline_colors: tuple[str, ...] = ()
+    headline_pt: float | None = None
+
+    def headline_color(self, bg_luminance: float, min_contrast: float) -> str | None:
+        for hex_color in self.headline_colors:
+            ratio = _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(hex_color))
+            if ratio >= min_contrast:
+                return hex_color
+        return None
+
+    def restyle(
+        self, content: SlotContent, profile: TemplateProfile, bg_luminance: float, min_contrast: float,
+    ) -> tuple[SlotContent, str | None]:
+        """Слот с кеглем шаблона и цвет текста (или `None`: как раньше)."""
+        slot = content.slot
+        if content.role_hint == "headline":
+            if self.headline_pt:
+                slot = replace(slot, size_pt=self.headline_pt * profile.canvas_norm)
+            color = self.headline_color(bg_luminance, min_contrast)
+            return (replace(content, slot=slot) if slot is not content.slot else content), color
+        if content.role_hint in _BODY_ROLES:
+            body = profile.type_scale.steps.get("body") or 0.0
+            if body > slot.size_pt:
+                return replace(content, slot=replace(slot, size_pt=body)), None
+        return content, None
+
+
+def template_look(
+    profile: TemplateProfile, patterns: list[Pattern], samples: dict[int, object], canvas: Canvas,
+) -> TemplateLook:
+    """Облик заголовков шаблона по его слайдам-примерам. Пустой облик (нет
+    примеров или ни один заголовок не узнан) сборку не меняет."""
+    colors: Counter = Counter()
+    sizes: Counter = Counter()
+    scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
+    for pattern in patterns:
+        source = _clone_source(pattern, samples)
+        if source is None:
+            continue
+        _number, slide = source
+        slots = list(pattern.slots)
+        heads = [i for i, s in enumerate(slots) if s.role == "headline"]
+        if not heads:
+            continue
+        try:
+            matched = match_slots(slide, slots, canvas)
+        except Exception:  # noqa: BLE001: незнакомая разметка примера: облик без него
+            continue
+        for i in heads:
+            ref = matched.get(i)
+            if ref is None:
+                continue
+            color = inherited_text_color(slide, ref.element, scheme, clr_map)
+            if color:
+                colors[color] += 1
+            size = text_style(ref.element).size_pt or inherited_text_size(slide, ref.element)
+            if size:
+                sizes[round(size)] += 1
+    return TemplateLook(
+        headline_colors=tuple(c for c, _n in colors.most_common()),
+        headline_pt=float(sizes.most_common(1)[0][0]) if sizes else None,
+    )
+
+
+def _at_least_wide(box: Box, min_width: float, grid: Grid) -> Box:
+    """Коробка картинки не уже `min_width` холста: растёт от своего центра с
+    теми же пропорциями и остаётся в полях шаблона."""
+    if box.width >= min_width or box.width <= 0:
+        return box
+    scale = min_width / box.width
+    width, height = min_width, min(box.height * scale, 1.0 - grid.margin_top - grid.margin_bottom)
+    cx, cy = box.left + box.width / 2, box.top + box.height / 2
+    left = min(max(cx - width / 2, grid.margin_left), 1.0 - grid.margin_right - width)
+    top = min(max(cy - height / 2, grid.margin_top), 1.0 - grid.margin_bottom - height)
+    return Box(left=left, top=top, width=width, height=height)
+
+
+def _align_scattered_units(
+    contents: list[SlotContent], pattern: Pattern, grid: Grid,
+) -> tuple[list[SlotContent], list[DecorShape]]:
+    """Подписи, разбросанные по слотам примера (схема с ячейками по углам,
+    из которых заполнены две), встают в один ряд по сетке: общий верх,
+    равная ширина, шаг сетки между ними. Ряд ставится не выше низа того,
+    что стоит над ним (заголовок, главный абзац).
+
+    Трогаются только узкие текстовые места (`_UNIT_ROLES`, уже половины
+    холста): главный абзац на всю ширину остаётся на месте. Карточки с
+    заголовками и показатели не трогаются: их уже разложил повтор. Ряд,
+    который уже стоит ровно, не трогается.
+
+    Плашка: заливная фигура группы повтора раскладки (карточка шаблона),
+    если она есть, копия под каждой единицей ряда."""
+    if any(c.role_hint in ("card_title", "kpi_value", "kpi_label") for c in contents):
+        return contents, []
+    units = [
+        i for i, c in enumerate(contents)
+        if c.role_hint in _UNIT_ROLES and c.slot.box.width < _UNIT_MAX_WIDTH
+        and any(p.text.strip() for p in c.paragraphs)
+    ]
+    if len(units) < 2:
+        return contents, []
+    boxes = [contents[i].slot.box for i in units]
+    if max(b.top for b in boxes) - min(b.top for b in boxes) <= _ROW_TOLERANCE:
+        return contents, []
+    others = [c.slot.box for k, c in enumerate(contents) if k not in units]
+    top = min(b.top for b in boxes)
+    above = [b.top + b.height for b in others if b.top < top]
+    if above:
+        top = max(top, max(above) + grid.gutter)
+    bottom = 1.0 - grid.margin_bottom
+    below = [b.top for b in others if b.top >= top]
+    if below:
+        bottom = min(bottom, min(below) - grid.gutter)
+    height = min(max(b.height for b in boxes), bottom - top)
+    if height <= 0.05:
+        return contents, []
+    span = 1.0 - grid.margin_left - grid.margin_right
+    n = len(units)
+    width = (span - grid.gutter * (n - 1)) / n
+    order = sorted(units, key=lambda i: (round(contents[i].slot.box.top, 2), contents[i].slot.box.left))
+    plaque = next(
+        (d for d in pattern.decor if d.repeat_group and d.kind == "shape" and d.has_fill and d.fill_hex), None,
+    )
+    pad = grid.gutter / 2 if plaque is not None else 0.0
+    out = list(contents)
+    plaques: list[DecorShape] = []
+    for k, i in enumerate(order):
+        left = grid.margin_left + k * (width + grid.gutter)
+        box = Box(left=left + pad, top=top + pad, width=width - 2 * pad, height=height - 2 * pad)
+        out[i] = replace(contents[i], slot=replace(contents[i].slot, box=box))
+        if plaque is not None:
+            plaques.append(replace(
+                plaque, box=Box(left=left, top=top, width=width, height=height), repeat_group=False,
+            ))
+    return out, plaques
+
+
+# ---------------------------------------------------------------------------
 # Отрисовка одного слота
 # ---------------------------------------------------------------------------
 
@@ -2741,6 +2929,7 @@ def _apply_bullet(paragraph, bullet_char: str, family: str) -> None:
 def _draw_slot(
     slide, slide_spec: SlideSpec, content: SlotContent, profile: TemplateProfile, family: str,
     bullet_char: str, canvas_width_emu: int, canvas_height_emu: int, bg_luminance: float,
+    *, color_hex: str | None = None,
 ) -> None:
     box = content.slot.box
     left = round(box.left * canvas_width_emu)
@@ -2810,7 +2999,7 @@ def _draw_slot(
             )
 
     display_paragraphs = _split_back(chosen_text, content.paragraphs)
-    color_hex = _color_for_role(content.role_hint, content.slot, profile, bg_luminance)
+    color_hex = color_hex or _color_for_role(content.role_hint, content.slot, profile, bg_luminance)
     align = _ALIGN_MAP.get(content.slot.align, PP_ALIGN.LEFT)
     bold = profile.type_scale.bold_is_idiomatic and content.role_hint in _HEADING_ROLES
 
