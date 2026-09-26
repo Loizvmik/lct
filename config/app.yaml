@@ -88,7 +88,9 @@ llm:
     pattern_picker: none
     photo_picker: none
     outline: low
-    content_audit: low
+    # Аудит по картинке с low шёл 30 с на слайд (82-188 с на презентацию,
+    # замер 28 сентября): это чек-лист по картинке, рассуждения ему не нужны.
+    content_audit: none
   # Число слайдов, чей текст пишется ОДНОВРЕМЕННО (`plan.writer.write_slides`,
   # `ThreadPoolExecutor`) — слайды друг от друга не зависят (свой пункт
   # структуры, свои источники), а живой замер (`task-12-report.md`) показал,
