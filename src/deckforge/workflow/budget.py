@@ -167,6 +167,14 @@ class RunBudget:
         уже превышен (обязательные стадии всё равно доделываются)."""
         return self.deadline_seconds - self.elapsed()
 
+
+    def allowance(self, wanted: float, *, reserve: float) -> float:
+        """Сколько секунд дать необязательному шагу (починка текста под
+        контракт, задача U): не больше `wanted` и не больше остатка минус
+        `reserve` на обязательные стадии после него (сборка, аудит,
+        экспорт). Ноль значит «шаг не запускать». Метод пропал при
+        слиянии задач Q и U (27 сентября 2026)."""
+        return max(0.0, min(wanted, self.remaining() - reserve))
     def decide_mode(self, checkpoint: str) -> RunMode:
         """Контрольная точка пайплайна: `"after_outline"` перед раскладками
         и текстом, `"after_write"` перед сборкой, `"after_compose"` перед
