@@ -39,6 +39,14 @@
 не меняют число слайдов вовсе — их различие целиком в `kind`/`pattern_id`
 и, тем самым, в реальной раскладке шаблона.
 
+Задача N добавила к этому второй шаг вне модуля: `writer.realize_for_
+variant` переписывает текст `visual`/`airy` под контракт уже выбранной
+раскладки (с проверкой, что все числа исходного текста на месте). Когда он
+включён, `apply_variant(..., prefer_decor=True)` ставит оформление выше
+вместимости по знакам: длинный текст плотного варианта больше не гонит эти
+два варианта с нарядных раскладок на голые, его всё равно перепишут.
+`apply_variant` сам текст по-прежнему не трогает.
+
 ## Почему `pattern_id`, а не только `kind`
 
 `apply_variant` не может позволить себе оставить `pattern_id=None` и
@@ -396,7 +404,7 @@ _HERO_IMAGE_KINDS = frozenset({"section", "image", "closing"})
 def _pattern_rank_key(
     p, variant: Variant, item_count: int | None, char_len: int, kind_rank: int, avoid: frozenset[str],
     history: _SelectionHistory = _EMPTY_HISTORY, needs_image: bool = False,
-    is_cover: bool = False,
+    is_cover: bool = False, prefer_decor: bool = False,
 ) -> tuple:
     """Ключ сортировки одного паттерна-кандидата — ОБЩИЙ для всех `kind` из
     предпочтения варианта (см. `_choose_kind_and_pattern`), не только внутри
@@ -578,6 +586,21 @@ def _pattern_rank_key(
     # заголовка они равны (VK Education: все семь героических раскладок
     # по 48 pt), и без этого признака обложка садилась на финальный слайд.
     cover_bias = (-_headline_size(p), min(p.source_slide_index or [0])) if is_cover else (0.0, 0)
+    if prefer_decor and variant is not Variant.dense:
+        # Задача N: текст этого варианта перепишут под контракт выбранной
+        # раскладки (`writer.realize_for_variant`), поэтому длина текста
+        # плотного варианта больше не повод уходить с нарядной раскладки на
+        # голую. Замер 27 сентября 2026 на VK Education: пункты по 140-200
+        # знаков против 36-84 у раскладок с плашками, и `char_bucket` уводил
+        # visual на белые листы. Число единиц (`cap_bucket`) остаётся первым:
+        # пять карточек на три ячейки не перепишешь без потери факта.
+        # Повторы и избегание соседей стоят выше декора, иначе все слайды
+        # сядут на одну самую нарядную раскладку (см. комментарий к
+        # `decor_bias` про попытку 25 сентября); пустое место под фото тоже.
+        return (
+            cap_bucket, image_penalty, avoid_penalty, repeat_penalty, orphan_image,
+            cover_bias, decor_bias, kind_rank, char_bucket, capacity_bias, roominess_bias, -p.score,
+        )
     return (
         fit_bucket, image_penalty, avoid_penalty, repeat_penalty, kind_rank,
         orphan_image, cover_bias, decor_bias, capacity_bias, roominess_bias, -p.score,
@@ -620,7 +643,7 @@ _HARD_REQUIREMENT_KINDS = frozenset({"cards", "kpi", "kpi_caption", "table", "ph
 def _choose_kind_and_pattern(
     slide: SlideSpec, profile, variant: Variant, *,
     avoid: frozenset[str] = frozenset(), history: _SelectionHistory = _EMPTY_HISTORY,
-    preferred: str | None = None, is_last: bool = False,
+    preferred: str | None = None, is_last: bool = False, prefer_decor: bool = False,
 ) -> tuple[str, str | None]:
     """`kind`+`pattern_id` для один слайд — брифом: "выбирает раскладку из
     списка, который ей дал разбор шаблона... если предложит несуществующую,
@@ -692,7 +715,9 @@ def _choose_kind_and_pattern(
         if authored is not None and not (_is_closing_pattern(authored, profile) and not is_last):
             return authored.kind, authored.pattern_id
 
-    ranked = _ranked_candidates(slide, profile, variant, avoid=avoid, history=history, is_last=is_last)
+    ranked = _ranked_candidates(
+        slide, profile, variant, avoid=avoid, history=history, is_last=is_last, prefer_decor=prefer_decor,
+    )
     if not ranked:
         return slide.kind, None
     if preferred:
@@ -767,7 +792,7 @@ _THANKS_RE = re.compile(r"спасибо|благодар|thank|вопрос|que
 def _ranked_candidates(
     slide: SlideSpec, profile, variant: Variant, *,
     avoid: frozenset[str] = frozenset(), history: _SelectionHistory = _EMPTY_HISTORY,
-    is_last: bool = False,
+    is_last: bool = False, prefer_decor: bool = False,
 ) -> list[tuple[tuple, object]]:
     """Все кандидаты слайда с их ключами, от лучшего к худшему. Пустой
     список только у профиля без единого паттерна. Сортировка устойчивая,
@@ -801,7 +826,7 @@ def _ranked_candidates(
         (
             _pattern_rank_key(
                 p, variant, item_count, char_len, kind_rank[p.kind], avoid, history, needs_image,
-                is_cover=_is_cover(slide),
+                is_cover=_is_cover(slide), prefer_decor=prefer_decor,
             ),
             p,
         )
@@ -824,6 +849,7 @@ RERANK_TOP = 3
 def rank_patterns(
     slide: SlideSpec, profile, variant: Variant, *,
     avoid: frozenset[str] = frozenset(), history: _SelectionHistory = _EMPTY_HISTORY, top: int = RERANK_TOP,
+    prefer_decor: bool = False,
 ) -> list[str]:
     """Лучшие `top` раскладок слайда в порядке детерминированного ранжира;
     первая та же, что выберет `apply_variant` без подсказки.
@@ -833,7 +859,7 @@ def rank_patterns(
     смыслу и вкусу, а не по вместимости, и предлагать ей раскладку, где
     текст переполнится или фото некуда поставить, значит дать ей способ
     сделать слайд хуже."""
-    ranked = _ranked_candidates(slide, profile, variant, avoid=avoid, history=history)
+    ranked = _ranked_candidates(slide, profile, variant, avoid=avoid, history=history, prefer_decor=prefer_decor)
     if not ranked:
         return []
     leader = ranked[0][0][:2]
@@ -879,6 +905,7 @@ def _with_dividers(slides: list[SlideSpec]) -> list[SlideSpec]:
 
 def _pattern_choices(
     slides: list[SlideSpec], profile, variant: Variant, *, avoid_by_slide: dict[int, frozenset[str]] | None = None,
+    prefer_decor: bool = False,
 ) -> dict[int, str | None]:
     """`id(slide) -> pattern_id`, выбранный для `variant` по каждому слайду
     `slides` — вынесено отдельной функцией, чтобы `apply_variant` могло
@@ -899,6 +926,7 @@ def _pattern_choices(
         avoid = avoid_by_slide.get(id(slide), frozenset())
         _kind, pattern_id = _choose_kind_and_pattern(
             slide, profile, variant, avoid=avoid, history=history, is_last=(slide is slides[-1]),
+            prefer_decor=prefer_decor,
         )
         result[id(slide)] = pattern_id
         history = history.with_choice(pattern_id)
@@ -906,7 +934,7 @@ def _pattern_choices(
 
 
 def _variant_slides_and_avoid(
-    deck_spec: DeckSpec, profile, variant: Variant,
+    deck_spec: DeckSpec, profile, variant: Variant, *, prefer_decor: bool = False,
 ) -> tuple[list[SlideSpec], dict[int, frozenset[str]]]:
     """Слайды варианта (у `airy` с разделителями) и то, чего избегать на
     каждом из них. Общее для `apply_variant` и `rerank_candidates`: номера
@@ -923,7 +951,11 @@ def _variant_slides_and_avoid(
         avoid_for_visual = {
             sid: frozenset({pid}) if pid else frozenset() for sid, pid in dense_choice.items()
         }
-        visual_choice = _pattern_choices(slides, profile, Variant.visual, avoid_by_slide=avoid_for_visual)
+        # Тот же режим, в котором соберётся сам visual: иначе airy избегал
+        # бы не той раскладки, которую visual на деле получит.
+        visual_choice = _pattern_choices(
+            slides, profile, Variant.visual, avoid_by_slide=avoid_for_visual, prefer_decor=prefer_decor,
+        )
 
     avoid_by_slide: dict[int, frozenset[str]] = {}
     for slide in slides:
@@ -933,7 +965,7 @@ def _variant_slides_and_avoid(
 
 
 def rerank_candidates(
-    deck_spec: DeckSpec, profile, variant: Variant, *, top: int = RERANK_TOP,
+    deck_spec: DeckSpec, profile, variant: Variant, *, top: int = RERANK_TOP, prefer_decor: bool = False,
 ) -> list[tuple[int, SlideSpec, list[str]]]:
     """`(номер слайда в варианте, слайд, кандидаты)` для слайдов, где модели
     есть из чего выбирать: у слайда есть содержание и кандидатов больше
@@ -944,12 +976,14 @@ def rerank_candidates(
     потом выберет другое, кандидаты следующих слайдов могли бы сдвинуться,
     но `apply_variant` всё равно проверяет выбор модели по пулу совместимых
     раскладок, а пул от истории не зависит."""
-    slides, avoid_by_slide = _variant_slides_and_avoid(deck_spec, profile, variant)
+    slides, avoid_by_slide = _variant_slides_and_avoid(deck_spec, profile, variant, prefer_decor=prefer_decor)
     result: list[tuple[int, SlideSpec, list[str]]] = []
     history = _EMPTY_HISTORY
     for i, slide in enumerate(slides):
         avoid = avoid_by_slide.get(id(slide), frozenset())
-        ids = rank_patterns(slide, profile, variant, avoid=avoid, history=history, top=top)
+        ids = rank_patterns(
+            slide, profile, variant, avoid=avoid, history=history, top=top, prefer_decor=prefer_decor,
+        )
         if len(ids) > 1 and (slide.blocks or slide.visual is not None):
             result.append((i, slide, ids))
         history = history.with_choice(ids[0] if ids else None)
@@ -958,6 +992,7 @@ def rerank_candidates(
 
 def apply_variant(
     deck_spec: DeckSpec, profile, variant: Variant, preferred: dict[int, str] | None = None,
+    *, prefer_decor: bool = False,
 ) -> DeckSpec:
     """Единственная точка, где `DeckSpec`, написанный ОДИН РАЗ `writer.
     write_slides`, превращается в ТРИ различающихся набора `kind`+
@@ -987,8 +1022,15 @@ def apply_variant(
     `preferred` (номер слайда в варианте -> `pattern_id`) приносит выбор
     модели из `writer.rerank_patterns`. Модель сюда не заходит: функция
     остаётся чистой, а чужой выбор принимается, только если раскладка
-    совместима со слайдом (см. `_choose_kind_and_pattern`)."""
-    slides, avoid_by_slide = _variant_slides_and_avoid(deck_spec, profile, variant)
+    совместима со слайдом (см. `_choose_kind_and_pattern`).
+
+    `prefer_decor` (задача N) включают, только когда после этой функции
+    текст варианта перепишут под раскладку (`writer.realize_for_variant`):
+    оформление тогда стоит выше вместимости по знакам (см. конец
+    `_pattern_rank_key`). На `dense` не действует: он держит полный текст на
+    вместительной раскладке. Тот же флаг обязан уйти в `rerank_candidates`,
+    иначе модель выбирала бы из другого списка."""
+    slides, avoid_by_slide = _variant_slides_and_avoid(deck_spec, profile, variant, prefer_decor=prefer_decor)
     preferred = preferred or {}
 
     new_slides: list[SlideSpec] = []
@@ -997,7 +1039,7 @@ def apply_variant(
         avoid = avoid_by_slide.get(id(slide), frozenset())
         kind, pattern_id = _choose_kind_and_pattern(
             slide, profile, variant, avoid=avoid, history=history, preferred=preferred.get(i),
-            is_last=(i == len(slides) - 1),
+            is_last=(i == len(slides) - 1), prefer_decor=prefer_decor,
         )
         # Свой список находок на вариант: раньше три варианта делили один
         # список, и находки сборки dense попадали в airy и visual (53 → 98 →

@@ -695,3 +695,46 @@ def test_dense_stops_inheriting_a_layout_the_writer_chose_twice():
     if others:
         assert again[1] != chosen
 
+
+def _synthetic_pattern(pattern_id: str, *, decor: int, max_chars: int, order: int, kind: str = "two_col"):
+    """Раскладка ровно с теми полями, которые читает ранжир: две раскладки,
+    отличающиеся только декором и вместимостью по знакам."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        pattern_id=pattern_id, kind=kind, repeat=None, score=1.0, is_dark=False,
+        source_slide_index=[order], decor=[object()] * decor,
+        capacity=SimpleNamespace(max_items=1, max_chars_per_item=max_chars),
+        slots=[SimpleNamespace(role="body", max_chars=max_chars, size_pt=14.0, sample_text=None)],
+    )
+
+
+def test_prefer_decor_moves_visual_to_the_decorated_layout_at_equal_structure():
+    """Задача N: при равной структуре (тот же вид, то же число мест) visual
+    без переписывания уходит на голую вместительную раскладку, потому что
+    текст плотного варианта длиннее нарядной; с `prefer_decor` текст
+    перепишут, и выигрывает оформление. dense флаг не трогает."""
+    from types import SimpleNamespace
+
+    plain = _synthetic_pattern("plain", decor=0, max_chars=400, order=1)
+    decorated = _synthetic_pattern("decorated", decor=6, max_chars=60, order=2)
+    closing = _synthetic_pattern("closing", decor=0, max_chars=40, order=9, kind="section")
+    profile = SimpleNamespace(patterns=[plain, decorated, closing])
+    long_text = "Ожидание первого согласующего — медиана 18 часов, второй ждёт ещё 11 часов подряд"
+    deck = DeckSpec(title="T", language="ru", slides=[
+        SlideSpec(index=0, kind="two_col", headline="Где уходит время", blocks=[
+            TextBlock(text=long_text), TextBlock(text=long_text),
+        ]),
+        SlideSpec(index=1, kind="section", headline="Спасибо"),
+    ])
+
+    assert apply_variant(deck, profile, Variant.visual).slides[0].pattern_id == "plain"
+    assert apply_variant(deck, profile, Variant.visual, prefer_decor=True).slides[0].pattern_id == "decorated"
+    assert (
+        apply_variant(deck, profile, Variant.dense, prefer_decor=True).slides[0].pattern_id
+        == apply_variant(deck, profile, Variant.dense).slides[0].pattern_id
+    )
+    # Модель rerank выбирает из того же списка, что и сборка.
+    for _i, _slide, ids in rerank_candidates(deck, profile, Variant.visual, prefer_decor=True):
+        assert ids[0] == "decorated"
+
