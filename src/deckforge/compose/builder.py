@@ -1414,17 +1414,29 @@ def _scratch_candidates(
     - находки есть: слайд откатывается (`_remove_last_slide`), причина в
       лог, следующий кандидат;
     - без находок никто: заново укладывается тот, у кого находок меньше
-      всего (бриф: «пустого слайда быть не должно никогда»)."""
+      всего (бриф: «пустого слайда быть не должно никогда»).
+
+    Раскладка, в которую не легло содержание (карточки без слота), сразу
+    не принимается, даже без находок аудита: пустой слайд с одним
+    заголовком аудит пропускает, а смысл потерян (живой прогон задачи U:
+    риски на три карточки ушли на коллаж фотографий без текстовых мест).
+    Среди отклонённых выбор по числу находок, при равенстве меньше
+    потерянных блоков. Не наоборот: раскладка без потерь, но с наложениями
+    и переполнением (диаграмма Ганта под три абзаца) читается хуже, чем
+    честная находка «карточки не попали на слайд»."""
     tried = candidates[:_MAX_LAYOUT_ATTEMPTS]
-    best: tuple[int, Pattern, list[str]] | None = None  # (число находок, паттерн, коды находок)
+    grid = _grid_from_model(profile.grid)
+    # (число находок, потеряно блоков, номер попытки, паттерн, коды находок)
+    best: tuple[int, int, int, Pattern, list[str]] | None = None
     for attempt, pattern in enumerate(tried, start=1):
+        lost = _lost_blocks(slide_spec, pattern, grid)
         trial_spec = replace(slide_spec, findings=[])
         place_slide(
             prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char,
             user_photos=user_photos, image_bytes=image_bytes, look=look,
         )
         errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index)
-        if not errors:
+        if not errors and not lost:
             if attempt > 1:
                 notes.append(
                     f"Слайд {slide_spec.index}: раскладка {pattern.pattern_id!r} принята с попытки "
@@ -1433,15 +1445,18 @@ def _scratch_candidates(
             notes.extend(trial_spec.findings)
             return pattern
         ids = sorted({f.check_id for f in errors})
+        why = f"{len(errors)} находок уровня ошибки: {', '.join(ids)}" if errors else "без находок"
+        if lost:
+            why += f"; не легло блоков содержания: {lost}"
         notes.append(
             f"Слайд {slide_spec.index}: раскладка {pattern.pattern_id!r} отклонена (попытка "
-            f"{attempt}/{len(tried)}) — {len(errors)} находок уровня ошибки: {', '.join(ids)}."
+            f"{attempt}/{len(tried)}) — {why}."
         )
-        if best is None or len(errors) < best[0]:
-            best = (len(errors), pattern, ids)
+        if best is None or (len(errors), lost, attempt) < best[:3]:
+            best = (len(errors), lost, attempt, pattern, ids)
         _remove_last_slide(prs)
 
-    best_errors, best_pattern, best_ids = best
+    best_errors, _lost, _attempt, best_pattern, best_ids = best
     trial_spec = replace(slide_spec, findings=[])
     place_slide(
         prs, trial_spec, best_pattern, profile, audit_config, bullet_char=bullet_char,
@@ -1454,6 +1469,17 @@ def _scratch_candidates(
     )
     notes.extend(trial_spec.findings)
     return best_pattern
+
+
+# Роли, потеря которых не делает слайд пустым: сноска и подзаголовок.
+_MINOR_DROP_ROLES = frozenset({"source", "subhead"})
+
+
+def _lost_blocks(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> int:
+    """Сколько частей содержания (кроме сноски и подзаголовка) раскладка
+    не примет вовсе: нет слота их роли."""
+    _contents, drops = assign_content_with_drops(slide_spec, pattern, grid)
+    return sum(1 for d in drops if d.role not in _MINOR_DROP_ROLES)
 
 
 # ---------------------------------------------------------------------------

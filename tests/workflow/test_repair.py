@@ -264,6 +264,17 @@ def test_planner_backups_come_right_after_the_chosen_layout(profile):
     assert order[:3] == [bullets[0], bullets[2], bullets[1]]
 
 
+def test_lost_blocks_count_content_without_a_slot(profile):
+    """Сборка с нуля не принимает раскладку, куда не легли карточки, даже
+    без находок аудита: `_lost_blocks` считает такие части."""
+    grid = builder._grid_from_model(profile.grid)
+    by_id = {m.pattern_id: builder._pattern_from_model(m) for m in profile.patterns}
+    photos_only = next(pid for pid, p in by_id.items() if not any(s.role in ("body", "card_body") for s in p.slots))
+
+    assert builder._lost_blocks(_cards_slide(4), by_id["slide21"], grid) == 0
+    assert builder._lost_blocks(_cards_slide(4), by_id[photos_only], grid) >= 1
+
+
 def test_no_model_calls_in_emergency_mode_or_without_time(profile):
     from deckforge.workflow.budget import BudgetPolicy, RunBudget, RunMode
     from deckforge.workflow.repair import repairer_for
