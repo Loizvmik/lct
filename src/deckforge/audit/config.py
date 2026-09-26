@@ -40,6 +40,7 @@ class DensityThresholds(BaseModel):
     max_chart_series: int
     fill_ratio_min: float
     fill_ratio_max: float
+    pattern_delta_max: float
 
 
 class IntegrityThresholds(BaseModel):
@@ -49,11 +50,18 @@ class IntegrityThresholds(BaseModel):
     min_duplicate_check_text_len: int
 
 
+class RepairThresholds(BaseModel):
+    overflow_ratio: float
+    overlap_ratio: float
+    density_delta: float
+
+
 class AuditConfig(BaseModel):
     layout: LayoutThresholds
     template: TemplateThresholds
     density: DensityThresholds
     integrity: IntegrityThresholds
+    repair: RepairThresholds
 
     @classmethod
     def load(cls, path: Path = AUDIT_YAML_PATH) -> "AuditConfig":

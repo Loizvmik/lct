@@ -218,7 +218,10 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # уверенности не ниже 0,8, а `fixed` ещё и только для короткой фразы без
 # подсказок дизайнера (`patterns.is_fixed_phrase`). В кеше v21 подсказка
 # «Точки используются для навигации» могла лежать как `fixed`.
-PROFILE_SCHEMA_VERSION = 22
+# 22 -> 23: задача R, у паттерна `source_density`, заполненность
+# слайда-примера (D05 сравнивает клон с ней). Старый кеш прочитался бы с
+# `None`, и D05 молча остался бы на глобальном коридоре.
+PROFILE_SCHEMA_VERSION = 23
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -638,6 +641,11 @@ class PatternModel(BaseModel):
     # вовсе — см. докстроку `_save_pattern_previews`, честная деградация,
     # тот же принцип, что и у остальных опциональных источников профиля).
     preview_path: str | None = None
+    # Задача R: заполненность слайда-примера (`patterns.Pattern.
+    # source_density`), с ней D05 сравнивает клон. `None` у моделей,
+    # собранных без майнинга (тестовые фикстуры): D05 тогда судит по
+    # глобальному коридору.
+    source_density: float | None = None
 
 
 def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> PatternModel:
@@ -649,6 +657,7 @@ def _pattern_model(pattern: Pattern, preview_path: str | None = None) -> Pattern
         decor=[_decor_shape_model(d) for d in pattern.decor],
         capacity=_capacity_model(pattern.capacity), score=pattern.score, is_dark=pattern.is_dark,
         kind_confidence=pattern.kind_confidence, preview_path=preview_path,
+        source_density=pattern.source_density,
     )
 
 
@@ -1484,6 +1493,14 @@ class TemplateProfile(BaseModel):
         if raw is None:
             return None
         return self.denorm_pt(raw)
+
+    def min_font_pt(self) -> float:
+        """Нижняя граница кегля для любого ужимания текста: ступень caption
+        шкалы ЭТОГО шаблона, денормированная к его холсту (раздел 14
+        архитектуры). Раньше автопочинка держала глобальные 8pt, а сборка
+        caption: у шаблона с caption 12pt починка опускала текст ниже
+        того, что сборка сочла бы нечитаемым. Одна функция на обоих."""
+        return self.type_scale_pt("caption", 12.0)
 
     def pattern_preview_path(
         self, pattern: PatternModel, *, cache_dir: Path | None = _CACHE_DIR_UNSET,  # type: ignore[assignment]

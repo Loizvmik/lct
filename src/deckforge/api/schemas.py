@@ -55,6 +55,10 @@ class JobResponse(BaseModel):
     # почему) и сводка аудита по картинке рискованных слайдов.
     budget: dict | None = None
     visual_audit: dict | None = None
+    # Задача R: по вариантам список находок «требует переписать текст или
+    # другую раскладку» (`Finding.repair == "structural"`), автопочинка их
+    # не трогает.
+    structural: dict[str, list[dict]] | None = None
 
 
 class FindingModel(BaseModel):
@@ -67,6 +71,9 @@ class FindingModel(BaseModel):
     box: dict | None  # {left, top, width, height} — доли холста, или null
     fixable: bool
     fix_hint: str
+    # "local" чинит автопочинка, "structural" требует другого текста или
+    # раскладки, "none" только сведения (см. `audit.findings.Repair`).
+    repair: Literal["local", "structural", "none"] = "none"
 
 
 class VariantSummary(BaseModel):

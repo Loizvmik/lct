@@ -222,6 +222,15 @@ class JobRecord:
             "error": self.error,
             "budget": self.budget.summary() if self.budget is not None else None,
             "visual_audit": self.visual_audit,
+            # Задача R: находки, которые автопочинка не трогает, потому что
+            # нужен другой текст или другая раскладка, по вариантам.
+            "structural": {
+                name: [
+                    {"slide_index": f.slide_index, "check_id": f.check_id, "message": f.message}
+                    for f in state.findings if f.repair == "structural"
+                ]
+                for name, state in self.variants.items()
+            },
         }
 
     def subscribe(self) -> asyncio.Queue:

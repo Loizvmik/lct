@@ -94,6 +94,20 @@ class AuditReport:
             out[f.severity] = out.get(f.severity, 0) + 1
         return out
 
+    def by_repair(self) -> dict[str, int]:
+        """Сколько находок чинит автопочинка ("local"), сколько требует
+        другого текста или раскладки ("structural"), сколько только
+        сведения ("none")."""
+        out: dict[str, int] = {}
+        for f in self.findings:
+            out[f.repair] = out.get(f.repair, 0) + 1
+        return out
+
+    def structural(self) -> list[Finding]:
+        """Находки «требует переписать текст или другую раскладку»: их
+        автопочинка не трогает, решать их будет писатель или планировщик."""
+        return [f for f in self.findings if f.repair == "structural"]
+
     def by_check(self) -> dict[str, int]:
         out: dict[str, int] = {}
         for f in self.findings:

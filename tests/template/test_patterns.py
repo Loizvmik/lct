@@ -892,3 +892,32 @@ def test_a_fixed_headline_never_keeps_the_sample_text():
     caption = replace(slot, role="caption", sample_text="Спасибо за внимание!")
     assert keeps_sample_text(caption)
 
+
+
+def test_source_density_is_a_share_of_the_canvas(profile_fixture):
+    """Задача R: заполненность слайда-примера (та же мера, что D05 аудита)
+    лежит в 0..1 у каждого паттерна, где она снята. Мера считает
+    объединение коробок: текст на своей плашке не идёт дважды, и пример с
+    карточками на подложках не выходит за 100% холста."""
+    for name in ALL_TEMPLATES:
+        densities = [p.source_density for p in profile_fixture(name).patterns if p.source_density is not None]
+        assert densities, f"{name}: ни у одного паттерна не снята заполненность"
+        assert all(0.0 <= d <= 1.0 for d in densities), f"{name}: {densities}"
+
+
+def test_cover_is_sparser_than_table_in_vk_education(profile_fixture):
+    """Раздел 15 архитектуры: у разных раскладок разная природная
+    плотность, ради этого D05 и сравнивает клон с его примером."""
+    patterns = profile_fixture("Шаблон презентации VK Education.pptx").patterns
+    table = next(p for p in patterns if p.kind == "table")
+    covers = [p for p in patterns if p.kind == "section" and p.source_density is not None]
+    assert table.source_density is not None and covers
+    assert min(p.source_density for p in covers) < table.source_density
+
+
+def test_example_with_empty_headline_has_no_source_density(profile_fixture):
+    """Титульный слайд VK Education с пустыми плейсхолдерами показывает
+    раскладку, а не заполненный слайд: 0% в эталоне штрафовал бы любой клон."""
+    patterns = profile_fixture("Шаблон презентации VK Education.pptx").patterns
+    empty = [p for p in patterns if any(s.role == "headline" and not (s.sample_text or "").strip() for s in p.slots)]
+    assert empty and all(p.source_density is None for p in empty)

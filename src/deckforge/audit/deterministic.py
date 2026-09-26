@@ -50,9 +50,18 @@ from pptx.enum.chart import XL_CHART_TYPE
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from deckforge.audit.config import AuditConfig
-from deckforge.audit.findings import Finding, Severity
+from deckforge.audit.findings import Finding, Repair, Severity
+from deckforge.compose.clone import clone_pattern_id
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.textfit import measure
+from deckforge.ink import (
+    dominant_run_style as _dominant_run_style,
+    find_fill_node as _find_fill_node,
+    first_paragraph_line_spacing as _first_paragraph_line_spacing,
+    ink_box as _effective_box,
+    ink_ratio,
+    text_frame_insets_in as _text_frame_insets_in,
+)
 from deckforge.ooxml.color import Color, UnresolvedColor, resolve_color
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import local_name, qn
@@ -149,9 +158,9 @@ def audit_slide_layout(
     findings: list[Finding] = []
     findings.extend(_check_L01(ctx, config))
     findings.extend(_check_L02(ctx, config))
-    findings.extend(_check_L03(ctx, config))
-    findings.extend(_check_L04(ctx, config))
-    findings.extend(_check_D05(ctx, config))
+    findings.extend(_check_L03(ctx, profile, config))
+    findings.extend(_check_L04(ctx, profile, config))
+    findings.extend(_check_D05(ctx, profile, config))
     return _stable_sort(findings)
 
 
@@ -215,6 +224,10 @@ class _SlideContext:
     scheme: dict
     clr_map: dict
     full_text: str = ""
+    # `pattern_id` примера, если слайд собран его клоном (метка в имени
+    # слайда, `compose.clone.clone_pattern_id`); `None` у сборки с нуля и
+    # у чужого файла.
+    clone_pattern: str | None = None
 
 
 def _build_context(index: int, slide, prs, pkg: PptxPackage, canvas: Canvas, profile: TemplateProfile) -> _SlideContext:
@@ -284,7 +297,7 @@ def _context_from_root(index: int, slide, root, canvas: Canvas, profile: Templat
         index=index, slide=slide, canvas=canvas, items=items,
         layout_part_name=layout_part_name, layout_entry=layout_entry,
         bg_luminance=bg_luminance, bg_hex=bg_hex, scheme=scheme, clr_map=clr_map,
-        full_text=full_text,
+        full_text=full_text, clone_pattern=clone_pattern_id(root) if local_name(root) == "sld" else None,
     )
 
 
@@ -329,17 +342,6 @@ def _make_item(ref: ShapeRef, pptx_shape, scheme: dict, clr_map: dict) -> _Item:
         text=text, has_fill=has_fill, fill_color=fill_color, pptx_shape=pptx_shape,
         is_table=is_table, is_chart=is_chart,
     )
-
-
-_FILL_TAGS = ("a:noFill", "a:solidFill", "a:gradFill", "a:grpFill")
-
-
-def _find_fill_node(container):
-    for tag in _FILL_TAGS:
-        el = container.find(qn(tag))
-        if el is not None:
-            return el
-    return None
 
 
 def _joined_text(tx_body) -> str:
@@ -424,8 +426,8 @@ def _check_slide(ctx: _SlideContext, profile: TemplateProfile, config: AuditConf
     findings: list[Finding] = []
     findings.extend(_check_L01(ctx, config))
     findings.extend(_check_L02(ctx, config))
-    findings.extend(_check_L03(ctx, config))
-    findings.extend(_check_L04(ctx, config))
+    findings.extend(_check_L03(ctx, profile, config))
+    findings.extend(_check_L04(ctx, profile, config))
     findings.extend(_check_L05(ctx, profile, config))
     findings.extend(_check_L06(ctx, profile, config))
     findings.extend(_check_L07(ctx, config))
@@ -439,7 +441,7 @@ def _check_slide(ctx: _SlideContext, profile: TemplateProfile, config: AuditConf
     findings.extend(_check_D02(ctx, config))
     findings.extend(_check_D03(ctx, config))
     findings.extend(_check_D04(ctx, config))
-    findings.extend(_check_D05(ctx, config))
+    findings.extend(_check_D05(ctx, profile, config))
     findings.extend(_check_I02(ctx, config))
     findings.extend(_check_I03(ctx, profile, config))
     findings.extend(_check_I04(ctx, config))
@@ -449,13 +451,21 @@ def _check_slide(ctx: _SlideContext, profile: TemplateProfile, config: AuditConf
 
 def _finding(
     check_id: str, severity: Severity, ctx: _SlideContext | None, item: _Item | None,
-    message: str, box: Box | None, fixable: bool, fix_hint: str,
+    message: str, box: Box | None, fixable: bool, fix_hint: str, repair: Repair | None = None,
 ) -> Finding:
+    """`repair` по умолчанию выводится из `fixable`: что автопочинка умеет,
+    то локальное. Проверки, у которых часть находок структурная (L02, L03,
+    L04, D01-D05), передают его явно; структурная находка при этом теряет
+    `fixable`: автопочинка её не тронет, и обещать починку в интерфейсе
+    было бы неправдой."""
+    if repair is None:
+        repair = "local" if fixable else "none"
     return Finding(
         check_id=check_id, severity=severity,
         slide_index=ctx.index if ctx is not None else None,
         shape_ref=(f"{item.shape_id}:{item.name}" if item is not None else None),
-        message=message, box=box, fixable=fixable, fix_hint=fix_hint,
+        message=message, box=box, fixable=fixable and repair == "local", fix_hint=fix_hint,
+        repair=repair,
     )
 
 
@@ -481,103 +491,9 @@ def _check_L01(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
                 b, True, "Переместить или уменьшить фигуру так, чтобы она целиком лежала на холсте.",
             ))
     return findings
-
-
-# ---------------------------------------------------------------------------
-# Внутренние поля текстовой рамки (`a:bodyPr` lIns/tIns/rIns/bIns)
-# ---------------------------------------------------------------------------
-
-# Дефолты ECMA-376 Part 1, §21.1.2.1.1 (CT_TextBodyProperties) для
-# lIns/rIns/tIns/bIns, когда атрибут в разметке отсутствует — 0.1″/0.1″/
-# 0.05″/0.05″ (в EMU). НАША сборка обнуляет их явно (`compose/builder.py::
-# _draw_slot` — единственная причина, по которой `measure()` там мерит по
-# ПОЛНОЙ ширине/высоте фигуры и это корректно), но аудит применяется к
-# ПРОИЗВОЛЬНОМУ чужому файлу — там поля почти наверняка НЕ нулевые (Task 11
-# повторное ревью, находка №2: `python-pptx` без явного `tf.margin_*`
-# оставляет их на этом самом дефолте). Без вычитания полей замер видит
-# больше места, чем реально доступно тексту, и "не влезает"/"обрезан
-# краем" (L03/L04) и заполненность (L02/D05, через `_effective_box`)
-# молчат там, где реально должны сработать.
-_DEFAULT_LINS_EMU = 91440
-_DEFAULT_TINS_EMU = 45720
-_DEFAULT_RINS_EMU = 91440
-_DEFAULT_BINS_EMU = 45720
-
-
-def _text_frame_insets_in(sp_element) -> tuple[float, float, float, float]:
-    """(left, top, right, bottom) внутренних полей `a:bodyPr` в дюймах —
-    ЯВНОЕ значение атрибута, если задано, иначе дефолт спецификации (см.
-    докстроку выше). Отсутствие `p:txBody`/`a:bodyPr` — тот же дефолт: текст
-    без явной рамки всё равно рисуется с дефолтными полями, это не "нулевые
-    поля" по умолчанию."""
-    tx_body = sp_element.find(qn("p:txBody"))
-    body_pr = tx_body.find(qn("a:bodyPr")) if tx_body is not None else None
-
-    def _inset(attr: str, default_emu: int) -> float:
-        raw = body_pr.get(attr) if body_pr is not None else None
-        if raw is None:
-            return default_emu / EMU_PER_INCH
-        try:
-            return int(raw) / EMU_PER_INCH
-        except ValueError:
-            return default_emu / EMU_PER_INCH
-
-    return (
-        _inset("lIns", _DEFAULT_LINS_EMU), _inset("tIns", _DEFAULT_TINS_EMU),
-        _inset("rIns", _DEFAULT_RINS_EMU), _inset("bIns", _DEFAULT_BINS_EMU),
-    )
-
-
 # ---------------------------------------------------------------------------
 # L02 — два блока наложились друг на друга
 # ---------------------------------------------------------------------------
-
-
-def _effective_box(item: _Item, canvas: Canvas) -> Box:
-    """Площадь текстового блока — ИЗМЕРЕННАЯ (`textfit.measure`), а не
-    объявленная: сборка нарочно даёт блокам запас по высоте (см. докстроку
-    модуля/бриф), и объявленная рамка дала бы ложные наложения. Высота
-    ограничена сверху объявленной (текст, переполнивший рамку, — отдельная
-    находка L03/L04, не повод удвоить площадь для L02).
-
-    Правка по итогам обязательного осмотра (отчёт задачи): усадка НЕ
-    применяется, если у фигуры есть СОБСТВЕННАЯ непрозрачная заливка
-    (`item.has_fill`) — плашка/карточка (`compose/diagrams.py::_add_card`
-    и подобные) даёт видимые чернила на ВСЮ свою рамку целиком, независимо
-    от того, сколько места внутри реально занимает текст (карточка схемы
-    "Заявка" на крошечной подписи посреди большого чёрного прямоугольника
-    — прямоугольник виден целиком, а не только текст в нём). Усадка имеет
-    смысл только для ГОЛОГО текста без своей заливки: там объявленная
-    рамка — запас на переполнение, а не видимая площадь. Без этой поправки
-    D05 на реальной demo-колоде (Task 11, обязательный осмотр) занижал
-    заполненность слайда со схемой "process" вчетверо (11% вместо
-    фактических ~37% чёрных карточек) и грозил ложным "слайд почти пуст"
-    там, где на рендере холст занят заметно.
-
-    Правка Task 11 повторного ревью (находка №2): ширина/высота, которыми
-    мерится текст, теперь за вычетом внутренних полей рамки (`a:bodyPr`,
-    см. `_text_frame_insets_in`) — на нашей сборке поля нулевые, ничего не
-    меняется, на чужом файле с полями по умолчанию текст меряется по
-    реально доступному месту, не по полной рамке. Эффективная высота
-    после капа ДОБАВЛЯЕТ поля обратно (контент-высота — это не вся видимая
-    площадь блока, вокруг неё ещё есть поля) — так на нулевых полях
-    поведение бит-в-бит прежнее."""
-    if item.kind != "shape" or not item.text.strip() or item.has_fill:
-        return item.box
-    style = _dominant_run_style(item.element)
-    if style is None:
-        return item.box
-    family, size_pt, _bold = style
-    l_in, t_in, r_in, b_in = _text_frame_insets_in(item.element)
-    box_width_in = max(0.0, item.box.width * canvas.width_in - l_in - r_in)
-    line_spacing = _first_paragraph_line_spacing(item.element)
-    metrics = measure(item.text, family, size_pt, box_width_in, line_spacing=line_spacing)
-    declared_full_height_in = item.box.height * canvas.height_in
-    available_height_in = max(0.0, declared_full_height_in - t_in - b_in)
-    effective_content_height_in = min(metrics.height_in, available_height_in)
-    effective_height_in = min(effective_content_height_in + t_in + b_in, declared_full_height_in)
-    effective_height = effective_height_in / canvas.height_in if canvas.height_in else item.box.height
-    return Box(left=item.box.left, top=item.box.top, width=item.box.width, height=effective_height)
 
 
 def _overlap_ratio(a: Box, b: Box) -> float:
@@ -657,11 +573,17 @@ def _check_L02(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
                 width=max(box_a.right, box_b.right) - min(box_a.left, box_b.left),
                 height=max(box_a.bottom, box_b.bottom) - min(box_a.top, box_b.top),
             )
+            # Сильное наложение сдвигом не лечится: блок наполовину под
+            # соседом, и сдвиг вытолкнет его на поля или на третий блок.
+            structural = ratio > config.repair.overlap_ratio
             findings.append(_finding(
                 "L02", "major", ctx, item_a,
                 f"Блоки «{item_a.name or item_a.shape_id}» и «{item_b.name or item_b.shape_id}» "
                 f"наложились друг на друга ({ratio:.0%} площади меньшего блока).",
-                union_box, True, "Раздвинуть блоки или уменьшить один из них так, чтобы наложение исчезло.",
+                union_box, True,
+                "Взять другую раскладку или сократить содержание одного из блоков."
+                if structural else "Раздвинуть блоки или уменьшить один из них так, чтобы наложение исчезло.",
+                repair="structural" if structural else "local",
             ))
     return findings
 
@@ -671,54 +593,34 @@ def _check_L02(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
 # ---------------------------------------------------------------------------
 
 
-def _dominant_run_style(sp_element) -> tuple[str, float, bool] | None:
-    """(гарнитура, кегль pt, полужирность) самого "весомого" run'а шейпа —
-    голосование по числу символов, тот же приём, что и `template/patterns.
-    py::_shape_dominant_size` (см. его докстроку)."""
-    tx_body = sp_element.find(qn("p:txBody"))
-    if tx_body is None:
-        return None
-    votes: dict[tuple[str, float, bool], int] = {}
-    for r in tx_body.iter(qn("a:r")):
-        r_pr = r.find(qn("a:rPr"))
-        if r_pr is None:
-            continue
-        sz_raw = r_pr.get("sz")
-        latin = r_pr.find(qn("a:latin"))
-        family = latin.get("typeface") if latin is not None else None
-        if sz_raw is None or not family:
-            continue
-        size_pt = int(sz_raw) / 100
-        bold = r_pr.get("b") == "1"
-        t_el = r.find(qn("a:t"))
-        chars = len(t_el.text or "") if t_el is not None else 0
-        key = (family, size_pt, bold)
-        votes[key] = votes.get(key, 0) + max(chars, 1)
-    if not votes:
-        return None
-    return max(votes.items(), key=lambda kv: kv[1])[0]
+def _overflow_at_floor(item: _Item, ctx: _SlideContext, profile: TemplateProfile) -> float:
+    """На сколько текст переполняет свою рамку, если ужать его до нижней
+    ступени шкалы шаблона (`TemplateProfile.min_font_pt`, та же граница,
+    ниже которой не опускает кегль автопочинка): 0.2 значит, что даже на
+    caption нужно на 20% больше высоты, чем есть. Текст, уже набранный
+    мельче caption, меряется своим кеглем: поднимать его починка не будет."""
+    style = _dominant_run_style(item.element)
+    if style is None:
+        return 0.0
+    family, size_pt, _bold = style
+    l_in, t_in, r_in, b_in = _text_frame_insets_in(item.element)
+    box_width_in = max(0.0, item.box.width * ctx.canvas.width_in - l_in - r_in)
+    available_in = max(0.0, item.box.height * ctx.canvas.height_in - t_in - b_in)
+    if available_in <= 0:
+        return float("inf")
+    floor_pt = min(size_pt, profile.min_font_pt())
+    metrics = measure(
+        item.text, family, floor_pt, box_width_in, line_spacing=_first_paragraph_line_spacing(item.element),
+    )
+    return max(0.0, metrics.height_in / available_in - 1.0)
 
 
-def _first_paragraph_line_spacing(sp_element) -> float:
-    tx_body = sp_element.find(qn("p:txBody"))
-    if tx_body is None:
-        return _DEFAULT_LINE_SPACING
-    p_el = tx_body.find(qn("a:p"))
-    if p_el is None:
-        return _DEFAULT_LINE_SPACING
-    p_pr = p_el.find(qn("a:pPr"))
-    if p_pr is None:
-        return _DEFAULT_LINE_SPACING
-    ln_spc = p_pr.find(qn("a:lnSpc"))
-    if ln_spc is None:
-        return _DEFAULT_LINE_SPACING
-    pct = ln_spc.find(qn("a:spcPct"))
-    if pct is None or pct.get("val") is None:
-        return _DEFAULT_LINE_SPACING
-    return int(pct.get("val")) / 100000.0
+def _overflow_repair(item: _Item, ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> Repair:
+    """L03/L04: малое переполнение чинит ступень кегля, сильное нет."""
+    return "structural" if _overflow_at_floor(item, ctx, profile) > config.repair.overflow_ratio else "local"
 
 
-def _check_L03(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
+def _check_L03(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
     findings = []
     for item in ctx.items:
         if item.kind != "shape" or not item.text.strip():
@@ -733,17 +635,21 @@ def _check_L03(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
         metrics = measure(item.text, family, size_pt, box_width_in, line_spacing=line_spacing)
         declared_height_in = max(0.0, item.box.height * ctx.canvas.height_in - t_in - b_in)
         if metrics.height_in > declared_height_in + config.layout.text_fit_tolerance_in:
+            repair = _overflow_repair(item, ctx, profile, config)
             findings.append(_finding(
                 "L03", "major", ctx, item,
                 f"Текст «{item.name or item.shape_id}» не помещается в свою рамку "
                 f"(нужно {metrics.height_in:.2f}″, доступно {declared_height_in:.2f}″"
                 f"{' за вычетом внутренних полей рамки' if (t_in or b_in) else ''}).",
-                item.box, True, "Уменьшить кегль по шкале шаблона или увеличить рамку слота.",
+                item.box, True,
+                "Сократить текст или разбить на два слайда: не влезает даже минимальным кеглем шкалы."
+                if repair == "structural" else "Уменьшить кегль по шкале шаблона или увеличить рамку слота.",
+                repair=repair,
             ))
     return findings
 
 
-def _check_L04(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
+def _check_L04(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
     findings = []
     for item in ctx.items:
         if item.kind != "shape" or not item.text.strip():
@@ -775,6 +681,7 @@ def _check_L04(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
                 "выходит за нижний край слайда.",
                 Box(item.box.left, item.box.top, item.box.width, min(1.0, effective_bottom) - item.box.top),
                 True, "Уменьшить кегль/сократить текст или сдвинуть блок от края.",
+                repair=_overflow_repair(item, ctx, profile, config),
             ))
     return findings
 
@@ -1515,6 +1422,7 @@ def _check_D01(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
         "D01", "minor", ctx, None,
         f"На слайде {total} буллетов — больше {config.density.max_bullets}.",
         None, False, "Сократить число буллетов или разбить содержание на два слайда.",
+        repair="structural",
     )]
 
 
@@ -1529,7 +1437,7 @@ def _check_D02(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
                 findings.append(_finding(
                     "D02", "minor", ctx, item,
                     f"Буллет из {len(words)} слов длиннее {config.density.max_words_per_bullet}: «{shown}».",
-                    item.box, False, "Сократить формулировку буллета.",
+                    item.box, False, "Сократить формулировку буллета.", repair="structural",
                 ))
     return findings
 
@@ -1551,7 +1459,7 @@ def _check_D03(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
                 "D03", "minor", ctx, item,
                 f"Таблица {n_rows}×{n_cols} больше нормы {config.density.max_table_rows}×"
                 f"{config.density.max_table_cols}.",
-                item.box, False, "Сократить таблицу или разбить на несколько.",
+                item.box, False, "Сократить таблицу или разбить на несколько.", repair="structural",
             ))
     return findings
 
@@ -1575,7 +1483,7 @@ def _check_D04(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
             findings.append(_finding(
                 "D04", "minor", ctx, item,
                 f"На диаграмме {n_series} серий — больше {config.density.max_chart_series}.",
-                item.box, False, "Сократить число серий или сменить тип графика.",
+                item.box, False, "Сократить число серий или сменить тип графика.", repair="structural",
             ))
     return findings
 
@@ -1600,36 +1508,53 @@ def slide_fill_ratio(slide, canvas: Canvas, profile: TemplateProfile, *, index: 
 
 
 def _fill_ratio(ctx: _SlideContext) -> float:
-    canvas_area = ctx.canvas.width_in * ctx.canvas.height_in
-    if canvas_area <= 0:
-        return 0.0
-    covered = 0.0
-    for item in ctx.items:
-        if item.kind == "connector":
-            continue
-        if item.kind == "shape" and (item.text.strip() or item.has_fill):
-            # `_effective_box` сама решает, усаживать ли по измеренному
-            # тексту (голый текст без заливки) или отдать рамку как есть
-            # (своя заливка — видимые чернила на весь бокс, см. её докстроку).
-            eff = _effective_box(item, ctx.canvas)
-            covered += eff.area * canvas_area
-        elif item.kind in ("picture", "graphic_frame"):
-            covered += item.box.area * canvas_area
-    return covered / canvas_area
+    """Та же мера, что у разбора шаблона (`deckforge.ink.ink_ratio`): D05
+    сравнивает клон с `Pattern.source_density`, и счёт обязан совпадать."""
+    return ink_ratio(ctx.items, ctx.canvas)
 
 
-def _check_D05(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
+def _source_density(ctx: _SlideContext, profile: TemplateProfile) -> float | None:
+    if ctx.clone_pattern is None:
+        return None
+    pattern = next((p for p in profile.patterns if p.pattern_id == ctx.clone_pattern), None)
+    return pattern.source_density if pattern is not None else None
+
+
+def _check_D05(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
+    """Слайд, собранный клоном примера, сравнивается с заполненностью самого
+    примера (раздел 15 архитектуры): у обложки она по замыслу около 15%, у
+    таблицы около 80%, и глобальный коридор 25-75% штрафовал бы обе за их
+    природу. Слайд без метки клона (или с примером, чья плотность не
+    снята) судится прежним коридором.
+
+    Структурной находка становится, когда отклонение больше `repair.
+    density_delta`: от плотности примера у клона, от середины коридора
+    (50%) у остальных. Коридор 25-75% и есть "пример 50% плюс-минус 0.25",
+    так что обе ветки меряют одной линейкой."""
     if ctx.canvas.width_in * ctx.canvas.height_in <= 0:
         return []
     ratio = _fill_ratio(ctx)
     cfg = config.density
-    if cfg.fill_ratio_min <= ratio <= cfg.fill_ratio_max:
-        return []
-    direction = "меньше четверти" if ratio < cfg.fill_ratio_min else "больше трёх четвертей"
+    source = _source_density(ctx, profile)
+    if source is not None:
+        delta = ratio - source
+        if abs(delta) <= cfg.pattern_delta_max:
+            return []
+        direction = "плотнее" if delta > 0 else "пустее"
+        message = (
+            f"Слайд заполнен на {ratio:.0%}, пример раскладки {source:.0%}: "
+            f"{direction} примера на {abs(delta):.0%}."
+        )
+    else:
+        if cfg.fill_ratio_min <= ratio <= cfg.fill_ratio_max:
+            return []
+        delta = ratio - (cfg.fill_ratio_min + cfg.fill_ratio_max) / 2
+        direction = "меньше четверти" if ratio < cfg.fill_ratio_min else "больше трёх четвертей"
+        message = f"Слайд заполнен на {ratio:.0%} холста — {direction}."
     return [_finding(
-        "D05", "minor", ctx, None,
-        f"Слайд заполнен на {ratio:.0%} холста — {direction}.",
+        "D05", "minor", ctx, None, message,
         Box(0.0, 0.0, 1.0, 1.0), False, "Подобрать другую раскладку или изменить объём содержания.",
+        repair="structural" if abs(delta) > config.repair.density_delta else "none",
     )]
 
 

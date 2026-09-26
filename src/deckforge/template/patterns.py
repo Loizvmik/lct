@@ -47,6 +47,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from deckforge.ink import SimpleInk, ink_ratio, shape_has_fill
 from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import local_name, qn
@@ -352,6 +353,12 @@ class Pattern:
     # group_size`/`DecorShape.repeat_group` в этом же модуле, см. их
     # докстроки про "кеш без поля валидируется как..." принцип).
     kind_confidence: float = 1.0
+    # Доля холста под чернилами на слайде-примере (раздел 15 архитектуры):
+    # та же мера, что D05 аудита (`deckforge.ink.ink_ratio`), снятая с
+    # исходного слайда целиком, с декором. Аудит сравнивает с ней клон
+    # этого примера вместо глобального коридора 25-75%: обложка по замыслу
+    # пустая, таблица плотная. `None`: не снята (тестовые фикстуры).
+    source_density: float | None = None
 
 
 # --- геометрические допуски (бриф, Step 2, п.4 — оба числа литералом) ------
@@ -583,6 +590,8 @@ def _mine_slide(
     if score < _MIN_SCORE:
         return None
 
+    source_density = _source_density(refs, slots, theme, canvas)
+
     decor_membership = _decor_repeat_membership(decor, repeat)
     decor_shapes = [
         _to_decor(pkg, rels, ref, theme, decor_image_cache, decor_membership.get(i), canvas, scale)
@@ -601,7 +610,48 @@ def _mine_slide(
         score=score,
         is_dark=is_dark,
         kind_confidence=kind_confidence,
+        source_density=source_density,
     )
+
+
+# Доля площади текстовых мест, которую на слайде-примере могут занимать
+# пустые места, чтобы его плотность ещё годилась в эталон. 10%: пустая
+# подпись или номер под картинкой не меняют заполненность заметно, пустой
+# основной текст (на ЛЦТ2026 это треть и больше) меняет.
+_EMPTY_EXAMPLE_SHARE = 0.1
+
+
+def _source_density(
+    refs: list[ShapeRef], slots: list[PatternSlot], theme: ThemeInfo, canvas: Canvas,
+) -> float | None:
+    """Заполненность слайда-примера той же мерой, что у аудита. Берутся
+    все видимые фигуры слайда (содержание и декор, логотип и фон-картинка
+    тоже): клон переносит их на готовый слайд, и аудит их там посчитает.
+    Коробки плейсхолдеров уже унаследованы от макета (`_resolve_slide_
+    boxes`), так что фигура без своего `a:xfrm` не выпадает из счёта.
+
+    `None`, если пуст заголовок или пустые текстовые места занимают больше
+    `_EMPTY_EXAMPLE_SHARE` площади всех текстовых мест: такой пример
+    показывает раскладку, а не заполненный слайд (титульный VK Education с
+    пустыми плейсхолдерами дал бы 0%), и сравнение с ним штрафовало бы
+    любой клон. D05 тогда судит клон глобальным коридором. Крошечное пустое
+    место (номер слайда, сноска) пример не портит."""
+    text_slots = [s for s in slots if s.role not in _NON_TEXT_ROLES]
+    empty = [s for s in text_slots if not (s.sample_text or "").strip()]
+    if any(s.role == "headline" for s in empty):
+        return None
+    total_area = sum(s.box.area for s in text_slots)
+    if total_area > 0 and sum(s.box.area for s in empty) / total_area > _EMPTY_EXAMPLE_SHARE:
+        return None
+    items = [
+        SimpleInk(
+            kind=ref.kind, element=ref.element, box=ref.box,
+            text=_shape_text(ref.element) if ref.kind == "shape" else "",
+            has_fill=ref.kind == "shape" and shape_has_fill(ref.element, theme.scheme, theme.clr_map),
+        )
+        for ref in refs
+    ]
+    return round(ink_ratio(items, canvas), 4)
 
 
 def _slide_layout_part(pkg: PptxPackage, slide_part: str) -> str | None:

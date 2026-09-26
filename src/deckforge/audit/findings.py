@@ -36,6 +36,15 @@ from deckforge.ooxml.geometry import Box
 
 Severity = Literal["critical", "major", "minor"]
 
+# Как находку чинить (раздел 13 архитектуры). `"local"`: точечная правка
+# фигуры, её делает `audit.autofix` (сдвиг, snap, цвет, контраст, гарнитура,
+# легенда, малое переполнение). `"structural"`: локальный патч спрятал бы
+# симптом, а не убрал причину (сильное переполнение даже на минимальном
+# кегле, сильное наложение, много текста, заполненность далеко от примера);
+# нужен другой текст или другая раскладка. `"none"`: чинить нечем или
+# незачем (сведения для человека, находки модели по картинке).
+Repair = Literal["local", "structural", "none"]
+
 
 @dataclass(frozen=True)
 class Finding:
@@ -47,3 +56,11 @@ class Finding:
     box: Box | None
     fixable: bool
     fix_hint: str
+    # `None` при создании значит "выведи из `fixable`": находки, собранные
+    # до задачи R (модель по картинке, тесты, старые вызовы), остаются
+    # локальными, если их умели чинить, и не молчат в автопочинке.
+    repair: Repair | None = None
+
+    def __post_init__(self) -> None:
+        if self.repair is None:
+            object.__setattr__(self, "repair", "local" if self.fixable else "none")

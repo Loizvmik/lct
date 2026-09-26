@@ -181,6 +181,22 @@ def _remap_rids(root, mapping: dict[str, str]) -> None:
                 el.set(name, mapping[value])
 
 
+# Метка клона в имени слайда: префикс и `pattern_id` примера. Отсюда её
+# читают сборка (`builder._try_clone` ставит), `scripts/inspect_deck.py` и
+# аудит (`clone_pattern_id`: D05 сравнивает заполненность с примером).
+CLONE_MARK_PREFIX = "deckforge:clone:"
+
+
+def clone_pattern_id(slide_root) -> str | None:
+    """`pattern_id` примера, клоном которого собран слайд (`p:sld`), либо
+    `None`, если метки нет: слайд собран с нуля или файл чужой."""
+    c_sld = slide_root.find(qn("p:cSld"))
+    name = (c_sld.get("name") or "") if c_sld is not None else ""
+    if not name.startswith(CLONE_MARK_PREFIX):
+        return None
+    return name[len(CLONE_MARK_PREFIX):] or None
+
+
 def mark_slide(slide, label: str) -> None:
     """Метка пути сборки в имени слайда (`p:cSld/@name`): поле штатное,
     PowerPoint его не показывает, а `scripts/inspect_deck.py` читает, каким

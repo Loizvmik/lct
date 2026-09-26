@@ -36,7 +36,7 @@ from deckforge.compose.blocks import (
 from deckforge.compose.charts import ChartSpec, Series, add_chart
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
-    allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
+    CLONE_MARK_PREFIX, allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
     inherited_text_size, mark_slide, match_slots, native_table, prune_unfilled, remove_in_box,
     remove_sample_frames, remove_stray_text, replace_picture, sample_slides_by_number,
     set_native_table_geometry, set_shape_box, set_table_text_size, set_text_size, shape_text, slide_refs,
@@ -513,7 +513,7 @@ def _place_table_visual(
     box, floor = slot.box, None
     if sole_content:
         box = _table_frame_box(slide, slot.box, profile, canvas)
-        floor = profile.type_scale_pt("caption", 12.0)
+        floor = profile.min_font_pt()
     add_table(slide, box, TableSpec(header=header, rows=body_rows, align=align), profile, floor_pt=floor)
 
 
@@ -1374,9 +1374,9 @@ def _place_best_candidate(
 # Сборка клоном слайда-примера (CLONE → BIND → ADAPT, см. `compose.clone`)
 # ---------------------------------------------------------------------------
 
-# Метка пути сборки в имени слайда (`p:cSld/@name`), её читает
-# `scripts/inspect_deck.py`.
-CLONE_MARK_PREFIX = "deckforge:clone:"
+# Метка пути сборки в имени слайда (`CLONE_MARK_PREFIX`, `p:cSld/@name`)
+# живёт в `compose.clone`: её читают `scripts/inspect_deck.py` и аудит (D05
+# сравнивает клон с его примером), а аудиту незачем тянуть сборщик целиком.
 
 # Интерлиньяж, которым аудит (L03) меряет абзац без явного `a:lnSpc`
 # (`audit.deterministic._DEFAULT_LINE_SPACING`). Клон меряет тем же
@@ -1972,7 +1972,7 @@ def _fill_native_table_on_clone(
     width_in, height_in = box.width * canvas.width_in, box.height * canvas.height_in
     col_widths_in = [width_in * share for share in column_shares(rows)]
     family = _primary_family(profile)
-    caption = profile.type_scale_pt("caption", 12.0)
+    caption = profile.min_font_pt()
     styles = table_cell_styles(frame)
     own_sizes = [max((c.size_pt or _TABLE_DEFAULT_PT) for c in row) for row in styles]
     sizes = [max(s, caption) for s in own_sizes]
@@ -2087,7 +2087,7 @@ def _pattern_from_model(model) -> Pattern:
         pattern_id=model.pattern_id, source_slide_index=list(model.source_slide_index),
         layout_id=model.layout_id, kind=model.kind, slots=slots, repeat=repeat, decor=decor,
         capacity=capacity, score=model.score, is_dark=model.is_dark,
-        kind_confidence=model.kind_confidence,
+        kind_confidence=model.kind_confidence, source_density=model.source_density,
     )
 
 
@@ -2328,7 +2328,9 @@ def _shrink_sequence(profile: TemplateProfile, slot_size_pt: float) -> list[floa
     порознь у вызывающего."""
     size_pt = profile.denorm_pt(slot_size_pt)
     raw_steps = {name: profile.type_scale_pt(name, 0.0) for name in _SHRINK_STEPS}
-    caption_pt = raw_steps["caption"]
+    # Пол тот же, что у автопочинки (`TemplateProfile.min_font_pt`): сборка и
+    # починка не должны расходиться в том, какой кегль ещё читается.
+    caption_pt = profile.min_font_pt()
 
     seq = [size_pt]
     for name in _SHRINK_STEPS:

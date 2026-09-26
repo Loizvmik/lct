@@ -47,6 +47,7 @@ def _finding_model(f: Finding) -> schemas.FindingModel:
     return schemas.FindingModel(
         id=finding_id(f), check_id=f.check_id, severity=f.severity, slide_index=f.slide_index,
         shape_ref=f.shape_ref, message=f.message, box=box, fixable=f.fixable, fix_hint=f.fix_hint,
+        repair=f.repair,
     )
 
 
