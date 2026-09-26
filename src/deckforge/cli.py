@@ -16,6 +16,7 @@ import json
 import shutil
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from deckforge.audit.config import AuditConfig
@@ -27,7 +28,10 @@ from deckforge.plan.outline import build_outline, load_content_pack
 from deckforge.plan.photos import assign_photos, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import Variant, apply_variant
-from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, rerank_patterns, write_slides
+from deckforge.plan.writer import (
+    AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, REALIZE_RESERVE_SECONDS, RERANK_VARIANTS, REALIZE_VARIANTS,
+    realize_for_variant, rerank_patterns, write_slides,
+)
 from deckforge.provider.base import LLMProvider
 from deckforge.provider.registry import ModelNotAllowed
 from deckforge.provider.yandex import YandexProvider
@@ -62,7 +66,9 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
         return None
 
 
-def _rerank(deck, profile, variants, budget: RunBudget | None = None) -> tuple[dict, list[str]]:
+def _rerank(
+    deck, profile, variants, budget: RunBudget | None = None, *, prefer_decor: bool = False,
+) -> tuple[dict, list[str]]:
     """Задача D: модель выбирает раскладку из трёх, отобранных кодом, для
     airy и visual. Возвращает `(вариант -> {номер слайда -> pattern_id},
     заметки)`. Выключено в конфиге, нет ключа или конфиг не читается —
@@ -86,11 +92,22 @@ def _rerank(deck, profile, variants, budget: RunBudget | None = None) -> tuple[d
         deck, profile, variants, llm,
         max_workers=settings.llm.pattern_picker_max_workers,
         budget_seconds=settings.llm.pattern_picker_step_budget_seconds, notes=notes,
+        prefer_decor=prefer_decor,
     )
     by_variant: dict = {}
     for (variant, index), pattern_id in chosen.items():
         by_variant.setdefault(variant, {})[index] = pattern_id
     return by_variant, notes
+
+
+def _realize_settings() -> tuple[bool, int, float]:
+    """Переписывание под вариант (задача N, `plan.realize_*`): `(включено,
+    потоков, бюджет шага)`. Без читаемого конфига выключено."""
+    try:
+        plan = Settings.load(APP_YAML_PATH).plan
+    except Exception:
+        return False, 1, 0.0
+    return plan.realize_variants, plan.realize_max_workers, plan.realize_step_budget_seconds
 
 
 def _build_namer() -> LLMProvider | None:
@@ -256,11 +273,6 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     if "normalized_slides" in deck.meta:
         print(f"  содержание приведено к раскладке: {deck.meta['normalized_slides']} слайдов")
 
-    # Задача L: первая контрольная точка режима — решает, идёт ли rerank
-    # раскладок ниже. Держится до следующей точки (`after_compose`).
-    mode_after_write = budget.decide_mode("after_write")
-    print(f"Режим прогона: {mode_after_write.value} (точка after_write, осталось {budget.remaining():.0f}с)")
-
     # Task 20: распределение фотографий контент-пакета по слайдам — ПОСЛЕ
     # текста (нужны уже написанные заголовки/содержание, см. `plan.photos.
     # assign_photos`) и ДО `apply_variant`/`build_deck` (`_compatible_kinds`
@@ -300,97 +312,35 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     print(f"Содержание (для отладки) записано в {debug_path}")
     variants = [Variant[v] for v in args.variants] if args.variants else list(Variant)
 
-    rerank_started = time.monotonic()
-    preferred_by_variant, rerank_notes = _rerank(deck, profile, variants, budget)
-    budget.record("rerank", time.monotonic() - rerank_started)
-    if not preferred_by_variant:
-        for note in rerank_notes:
-            print(f"  ! {note}")
-    if preferred_by_variant:
-        picked = sum(len(v) for v in preferred_by_variant.values())
-        print(f"Раскладки airy/visual уточнены моделью: {picked} слайдов за {time.monotonic() - rerank_started:.1f}с")
-        for note in rerank_notes:
-            print(f"  ! {note}")
-
+    # Задача N: фотографии распределены, общие стадии позади. Дальше
+    # варианты идут параллельно, каждый целиком в своём бюджете (300с минус
+    # общие стадии): лимит ТЗ считается на одну презентацию. Бюджеты
+    # заводятся все сразу, чтобы дедлайн у вариантов был один. Печать
+    # каждого варианта копится и выводится целиком, иначе строки трёх
+    # потоков перемешались бы.
+    budget.record("photos", photos_at - written_at)
+    budgets = {variant: budget.for_variant(variant.value) for variant in variants}
     # Вариант, по которому идёт аудит по картинке: dense, если собирается,
-    # иначе первый из заказанных (содержание у вариантов одно).
+    # иначе первый из заказанных.
     visual_variant = Variant.dense if Variant.dense in variants else variants[0]
-    visual_target = None
-    for variant in variants:
-        step_started = time.monotonic()
-        variant_deck = apply_variant(deck, profile, variant, preferred=preferred_by_variant.get(variant))
-        built_path = build_deck(variant_deck, profile, args.template, variant, user_photos=user_photos)
-        built_at = time.monotonic()
-        path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-t13.pptx"
-        shutil.copy2(built_path, path)
-        findings = run_deterministic(path, profile, config)
-        audited_at = time.monotonic()
-        budget.record("compose", built_at - step_started)
-        budget.record("audit", audited_at - built_at)
-        if variant == visual_variant:
-            visual_target = (path, variant_deck, findings)
-
-        by_severity: dict[str, int] = {}
-        for f in findings:
-            by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
-        by_check: dict[str, int] = {}
-        for f in findings:
-            by_check[f.check_id] = by_check.get(f.check_id, 0) + 1
-
-        print(
-            f"\n[{variant.value}] {path.name}: {len(variant_deck.slides)} слайдов, "
-            f"сборка {built_at - step_started:.1f}с, аудит {audited_at - built_at:.1f}с"
-        )
-        print(f"  находки по серьёзности: {by_severity or '(нет)'}")
-        print(f"  находки по видам: {dict(sorted(by_check.items()))}")
-        slide_findings = [s for v in variant_deck.slides for s in v.findings]
-        if slide_findings:
-            print(f"  находки сборки (усечения/переполнения): {len(slide_findings)}")
-        for f in slide_findings:
-            if "раскладка под содержание не найдена" in f:
-                print(f"  ! {f}")
-
-        # Task 22: сколько фотографий контент-пакета РЕАЛЬНО легло на
-        # слайды ЭТОГО варианта — считано по байтам уже сохранённого
-        # `.pptx` (`count_embedded_photos`), не взято из плана
-        # `assign_photos` (см. комментарий у печати плана выше). Число не
-        # обязано совпадать с планом: у dense/airy/visual разные раскладки
-        # на один и тот же слайд, и у части из них может не быть слота под
-        # фото, даже если у другого варианта того же слайда — есть.
-        if photos:
-            embedded = count_embedded_photos(path, user_photos)
-            not_embedded_findings = [
-                f for f in slide_findings if "фотограф" in f.lower() and "не вставлен" in f.lower()
-            ]
-            print(
-                f"  фотографий физически на слайдах: {embedded} из {photo_report.placed_count} "
-                "распределённых планировщиком"
-            )
-            if embedded < photo_report.placed_count:
-                if not_embedded_findings:
-                    print("  ! не вставлены (нет слота в выбранной раскладке):")
-                    for f in not_embedded_findings:
-                        print(f"    - {f}")
-                else:
-                    print(
-                        "  ! расхождение план/факт есть, но причина не найдена среди находок "
-                        "сборки — требует разбора."
-                    )
-
-    # Вторая контрольная точка — после сборки всех вариантов, перед аудитом
-    # по картинке: столько же rerank уже позади, время потрачено, остаток
-    # может отличаться от точки after_write (см. докстроку `RunBudget.
-    # decide_mode`).
-    mode_after_compose = budget.decide_mode("after_compose")
-    print(f"Режим прогона: {mode_after_compose.value} (точка after_compose, осталось {budget.remaining():.0f}с)")
-
-    if visual_target is not None:
-        _visual_stage(budget, visual_target, visual_variant, sources)
+    ctx = dict(
+        deck=deck, profile=profile, args=args, config=config, user_photos=user_photos,
+        photos=photos, photo_report=photo_report, sources=sources, visual_variant=visual_variant,
+    )
+    with ThreadPoolExecutor(max_workers=len(variants)) as pool:
+        futures = [pool.submit(_generate_variant, variant, budgets[variant], ctx) for variant in variants]
+        outputs = [future.result() for future in futures]
+    for lines in outputs:
+        print("\n".join(lines))
 
     summary = budget.summary()
-    print(f"\nВсего: {time.monotonic() - started:.1f}с (бюджет {budget.deadline_seconds:.0f}с)")
-    print(f"  режим: {summary['mode']} (точка {summary['mode_checkpoint']})")
-    print(f"  по стадиям: {summary['stage_seconds']}")
+    print(f"\nВсего: {time.monotonic() - started:.1f}с (бюджет {budget.deadline_seconds:.0f}с на презентацию)")
+    print(f"  общие стадии: {summary['stage_seconds']}")
+    for name, part in summary.get("variants", {}).items():
+        print(
+            f"  [{name}] {part['elapsed_seconds']:.1f}с после общих стадий, режим {part['mode']}, "
+            f"по стадиям: {part['stage_seconds']}"
+        )
     print(
         "\nПолный аудит по картинке всех слайдов (C01-C11) запускается отдельно на "
         "готовом .pptx:\n"
@@ -400,30 +350,147 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     return 0
 
 
-def _visual_stage(budget: RunBudget, target, variant, sources) -> None:
+def _visual_stage(budget: RunBudget, target, variant, sources, out: list[str]) -> None:
     """Аудит по картинке рискованных слайдов одного варианта в рамках
-    бюджета прогона (задача H, `workflow.visual_stage`). Превью рендерятся,
-    только если стадия реально пойдёт."""
+    его бюджета (задача H, `workflow.visual_stage`). Превью рендерятся,
+    только если стадия реально пойдёт. Печать копится в `out`."""
     path, variant_deck, findings = target
     outcome = run_visual_stage(
         budget, variant_deck, findings, _build_vlm(),
         lambda: to_pngs(path, path.parent / f"{path.stem}__risk-preview"), sources=sources,
     )
     if outcome.result is None:
-        print(f"\nАудит по картинке рискованных слайдов не выполнялся: {outcome.skipped_reason}")
+        out.append(f"\nАудит по картинке рискованных слайдов не выполнялся: {outcome.skipped_reason}")
         return
     slides = ", ".join(
         f"{pos + 1} (техн. {tech:.1f}, смысл. {sem:.1f})" for pos, tech, sem in outcome.picked
     )
-    print(
+    out.append(
         f"\n[{variant.value}] аудит по картинке рискованных слайдов: {slides}; "
         f"{outcome.result.model_calls} вызовов модели за {outcome.seconds:.1f}с"
     )
     report = AuditReport.merge(findings, outcome.result)
-    print(f"  находок модели: {report.visual_count}, всего в отчёте: {len(report.findings)}")
+    out.append(f"  находок модели: {report.visual_count}, всего в отчёте: {len(report.findings)}")
     for f in outcome.findings:
         where = f"слайд {f.slide_index + 1}" if f.slide_index is not None else "колода"
-        print(f"  [{f.severity}] {f.check_id} ({where}): {f.message}")
+        out.append(f"  [{f.severity}] {f.check_id} ({where}): {f.message}")
+
+
+def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[str]:
+    """Всё после текста для одного варианта, в его бюджете (задача N):
+    rerank, переписывание под раскладку, сборка, аудит, аудит по картинке.
+    Возвращает строки отчёта, печатает их вызывающий код целиком."""
+    deck, profile, args = ctx["deck"], ctx["profile"], ctx["args"]
+    photos, photo_report = ctx["photos"], ctx["photo_report"]
+    out: list[str] = []
+    mode = budget.decide_mode("after_write")
+    out.append(f"\n[{variant.value}] режим: {mode.value} (точка after_write, осталось {budget.remaining():.0f}с)")
+
+    realize_on, realize_workers, realize_budget = _realize_settings()
+    realizer = _build_role_provider("writer") if realize_on and variant in REALIZE_VARIANTS else None
+    # Нарядная раскладка без переписывания даст переполнение: `prefer_decor`
+    # только когда переписывание реально пойдёт и после него останется время
+    # на сборку.
+    prefer_decor = (
+        realizer is not None and mode is not RunMode.EMERGENCY
+        and budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS) > 0
+    )
+
+    preferred = None
+    if variant in RERANK_VARIANTS:
+        step_started = time.monotonic()
+        chosen, notes = _rerank(deck, profile, [variant], budget, prefer_decor=prefer_decor)
+        budget.record("rerank", time.monotonic() - step_started)
+        preferred = chosen.get(variant)
+        if preferred:
+            out.append(f"  раскладки уточнены моделью: {len(preferred)} слайдов за {time.monotonic() - step_started:.1f}с")
+        for note in notes:
+            out.append(f"  ! {note}")
+
+    step_started = time.monotonic()
+    variant_deck = apply_variant(deck, profile, variant, preferred=preferred, prefer_decor=prefer_decor)
+    if prefer_decor:
+        variant_deck = realize_for_variant(
+            variant_deck, variant, profile, realizer, max_workers=realize_workers,
+            budget_seconds=budget.allowance(realize_budget, reserve=REALIZE_RESERVE_SECONDS),
+        )
+        realized_at = time.monotonic()
+        budget.record("realize", realized_at - step_started)
+        meta = variant_deck.meta
+        out.append(
+            f"  текст под раскладку: переписано {meta.get('realize_accepted', '0')} из "
+            f"{meta.get('realize_overflowing', '0')} переполненных слайдов за {realized_at - step_started:.1f}с"
+        )
+        if meta.get("realize_log"):
+            out.append(f"    {meta['realize_log']}")
+        step_started = realized_at
+    built_path = build_deck(variant_deck, profile, args.template, variant, user_photos=ctx["user_photos"])
+    built_at = time.monotonic()
+    path = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-t13.pptx"
+    shutil.copy2(built_path, path)
+    variant_debug = args.output_dir / f"{args.template.stem}__{args.content_pack.name}__{variant.value}-deck.json"
+    variant_debug.write_text(json.dumps(deck_spec_to_dict(variant_deck), ensure_ascii=False, indent=2), encoding="utf-8")
+    findings = run_deterministic(path, profile, ctx["config"])
+    audited_at = time.monotonic()
+    budget.record("compose", built_at - step_started)
+    budget.record("audit", audited_at - built_at)
+
+    by_severity: dict[str, int] = {}
+    for f in findings:
+        by_severity[f.severity] = by_severity.get(f.severity, 0) + 1
+    by_check: dict[str, int] = {}
+    for f in findings:
+        by_check[f.check_id] = by_check.get(f.check_id, 0) + 1
+
+    out.append(
+        f"[{variant.value}] {path.name}: {len(variant_deck.slides)} слайдов, "
+        f"сборка {built_at - step_started:.1f}с, аудит {audited_at - built_at:.1f}с"
+    )
+    out.append(f"  раскладки: {', '.join(s.pattern_id or '-' for s in variant_deck.slides)}")
+    out.append(f"  находки по серьёзности: {by_severity or '(нет)'}")
+    out.append(f"  находки по видам: {dict(sorted(by_check.items()))}")
+    slide_findings = [s for v in variant_deck.slides for s in v.findings]
+    if slide_findings:
+        out.append(f"  находки сборки (усечения/переполнения): {len(slide_findings)}")
+    for f in slide_findings:
+        if "раскладка под содержание не найдена" in f:
+            out.append(f"  ! {f}")
+
+    # Task 22: сколько фотографий контент-пакета РЕАЛЬНО легло на
+    # слайды ЭТОГО варианта — считано по байтам уже сохранённого
+    # `.pptx` (`count_embedded_photos`), не взято из плана
+    # `assign_photos`. Число не обязано совпадать с планом: у dense/airy/
+    # visual разные раскладки на один и тот же слайд.
+    if photos:
+        embedded = count_embedded_photos(path, ctx["user_photos"])
+        not_embedded_findings = [
+            f for f in slide_findings if "фотограф" in f.lower() and "не вставлен" in f.lower()
+        ]
+        out.append(
+            f"  фотографий физически на слайдах: {embedded} из {photo_report.placed_count} "
+            "распределённых планировщиком"
+        )
+        if embedded < photo_report.placed_count:
+            if not_embedded_findings:
+                out.append("  ! не вставлены (нет слота в выбранной раскладке):")
+                for f in not_embedded_findings:
+                    out.append(f"    - {f}")
+            else:
+                out.append(
+                    "  ! расхождение план/факт есть, но причина не найдена среди находок "
+                    "сборки — требует разбора."
+                )
+
+    # Вторая контрольная точка варианта — после сборки, перед аудитом по
+    # картинке (см. докстроку `RunBudget.decide_mode`).
+    mode_after_compose = budget.decide_mode("after_compose")
+    out.append(
+        f"  режим: {mode_after_compose.value} (точка after_compose, осталось {budget.remaining():.0f}с)"
+    )
+    if variant == ctx["visual_variant"]:
+        _visual_stage(budget, (path, variant_deck, findings), variant, ctx["sources"], out)
+    budget.stop()
+    return out
 
 
 def _cmd_audit_visual(args: argparse.Namespace) -> int:

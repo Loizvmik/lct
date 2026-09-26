@@ -193,6 +193,12 @@ class PlanConfig(BaseModel):
     # модели на незнакомом шаблоне окажется хуже кода или не влезет в бюджет
     # времени: вернуть чисто детерминированный выбор одной строкой конфига.
     rerank_variants: bool = True
+    # Задача N: текст airy/visual под выбранную раскладку (`plan.writer.
+    # realize_for_variant`) и выбор нарядных раскладок под это; числа см. в
+    # app.yaml.
+    realize_variants: bool = True
+    realize_max_workers: int = 4
+    realize_step_budget_seconds: float = 60.0
 
 
 class RunModeConfig(BaseModel):

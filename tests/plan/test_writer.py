@@ -6,7 +6,7 @@ import threading
 import time
 
 from deckforge.plan.outline import Outline, OutlineSlide, SourceDoc
-from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, validate_deck_spec
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock, validate_deck_spec
 from deckforge.compose.slide_tools import list_layouts
 from deckforge.plan.variants import Variant, apply_variant, rerank_candidates
 from deckforge.plan.writer import _drop_thin_duplicates, _flag_repeated_headlines, pick_patterns, rerank_patterns, write_slides
@@ -843,3 +843,146 @@ def test_repair_limited_by_item_count_skips_richer_slides(PROFILE):
 
     assert "fill_repairs" not in deck.meta
 
+
+# ---------------------------------------------------------------------------
+# realize_for_variant — текст под раскладку варианта (задача N)
+# ---------------------------------------------------------------------------
+
+_LONG_FACT = (
+    "Ожидание первого согласующего занимает медиану 18 часов, второго ещё 11 часов, "
+    "а чистая работа людей укладывается в 28 минут; переназначений вручную 4%. "
+)
+
+
+def _overflowing_layout(profile) -> str:
+    """Раскладка списка, куда длинный абзац не влезает, а короткий влезает:
+    ровно тот случай, ради которого переписывание и нужно."""
+    from deckforge.plan.writer import layout_overflow
+
+    for p in profile.patterns:
+        if p.kind != "bullets" or p.repeat is not None:
+            continue
+        long_slide = SlideSpec(index=1, kind="bullets", headline="Где уходит время",
+                               blocks=[TextBlock(text=_LONG_FACT * 3)], pattern_id=p.pattern_id)
+        short_slide = replace(long_slide, blocks=[TextBlock(text="Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%")])
+        if layout_overflow(long_slide, profile) and not layout_overflow(short_slide, profile):
+            return p.pattern_id
+    raise AssertionError("на контрольном шаблоне нет раскладки списка средней вместимости")
+
+
+def _realize_deck(profile) -> DeckSpec:
+    pid = _overflowing_layout(profile)
+    return DeckSpec(title="T", language="ru", slides=[
+        SlideSpec(index=0, kind="section", headline="Обложка"),
+        SlideSpec(index=1, kind="bullets", headline="Где уходит время", pattern_id=pid,
+                  blocks=[TextBlock(text=_LONG_FACT * 3)], source_note="Источник: пилот"),
+        SlideSpec(index=2, kind="bullets", headline="Что изменилось", pattern_id=pid,
+                  blocks=[TextBlock(text="Медиана сократилась до 6,2 часа")]),
+    ])
+
+
+def _realized_json(text: str) -> str:
+    return json.dumps({
+        "kind": "bullets", "headline": "Другой заголовок",
+        "blocks": [{"type": "text", "text": text}], "source_note": "Источник: пилот",
+    }, ensure_ascii=False)
+
+
+def test_realize_accepts_a_shorter_text_that_keeps_every_number(PROFILE):
+    from deckforge.plan.writer import layout_overflow, realize_for_variant
+
+    deck = _realize_deck(PROFILE)
+    llm = _PayloadLLM(lambda payload: _realized_json("Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%"))
+
+    out = realize_for_variant(deck, Variant.visual, PROFILE, llm)
+
+    assert llm.calls == 1  # второй слайд влезает, модель его не видит
+    slide = out.slides[1]
+    assert slide.blocks[0].text == "Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%"
+    assert slide.headline == "Где уходит время"  # заголовок-вывод не меняется
+    assert slide.pattern_id == deck.slides[1].pattern_id
+    assert not layout_overflow(slide, PROFILE)
+    assert "18" in slide.speaker_notes  # полный текст остался докладчику
+    assert out.slides[2] is deck.slides[2]
+    assert out.meta["realize_overflowing"] == "1" and out.meta["realize_accepted"] == "1"
+
+
+def test_realize_rejects_an_answer_that_lost_a_number(PROFILE):
+    from deckforge.plan.writer import realize_for_variant
+
+    deck = _realize_deck(PROFILE)
+    llm = _PayloadLLM(lambda payload: _realized_json("Медиана 18 ч и 11 ч, работа 28 мин"))  # без 4%
+
+    out = realize_for_variant(deck, Variant.visual, PROFILE, llm)
+
+    assert llm.calls == 1
+    assert out.slides[1] is deck.slides[1]
+    assert out.meta["realize_accepted"] == "0"
+    assert "4" in out.meta["realize_log"] and "потеряны числа" in out.meta["realize_log"]
+
+
+def test_realize_rejects_more_pieces_than_the_layout_has_places(PROFILE):
+    """Лишний абзац сборка молча выбросит: такой ответ теряет факт мимо
+    проверки чисел и приниматься не должен."""
+    from deckforge.plan.writer import realize_for_variant
+
+    deck = _realize_deck(PROFILE)
+    pieces = ["18 ч", "11 ч", "28 мин", "4%"] + [f"Пункт {chr(0x0430 + i)}" for i in range(12)]
+    llm = _PayloadLLM(lambda payload: json.dumps({
+        "kind": "bullets", "headline": "x", "blocks": [{"type": "text", "text": t} for t in pieces],
+    }, ensure_ascii=False))
+
+    out = realize_for_variant(deck, Variant.visual, PROFILE, llm)
+
+    assert out.slides[1] is deck.slides[1]
+    assert "кусков больше" in out.meta["realize_log"]
+
+
+def test_realize_does_not_demand_numbers_the_headline_already_carries(PROFILE):
+    from deckforge.plan.writer import realize_for_variant
+
+    deck = _realize_deck(PROFILE)
+    deck.slides[1] = replace(deck.slides[1], headline="Ожидание 18 часов вместо работы")
+    seen: list[dict] = []
+
+    def answer(payload):
+        seen.append(payload)
+        return _realized_json("Второй ждёт 11 ч, работа 28 мин, вручную 4%")
+
+    out = realize_for_variant(deck, Variant.visual, PROFILE, _PayloadLLM(answer))
+
+    assert "18" not in seen[0]["must_keep"]
+    assert out.meta["realize_accepted"] == "1"
+    assert out.slides[1].source_note == "Источник: пилот"
+
+
+def test_realize_payload_names_the_numbers_and_the_layout_places(PROFILE):
+    from deckforge.plan.writer import realize_for_variant
+
+    seen: list[dict] = []
+
+    def answer(payload):
+        seen.append(payload)
+        return _realized_json("Медиана 18 ч и 11 ч, работа 28 мин, вручную 4%")
+
+    deck = _realize_deck(PROFILE)
+    realize_for_variant(deck, Variant.airy, PROFILE, _PayloadLLM(answer))
+
+    assert seen[0]["must_keep"] == sorted({"18", "11", "28", "4"})
+    assert seen[0]["layout"]["layout_id"] == deck.slides[1].pattern_id
+    assert seen[0]["layout"]["places"] and seen[0]["overflow"]
+    assert "box" not in json.dumps(seen[0], ensure_ascii=False)
+
+
+def test_realize_calls_nothing_when_text_fits_or_for_dense(PROFILE):
+    from deckforge.plan.writer import realize_for_variant
+
+    deck = _realize_deck(PROFILE)
+    llm = _PayloadLLM(lambda payload: _realized_json("x"))
+
+    assert realize_for_variant(deck, Variant.dense, PROFILE, llm) is deck
+    fitting = replace(deck, slides=[deck.slides[0], deck.slides[2]])
+    out = realize_for_variant(fitting, Variant.visual, PROFILE, llm)
+    assert llm.calls == 0
+    assert out.slides == fitting.slides
+    assert realize_for_variant(deck, Variant.visual, PROFILE, None) is deck

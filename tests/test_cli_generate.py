@@ -117,9 +117,9 @@ def test_generate_passes_the_model_layout_choice_to_apply_variant(monkeypatch, c
     captured: dict = {}
     real_apply = cli_module.apply_variant
 
-    def _spy(deck, profile, variant, preferred=None):
+    def _spy(deck, profile, variant, preferred=None, **kw):
         captured[variant] = preferred
-        return real_apply(deck, profile, variant, preferred=preferred)
+        return real_apply(deck, profile, variant, preferred=preferred, **kw)
 
     monkeypatch.setattr(cli_module, "apply_variant", _spy)
     # Без ключа запасной текст слайдов пуст, и модели не из чего выбирать:

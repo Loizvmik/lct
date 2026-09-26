@@ -123,3 +123,34 @@ def test_load_policy_reads_run_section(tmp_path: Path):
 
 def test_load_policy_falls_back_to_defaults(tmp_path: Path):
     assert load_policy(tmp_path / "missing.yaml") == BudgetPolicy()
+
+
+def test_each_variant_gets_the_budget_left_after_shared_stages():
+    """Задача N: пять минут считаются на одну презентацию. Общие стадии
+    съедают часть бюджета прогона; дальше у каждого варианта свои часы,
+    свой режим и свои стадии, а медленный сосед режим не отнимает."""
+    clock = _Clock()
+    budget = _budget(clock, budget_seconds=300)
+    clock.now += 100
+    budget.record("write", 100)
+    fast, slow = budget.for_variant("dense"), budget.for_variant("visual")
+    assert fast.deadline_seconds == slow.deadline_seconds == 200
+
+    fast.decide_mode("after_write")
+    fast.record("compose", 10)
+    clock.now += 10
+    fast.stop()
+    clock.now += 100  # visual всё ещё работает
+    slow.record("realize", 110)
+    assert slow.decide_mode("after_compose") is RunMode.FAST  # 200 - 110 = 90 < 120
+    assert fast.mode is RunMode.FULL
+
+    summary = budget.summary()
+    assert summary["shared_stages"] == ["write"]
+    assert summary["stage_seconds"] == {"write": 100.0}
+    assert summary["variants"]["dense"]["elapsed_seconds"] == 10.0  # часы остановлены
+    assert summary["variants"]["visual"]["elapsed_seconds"] == 110.0
+    assert summary["variants"]["visual"]["stage_seconds"] == {"realize": 110.0}
+    view = budget.variant_summary("dense")
+    assert view["stage_seconds"] == {"write": 100.0, "compose": 10.0}
+    assert view["shared_stages"] == ["write"] and view["variant_seconds"] == 10.0
