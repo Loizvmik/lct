@@ -213,7 +213,12 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # по коробкам.
 # 20 -> 21: подсказка «Вставить фото» в рамке становится слотом `image`
 # (`patterns._promote_photo_placeholders`); старый кеш держал её подписью.
-PROFILE_SCHEMA_VERSION = 21
+# 21 -> 22: задача J — схема места от модели несёт уверенность
+# (`schema_confidence`), флаги `ordinal`/`fixed` принимаются только при
+# уверенности не ниже 0,8, а `fixed` ещё и только для короткой фразы без
+# подсказок дизайнера (`patterns.is_fixed_phrase`). В кеше v21 подсказка
+# «Точки используются для навигации» могла лежать как `fixed`.
+PROFILE_SCHEMA_VERSION = 22
 
 # Строка отчёта «откуда что взято» про вид раскладки: её пишет
 # `_build_provenance` при полном разборе и она же ищется/заменяется при
@@ -497,6 +502,7 @@ class PatternSlotModel(BaseModel):
     max_words: int | None = None
     ordinal: bool = False
     fixed: bool = False
+    schema_confidence: float | None = None
     # Id исходной фигуры на слайде-примере (`patterns.PatternSlot.
     # source_shape_id`). `None`: старый кеш или фигура без id, клон тогда
     # ищет фигуру по коробке.
@@ -505,7 +511,7 @@ class PatternSlotModel(BaseModel):
 
 # Поля схемы места: одним списком для применения ответа модели и для
 # переноса схемы между зеркалами при перемайнинге (`_carry_slot_schema`).
-_SLOT_SCHEMA_FIELDS = ("purpose", "content_hint", "max_words", "ordinal", "fixed")
+_SLOT_SCHEMA_FIELDS = ("purpose", "content_hint", "max_words", "ordinal", "fixed", "schema_confidence")
 
 
 def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
@@ -514,7 +520,7 @@ def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
         align=slot.align, max_chars=slot.max_chars, wraps=slot.wraps, sample_text=slot.sample_text,
         anchor=slot.anchor, purpose=slot.purpose, content_hint=slot.content_hint,
         max_words=slot.max_words, ordinal=slot.ordinal, fixed=slot.fixed,
-        source_shape_id=slot.source_shape_id,
+        schema_confidence=slot.schema_confidence, source_shape_id=slot.source_shape_id,
     )
 
 

@@ -435,7 +435,7 @@ def _placeholder_is_empty(shape) -> bool:
     (см. докстроку раздела) — проверка на текст/картинку, а не безусловное
     удаление, оставлена честно: если однажды появится путь, кладущий
     контент прямо в плейсхолдер, эта функция не снесёт его."""
-    if shape.has_text_frame and shape.text_frame.text.strip():
+    if shape.has_text_frame and shape.text_frame.text.strip().strip(_INVISIBLE_CHARS).strip():
         return False
     if shape._element.findall(".//" + qn("a:blip")):
         return False
@@ -1475,6 +1475,13 @@ def place_slide_by_clone(
             )
             continue
         clean.append(content)
+    blank = next((c for c in clean if not _visible_text(c)), None)
+    if blank is not None:
+        # Пустая привязка оставила бы фигуру примера без текста: плейсхолдер
+        # в PowerPoint показывает подсказку «Нажмите дважды», а заголовок
+        # разделителя выходит пустым (наблюдение 8.2). Такой клон честнее
+        # отклонить, чем собрать с пустым местом.
+        return CloneOutcome(f"слот «{blank.role_hint}» получил пустой текст")
     visual = slide_spec.visual
     table_rows = visual.table.rows if visual is not None and visual.kind == "table" and visual.table else None
     table_slot = _visual_slot(pattern, "table") if table_rows else None
@@ -1545,6 +1552,15 @@ def place_slide_by_clone(
     _note_drops(slide_spec, pattern, drops)
     mark_slide(slide, CLONE_MARK_PREFIX + pattern.pattern_id)
     return CloneOutcome(None)
+
+
+# Символы нулевой ширины: `str.strip` их не срезает, а на слайде они
+# невидимы, и текст из одних таких символов для глаза пуст.
+_INVISIBLE_CHARS = "​‌‍⁠﻿"
+
+
+def _visible_text(content: SlotContent) -> str:
+    return "".join(p.text for p in content.paragraphs).strip().strip(_INVISIBLE_CHARS).strip()
 
 
 def _native_repeat_contents(pattern: Pattern, contents: list[SlotContent]) -> list[SlotContent] | None:
@@ -1977,7 +1993,7 @@ def _pattern_from_model(model) -> Pattern:
             align=s.align, max_chars=s.max_chars, wraps=s.wraps, sample_text=s.sample_text,
             anchor=s.anchor, purpose=s.purpose, content_hint=s.content_hint,
             max_words=s.max_words, ordinal=s.ordinal, fixed=s.fixed,
-            source_shape_id=s.source_shape_id,
+            schema_confidence=s.schema_confidence, source_shape_id=s.source_shape_id,
         )
         for s in model.slots
     ]

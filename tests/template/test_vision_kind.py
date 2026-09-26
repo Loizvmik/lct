@@ -10,6 +10,7 @@ Task 18: модель спрашивается только про паттер�
 пачек читается из `config/app.yaml` при `max_workers=None`."""
 from __future__ import annotations
 import json
+from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image
@@ -26,6 +27,7 @@ from deckforge.template.vision_kind import (
     allowed_kind_ids,
     classify_patterns_by_vision,
     load_pattern_kinds,
+    validate_slot_schema,
 )
 
 
@@ -462,3 +464,66 @@ def test_build_grid_collage_returns_a_decodable_png_sized_for_the_batch():
 
 def test_allowed_kind_ids_matches_load_pattern_kinds():
     assert allowed_kind_ids() == {k["id"] for k in load_pattern_kinds()}
+
+
+# --- схема слотов: уверенность и фильтр постоянного текста (задача J) ---------
+
+def _schema_pattern(*samples: str) -> Pattern:
+    """Разделитель как `slide10`/`slide11` VK Education: заголовок и подпись
+    с текстом примера. `samples` — тексты примера по местам."""
+    slots = [
+        PatternSlot(
+            role="headline" if i == 0 else "caption", box=Box(0.05, 0.1 + 0.2 * i, 0.4, 0.1), size_pt=14.0,
+            color_hex=None, align="l", max_chars=120, wraps=True, sample_text=sample,
+        )
+        for i, sample in enumerate(samples)
+    ]
+    return Pattern(
+        pattern_id="divider", source_slide_index=[10], layout_id="L", kind="section", slots=slots,
+        repeat=None, decor=[],
+        capacity=Capacity(max_items=1, max_chars_per_item=120, max_bullets=0, max_series=0, max_rows=0, max_cols=0),
+        score=1.0, is_dark=False,
+    )
+
+
+def test_fixed_designer_hint_is_rejected_even_when_the_model_is_sure():
+    """Скриншот 8.2: подпись «Точки используются для навигации» модель
+    пометила постоянным текстом, и она осталась на разделителе."""
+    pattern = _schema_pattern(
+        "Спасибо \nза внимание!", "Точки используются для навигации. \nЧисло разделов = число точек.",
+        "Вставьте фото", "Пример слайда-разделителя",
+    )
+    answer = {str(i): {"purpose": "текст", "fixed": True, "confidence": 0.95} for i in range(1, 5)}
+
+    accepted, notes = validate_slot_schema(pattern, answer)
+
+    assert accepted[0].get("fixed") is True
+    assert not any(accepted[i].get("fixed") for i in (1, 2, 3))
+    assert sum("fixed не принят" in n for n in notes) == 3
+
+
+def test_low_confidence_drops_flags_first_and_description_below_half():
+    pattern = _schema_pattern("Спасибо за внимание", "1", "2", "3")
+    accepted, notes = validate_slot_schema(pattern, {
+        "1": {"purpose": "финальная фраза", "max_words": 3, "fixed": True, "confidence": 0.7},
+        "2": {"purpose": "номер", "ordinal": True, "confidence": 0.8},
+        "3": {"purpose": "номер", "content_hint": "цифра", "max_words": 1, "ordinal": True, "confidence": 0.3},
+        "4": {"purpose": "номер", "ordinal": True},  # без уверенности: схема места не принята
+    })
+
+    assert accepted[0] == {"purpose": "финальная фраза", "max_words": 3, "schema_confidence": 0.7}
+    assert accepted[1] == {"purpose": "номер", "ordinal": True, "schema_confidence": 0.8}
+    assert accepted[2] == {"schema_confidence": 0.3}
+    assert 3 not in accepted
+    assert any("fixed не принят" in n for n in notes)
+    assert any("нет уверенности" in n for n in notes)
+
+
+def test_keeps_sample_text_rechecks_fixed_from_an_old_cache():
+    """Профиль, записанный до фильтра, несёт `fixed=True` на подсказке
+    дизайнера: сборка всё равно не оставляет её на слайде."""
+    pattern = _schema_pattern("Спасибо за внимание!", "Точки используются для навигации.")
+    thanks, hint = (replace(s, fixed=True) for s in pattern.slots)
+
+    assert thanks.keeps_sample_text
+    assert not hint.keeps_sample_text
