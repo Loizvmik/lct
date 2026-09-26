@@ -84,6 +84,11 @@ class VariantSummary(BaseModel):
     by_severity: dict[str, int]
     by_check: dict[str, int]
     autofixed_count: int
+    # Задача T: метрики верности шаблону (`audit.fidelity.FidelityReport`,
+    # снятые слепком через `dataclasses.asdict`) — `None`, пока экспорт
+    # варианта ещё не дошёл до этого шага, или метрика не посчиталась
+    # (честная деградация, см. `api.jobs._export_variant`).
+    fidelity: dict | None = None
 
 
 class FixRequest(BaseModel):

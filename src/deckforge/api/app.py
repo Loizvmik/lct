@@ -66,7 +66,7 @@ def _variant_summary(store: JobStore, state: VariantState) -> schemas.VariantSum
         variant=state.variant.value, slide_count=len(state.deck_spec.slides),
         preview_pngs=[_png_url(store, p) for p in state.preview_pngs],
         findings=findings, by_severity=by_severity, by_check=by_check,
-        autofixed_count=state.autofixed_count,
+        autofixed_count=state.autofixed_count, fidelity=state.fidelity,
     )
 
 

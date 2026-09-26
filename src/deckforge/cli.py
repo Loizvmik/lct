@@ -21,6 +21,7 @@ from pathlib import Path
 
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
+from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.report import AuditReport
 from deckforge.audit.visual import run_visual
 from deckforge.compose.builder import build_deck, count_embedded_photos
@@ -447,6 +448,13 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
         f"сборка {built_at - step_started:.1f}с, аудит {audited_at - built_at:.1f}с"
     )
     out.append(f"  раскладки: {', '.join(s.pattern_id or '-' for s in variant_deck.slides)}")
+    # Задача T: сводка верности шаблону на вариант; печать, не решение
+    # пайплайна, и она не должна ронять генерацию (профиль в кэше старше
+    # кода метрики и т.п.).
+    try:
+        out.append(f"  {template_fidelity(path, variant_deck, profile).summary}")
+    except Exception as exc:  # noqa: BLE001 — сводка необязательна
+        out.append(f"  ! Верность шаблону не посчитана: {exc}")
     out.append(f"  находки по серьёзности: {by_severity or '(нет)'}")
     out.append(f"  находки по видам: {dict(sorted(by_check.items()))}")
     slide_findings = [s for v in variant_deck.slides for s in v.findings]
@@ -581,6 +589,47 @@ def _cmd_audit_visual(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_fidelity(args: argparse.Namespace) -> int:
+    """Задача T: метрики верности шаблону (`audit.fidelity.template_
+    fidelity`) на уже готовом `.pptx` и сохранённом `DeckSpec` (json,
+    тот же файл, что и `audit-visual` читает — `deckforge generate` пишет
+    его рядом с каждой колодой). Ничего не пересобирает и модель не
+    зовёт — тот же принцип, что и у `audit-visual`."""
+    profile = TemplateProfile.from_file(args.template)
+    spec = deck_spec_from_debug_dict(json.loads(args.deck_json.read_text(encoding="utf-8")))
+
+    report = template_fidelity(args.pptx, spec, profile)
+
+    print(f"{args.pptx.name}: {report.summary}")
+    print(f"  доля слайдов клоном: {report.native_clone_rate:.0%}")
+    print(f"  сохранность фигур примера: {_fmt_metric(report.native_shape_preservation)}")
+    print(f"  типографика/палитра без находок: {_fmt_metric(report.typography_palette_compliance)}")
+    print(
+        "  среднее отклонение геометрии: "
+        + (f"{report.mean_geometry_deviation:.1%}" if report.mean_geometry_deviation is not None else "н/д")
+    )
+    print(f"  разнообразие раскладок: {_fmt_metric(report.pattern_diversity)}")
+    print(
+        "  энтропия распределения раскладок: "
+        + (f"{report.pattern_entropy:.2f}" if report.pattern_entropy is not None else "н/д")
+    )
+    print(f"  использование родных ассетов: {_fmt_metric(report.native_asset_usage)}")
+    print(
+        "  дельта плотности к паттерну: "
+        + (f"{report.density_delta:.1%}" if report.density_delta is not None else "н/д")
+    )
+    if report.notes:
+        print("\nПримечания:")
+        for note in report.notes:
+            print(f"  ! {note}")
+
+    return 0
+
+
+def _fmt_metric(value: float | None) -> str:
+    return f"{value:.0%}" if value is not None else "н/д"
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="deckforge", description="DeckForge — разбор .pptx-шаблонов в дизайн-систему")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -628,6 +677,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Число параллельных вызовов модели на слайд (по умолчанию — 4, как у run_visual)",
     )
     audit_cmd.set_defaults(func=_cmd_audit_visual)
+
+    fidelity_cmd = sub.add_parser(
+        "fidelity",
+        help="Метрики верности шаблону (Template Fidelity) на уже готовом .pptx",
+    )
+    fidelity_cmd.add_argument("template", type=Path, help="Путь к .pptx-шаблону")
+    fidelity_cmd.add_argument("pptx", type=Path, help="Готовый собранный .pptx (например, из deckforge generate)")
+    fidelity_cmd.add_argument(
+        "deck_json", type=Path,
+        help="DeckSpec в JSON, сохранённый deckforge generate (<шаблон>__<пакет>__deck-t13.json)",
+    )
+    fidelity_cmd.set_defaults(func=_cmd_fidelity)
 
     return parser
 
