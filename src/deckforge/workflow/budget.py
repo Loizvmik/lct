@@ -42,6 +42,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable
 
+from deckforge.provider.scheduler import stage_priority
+
 
 class RunMode(str, Enum):
     """Три режима прогона (задача L, `config/app.yaml` — `run.modes`).
@@ -295,6 +297,13 @@ class RunBudget:
             role: {k: (round(v, 1) if isinstance(v, float) else v) for k, v in entry.items()}
             for role, entry in by_role.items()
         }
+        # Ожидание очереди по классам стадий (задача V4): видно, стояли ли
+        # обязательные стадии за чужими необязательными.
+        by_class: dict[str, float] = {}
+        for role, _sec, waited, _ok in calls:
+            name = f"P{int(stage_priority(role))}"
+            by_class[name] = by_class.get(name, 0.0) + waited
+        out["queue_wait_by_class"] = {k: round(v, 1) for k, v in sorted(by_class.items())}
         out["time_skipped"] = skips
         out["warnings"] = warnings
         return out

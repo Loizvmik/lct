@@ -232,3 +232,71 @@ def test_mandatory_writing_beats_optional_audit_of_a_job_with_the_same_clock():
     second.join()
 
     assert model.order == ["writer", "audit"]
+
+
+def _race(scheduler: ModelScheduler, model: _SlowModel, early, late) -> None:
+    """Слот занят; `early` встаёт в очередь первым, `late` вторым, затем
+    слот освобождается."""
+    first = threading.Thread(target=_ask, args=(early[0], early[1]))
+    first.start()
+    while len(scheduler._waiters) < 1:
+        time.sleep(0.005)
+    second = threading.Thread(target=_ask, args=(late[0], late[1]))
+    second.start()
+    while len(scheduler._waiters) < 2:
+        time.sleep(0.005)
+    scheduler.release()
+    first.join()
+    second.join()
+
+
+def test_writer_of_one_job_beats_visual_audit_of_another_even_with_more_time():
+    """Задача V4: первым встал аудит по картинке задания, у которого до
+    резерва 20с, вторым писатель соседа со 150с. Слот получает писатель:
+    класс стадии важнее остатка времени."""
+    scheduler = ModelScheduler(1)
+    model = _SlowModel(delay=0.01)
+    scheduler.acquire()
+    audit = ScheduledProvider(model, role="visual_audit", budget=_FixedBudget(20.0), scheduler=scheduler)
+    writer = ScheduledProvider(model, role="writer", budget=_FixedBudget(150.0), scheduler=scheduler)
+
+    _race(scheduler, model, (audit, "audit"), (writer, "writer"))
+
+    assert model.order == ["writer", "audit"]
+
+
+def test_repair_beats_visual_audit_but_yields_to_writer():
+    """P1 починка идёт раньше P3 аудита, внутри класса прежний порядок по
+    времени до резерва."""
+    scheduler = ModelScheduler(1)
+    model = _SlowModel(delay=0.01)
+    scheduler.acquire()
+    audit = ScheduledProvider(model, role="visual_audit", budget=_FixedBudget(10.0), scheduler=scheduler)
+    repair = ScheduledProvider(model, role="repair", budget=_FixedBudget(200.0), scheduler=scheduler)
+    _race(scheduler, model, (audit, "audit"), (repair, "repair"))
+    assert model.order == ["repair", "audit"]
+
+    scheduler.acquire()
+    roomy = ScheduledProvider(model, role="visual_audit", budget=_FixedBudget(200.0), scheduler=scheduler)
+    tight = ScheduledProvider(model, role="visual_audit", budget=_FixedBudget(30.0), scheduler=scheduler)
+    _race(scheduler, model, (roomy, "roomy"), (tight, "tight"))
+    assert model.order[-2:] == ["tight", "roomy"]
+
+
+def test_stage_class_is_derived_from_the_role():
+    from deckforge.provider.scheduler import StagePriority, stage_priority
+
+    assert stage_priority("outline") == stage_priority("writer") == StagePriority.STRUCTURE
+    assert stage_priority("repair") == stage_priority("shorten") == StagePriority.REPAIR
+    assert stage_priority("rerank") == StagePriority.RERANK
+    assert stage_priority("visual_audit") == StagePriority.VISUAL_AUDIT
+    assert stage_priority("незнакомая") == StagePriority.STRUCTURE, "незнакомое считается обязательным"
+    assert ScheduledProvider(object(), role="visual_audit", scheduler=ModelScheduler(1)).priority == 3
+
+
+def test_budget_summary_splits_queue_wait_by_stage_class():
+    budget = RunBudget(deadline_seconds=300.0)
+    budget.record_call("writer", 3.0, 1.0, ok=True)
+    budget.record_call("visual_audit", 4.0, 2.5, ok=True)
+    budget.record_call("repair", 2.0, 0.5, ok=True)
+    assert budget.summary()["queue_wait_by_class"] == {"P0": 1.0, "P1": 0.5, "P3": 2.5}

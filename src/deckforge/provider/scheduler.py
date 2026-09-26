@@ -20,8 +20,16 @@ _MODEL_SLOTS`, задача P), а аудит по картинке, почин�
 него и пишет в бюджет, сколько вызов шёл и сколько ждал очередь. Модуль не
 знает про `workflow.budget`: бюджет для него любой объект с `remaining()`
 и `record_call(...)`, чтобы `plan/` мог пользоваться планировщиком, не
-завися от слоя выше."""
+завися от слоя выше.
+
+Задача V4: слот выдаётся сначала по классу стадии, потом по времени до
+резерва. Одного времени мало: аудит по картинке задания, которому до
+резерва осталось 20с, обгонял писателя соседа со 100с, и сосед собирал
+слайды запасным путём ради шага, без которого файл всё равно есть.
+Необязательная стадия не должна стоить обязательной стадии другого
+задания; внутри класса прежний порядок."""
 from __future__ import annotations
+import enum
 import itertools
 import math
 import threading
@@ -37,6 +45,39 @@ DEFAULT_LIMIT = 6
 # Меньше этого вызов не начинается: ответ писателя или аудита по картинке
 # за такое время не приходит, а слот и квота будут потрачены.
 MIN_CALL_SECONDS = 5.0
+
+
+class StagePriority(enum.IntEnum):
+    """Класс стадии в очереди: меньше значит раньше."""
+
+    STRUCTURE = 0  # P0: структура и текст, без них нет презентации
+    REPAIR = 1  # P1: починка и сокращение текста под раскладку
+    RERANK = 2  # P2: переранжирование раскладок моделью
+    VISUAL_AUDIT = 3  # P3: аудит по картинке
+
+
+# Роль вызова -> класс. Разбор шаблона (имена палитры, вид и схема
+# раскладок) обязателен для задания так же, как структура: задание стоит
+# и ждёт его, поэтому P0. Бюджета у разбора нет, и внутри P0 он всё равно
+# идёт за заданиями с часами.
+_ROLE_PRIORITY: dict[str, StagePriority] = {
+    "outline": StagePriority.STRUCTURE,
+    "writer": StagePriority.STRUCTURE,
+    "palette_namer": StagePriority.STRUCTURE,
+    "pattern_kind": StagePriority.STRUCTURE,
+    "pattern_schema": StagePriority.STRUCTURE,
+    "repair": StagePriority.REPAIR,
+    "shorten": StagePriority.REPAIR,
+    "rerank": StagePriority.RERANK,
+    "visual_audit": StagePriority.VISUAL_AUDIT,
+}
+
+
+def stage_priority(role: str) -> StagePriority:
+    """Класс стадии по роли вызова. Незнакомая роль считается обязательной:
+    ошибка в таблице должна стоить соседям места в очереди, а не лишить
+    задание текста."""
+    return _ROLE_PRIORITY.get(role, StagePriority.STRUCTURE)
 
 
 class OutOfTime(RuntimeError):
@@ -59,6 +100,7 @@ class CallBudget(Protocol):
 class _Waiter:
     seq: int
     remaining: Callable[[], float]
+    priority: int = StagePriority.STRUCTURE
 
 
 class ModelScheduler:
@@ -75,19 +117,23 @@ class ModelScheduler:
     def _head(self) -> _Waiter | None:
         # Без бюджета (разбор шаблона, командная строка без бюджета)
         # вызов стоит за всеми заданиями с часами: их пять минут важнее.
-        def key(w: _Waiter) -> tuple[float, int]:
+        def key(w: _Waiter) -> tuple[int, float, int]:
             try:
                 left = w.remaining()
             except Exception:  # noqa: BLE001: сломанный бюджет не должен вешать очередь
                 left = math.inf
-            return (left, w.seq)
+            return (int(w.priority), left, w.seq)
 
         return min(self._waiters, key=key) if self._waiters else None
 
-    def acquire(self, remaining: Callable[[], float] | None = None, *, timeout: float | None = None) -> float:
+    def acquire(
+        self, remaining: Callable[[], float] | None = None, *, timeout: float | None = None,
+        priority: int = StagePriority.STRUCTURE,
+    ) -> float:
         """Занять слот; возвращает секунды ожидания. `timeout` истёк, а
-        слот так и не дали: `OutOfTime`."""
-        waiter = _Waiter(next(self._seq), remaining or (lambda: math.inf))
+        слот так и не дали: `OutOfTime`. `priority` из `StagePriority`:
+        класс важнее остатка времени."""
+        waiter = _Waiter(next(self._seq), remaining or (lambda: math.inf), int(priority))
         started = time.monotonic()
         give_up = None if timeout is None else started + max(timeout, 0.0)
         with self._cond:
@@ -148,14 +194,19 @@ class ScheduledProvider:
     на обязательные стадии (у писателя сборка, аудит и экспорт; у аудита
     по картинке рендер и экспорт отчёта). Дедлайн вызова не больше
     `remaining() - reserve` и не больше `max_call_seconds`; если это
-    меньше `MIN_CALL_SECONDS`, вызов не начинается (`OutOfTime`)."""
+    меньше `MIN_CALL_SECONDS`, вызов не начинается (`OutOfTime`).
+
+    `priority`: класс стадии в очереди; по умолчанию выводится из роли
+    (`stage_priority`)."""
 
     def __init__(
         self, inner: Any, *, role: str, budget: CallBudget | None = None, reserve: float = 0.0,
         scheduler: ModelScheduler | None = None, max_call_seconds: float | None = None,
+        priority: StagePriority | None = None,
     ) -> None:
         self.inner = inner
         self.role = role
+        self.priority = priority if priority is not None else stage_priority(role)
         self.budget = budget
         self.reserve = reserve
         self.scheduler = scheduler if scheduler is not None else default_scheduler()
@@ -194,6 +245,7 @@ class ScheduledProvider:
         try:
             waited = self.scheduler.acquire(
                 remaining, timeout=None if math.isinf(allowed) else allowed - MIN_CALL_SECONDS,
+                priority=self.priority,
             )
         except OutOfTime as exc:
             raise self._skip("очередь к модели не дошла до вызова", str(exc)) from exc
