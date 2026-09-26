@@ -632,3 +632,34 @@ def test_table_without_table_layout_is_named():
     )
     assert structural_gap(slide, PROFILE) == "нужен слот под таблицу, в шаблоне его нет"
 
+
+def test_each_variant_gets_its_own_findings_list():
+    """Три варианта делили один список находок, и находки сборки dense
+    попадали в airy и visual (27 сентября 2026)."""
+    deck = DeckSpec(title="t", language="ru", slides=[
+        SlideSpec(index=0, kind="bullets", headline="Заголовок слайда", blocks=[BulletBlock(items=["а", "б"])]),
+    ])
+    dense = apply_variant(deck, PROFILE, Variant.dense)
+    dense.slides[0].findings.append("только dense")
+    airy = apply_variant(deck, PROFILE, Variant.airy)
+    assert "только dense" not in airy.slides[0].findings
+    assert "только dense" not in deck.slides[0].findings
+
+
+def test_a_layout_with_a_photo_slot_loses_to_an_equal_one_without_when_there_is_no_photo():
+    """Слайд без фото не должен садиться на раскладку с местом под фото,
+    если есть равноценная без него: картинка примера удаляется, и на её
+    месте остаётся пустота."""
+    from deckforge.plan.variants import _has_image_slot, _ranked_candidates
+
+    slide = SlideSpec(index=2, kind="bullets", headline="Тезисы без фотографии",
+                      blocks=[BulletBlock(items=["Первый тезис", "Второй тезис", "Третий тезис"])])
+    ranked = _ranked_candidates(slide, PROFILE, Variant.dense)
+    with_photo = [p for _k, p in ranked if _has_image_slot(p) and p.kind not in ("section", "image", "closing")]
+    without = [p for _k, p in ranked if not _has_image_slot(p)]
+    if not with_photo or not without:
+        pytest.skip("в шаблоне нет пары раскладок с фото и без")
+    first_with = next(i for i, (_k, p) in enumerate(ranked) if p is with_photo[0])
+    first_without = next(i for i, (_k, p) in enumerate(ranked) if p is without[0])
+    assert first_without < first_with or ranked[first_with][0][:5] < ranked[first_without][0][:5]
+

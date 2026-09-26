@@ -389,6 +389,9 @@ def _has_image_slot(p) -> bool:
     return any(slot.role in ("image", "icon") for slot in p.slots)
 
 
+_HERO_IMAGE_KINDS = frozenset({"section", "image", "closing"})
+
+
 def _pattern_rank_key(
     p, variant: Variant, item_count: int | None, char_len: int, kind_rank: int, avoid: frozenset[str],
     history: _SelectionHistory = _EMPTY_HISTORY, needs_image: bool = False,
@@ -556,6 +559,12 @@ def _pattern_rank_key(
     # раскладки с картинкой по-прежнему собирается, а сборка честно пишет
     # находку «нет слота под фото/иконку».
     image_penalty = 0 if (not needs_image or _has_image_slot(p)) else 1
+    # Обратный случай: у слайда фото нет, а у раскладки место под него есть.
+    # Картинка примера из клона удаляется, и на её месте остаётся пустота
+    # (VK Education, «IT-дайвинг», 27 сентября 2026). Штраф мягкий, после
+    # вкуса варианта: героические раскладки (обложка, фото во весь слайд) не
+    # трогаются, там картинка часть оформления.
+    orphan_image = 1 if (not needs_image and _has_image_slot(p) and p.kind not in _HERO_IMAGE_KINDS) else 0
 
     # Обложке — раскладка с самым крупным заголовком среди героических. У
     # VK Education шесть раскладок вида section: обложка с заголовком 40 pt
@@ -570,7 +579,7 @@ def _pattern_rank_key(
     cover_bias = (-_headline_size(p), min(p.source_slide_index or [0])) if is_cover else (0.0, 0)
     return (
         fit_bucket, image_penalty, avoid_penalty, repeat_penalty, kind_rank,
-        cover_bias, decor_bias, capacity_bias, roominess_bias, -p.score,
+        orphan_image, cover_bias, decor_bias, capacity_bias, roominess_bias, -p.score,
     )
 
 
@@ -952,7 +961,10 @@ def apply_variant(
         kind, pattern_id = _choose_kind_and_pattern(
             slide, profile, variant, avoid=avoid, history=history, preferred=preferred.get(i),
         )
-        placed = replace(slide, index=i, kind=kind, pattern_id=pattern_id)
+        # Свой список находок на вариант: раньше три варианта делили один
+        # список, и находки сборки dense попадали в airy и visual (53 → 98 →
+        # 134 находок в отчёте одного прогона, 27 сентября 2026).
+        placed = replace(slide, index=i, kind=kind, pattern_id=pattern_id, findings=list(slide.findings))
         gap = structural_gap(slide, profile)
         if gap is not None:
             # Своя копия списка: `replace` делит его с исходным слайдом, и
