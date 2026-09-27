@@ -290,6 +290,11 @@ def assign_photos(
 
     if not assignments:
         notes.append(f"Пришло {len(photos)} фотографий контент-пакета, ни одна не была поставлена ни на один слайд.")
+    for photo in photos:
+        # Каждое неразмещённое фото называется отдельно: пользователь
+        # присылал именно его, и «2 из 3» без имени не говорит, чего нет.
+        if photo.name not in assignments.values():
+            notes.append(f"Фото {photo.name!r} не поставлено: модель не нашла слайда, который оно иллюстрирует.")
 
     photos_by_name = {p.name: p for p in photos}
     new_slides = []
@@ -313,6 +318,21 @@ def assign_photos(
     return new_deck, PhotoAssignmentReport(assigned=dict(assignments), unused_photos=unused, notes=notes)
 
 
+# Формы пункта структуры, у которых визуальное место уже занято данными:
+# график или таблица по числам источника, панель показателей. Фото на
+# таком пункте терялось молча: писатель ставит график, и `writer._with_
+# photo` фото не кладёт (27 сентября 2026, VK Education: 3 прислано,
+# 2 в плане, 1 на слайдах).
+_DATA_FORMS = {"chart": "chart", "table": "table", "kpi": "chart"}
+
+
+def _outline_visual(slide) -> Visual | None:
+    form = getattr(slide, "form", None)
+    if form in _DATA_FORMS:
+        return Visual(kind=_DATA_FORMS[form])
+    return None
+
+
 def assign_photos_to_outline(
     outline, photos: list[ContentPhoto], llm: LLMProvider | None,
 ) -> tuple[dict[int, tuple[str, str | None]], PhotoAssignmentReport]:
@@ -325,7 +345,7 @@ def assign_photos_to_outline(
 
     Возвращает `номер пункта -> (имя файла, подпись)` и отчёт."""
     skeleton = DeckSpec(title=getattr(outline, "title", ""), language=getattr(outline, "language", "ru"), slides=[
-        SlideSpec(index=i, kind=slide.kind, headline=slide.intent)
+        SlideSpec(index=i, kind=slide.kind, headline=slide.intent, visual=_outline_visual(slide))
         for i, slide in enumerate(outline.slides)
     ])
     placed, report = assign_photos(skeleton, photos, llm)
@@ -334,3 +354,34 @@ def assign_photos_to_outline(
         if slide.visual is not None and slide.visual.photo_name:
             by_index[slide.index] = (slide.visual.photo_name, slide.visual.caption)
     return by_index, report
+
+
+def _without_slide_prefix(finding: str) -> str:
+    head, sep, tail = finding.partition(": ")
+    return tail if sep and head.startswith("Слайд") else finding
+
+
+def missing_photo_warnings(
+    sent: list[str], embedded: set[str], report: PhotoAssignmentReport, deck: DeckSpec | None = None,
+) -> list[str]:
+    """По строке на каждое присланное фото, которого нет на слайдах
+    собранного файла, с причиной: не распределено по слайдам (и почему),
+    либо распределено, но сборка его не поставила (находка слайда: нет
+    рамки под фото, место занято графиком, файл не читается). Фото не
+    должно теряться молча: «1 из 3» без имён не говорит, чего не хватает."""
+    placed = set(report.assigned.values())
+    findings = [f for slide in (deck.slides if deck is not None else []) for f in slide.findings]
+    out = []
+    for name in sent:
+        if name in embedded:
+            continue
+        if name not in placed:
+            note = next((n for n in report.notes if repr(name) in n), None) or next(
+                (n for n in report.notes if "не размещены" in n or "не выполнялось" in n), None,
+            )
+            reason = note or "модель не нашла слайда, который оно иллюстрирует"
+        else:
+            finding = next((f for f in findings if repr(name) in f and "фото" in f), None)
+            reason = _without_slide_prefix(finding) if finding else "раскладка слайда не дала рамки под фото"
+        out.append(f"фото {name!r} не на слайдах: {reason.rstrip('.')}")
+    return out

@@ -249,3 +249,79 @@ def test_assign_photos_survives_llm_raising():
     assert new_deck.slides[0].visual is None
     assert report.placed_count == 0
     assert report.notes
+
+
+# ---------------------------------------------------------------------------
+# Задача T4: фото не теряются молча
+# ---------------------------------------------------------------------------
+
+
+class _RecordingLLM(LLMProvider):
+    def __init__(self, response: str):
+        self.response = response
+        self.payload = None
+
+    def complete(self, messages, *, schema=None, max_tokens=4096, temperature=0.3) -> str:
+        self.payload = json.loads(messages[1]["content"])
+        return self.response
+
+
+def test_outline_points_with_a_chart_or_table_are_not_offered_for_photos():
+    """Пункт, которому структура уже отдала график или таблицу, фото не
+    примет: писатель поставит график, и фото пропадёт (VK Education, 27
+    сентября 2026: 3 прислано, 2 в плане, 1 на слайдах)."""
+    from deckforge.plan.outline import Outline, OutlineSlide
+    from deckforge.plan.photos import assign_photos_to_outline
+
+    outline = Outline(slides=[
+        OutlineSlide(kind="title", intent="Тема"),
+        OutlineSlide(kind="data", intent="Динамика", form="chart"),
+        OutlineSlide(kind="data", intent="Сводка", form="table"),
+        OutlineSlide(kind="case", intent="Пилот"),
+        OutlineSlide(kind="closing", intent="Итог"),
+    ])
+    llm = _RecordingLLM(json.dumps({"assignments": [{"photo": "a.jpg", "slide_index": 1}]}))
+    by_index, report = assign_photos_to_outline(outline, [ContentPhoto(name="a.jpg", path=Path("a.jpg"))], llm)
+
+    offered = {s["index"] for s in llm.payload["slides"]}
+    assert offered == {0, 3, 4}
+    assert by_index == {}
+    assert any("'a.jpg'" in n for n in report.notes)
+
+
+def test_every_photo_missing_from_the_file_gets_a_named_reason():
+    from deckforge.plan.photos import missing_photo_warnings
+
+    report = PhotoAssignmentReport(
+        assigned={2: "b.jpg", 3: "c.jpg"}, unused_photos=["a.jpg"],
+        notes=["Фото 'a.jpg' не поставлено: модель не нашла слайда, который оно иллюстрирует."],
+    )
+    deck = _deck(
+        SlideSpec(index=2, kind="bullets", headline="Слайд", findings=[
+            "Слайд 2: в раскладке 'slide17' нет слота под фото/иконку — пользовательская фотография 'b.jpg' не вставлена.",
+        ]),
+        SlideSpec(index=3, kind="photo_text", headline="Слайд"),
+    )
+    warnings = missing_photo_warnings(["a.jpg", "b.jpg", "c.jpg"], {"c.jpg"}, report, deck)
+
+    assert len(warnings) == 2
+    assert warnings[0].startswith("фото 'a.jpg' не на слайдах: ") and "модель не нашла" in warnings[0]
+    assert warnings[1].startswith("фото 'b.jpg' не на слайдах: ") and "нет слота под фото" in warnings[1]
+    assert missing_photo_warnings(["c.jpg"], {"c.jpg"}, report, deck) == []
+
+
+def test_photo_on_a_slide_whose_visual_is_a_chart_leaves_a_finding():
+    from deckforge.plan.contracts import SlideContract
+    from deckforge.plan.spec import ChartSeriesData, ChartVisual
+    from deckforge.plan.writer import _with_photo
+
+    chart = ChartVisual(kind="bar", categories=["I"], series=[ChartSeriesData(name="r", values=[1.0])])
+    slide = SlideSpec(index=4, kind="chart", headline="Слайд", visual=Visual(kind="chart", chart=chart))
+    contract = SlideContract.__new__(SlideContract)
+    object.__setattr__(contract, "photo", "a.jpg")
+    object.__setattr__(contract, "slide_id", 4)
+
+    result = _with_photo(slide, contract)
+
+    assert result.visual.kind == "chart"
+    assert any("'a.jpg'" in f and "графиком" in f for f in result.findings)

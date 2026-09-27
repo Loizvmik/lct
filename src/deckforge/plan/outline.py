@@ -96,6 +96,11 @@ class Outline:
     slides: list[OutlineSlide]
     title: str = ""
     language: str = "ru"
+    # Модель была, но структуру не дала (сбой сети, ответ вне схемы), и
+    # колода собрана по запасному скелету: причина доходит до
+    # предупреждений задания, а не теряется в `except`. `None`: структура
+    # от модели или модели не было вовсе (это видно и так).
+    fallback_reason: str | None = None
 
 
 _SCHEMA = {
@@ -159,11 +164,18 @@ def _fallback_outline(n: int) -> list[OutlineSlide]:
     return _clamp_slide_count(skeleton, n)
 
 
-def _clamp_slide_count(slides: list[OutlineSlide], target: int) -> list[OutlineSlide]:
+def _clamp_slide_count(slides: list[OutlineSlide], target: int, *, pad: bool = False) -> list[OutlineSlide]:
     """Гарантирует структурные инварианты AGENT.md ("первый слайд —
-    титульный, последний — итоговый") и объём ТЗ (`MIN_SLIDES`..
-    `MAX_SLIDES`) КОДОМ, а не доверием модели — тот же принцип, что и
-    остальной проект: модель предлагает, код проверяет."""
+    титульный, последний — итоговый") и верхнюю границу объёма ТЗ
+    (`MAX_SLIDES`) КОДОМ, а не доверием модели — тот же принцип, что и
+    остальной проект: модель предлагает, код проверяет.
+
+    Короткую структуру код больше не добивает пустыми пунктами до цели:
+    повторы «Дополнительный контекст» писатель заполнял водой («Контекст
+    пилота» три раза подряд на WorkSpace, 15 слайдов, 27 сентября 2026), и
+    колода короче цели лучше такой. Предел добивки один пункт «Что дальше»,
+    и только если есть материал (`pad`: источники не пусты) и такого
+    пункта ещё нет."""
     slides = list(slides)
     if not slides:
         slides = [OutlineSlide(kind="title", intent="Тема презентации")]
@@ -176,14 +188,14 @@ def _clamp_slide_count(slides: list[OutlineSlide], target: int) -> list[OutlineS
         keep_middle = MAX_SLIDES - 2
         slides = [slides[0], *slides[1:-1][:keep_middle], slides[-1]]
 
-    filler_kinds = ("context", "data", "case")
-    i = 0
-    while len(slides) < min(target, MAX_SLIDES) or len(slides) < MIN_SLIDES:
-        kind = filler_kinds[i % len(filler_kinds)]
-        slides.insert(-1, OutlineSlide(kind=kind, intent="Дополнительный контекст"))
-        i += 1
+    if pad and len(slides) < min(target, MAX_SLIDES) and not any(s.kind == "roadmap" for s in slides):
+        slides.insert(-1, OutlineSlide(kind="roadmap", intent=NEXT_STEPS_INTENT))
 
     return slides
+
+
+# Единственный пункт, которым код добивает короткую структуру.
+NEXT_STEPS_INTENT = "Что дальше: следующие шаги по материалам источников"
 
 
 def _summarize_available_forms(profile) -> list[dict]:
@@ -278,12 +290,23 @@ def build_outline(
             slides.append(OutlineSlide(kind=kind, intent=intent, needs=needs, items=items, form=form))
         if not slides:
             raise ValueError("модель не вернула ни одного валидного слайда структуры")
-    except Exception:
+    except Exception as exc:  # noqa: BLE001: любой сбой модели ведёт к скелету, но не молча
         slides = _fallback_outline(n)
-    else:
-        slides = _clamp_slide_count(slides, n)
+        reason = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
+        return Outline(
+            slides=apply_visual_intents(slides, sources), title=title, language=language,
+            fallback_reason=reason[:300],
+        )
+    slides = _clamp_slide_count(slides, n, pad=bool(sources))
 
     return Outline(slides=apply_visual_intents(slides, sources), title=title, language=language)
+
+
+def fallback_warning(outline: Outline) -> str | None:
+    """Строка предупреждения задания о запасной структуре или `None`."""
+    if outline.fallback_reason is None:
+        return None
+    return f"структура собрана без модели: {outline.fallback_reason}"
 
 
 # ---------------------------------------------------------------------------

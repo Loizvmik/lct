@@ -87,7 +87,9 @@ def _attach(intents: list[SlideIntent], vi, form: str, visual) -> bool:
     ]
     best = None
     for i, it in enumerate(intents):
-        if not _plain(it):
+        # Повестка перечисляет темы, числа ей не нужны: кольцо «ожидание
+        # 92%» на слайде «О чём пойдёт речь» (VK Tech, bf3b1cd в структуре).
+        if not _plain(it) or it.outline_kind == "agenda":
             continue
         overlap, is_data, _ = scored[i]
         if overlap == 0 and not is_data:
