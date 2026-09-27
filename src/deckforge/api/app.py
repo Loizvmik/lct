@@ -36,6 +36,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+
+# Предел загрузки шаблона. Самый крупный шаблон датасета 34 МБ (ЛЦТ2026);
+# корпоративные шаблоны с фотографиями доходят до сотни.
+MAX_TEMPLATE_BYTES = 150 * 1024 * 1024
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -136,7 +140,14 @@ def create_app(store: JobStore | None = None) -> FastAPI:
     async def upload_template(
         file: UploadFile = File(...), store: JobStore = Depends(get_store),
     ) -> schemas.TemplateUploadResponse:
-        data = await file.read()
+        # Тело читается не дальше предела (ревью 27 сентября 2026): без
+        # него файл любого размера целиком ложился в память процесса.
+        data = await file.read(MAX_TEMPLATE_BYTES + 1)
+        if len(data) > MAX_TEMPLATE_BYTES:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Шаблон больше {MAX_TEMPLATE_BYTES // (1024 * 1024)} МБ.",
+            )
         try:
             record = await store.create_template(data, file.filename or "template.pptx")
         except JobError as exc:

@@ -425,6 +425,13 @@ class OutlineShare:
         return outline, self._owner != job_id
 
 
+# Сколько заданий и шаблонов хранилище держит в памяти (`_evict_finished`).
+# Задание с планом и находками весит сотни килобайт, профиль шаблона до
+# мегабайта; на защите за день набегают десятки, не тысячи.
+MAX_JOBS_IN_MEMORY = 300
+MAX_TEMPLATES_IN_MEMORY = 60
+
+
 class JobStore:
     """Реестр задач и шаблонов процесса (в памяти — см. докстроку модуля
     про то, что переживает и что не переживает перезапуск)."""
@@ -460,7 +467,24 @@ class JobStore:
         (tdir / "profile.json").write_text(profile.to_json(), encoding="utf-8")
         record = TemplateRecord(template_id=template_id, path=path, profile=profile)
         self.templates[template_id] = record
+        self._evict_finished()
         return record
+
+    def _evict_finished(self) -> None:
+        """Память хранилища не растёт без предела (ревью 27 сентября 2026):
+        завершённые задания сверх `MAX_JOBS_IN_MEMORY` и шаблоны сверх
+        `MAX_TEMPLATES_IN_MEMORY`, на которые не ссылается ни одно живое
+        задание, забываются, начиная с самых старых. Артефакты на диске
+        остаются: ссылки на файлы в выданных отчётах продолжают работать,
+        только `GET /api/jobs/{id}` таких заданий отвечает 404."""
+        finished = [j for j in self.jobs.values() if j.status != "running"]
+        for job in finished[: max(0, len(self.jobs) - MAX_JOBS_IN_MEMORY)]:
+            self.jobs.pop(job.job_id, None)
+        if len(self.templates) > MAX_TEMPLATES_IN_MEMORY:
+            live = {j.template_id for j in self.jobs.values() if j.status == "running"}
+            stale = [tid for tid in self.templates if tid not in live]
+            for tid in stale[: len(self.templates) - MAX_TEMPLATES_IN_MEMORY]:
+                self.templates.pop(tid, None)
 
     def get_template(self, template_id: str) -> TemplateRecord:
         record = self.templates.get(template_id)
@@ -558,6 +582,7 @@ class JobStore:
             style=chosen.value, batch_id=batch_id,
         )
         self.jobs[job_id] = job
+        self._evict_finished()
         asyncio.create_task(_run_job(
             job=job, template=template, brief=brief, sources=sources, title=title,
             language=language, target_slides=target_slides, autofix=autofix,
