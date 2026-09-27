@@ -117,3 +117,14 @@ def test_style_guides_and_asset_sheets_are_not_content_layouts():
     found = candidates_for(intent, prof, forms, position=1, last=4, cover_id="cover")
     assert "guide" not in found.pattern_ids and "sheet" not in found.pattern_ids
     assert found.relaxed == ()
+
+
+def test_photo_slide_does_not_go_to_an_instruction_slide():
+    """«Оформление схем» VK Education: инструкция с картинкой-иконкой.
+    Фото слайда туда уходило в кружок среди пустых стрелок."""
+    guide = _photo("guide", source=13)
+    guide.slide_class = "instruction"
+    prof = profile(section("cover", source=1), guide, _photo())
+    intent = SlideIntent(index=2, outline_kind="case", intent="Портал", items=1, photo="portal.png")
+    found = candidates_for(intent, prof, forms_of(prof), position=2, last=5, cover_id=cover_pattern_id(prof))
+    assert found.pattern_ids == ("photo",)
