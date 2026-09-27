@@ -401,7 +401,10 @@ def apply_visual_intents(slides: list[OutlineSlide], sources: list[SourceDoc]) -
             continue
         content = [i for i, s in enumerate(slides) if s.kind not in _HERO_KINDS and s.visual_intent is None]
         free = [i for i in content if slides[i].form is None]
-        retold = [i for i in free if slides[i].kind == "data" and _overlap(slides[i], vi) > 0]
+        # Таблица сравнения словами уходит на пункт «сравнение» о том же:
+        # новый слайд рядом повторил бы его другими словами.
+        retold_kinds = ("data", "comparison") if vi.type == "table" else ("data",)
+        retold = [i for i in free if slides[i].kind in retold_kinds and _overlap(slides[i], vi) > 0]
         if retold:
             target = max(retold, key=lambda i: (_overlap(slides[i], vi), -i))
             slides[target] = replace(slides[target], form=_FORM_OF[vi.type], items=1, visual_intent=vi)

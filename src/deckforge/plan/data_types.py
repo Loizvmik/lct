@@ -19,13 +19,22 @@
   круговая; обязателен от трёх частей;
 - `MetricSet`: одно-два числа. Показатель (`kpi`), не обязателен:
   подходящий пункт структуры есть не всегда;
-- `TableData`: единицы в столбце разные («31,5 ч», «39%») или матрица
-  больше графика. Таблица, не обязательна."""
+- `TableData`: единицы в столбце разные («31,5 ч», «39%»), матрица
+  больше графика или в таблице вовсе слова, а не числа. Таблица. Обязательна
+  у таблицы сравнения (`is_comparison_table`): столбцы со словами по
+  критериям, не по времени. Такая таблица, пересказанная карточками,
+  теряет сопоставление строк, ради которого её и писали.
+
+Кроме таблиц слой находит в источниках цитаты (`find_quotes`): абзац в
+кавычках и подпись с именем. Цитата не число, но решение то же: показать
+её цитатой, а не абзацем, решает код до письма."""
 from __future__ import annotations
+import re
 from dataclasses import dataclass, field
 
 from deckforge.plan.series import (
     MAX_SERIES, NumericSeries, RawTable, find_tables, numeric_columns, numeric_series_of, parse_number, stems,
+    timelike_labels,
 )
 
 DATA_TYPES = ("TimeSeries", "CategoryComparison", "PartToWhole", "MetricSet", "TableData")
@@ -64,15 +73,17 @@ class DataSet:
 
 @dataclass(frozen=True)
 class VisualIntent:
-    """Что показать и почему. `type`: chart / kpi / table. `required`:
-    структура обязана отдать под это слайд. `chart_kind`: вид графика по
-    правилам типа (`compose.charts.CHART_KINDS`)."""
+    """Что показать и почему. `type`: chart / kpi / table / quote.
+    `required`: структура обязана отдать под это слайд. `chart_kind`: вид
+    графика по правилам типа (`compose.charts.CHART_KINDS`). `quote`:
+    цитата источника у `type == "quote"`."""
     type: str
     required: bool
     reason: str
     data_ref: str
     chart_kind: str | None = None
     data: DataSet | None = field(default=None, compare=False)
+    quote: "SourceQuote | None" = field(default=None, compare=False)
 
     def payload(self) -> dict | None:
         """Данные для контракта писателя: готовый ряд графика или строки
@@ -136,9 +147,38 @@ def _sums_to_total(table: RawTable, series: NumericSeries) -> bool:
     return False
 
 
+def _text_column(table: RawTable, col: int) -> bool:
+    """Столбец несёт слова, а не числа: больше половины ячеек тела не
+    начинаются с числа («автор заявки», «до 4 часов»)."""
+    cells = [r[col] for r in table.body if col < len(r) and r[col].strip()]
+    if not cells:
+        return False
+    words = sum(1 for c in cells if parse_number(c) is None)
+    return words * 2 > len(cells)
+
+
+def is_comparison_table(table: RawTable) -> bool:
+    """Таблица сравнения: строки это критерии, а не моменты времени, хоть
+    один столбец значений несёт слова, и сравниваемых столбцов не меньше
+    двух (две колонки «термин / пояснение» это словарь, не сравнение). План
+    по кварталам сюда не входит: у него своя форма (дорожная карта,
+    таймлайн), и обязательная таблица отняла бы её у визуального варианта."""
+    if table.is_list or len(table.header) < 3 or len(table.body) < 2:
+        return False
+    if timelike_labels([r[0] for r in table.body if r]):
+        return False
+    return any(_text_column(table, col) for col in range(1, len(table.header)))
+
+
 def classify(table: RawTable, ref: str) -> DataSet | None:
-    """Тип таблицы или `None`, если чисел в ней нет вовсе."""
+    """Тип таблицы или `None`, если в ней нет ни чисел, ни сравнения
+    словами."""
     if not _has_numbers(table):
+        # Таблица из одних слов («ручная / автоматическая маршрутизация»):
+        # раньше пропадала из слоя данных, и писатель пересказывал её
+        # карточками мелким шрифтом.
+        if is_comparison_table(table):
+            return DataSet(ref=ref, type="TableData", table=table)
         return None
     series = numeric_series_of(table)
     body = table.body
@@ -186,6 +226,11 @@ def visual_intent_for(ds: DataSet) -> VisualIntent:
         )
     if ds.type == "MetricSet":
         return VisualIntent(type="kpi", required=False, data_ref=ds.ref, data=ds, reason="одно-два числа: показатель")
+    if is_comparison_table(ds.table):
+        return VisualIntent(
+            type="table", required=True, data_ref=ds.ref, data=ds,
+            reason="сравнение по критериям словами: таблица держит сопоставление строк",
+        )
     return VisualIntent(
         type="table", required=False, data_ref=ds.ref, data=ds,
         reason="единицы в столбцах разные или строк больше, чем читается на графике",
@@ -205,4 +250,49 @@ def type_sources(sources) -> list[DataSet]:
 
 
 def visual_intents(sources) -> list[VisualIntent]:
-    return [visual_intent_for(ds) for ds in type_sources(sources)]
+    """Визуалы таблиц источников, затем цитаты (`type == "quote"`,
+    необязательные: структура их не раздаёт, форму цитаты назначает стиль,
+    `pattern.shape`)."""
+    out = [visual_intent_for(ds) for ds in type_sources(sources)]
+    for i, quote in enumerate(source_quotes(sources), start=1):
+        out.append(VisualIntent(
+            type="quote", required=False, data_ref=f"q{i}", quote=quote,
+            reason="цитата в источнике: абзац в кавычках и подпись с именем",
+        ))
+    return out
+
+
+@dataclass(frozen=True)
+class SourceQuote:
+    """Цитата источника дословно и её автор («Сергей Лебедев, директор по
+    операциям»)."""
+    text: str
+    author: str
+
+    @property
+    def words(self) -> set[str]:
+        return stems(self.text + " " + self.author)
+
+
+# Абзац в кавычках с начала строки, за ним подпись: имя из двух-трёх слов
+# с заглавной и, через запятую, должность. Имя обязательно: кавычки без
+# автора в источниках чаще название продукта или термин, а не цитата.
+_QUOTE_RE = re.compile(
+    r"(?:^|\n)[ \t]*[«“\"](?P<text>[^«»“”\"]{20,600}?)[»”\"][ \t]*\n?[ \t]*[—–-]?[ \t]*"
+    r"(?P<name>[А-ЯЁA-Z][а-яёa-z]+(?:[ \t]+[А-ЯЁA-Z][а-яёa-z.]+){1,2})"
+    r"(?:[ \t]*,[ \t]*(?P<role>[^\n]{2,80}))?",
+)
+
+
+def find_quotes(text: str) -> list[SourceQuote]:
+    out = []
+    for m in _QUOTE_RE.finditer(text or ""):
+        body = " ".join(m.group("text").split())
+        author = m.group("name").strip()
+        role = (m.group("role") or "").strip().rstrip(".;")
+        out.append(SourceQuote(text=body, author=f"{author}, {role}" if role else author))
+    return out
+
+
+def source_quotes(sources) -> list[SourceQuote]:
+    return [q for doc in sources or [] for q in find_quotes(getattr(doc, "text", "") or "")]

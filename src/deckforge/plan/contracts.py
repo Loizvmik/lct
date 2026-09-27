@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, replace
 from deckforge.pattern.forms import MIN_HEADLINE_CHARS, FormPart, Limit, form_of, list_item_limit
 from deckforge.pattern.style import load_style
 from deckforge.template.patterns import CHART_TIER_TEXT
-from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
+from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TeamBlock, TextBlock
 
 _WORD_RE = re.compile(r"\S+")
 
@@ -33,7 +33,18 @@ _DEFAULT_VISUAL_LIMITS = {"max_rows": 6, "max_cols": 4, "max_series": 4}
 # отверг бы любую единицу измерения, поэтому у значения предел в словах.
 _KPI_VALUE_MAX_WORDS = 3
 
-_BLOCK_TYPES = {"text": TextBlock, "bullets": BulletBlock, "cards": CardBlock, "kpi": KpiBlock, "quote": QuoteBlock}
+_BLOCK_TYPES = {
+    "text": TextBlock, "bullets": BulletBlock, "cards": CardBlock, "kpi": KpiBlock, "quote": QuoteBlock,
+    "team": TeamBlock,
+}
+
+# Формы, которые сборка строит с нуля (`pattern.candidates.SCRATCH_FORMS`):
+# их пределы задаёт не рамка носителя, а сама форма. Показателей в ряд от
+# двух до четырёх: больше не читаются крупным кеглем. Подпись показателя
+# и роль участника в несколько слов, цитата не длиннее двух строк h2 на
+# всю ширину.
+SCRATCH_KPI_MIN, SCRATCH_KPI_MAX = 2, 4
+SCRATCH_TEAM_MIN, SCRATCH_TEAM_MAX = 2, 6
 
 
 def count_words(text: str | None) -> int:
@@ -86,10 +97,10 @@ class SlotContract:
 
     def to_dict(self) -> dict:
         out: dict = {"type": self.block, "count": self.count, "required": self.required}
-        key = {"cards": "body", "kpi": "value", "bullets": "item"}.get(self.block, "text")
+        key = {"cards": "body", "kpi": "value", "bullets": "item", "team": "role"}.get(self.block, "text")
         out[key] = self.item.to_dict()
         if self.title is not None:
-            out["label" if self.block == "kpi" else "title"] = self.title.to_dict()
+            out[{"kpi": "label", "team": "name"}.get(self.block, "title")] = self.title.to_dict()
         if self.block == "cards" and not self.title_slot:
             out["title_note"] = "у карточки нет своего места под заголовок: код сам поставит его жирной первой строкой тела; в тело его не повторяй"
         if self.purpose:
@@ -126,6 +137,9 @@ class SlideContract:
     # визуал по ним без модели. `visual_reason`: почему визуал нужен.
     visual_data: dict | None = None
     visual_reason: str | None = None
+    # Форма, которую сборка строит с нуля (`PatternAssignment.scratch_form`):
+    # писатель пишет её блок, раскладка даёт только заголовок и оформление.
+    scratch_form: str | None = None
 
     @property
     def is_divider(self) -> bool:
@@ -233,6 +247,37 @@ def _visual_reason(intent) -> str | None:
     return vi.reason if vi is not None else None
 
 
+_SCRATCH_KPI_LABEL = TextSpec(target_words=4, max_words=7)
+_SCRATCH_QUOTE = TextSpec(target_words=22, max_words=40)
+_SCRATCH_TEAM_NAME = TextSpec(target_words=2, max_words=3)
+_SCRATCH_TEAM_ROLE = TextSpec(target_words=4, max_words=8)
+
+
+def _scratch_slots(intent, scratch: str) -> list[SlotContract]:
+    """Места формы, которую строит сборка с нуля: число единиц из
+    намерения в пределах формы, пределы слов у самой формы."""
+    items = max(1, intent.items)
+    if scratch == "kpi":
+        count = max(SCRATCH_KPI_MIN, min(items, SCRATCH_KPI_MAX))
+        return [SlotContract(
+            block="kpi", count=count, item=TextSpec(target_words=1, max_words=_KPI_VALUE_MAX_WORDS),
+            role="kpi_value", title=_SCRATCH_KPI_LABEL, title_slot=True,
+        )]
+    if scratch == "quote":
+        return [SlotContract(block="quote", count=1, item=_SCRATCH_QUOTE, role="quote")]
+    if scratch == "team":
+        # У команды `count` предел сверху (`contract_problems`): сколько
+        # людей в источниках, структура знает не всегда, а четверо в ряд
+        # ещё читаются карточками с фото.
+        count = max(4, min(items, SCRATCH_TEAM_MAX))
+        return [SlotContract(
+            block="team", count=count, item=_SCRATCH_TEAM_ROLE, role="team", title=_SCRATCH_TEAM_NAME,
+            title_slot=True,
+        )]
+    # Таблица: визуал контракта (`required_visual`), текстовых мест нет.
+    return []
+
+
 def _chart_takes_main(intent, form) -> bool:
     """График встаёт на главное текстовое место раскладки (у неё нет ни
     родного графика, ни картинки-графика): писать туда нечего, пункты
@@ -276,16 +321,20 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
             key: (getattr(cap, key, 0) or default) if cap is not None else default
             for key, default in _DEFAULT_VISUAL_LIMITS.items()
         }
+    scratch = getattr(assignment, "scratch_form", None)
+    if scratch is not None:
+        slots: tuple[SlotContract, ...] = tuple(_scratch_slots(intent, scratch))
+    elif not intent.divider and not _chart_takes_main(intent, form):
+        slots = _style_capped(tuple(_content_slots(intent, form)), policy)
+    else:
+        slots = ()
     return SlideContract(
         slide_id=assignment.position,
         intent=intent.intent,
         pattern_id=assignment.pattern_id,
         kind=assignment.kind,
         headline=_headline_spec(form),
-        slots=_style_capped(
-            tuple(_content_slots(intent, form)) if not intent.divider and not _chart_takes_main(intent, form) else (),
-            policy,
-        ),
+        slots=slots,
         subhead=TextSpec.of(form.subhead) if form is not None and form.subhead is not None and not intent.divider else None,
         evidence=tuple(intent.needs),
         required_visual=intent.required_visual,
@@ -299,6 +348,7 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
         alternatives=tuple(getattr(assignment, "alternatives", ()) or ()),
         visual_data=_visual_data(intent),
         visual_reason=_visual_reason(intent),
+        scratch_form=scratch,
     )
 
 
@@ -323,6 +373,8 @@ def _units_of(block) -> list[tuple[str, str | None]]:
         return [(kpi.value, kpi.label) for kpi in block.items]
     if isinstance(block, QuoteBlock):
         return [(block.text, None)]
+    if isinstance(block, TeamBlock):
+        return [(member.role, member.name) for member in block.items]
     return []
 
 
@@ -341,7 +393,10 @@ def _match(slide: SlideSpec, contract: SlideContract) -> tuple[list[tuple[SlotCo
     return pairs, left
 
 
-_BLOCK_TITLES = {"text": "абзац", "bullets": "список", "cards": "карточки", "kpi": "показатели", "quote": "цитата"}
+_BLOCK_TITLES = {
+    "text": "абзац", "bullets": "список", "cards": "карточки", "kpi": "показатели", "quote": "цитата",
+    "team": "команда",
+}
 
 
 def contract_problems(slide: SlideSpec, contract: SlideContract) -> list[str]:
@@ -369,6 +424,10 @@ def contract_problems(slide: SlideSpec, contract: SlideContract) -> list[str]:
         units = _units_of(block)
         if slot.block in ("cards", "kpi", "bullets") and len(units) != slot.count:
             problems.append(f"{name}: {len(units)} единиц, нужно ровно {slot.count}")
+        elif slot.block == "team" and not SCRATCH_TEAM_MIN <= len(units) <= slot.count:
+            # Участников столько, сколько их в источниках: предел сверху,
+            # а не число, которое надо добить выдуманными людьми.
+            problems.append(f"{name}: {len(units)} участников, нужно от {SCRATCH_TEAM_MIN} до {slot.count}")
         for j, (text, title) in enumerate(units):
             issue = slot.item.problem(text, f"{name}, единица {j + 1}")
             if issue:

@@ -14,7 +14,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
+from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TeamBlock, TextBlock
 
 # Виды пункта плана, у которых слайд героический по замыслу: заголовок и,
 # может быть, строка. Разделитель стиля airy узнаётся по контракту.
@@ -56,7 +56,7 @@ def has_content(slide: SlideSpec) -> bool:
     for block in slide.blocks:
         if isinstance(block, (TextBlock, QuoteBlock)) and block.text.strip():
             return True
-        if isinstance(block, (BulletBlock, CardBlock, KpiBlock)) and block.items:
+        if isinstance(block, (BulletBlock, CardBlock, KpiBlock, TeamBlock)) and block.items:
             return True
     return slide.visual is not None
 

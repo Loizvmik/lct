@@ -97,13 +97,22 @@ def load_content_pack_photos(pack_dir: Path) -> list[ContentPhoto]:
     for path in sorted(photos_dir.iterdir()):
         if not path.is_file() or path.suffix.lower() not in _PHOTO_EXTENSIONS:
             continue
-        caption_path = path.with_suffix(".txt")
-        caption = None
-        if caption_path.is_file():
-            text = caption_path.read_text(encoding="utf-8").strip()
-            caption = text or None
-        photos.append(ContentPhoto(name=path.name, path=path, caption=caption))
+        photos.append(ContentPhoto(name=path.name, path=path, caption=photo_caption(path)))
     return photos
+
+
+def photo_caption(path: Path) -> str | None:
+    """Подпись фотографии: текст файла `<имя без расширения>.txt` рядом с
+    ней. Нужна и сборке: карточки команды ищут фото участника по подписи
+    (`compose.team`), а сборка получает только словарь имя -> путь."""
+    caption_path = Path(path).with_suffix(".txt")
+    if not caption_path.is_file():
+        return None
+    try:
+        text = caption_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
 
 
 def _load_agent_prompt(path: Path = AGENT_PATH) -> tuple[dict, str]:
