@@ -119,12 +119,17 @@ def test_style_guides_and_asset_sheets_are_not_content_layouts():
     assert found.relaxed == ()
 
 
-def test_photo_slide_does_not_go_to_an_instruction_slide():
-    """«Оформление схем» VK Education: инструкция с картинкой-иконкой.
-    Фото слайда туда уходило в кружок среди пустых стрелок."""
-    guide = _photo("guide", source=13)
-    guide.slide_class = "instruction"
-    prof = profile(section("cover", source=1), guide, _photo())
-    intent = SlideIntent(index=2, outline_kind="case", intent="Портал", items=1, photo="portal.png")
-    found = candidates_for(intent, prof, forms_of(prof), position=2, last=5, cover_id=cover_pattern_id(prof))
+def test_photo_slide_skips_asset_sheets_and_instructions():
+    """VK Tech: лист ассетов (slide30, 3D-иллюстрации с кнопками «Перейти»)
+    и инструкция (slide52, диаграмма Ганта) держат картинку, и слайд с фото
+    брал их наравне с раскладками: проверка «вид» у слайда с фото смотрела
+    только на место под картинку."""
+    sheet = _photo("sheet", source=30)
+    sheet.slide_class = "asset_sheet"
+    howto = _photo("howto", source=52)
+    howto.slide_class = "instruction"
+    prof = profile(section("cover", source=1), sheet, howto, _photo("photo", source=40))
+    forms = forms_of(prof)
+    intent = SlideIntent(index=1, outline_kind="case", intent="Кейс", items=1, photo="team.jpg")
+    found = candidates_for(intent, prof, forms, position=1, last=4, cover_id="cover")
     assert found.pattern_ids == ("photo",)

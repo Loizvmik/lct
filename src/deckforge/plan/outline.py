@@ -409,8 +409,12 @@ def apply_visual_intents(slides: list[OutlineSlide], sources: list[SourceDoc]) -
             near = max(content, key=lambda i: (_overlap(slides[i], vi), -i), default=None)
             at = near + 1 if near is not None and _overlap(slides[near], vi) >= _NEAR_WORDS else max(1, len(slides) - 1)
             slides.insert(at, _new_slide(vi))
-        elif free:
-            slides[free[0]] = replace(slides[free[0]], form=_FORM_OF[vi.type], items=1, visual_intent=vi)
+        elif spare := [i for i in free if slides[i].kind != "agenda"]:
+            # Самый близкий по словам пункт, не первый попавшийся: первым
+            # без формы обычно стоит повестка, и доля «ожидание 92%»
+            # уходила кольцом на неё (живой прогон full-coverage, VK Tech).
+            target = max(spare, key=lambda i: (_overlap(slides[i], vi), -i))
+            slides[target] = replace(slides[target], form=_FORM_OF[vi.type], items=1, visual_intent=vi)
         else:
             continue
         used.add(vi.data_ref)

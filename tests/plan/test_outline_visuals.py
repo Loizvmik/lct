@@ -73,6 +73,22 @@ def test_full_deck_converts_a_plain_slide_instead_of_growing_past_the_limit():
     assert len(_chart_slides(out)) == 2
 
 
+def test_full_deck_puts_the_chart_on_the_closest_slide_not_the_agenda():
+    """Живой прогон full-coverage на VK Tech: колода в 15 пунктов, и доля
+    «ожидание 92%» уходила кольцом на повестку, первый пункт без формы,
+    а не на пункт «проблема», где эти числа пересказаны."""
+    slides = [OutlineSlide(kind="title", intent="Итоги"), OutlineSlide(kind="agenda", intent="О чём пойдём речь")]
+    slides += [OutlineSlide(kind="context", intent=f"Пункт {i}") for i in range(MAX_SLIDES - 4)]
+    slides += [
+        OutlineSlide(kind="problem", intent="Ожидание согласующего съедает время согласования"),
+        OutlineSlide(kind="closing", intent="Итог"),
+    ]
+    out = apply_visual_intents(slides, _sources("full-coverage"))
+    assert len(out) == MAX_SLIDES
+    assert out[1].visual_intent is None
+    assert out[-2].visual_intent is not None and out[-2].visual_intent.type == "chart"
+
+
 def test_sources_without_chartable_series_do_not_force_a_chart():
     """Источник без числового ряда (набор «заявки» с приведением минут и
     часов к одной единице ряд уже даёт, поэтому здесь текст без таблиц)."""

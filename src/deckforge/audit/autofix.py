@@ -155,15 +155,15 @@ def _fix_L01(shape, finding: Finding, profile: TemplateProfile) -> bool:
 
 
 def _fix_L06(shape, finding: Finding, profile: TemplateProfile) -> bool:
-    """Сдвинуть содержимое внутрь полей шаблона (без изменения размера)."""
-    cw, ch = profile.canvas_width_emu, profile.canvas_height_emu
+    """Сдвинуть содержимое внутрь левого и правого поля шаблона (без
+    изменения размера). Только по горизонтали, как и сама проверка
+    (`deterministic._check_L06`): верхнее поле сетки усреднено по
+    заголовкам и телам, у VK Tech оно около 0.235, и прижим к нему
+    уводил заголовок с 5% высоты вниз на карточки."""
+    cw = profile.canvas_width_emu
     ml = int(profile.grid.margin_left * cw)
     mr = int(profile.grid.margin_right * cw)
-    mt = int(profile.grid.margin_top * ch)
-    mb = int(profile.grid.margin_bottom * ch)
-    left = max(ml, min(shape.left, cw - mr - shape.width))
-    top = max(mt, min(shape.top, ch - mb - shape.height))
-    shape.left, shape.top = Emu(left), Emu(top)
+    shape.left = Emu(max(ml, min(shape.left, cw - mr - shape.width)))
     return True
 
 
