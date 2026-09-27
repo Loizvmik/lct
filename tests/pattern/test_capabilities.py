@@ -7,10 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from deckforge.pattern.forms import SlideRequirements, capabilities_of, pattern_form, unmet_requirements
+from deckforge.pattern.forms import SlideRequirements, capabilities_of, forms_of, pattern_form, unmet_requirements
 from deckforge.pattern.intent import SlideIntent
-from deckforge.pattern.planner import plan_patterns
-from deckforge.pattern.scoring import growing_repeat_cost, look_key
+from deckforge.pattern.candidates import candidates_for, cover_pattern_id
+from deckforge.pattern.planner import TIGHT_OVERFLOW, plan_patterns
+from deckforge.pattern.scoring import growing_repeat_cost, look_key, overflow
 from deckforge.pattern.style import load_style
 from deckforge.plan.outline import Outline, OutlineSlide
 from deckforge.plan.spec import Card, CardBlock, SlideSpec
@@ -97,10 +98,30 @@ def test_twelve_card_slides_on_vk_education_repeat_a_layout_at_most_three_times(
     plan = plan_patterns(_cards_outline(12), vk_education, style)
 
     ids = [a.pattern_id for a in plan]
-    looks = Counter(look_key(next(p for p in vk_education.patterns if p.pattern_id == pid)) for pid in ids)
-    assert max(Counter(ids).values()) <= 3, ids
-    assert max(looks.values()) <= 3, ids
     assert all(a != b for a, b in zip(ids, ids[1:])), ids
+    # Предел повторов (3) действует, пока есть просторная альтернатива
+    # (задача V5). По замеру клона три карточки со словами стиля держат у
+    # VK Education две-три раскладки, остальные карточные (таймлайн 42,
+    # кружки 44, «четыре преимущества» 17) тесны: в них ложится два слова
+    # на карточку. Тесную раскладку ради разнообразия планировщик не берёт,
+    # повтор просторной честнее.
+    forms = forms_of(vk_education)
+    policy = load_style(style)
+    for a in plan[1:-1]:
+        assert overflow(a.intent, forms[a.pattern_id], policy) < TIGHT_OVERFLOW, (a.position, a.pattern_id)
+    middle = plan[len(plan) // 2]
+    found = candidates_for(
+        middle.intent, vk_education, forms, position=middle.position, last=len(plan) - 1,
+        cover_id=cover_pattern_id(vk_education),
+    )
+    roomy = {
+        look_key(p) for p in vk_education.patterns
+        if p.pattern_id in found.pattern_ids and overflow(middle.intent, forms[p.pattern_id], policy) < TIGHT_OVERFLOW
+    }
+    assert len(roomy) >= 2, "есть из чего чередовать"
+    looks = Counter(look_key(next(p for p in vk_education.patterns if p.pattern_id == pid)) for pid in ids)
+    if len(roomy) >= 4:
+        assert max(looks.values()) <= 3, ids
 
 
 def test_same_kind_runs_are_capped_when_there_is_an_alternative():

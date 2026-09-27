@@ -162,6 +162,16 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
     def _biggest(candidates):
         return _biggest_slot(candidates, by_slot)
 
+    def _unit_limit(candidates, fallback) -> Limit:
+        """Предел единицы повтора: по замеру самая тесная из её рамок, ведь
+        текст пишется один на все единицы, и лечь он обязан в каждую (у
+        таймлайна примера 42 одна рамка выше остальных, и контракт по ней
+        обещал вдвое больше, чем клон принимал в шести других)."""
+        measured = [s for s in candidates if id(s) in by_slot]
+        if not measured:
+            return _limit(fallback)
+        return _limit(min(measured, key=lambda s: (_capacity(s, by_slot[id(s)]), by_slot[id(s)].lines)))
+
     repeat = pattern.repeat if (pattern.repeat is not None and pattern.repeat.count >= 2) else None
     repeat_roles = set(repeat.slot_roles) if repeat is not None else set()
     parts: list[FormPart] = []
@@ -169,13 +179,14 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
 
     if repeat is not None and repeat_roles & set(_UNIT_BODY_ROLES):
         body_role = next(r for r in _UNIT_BODY_ROLES if r in repeat_roles)
-        body = _biggest(_open(slots, body_role))
+        bodies = _open(slots, body_role)
+        body = _biggest(bodies)
         if body is not None:
             titles = _open(slots, "card_title") if "card_title" in repeat_roles else []
             title_slot = _biggest(titles)
             parts.append(FormPart(
-                block="cards", units=repeat.count, unit=_limit(body), role=body_role,
-                title=_limit(title_slot) if title_slot is not None else Limit(max_words=3, max_chars=3 * CHARS_PER_WORD),
+                block="cards", units=repeat.count, unit=_unit_limit(bodies, body), role=body_role,
+                title=_unit_limit(titles, title_slot) if title_slot is not None else Limit(max_words=3, max_chars=3 * CHARS_PER_WORD),
                 title_slot=title_slot is not None, purpose=body.purpose, content_hint=body.content_hint,
             ))
             used_roles |= repeat_roles
@@ -185,8 +196,8 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
         if values:
             label = _biggest(labels)
             parts.append(FormPart(
-                block="kpi", units=repeat.count, unit=_limit(_biggest(values)), role="kpi_value",
-                title=_limit(label) if label is not None else None, title_slot=label is not None,
+                block="kpi", units=repeat.count, unit=_unit_limit(values, _biggest(values)), role="kpi_value",
+                title=_unit_limit(labels, label) if label is not None else None, title_slot=label is not None,
             ))
             used_roles |= repeat_roles
 
