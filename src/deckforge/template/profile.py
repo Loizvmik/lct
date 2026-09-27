@@ -251,6 +251,9 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # по своему ключу, который тоже перестаёт совпадать).
 # Детерминированная версия 2, а не 1: `source_density` паттерна (задача R)
 # снимается детерминированно и влилась одновременно с разделением кеша.
+# Версия 6 (задача D4): коробки плейсхолдеров наследуются с лейаута и
+# мастера, колонтитулы и номер слайда не место под текст; у ЛЦТ2026
+# раскладок 16 вместо 15.
 # Версия 5: схема-образец из блоков-рыб («Оформление схем» VK Education)
 # классифицируется как инструкция, а не раскладка содержания.
 # Версия 4: слияние задач V1 и V2, каждая поднимала версию до 3 со своим
@@ -261,7 +264,7 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # 2 -> 3: `PatternSlot.chart_frame` (картинка примера сама график) и
 # `chart_rules` (правила оформления диаграмм, которые шаблон пишет текстом),
 # оба снимаются без модели; старый кеш отдал бы их пустыми молча.
-DETERMINISTIC_SCHEMA_VERSION = 5
+DETERMINISTIC_SCHEMA_VERSION = 6
 MODEL_SCHEMA_VERSION = 1
 PROFILE_SCHEMA_VERSION = DETERMINISTIC_SCHEMA_VERSION * 1000 + MODEL_SCHEMA_VERSION
 
