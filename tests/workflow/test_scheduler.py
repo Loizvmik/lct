@@ -335,6 +335,12 @@ def test_slots_are_shared_between_jobs_of_the_same_class():
     while len(scheduler._waiters) < 3:
         time.sleep(0.005)
     scheduler.release()
+    # Первый слот держит a1, пока `hold` не снят: до этого в модель может
+    # войти только тот, кому достался освобождённый слот. Ждём его, и лишь
+    # потом отпускаем a1, иначе порядок зависел бы от планировщика потоков.
+    deadline = time.monotonic() + 2.0
+    while not model.order and time.monotonic() < deadline:
+        time.sleep(0.005)
     hold.set()
     for thread in threads:
         thread.join()
