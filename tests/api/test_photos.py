@@ -163,3 +163,14 @@ def test_job_with_photos_puts_them_into_the_deck(photo_job: dict) -> None:
     assert result["outcome"] == "done_with_warnings"
     assert any("фотографий на слайдах 1 из 2" in w for w in result["warnings"])
 
+
+
+def test_too_many_photos_are_refused_before_their_bodies_are_read(client, monkeypatch):
+    """Число файлов проверяется до чтения тел (ревью codex 27 сентября
+    2026): сотня файлов по 10 МБ не должна лечь в память ради отказа."""
+    from deckforge.api import app as app_module
+
+    monkeypatch.setattr(app_module, "MAX_PHOTOS_PER_UPLOAD", 2)
+    files = [("files", (f"p{i}.png", b"x" * 10, "image/png")) for i in range(3)]
+    response = client.post("/api/photos", files=files)
+    assert response.status_code == 400

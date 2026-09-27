@@ -46,7 +46,8 @@ from fastapi.staticfiles import StaticFiles
 
 from deckforge.api import schemas
 from deckforge.api.jobs import (
-    MAX_PHOTO_BYTES, JobError, JobRecord, JobStore, PhotoRecord, PhotoRejected, STAGES, VariantState, finding_id, fix_deck,
+    MAX_PHOTO_BYTES, MAX_PHOTOS_PER_UPLOAD, JobError, JobRecord, JobStore, PhotoRecord, PhotoRejected, STAGES,
+    VariantState, finding_id, fix_deck,
 )
 from deckforge.audit.findings import Finding
 
@@ -169,8 +170,15 @@ def create_app(store: JobStore | None = None) -> FastAPI:
         files: list[UploadFile] = File(...), captions: list[str] = Form(default=[]),
         store: JobStore = Depends(get_store),
     ) -> schemas.PhotoUploadResponse:
-        # Читается на байт больше предела: этого хватает, чтобы отличить
-        # «ровно 10 МБ» от «больше», не держа в памяти весь лишний файл.
+        # Число файлов проверяется до чтения тел (ревью codex 27 сентября
+        # 2026): иначе пачка из сотни файлов по 10 МБ ложилась в память до
+        # отказа. Читается на байт больше предела: этого хватает, чтобы
+        # отличить «ровно 10 МБ» от «больше», не держа весь лишний файл.
+        if len(files) > MAX_PHOTOS_PER_UPLOAD:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Фотографий {len(files)}, а за одну загрузку можно не больше {MAX_PHOTOS_PER_UPLOAD}.",
+            )
         payload = [(f.filename or "photo", await f.read(MAX_PHOTO_BYTES + 1)) for f in files]
         try:
             records = await asyncio.to_thread(store.save_photos, payload, list(captions))

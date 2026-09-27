@@ -455,7 +455,7 @@ def place_slide(
     _place_visual(
         slide, slide_spec, pattern, profile, user_photos, sole_content=_only_frame_text(contents),
         min_photo_width=_MIN_SCRATCH_PHOTO_WIDTH if look is not None else 0.0,
-        free_box=_free_visual_box(contents, grid),
+        free_box=_free_visual_box(contents, grid), occupied=[c.slot.box for c in contents],
     )
     _remove_empty_placeholders(slide)
 
@@ -582,9 +582,11 @@ def _visual_slot(pattern: Pattern, role: str) -> PatternSlot | None:
 def _place_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile,
     user_photos: dict[str, Path] | None = None, *, sole_content: bool = False, min_photo_width: float = 0.0,
-    free_box: Box | None = None,
+    free_box: Box | None = None, occupied: list[Box] | None = None,
 ) -> None:
-    """`free_box`: свободное место слайда, куда сборка с нуля ставит
+    """`occupied`: рамки уже уложенного текста (сборка с нуля), чтобы график
+    не встал в текстовое место, где уже лежит абзац.
+    `free_box`: свободное место слайда, куда сборка с нуля ставит
     таблицу или график, если у раскладки нет их слота (`_free_visual_box`).
     Клон его не передаёт: клон без слота под визуал отклоняется раньше
     (`place_slide_by_clone`)."""
@@ -597,7 +599,7 @@ def _place_visual(
             slide, slide_spec, pattern, profile, visual.table, sole_content=sole_content, free_box=free_box,
         )
     elif visual.kind == "chart" and visual.chart is not None:
-        _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart, free_box=free_box)
+        _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart, free_box=free_box, occupied=occupied)
     elif visual.kind in ("photo", "icon"):
         _place_picture_visual(
             slide, slide_spec, pattern, profile, visual.kind, user_photos,
@@ -630,7 +632,14 @@ def _free_visual_box(contents: list[SlotContent], grid: Grid) -> Box | None:
     )
     top = frame_bottom + _FREE_VISUAL_GAP
     middle = (left + right) / 2 + _FREE_VISUAL_GAP / 2
-    if bottom - top >= _FREE_VISUAL_MIN_HEIGHT:
+    # Правая половина годится, только если уложенный текст в неё не
+    # заходит: у раскладки «заголовок и содержание» тело во всю ширину
+    # (ревью codex 27 сентября 2026).
+    right_half_free = not any(
+        c.slot.box.right > middle and c.slot.box.bottom > top and c.role_hint not in _CLONE_FRAME_ROLES
+        for c in contents
+    )
+    if bottom - top >= _FREE_VISUAL_MIN_HEIGHT and right_half_free:
         return Box(middle, top, right - middle, bottom - top)
     # Текст прижат к низу (разделитель с заголовком над полосой): место
     # над ним.
@@ -814,14 +823,26 @@ def _chart_slot(pattern: Pattern) -> PatternSlot | None:
     return slot or _visual_slot(pattern, "table")
 
 
+def _slot_is_occupied(slot: PatternSlot, occupied: list[Box] | None) -> bool:
+    """Слот не под график по роли, и в его рамку уже лёг текст слайда."""
+    if slot.role in ("chart", "table", "image") or not occupied:
+        return False
+    return any(_overlap_ratio(slot.box, other) > _OVERLAP_MIN_AREA_SHARE for other in occupied)
+
+
 def _place_chart_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, chart, *, box: Box | None = None,
-    free_box: Box | None = None,
+    free_box: Box | None = None, occupied: list[Box] | None = None,
 ) -> None:
     """`box`: рамка, уже найденная клоном образца графика
     (`_clear_sample_charts`); без неё рамка из слота раскладки, а у
     раскладки без такого слота свободное место слайда (`free_box`)."""
     slot = _chart_slot(pattern)
+    if box is None and slot is not None and free_box is not None and _slot_is_occupied(slot, occupied):
+        # Текстовое место, отданное графику за неимением лучшего, уже
+        # занято текстом слайда: график встаёт на свободное место, а не
+        # поверх абзаца (ревью codex 27 сентября 2026).
+        box, slot = free_box, None
     if slot is None and box is None and free_box is not None:
         box = free_box
     if slot is None and box is None:
@@ -1776,8 +1797,8 @@ def _scratch_candidates(
     # попытки, паттерн, коды находок)
     best: tuple[bool, int, int, int, Pattern, list[str]] | None = None
     for attempt, pattern in enumerate(tried, start=1):
-        lost = _lost_blocks(slide_spec, pattern, grid)
-        empty = _loses_all_content(slide_spec, pattern, grid)
+        lost = _lost_blocks(slide_spec, pattern, grid, cards_as_text=True)
+        empty = _loses_all_content(slide_spec, pattern, grid, cards_as_text=True)
         trial_spec = replace(slide_spec, findings=[])
         place_slide(
             prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char,
@@ -1828,13 +1849,15 @@ def _scratch_candidates(
 _MINOR_DROP_ROLES = frozenset({"source", "subhead"})
 
 
-def _loses_all_content(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> bool:
+def _loses_all_content(slide_spec: SlideSpec, pattern: Pattern, grid: Grid, *, cards_as_text: bool = False) -> bool:
     """На слайд с содержанием из всех его блоков не ляжет ни один: останутся
     заголовок и подпись. Слайд с визуалом пустым не бывает: сборка с нуля
-    ставит визуал и без своего слота."""
+    ставит визуал и без своего слота. `cards_as_text`: тот же режим, что у
+    сборки с нуля (`place_slide`), иначе проверка считала бы потерянными
+    карточки, которые сборка кладёт текстом (ревью codex 27 сентября 2026)."""
     if not slide_spec.blocks:
         return False
-    contents, _drops = assign_content_with_drops(slide_spec, pattern, grid)
+    contents, _drops = assign_content_with_drops(slide_spec, pattern, grid, cards_as_text=cards_as_text)
     if not _only_frame_text(contents):
         return False
     return slide_spec.visual is None
@@ -1846,13 +1869,14 @@ def _keeping_content_first(slide_spec: SlideSpec, candidates: list[Pattern], gri
     места под блоки (разделители у списка) занимали эти попытки."""
     if not slide_spec.blocks:
         return candidates
-    return sorted(candidates, key=lambda p: _loses_all_content(slide_spec, p, grid))
+    return sorted(candidates, key=lambda p: _loses_all_content(slide_spec, p, grid, cards_as_text=True))
 
 
-def _lost_blocks(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> int:
+def _lost_blocks(slide_spec: SlideSpec, pattern: Pattern, grid: Grid, *, cards_as_text: bool = False) -> int:
     """Сколько частей содержания (кроме сноски и подзаголовка) раскладка
-    не примет вовсе: нет слота их роли."""
-    _contents, drops = assign_content_with_drops(slide_spec, pattern, grid)
+    не примет вовсе: нет слота их роли. `cards_as_text`: см.
+    `_loses_all_content`."""
+    _contents, drops = assign_content_with_drops(slide_spec, pattern, grid, cards_as_text=cards_as_text)
     return sum(1 for d in drops if d.role not in _MINOR_DROP_ROLES)
 
 
