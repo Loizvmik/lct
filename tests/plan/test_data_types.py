@@ -96,6 +96,10 @@ def test_numbers_are_read_as_written_in_russian_sources():
     assert parse_number("98,5%") == (98.5, "%")
     assert parse_number("−80%") == (-80.0, "%")
     assert parse_number("нет данных") is None
+    # Английский разделитель тысяч из Excel: группы ровно по три цифры.
+    assert parse_number("1,200") == (1200.0, "")
+    assert parse_number("12,345,678 ₽") == (12345678.0, "₽")
+    assert parse_number("1,25") == (1.25, "")
 
 
 def test_text_without_numbers_gives_no_dataset():

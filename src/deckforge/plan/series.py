@@ -23,7 +23,7 @@ MAX_POINTS = 12
 _TOTAL_RE = re.compile(r"^\s*(итого|всего|сумма|total)\b", re.IGNORECASE)
 # Число в начале ячейки: знак, цифры с пробелами-разделителями тысяч,
 # дробная часть через запятую или точку. Хвост после числа: единица.
-_NUMBER_RE = re.compile(r"^\s*([+\-−]?\d[\d\s  ]*(?:[.,]\d+)?)\s*(.*?)\s*$")
+_NUMBER_RE = re.compile(r"^\s*([+\-−]?\d[\d\s  ]*(?:,\d{3})*(?:[.,]\d+)?)\s*(.*?)\s*$")
 _HEADING_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.+?)\s*#*\s*$")
 _LIST_POINT_RE = re.compile(
     r"^\s*(?:[-*•]\s+)?([^:|]{1,40}?)\s*[:—–]\s*([+\-−]?\d[\d\s  ]*(?:[.,]\d+)?)\s*([^\s,;.]*)\s*[,;.]?\s*$",
@@ -79,12 +79,23 @@ class NumericSeries:
         return all(_TIME_RE.match(c.strip()) for c in self.categories)
 
 
+_THOUSANDS_RE = re.compile(r"^[+-]?\d{1,3}(,\d{3})+$")
+
+
 def parse_number(cell: str) -> tuple[float, str] | None:
     """(число, хвост-единица) или `None`, если ячейка не число."""
     m = _NUMBER_RE.match(cell or "")
     if not m:
         return None
-    digits = re.sub(r"[\s  ]", "", m.group(1)).replace(",", ".").replace("−", "-")
+    digits = re.sub(r"[\s  ]", "", m.group(1)).replace("−", "-")
+    # Запятая в русском тексте десятичная («31,5»), но группы ровно по три
+    # цифры после неё («1,200», «12,345,678») это английский разделитель
+    # тысяч из Excel и аналитики: десятичная часть на три нуля по-русски
+    # пишется «1,2». Ревью 27 сентября 2026: «1,200» читалось как 1,2, и
+    # сверка с источником этого не ловила, потому что сравнивала так же.
+    if _THOUSANDS_RE.match(digits):
+        digits = digits.replace(",", "")
+    digits = digits.replace(",", ".")
     try:
         return float(digits), m.group(2).strip()
     except ValueError:
