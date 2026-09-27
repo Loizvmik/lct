@@ -150,8 +150,8 @@ def _allowed_blocks(intent: SlideIntent) -> set[str | None]:
         allowed.add("kpi")
     if intent.form == "quote":
         allowed.add("quote")
-    if intent.required_visual in ("table", "chart"):
-        # Слайд, где главное: таблица или график: подпись необязательна.
+    if intent.required_visual in ("table", "chart", "code"):
+        # Слайд, где главное: таблица, график или код: подпись необязательна.
         allowed.add(None)
     return allowed
 
@@ -210,6 +210,8 @@ def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: i
         checks["visual"] = form.has_table
     elif visual == "chart":
         checks["visual"] = has_chart_place(form)
+    elif visual == "code":
+        checks["visual"] = has_code_place(form)
     elif visual == "photo":
         # Инструкция и правила шаблона не раскладки, даже если на них есть
         # картинка: «Оформление схем» VK Education (слайд 13) брала фото
@@ -236,6 +238,13 @@ def has_chart_place(form: PatternForm) -> bool:
     (`forms.PatternForm.chart_tier`). Какое из трёх лучше, решает
     стоимость (`scoring.chart_fit`), здесь только «можно ли»."""
     return form.chart_tier is not None and form.slide_class in ("content_pattern", "visual_prototype")
+
+
+def has_code_place(form: PatternForm) -> bool:
+    """Задача T2: у раскладки есть куда положить фрагмент кода: слот роли
+    `code` или крупное текстовое место (`forms.code_target_slot`). Какое
+    лучше, решает стоимость (`scoring.code_fit`)."""
+    return form.code_tier is not None and form.slide_class in ("content_pattern", "visual_prototype")
 
 
 def not_plain_content(form: PatternForm) -> bool:

@@ -44,7 +44,7 @@ def contract_for_slide(slide: SlideSpec, pattern_id: str, profile, style=None) -
     """Контракт места `pattern_id` под уже написанный слайд: число единиц
     берётся из самого слайда, чтобы починка сокращала текст, а не
     выбрасывала карточки."""
-    visual = slide.visual.kind if slide.visual is not None and slide.visual.kind in ("table", "chart") else None
+    visual = slide.visual.kind if slide.visual is not None and slide.visual.kind in ("table", "chart", "code") else None
     photo = slide.visual.photo_name if slide.visual is not None and slide.visual.kind == "photo" else None
     intent = SlideIntent(
         index=slide.index, outline_kind="context", intent=slide.headline, items=_units(slide),

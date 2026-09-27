@@ -41,8 +41,8 @@ from deckforge.plan.invariants import invariant_for, invariant_problems
 from deckforge.plan.normalize import normalize_deck
 from deckforge.plan.outline import Outline, SourceDoc
 from deckforge.plan.spec import (
-    SLIDE_KINDS, BulletBlock, Card, CardBlock, ChartSeriesData, ChartVisual, DeckSpec, SlideSpec, TableVisual,
-    TextBlock, Visual,
+    SLIDE_KINDS, BulletBlock, Card, CardBlock, ChartSeriesData, ChartVisual, CodeBlock, DeckSpec, SlideSpec,
+    TableVisual, TextBlock, Visual,
     slide_spec_from_dict, slide_spec_problems, slide_spec_to_dict,
 )
 from deckforge.provider.base import LLMProvider
@@ -407,6 +407,11 @@ def shorten_to_contract(
         return None
     repaired = _with_photo(repaired, contract)
     visual = repaired.visual if repaired.visual is not None else slide.visual
+    if slide.visual is not None and slide.visual.kind == "code":
+        # Фрагмент кода снят из источника до письма, починка текста его не
+        # трогает: от ответа берётся только подпись.
+        caption = repaired.visual.caption if repaired.visual is not None else None
+        visual = replace(slide.visual, caption=caption or slide.visual.caption)
     return replace(
         repaired, index=slide.index, pattern_id=slide.pattern_id, alternatives=slide.alternatives,
         visual=visual, speaker_notes=repaired.speaker_notes or slide.speaker_notes,
@@ -440,7 +445,7 @@ def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> Sl
         else:
             blocks = [BulletBlock(items=list(needs))]
     visual = _visual_from_contract(contract)
-    if visual is not None:
+    if visual is not None and visual.kind != "code":
         # График запасного слайда строится по данным источника: они уже
         # сняты кодом, модель для них не нужна.
         source_note = source_note or _CHART_SOURCE_NOTE
@@ -448,7 +453,10 @@ def _fallback_slide(contract: SlideContract, *, reason: str | None = None) -> Sl
         index=contract.slide_id, kind=contract.kind, headline=headline, blocks=blocks, visual=visual,
         source_note=source_note, findings=[finding], pattern_id=contract.pattern_id,
         alternatives=contract.alternatives,
-        speaker_notes="Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
+        speaker_notes=_with_code_note(
+            "Слайд собран запасным вариантом без модели: пункты взяты из плана, проверьте данные перед показом.",
+            contract,
+        ),
     )
 
 
@@ -503,7 +511,30 @@ def _visual_from_contract(contract: SlideContract) -> Visual | None:
         ))
     if contract.required_visual == "table" and data.get("rows"):
         return Visual(kind="table", table=TableVisual(rows=[list(r) for r in data["rows"]]))
+    if contract.required_visual == "code" and data.get("code"):
+        return Visual(kind="code", code=CodeBlock(
+            language=data.get("language") or "", code=data["code"], truncated=bool(data.get("truncated")),
+        ))
     return None
+
+
+def _code_note(contract: SlideContract) -> str | None:
+    """Заметка докладчику об укороченном фрагменте: на слайде видна «…»,
+    и говорящему нужно знать, что код длиннее и где он целиком."""
+    data = contract.visual_data or {}
+    if not data.get("truncated"):
+        return None
+    shown = len(str(data.get("code", "")).splitlines())
+    total = data.get("lines_total")
+    lines = f"{shown} строк из {total}" if total else "не весь фрагмент"
+    return f"Фрагмент кода на слайде сокращён ({lines}, длинные строки обрезаны «…»): целиком он в исходных материалах."
+
+
+def _with_code_note(notes: str | None, contract: SlideContract) -> str | None:
+    note = _code_note(contract)
+    if note is None or (notes and note in notes):
+        return notes
+    return f"{notes}\n\n{note}" if notes else note
 
 
 def _ensure_visual(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
@@ -516,6 +547,15 @@ def _ensure_visual(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
     if target is None:
         return slide
     visual = slide.visual
+    if target.kind == "code":
+        # Код ставит код, всегда: модель пишет только подпись.
+        caption = visual.caption if visual is not None else None
+        if caption is None and visual is not None and visual.code is not None:
+            caption = visual.code.caption
+        return replace(
+            slide, visual=replace(target, caption=caption),
+            speaker_notes=_with_code_note(slide.speaker_notes, contract),
+        )
     if target.kind == "table":
         if visual is not None and visual.kind == "table" and visual.table is not None:
             return slide
@@ -552,7 +592,7 @@ def _with_photo(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
     уже выбрана с местом под картинку, модель фото не выбирает."""
     if not contract.photo:
         return slide
-    if slide.visual is not None and slide.visual.kind in ("table", "chart"):
+    if slide.visual is not None and slide.visual.kind in ("table", "chart", "code"):
         return slide
     caption = (slide.visual.caption if slide.visual is not None else None) or contract.photo_caption
     return replace(slide, visual=Visual(kind="photo", caption=caption, photo_name=contract.photo))
@@ -818,7 +858,7 @@ def _content_units(slide: SlideSpec) -> int:
     for block in slide.blocks:
         items = getattr(block, "items", None)
         units += len(items) if items is not None else 1
-    if slide.visual is not None and slide.visual.kind in ("table", "chart"):
+    if slide.visual is not None and slide.visual.kind in ("table", "chart", "code"):
         units += 3
     return units
 

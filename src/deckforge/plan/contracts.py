@@ -17,9 +17,10 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 
-from deckforge.pattern.forms import MIN_HEADLINE_CHARS, FormPart, Limit, form_of, list_item_limit
+from deckforge.pattern.forms import CODE_TIER_TEXT, MIN_HEADLINE_CHARS, FormPart, Limit, form_of, list_item_limit
 from deckforge.pattern.style import load_style
 from deckforge.template.patterns import CHART_TIER_TEXT
+from deckforge.plan.code import DEFAULT_CODE_LINES, MAX_CODE_COLS, code_payload
 from deckforge.plan.spec import BulletBlock, CardBlock, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 
 _WORD_RE = re.compile(r"\S+")
@@ -144,7 +145,7 @@ class SlideContract:
         }
         if self.subhead is not None:
             out["subhead"] = {**self.subhead.to_dict(), "required": False}
-        if self.required_visual in ("table", "chart"):
+        if self.required_visual in ("table", "chart", "code"):
             out["visual"] = {"type": self.required_visual, **self.visual_limits}
             if self.visual_data is not None:
                 out["visual"]["data"] = self.visual_data
@@ -218,14 +219,24 @@ def _content_slots(intent, form) -> list[SlotContract]:
 def _matching_visual_intent(intent):
     """Визуал слоя данных, если он того же вида, что визуал контракта."""
     vi = getattr(intent, "visual_intent", None)
-    if vi is None or intent.required_visual not in ("table", "chart") or vi.type != intent.required_visual:
+    if vi is None or intent.required_visual not in ("table", "chart", "code") or vi.type != intent.required_visual:
         return None
     return vi
 
 
-def _visual_data(intent) -> dict | None:
+def _visual_data(intent, limits: dict | None = None) -> dict | None:
     vi = _matching_visual_intent(intent)
-    return vi.payload() if vi is not None else None
+    if vi is None:
+        return None
+    if vi.type == "code":
+        # Фрагмент укорачивается здесь, под место раскладки, а не на
+        # сборке: писатель и заметки докладчика видят ту же версию, что
+        # ляжет на слайд.
+        limits = limits or {}
+        return code_payload(
+            vi, limits.get("max_lines", DEFAULT_CODE_LINES), limits.get("max_cols", MAX_CODE_COLS),
+        )
+    return vi.payload()
 
 
 def _visual_reason(intent) -> str | None:
@@ -237,6 +248,9 @@ def _chart_takes_main(intent, form) -> bool:
     """График встаёт на главное текстовое место раскладки (у неё нет ни
     родного графика, ни картинки-графика): писать туда нечего, пункты
     легли бы под график."""
+    if intent.required_visual == "code":
+        # Код на крупном текстовом месте занимает его целиком, как график.
+        return form is not None and form.code_tier == CODE_TIER_TEXT
     return intent.required_visual == "chart" and form is not None and form.chart_tier == CHART_TIER_TEXT
 
 
@@ -276,6 +290,10 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
             key: (getattr(cap, key, 0) or default) if cap is not None else default
             for key, default in _DEFAULT_VISUAL_LIMITS.items()
         }
+    elif intent.required_visual == "code":
+        limits = {
+            "max_lines": form.code_lines if form is not None else DEFAULT_CODE_LINES, "max_cols": MAX_CODE_COLS,
+        }
     return SlideContract(
         slide_id=assignment.position,
         intent=intent.intent,
@@ -297,7 +315,7 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
         photo_caption=intent.photo_caption,
         gap_note=assignment.gap_note(),
         alternatives=tuple(getattr(assignment, "alternatives", ()) or ()),
-        visual_data=_visual_data(intent),
+        visual_data=_visual_data(intent, limits),
         visual_reason=_visual_reason(intent),
     )
 
@@ -380,12 +398,26 @@ def contract_problems(slide: SlideSpec, contract: SlideContract) -> list[str]:
     for block in extra:
         problems.append(f"лишний блок типа {type(block).__name__}: места под него у раскладки нет")
     visual = slide.visual
-    if contract.required_visual in ("table", "chart"):
+    if contract.required_visual in ("table", "chart", "code"):
         if visual is None or visual.kind != contract.required_visual:
             problems.append(f"нужен visual типа {contract.required_visual!r}")
-    elif visual is not None and visual.kind in ("table", "chart"):
+        elif contract.required_visual == "code":
+            problems.extend(code_problems(slide, contract))
+    elif visual is not None and visual.kind in ("table", "chart", "code"):
         problems.append(f"visual {visual.kind!r}: места под него у раскладки нет, убери его")
     return problems
+
+
+def code_problems(slide: SlideSpec, contract: SlideContract) -> list[str]:
+    """Код слайда обязан совпасть с фрагментом контракта знак в знак:
+    модель код не пишет, а переписанный код выглядит настоящим."""
+    want = (contract.visual_data or {}).get("code")
+    code = slide.visual.code if slide.visual is not None else None
+    if want is None:
+        return []
+    if code is None or code.code != want:
+        return ["код: фрагмент изменён или пропал; код ставит код из источника дословно, не переписывай его"]
+    return []
 
 
 def contract_fill(slide: SlideSpec, contract: SlideContract) -> tuple[int, int]:

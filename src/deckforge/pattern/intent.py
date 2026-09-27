@@ -39,8 +39,9 @@ _MAX_ITEMS = 8
 
 # Формы, которые модель структуры может заказать явно. Цитату и показатель
 # код сам не назначает: выдуманная цитата и число без источника хуже
-# обычного списка.
-FORMS = ("quote", "kpi", "table", "chart")
+# обычного списка. Код (задача T2) назначает слой фрагментов источников
+# (`plan.code`), не модель: выдуманный код хуже пересказа.
+FORMS = ("quote", "kpi", "table", "chart", "code")
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,7 @@ class SlideIntent:
 
     @property
     def required_visual(self) -> str | None:
-        if self.form in ("table", "chart"):
+        if self.form in ("table", "chart", "code"):
             return self.form
         if self.photo:
             return "photo"

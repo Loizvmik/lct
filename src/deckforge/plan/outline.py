@@ -21,6 +21,7 @@ from pathlib import Path
 
 import yaml
 
+from deckforge.plan.code import apply_code_intents
 from deckforge.plan.data_types import VisualIntent, visual_intents
 from deckforge.plan.series import stems
 from deckforge.provider.base import LLMProvider
@@ -35,7 +36,8 @@ OUTLINE_KINDS = (
 
 # Особая форма пункта, которую планировщик раскладок сам не назначает:
 # цитата и показатель только там, где материал их действительно несёт.
-OUTLINE_FORMS = ("quote", "kpi", "table", "chart")
+# `code` (задача T2): фрагмент кода источника, показанный как код.
+OUTLINE_FORMS = ("quote", "kpi", "table", "chart", "code")
 
 # Объём колоды — ТЗ дословно ("10-15 слайдов или заданное пользователем").
 MIN_SLIDES = 10
@@ -217,6 +219,12 @@ def _summarize_available_forms(profile) -> list[dict]:
     return forms
 
 
+def _apply_intents(slides: list[OutlineSlide], sources: list[SourceDoc]) -> list[OutlineSlide]:
+    """Визуалы слоя данных, потом фрагменты кода: график берёт пункт
+    «данные», код пункт «как устроено», и друг другу они не мешают."""
+    return apply_code_intents(apply_visual_intents(slides, sources), sources, max_slides=MAX_SLIDES)
+
+
 def build_outline(
     brief: str,
     sources: list[SourceDoc],
@@ -242,7 +250,7 @@ def build_outline(
     n = _clamp_target(target_slides)
 
     if llm is None:
-        return Outline(slides=apply_visual_intents(_fallback_outline(n), sources), title=title, language=language)
+        return Outline(slides=_apply_intents(_fallback_outline(n), sources), title=title, language=language)
 
     _meta, prompt_body = _load_agent_prompt()
     payload = {
@@ -283,7 +291,7 @@ def build_outline(
     else:
         slides = _clamp_slide_count(slides, n)
 
-    return Outline(slides=apply_visual_intents(slides, sources), title=title, language=language)
+    return Outline(slides=_apply_intents(slides, sources), title=title, language=language)
 
 
 # ---------------------------------------------------------------------------

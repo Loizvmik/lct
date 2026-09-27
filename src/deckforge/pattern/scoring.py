@@ -156,6 +156,8 @@ def static_cost(
     cost += photo_void_cost(pattern, intent, style)
     if intent.required_visual == "chart":
         cost += w("chart_fit") * style.chart_weight * chart_fit(form)
+    elif intent.required_visual == "code":
+        cost += w("chart_fit") * code_fit(form)
     if position == 0 and cover_id is not None and pattern.pattern_id != cover_id:
         cost += w("cover_miss")
     if (
@@ -183,6 +185,13 @@ def chart_fit(form: PatternForm) -> float:
     дизайнера остаётся), 1 у картинки-графика (наш график встаёт в её
     рамку), 2 у крупного текстового места, 3 без места. Задача V1."""
     return float(_NO_CHART_PLACE if form.chart_tier is None else form.chart_tier)
+
+
+def code_fit(form: PatternForm) -> float:
+    """Задача T2: 0 у слота роли `code` (плашка и моногарнитура дизайнера),
+    1 у крупного текстового места (плашку рисует сборка), 2 без места.
+    Вес тот же, что у места графика: оба про качество места под визуал."""
+    return float(2 if form.code_tier is None else form.code_tier)
 
 
 def repeat_cost(pattern_id: str, previous: str | None, uses: int, style: StylePolicy) -> float:

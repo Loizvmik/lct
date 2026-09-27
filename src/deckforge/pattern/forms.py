@@ -21,6 +21,19 @@ from deckforge.template.patterns import (
     CHART_TIER_TEXT, CHARS_PER_WORD, chart_target_slot, keeps_sample_text, slot_char_capacity,
 )
 
+# Места под фрагмент кода (задача T2), от лучшего: слот роли `code` с
+# моногарнитурой и плашкой дизайнера (вид раскладки `code`, задача T1),
+# крупное текстовое место, на которое код встаёт своей плашкой.
+CODE_TIER_SLOT = 0
+CODE_TIER_TEXT = 1
+# Строк кода на слайде (`plan.code.MIN_CODE_LINES`..`MAX_CODE_LINES`): по
+# замеру места, но не меньше 14 (фрагмент теряет смысл) и не больше 18
+# (кегль моно уходит ниже 10 pt). Числа повторены здесь, а не взяты из
+# `plan`: формы не зависят от плана.
+_CODE_LINES_MIN = 14
+_CODE_LINES_MAX = 18
+_CODE_LINES_DEFAULT = 16
+
 TEXT_ROLES = ("body", "bullet", "card_body")
 _UNIT_BODY_ROLES = ("card_body", "bullet", "body")
 # Пунктов в одном месте-списке не больше этого: дальше список читается
@@ -96,6 +109,10 @@ class PatternForm:
     chart_tier: int | None = None
     # Класс слайда-примера (`template.prototypes.SLIDE_CLASSES`).
     slide_class: str = "content_pattern"
+    # Задача T2: место под фрагмент кода (`CODE_TIER_*`), `None`: коду
+    # места нет. `code_lines`: сколько строк кода место держит.
+    code_tier: int | None = None
+    code_lines: int = _CODE_LINES_DEFAULT
 
     @property
     def main(self) -> FormPart | None:
@@ -255,6 +272,8 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
     headline = _biggest([s for s in slots if s.role == "headline"])
     subhead = _biggest([s for s in slots if s.role in ("subhead", "caption") and not keeps_sample_text(s)])
     roles = {s.role for s in slots}
+    code_slot, code_tier = code_target_slot(pattern, parts)
+    code_lines = _code_lines(_limit(code_slot) if code_slot is not None else None)
     return PatternForm(
         pattern_id=pattern.pattern_id, kind=pattern.kind, parts=tuple(parts),
         headline=_limit(headline) if headline is not None else None,
@@ -265,7 +284,37 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
         decor=len(pattern.decor), repeated=repeat is not None,
         chart_tier=_chart_tier(pattern, parts),
         slide_class=getattr(pattern, "slide_class", "content_pattern"),
+        code_tier=code_tier, code_lines=code_lines,
     )
+
+
+def code_target_slot(pattern, parts=None):
+    """Место, куда ляжет фрагмент кода, и его ступень (`CODE_TIER_*`). Одна
+    функция на планировщик и сборку (`compose.code`), чтобы они не
+    разошлись. Слот роли `code` у раскладки вида `code` (задача T1) лучше
+    всего: плашку и моногарнитуру там выбрал дизайнер. Иначе крупное
+    текстовое место, то же, что берёт график (`chart_target_slot`), и
+    только у раскладки, чьё главное содержание абзац или список: код в
+    одной карточке из трёх ломает ряд."""
+    slots = list(pattern.slots)
+    coded = [s for s in slots if s.role == "code"]
+    if coded:
+        # Самый ёмкий по знакам: координат формы не знают.
+        return max(coded, key=lambda s: getattr(s, "max_chars", 0) or 0), CODE_TIER_SLOT
+    slot, tier = chart_target_slot(slots)
+    if tier != CHART_TIER_TEXT:
+        return None, None
+    if parts is not None:
+        main = next((p for p in parts if p.required), None)
+        if main is None or main.block not in ("bullets", "text"):
+            return None, None
+    return slot, CODE_TIER_TEXT
+
+
+def _code_lines(limit: Limit | None) -> int:
+    if limit is None or not limit.lines:
+        return _CODE_LINES_DEFAULT
+    return max(_CODE_LINES_MIN, min(_CODE_LINES_MAX, int(limit.lines)))
 
 
 def _chart_tier(pattern, parts: list[FormPart]) -> int | None:
@@ -369,6 +418,7 @@ class PatternCapabilities:
     photo_frames: int = 0
     photo_area: float = 0.0
     photo_slot_area: float = 0.0
+    supports_code: bool = False
 
     def photo_void(self, has_photo: bool) -> float:
         """Доля холста, которая опустеет, когда клон удалит фото примера."""
@@ -423,6 +473,7 @@ def capabilities_of(pattern, form: PatternForm | None = None) -> PatternCapabili
         photo_frames=int(getattr(pattern, "photo_frames", 0) or 0),
         photo_area=float(getattr(pattern, "photo_area", 0.0) or 0.0),
         photo_slot_area=float(getattr(pattern, "photo_slot_area", 0.0) or 0.0),
+        supports_code=form.code_tier is not None,
     )
 
 
@@ -441,6 +492,7 @@ class SlideRequirements:
     chart: bool = False
     photo: bool = False
     quote: bool = False
+    code: bool = False
     allow_split: bool = True
     max_photo_void: float = MAX_PHOTO_VOID
 
@@ -450,7 +502,7 @@ class SlideRequirements:
         return cls(
             headline=True,
             kpis=int(getattr(intent, "items", 0) or 0) if form == "kpi" else 0,
-            table=form == "table", chart=form == "chart", quote=form == "quote",
+            table=form == "table", chart=form == "chart", quote=form == "quote", code=form == "code",
             photo=bool(getattr(intent, "photo", None)),
         )
 
@@ -470,6 +522,7 @@ class SlideRequirements:
             table=visual is not None and visual.kind == "table",
             chart=visual is not None and visual.kind == "chart",
             photo=visual is not None and visual.kind == "photo",
+            code=visual is not None and visual.kind == "code",
         )
 
 
@@ -493,6 +546,8 @@ def unmet_requirements(req: SlideRequirements, caps: PatternCapabilities) -> lis
         missing.append("нет места под таблицу")
     if req.chart and not caps.supports_chart:
         missing.append("нет места под график")
+    if req.code and not caps.supports_code:
+        missing.append("нет места под код")
     if req.photo and not caps.supports_photo:
         missing.append("нет места под фото")
     if req.quote and not (caps.supports_quote or caps.text_blocks_max):

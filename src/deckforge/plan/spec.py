@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 # отличалась от обычного текстового слайда (`bullets`) и терялась в подборе.
 SLIDE_KINDS = (
     "cards", "two_col", "kpi", "section", "image", "table", "bullets",
-    "quote", "photo_text", "kpi_caption",
+    "quote", "photo_text", "kpi_caption", "code",
 )
 
 
@@ -126,6 +126,20 @@ class ChartVisual:
 
 
 @dataclass(frozen=True)
+class CodeBlock:
+    """Фрагмент кода из источника (задача T2). `code` дословно тот, что
+    лежал в fenced-блоке источника, только, может быть, укорочен по
+    строкам под раскладку (`plan.code.fit_code`, отметка `truncated`).
+    Модель его не пишет и не переписывает: пересказанный код хуже
+    отсутствующего, он выглядит настоящим. `language`: метка языка из
+    ограды (```python), пустая, если её не было."""
+    language: str
+    code: str
+    caption: str | None = None
+    truncated: bool = False
+
+
+@dataclass(frozen=True)
 class Visual:
     """Что должно занять нетекстовый слот раскладки (роль `image`/`icon`/
     `chart`/`table` у `Pattern.slots`) — тоже описание содержания, не
@@ -148,11 +162,12 @@ class Visual:
     ниже (тот же приём, что и `SlideSpec.pattern_id`, который тоже
     проставляется ПОСЛЕ содержания отдельным шагом, не моделью, писавшей
     текст)."""
-    kind: str  # "photo" | "icon" | "chart" | "table"
+    kind: str  # "photo" | "icon" | "chart" | "table" | "code"
     caption: str | None = None
     photo_name: str | None = None
     table: TableVisual | None = None
     chart: ChartVisual | None = None
+    code: CodeBlock | None = None
 
 
 @dataclass
@@ -319,6 +334,9 @@ def slide_spec_problems(slide: SlideSpec) -> list[str]:
                         f"а категорий {n_cat}"
                     )
             has_digits = True
+        code = slide.visual.code
+        if code is not None and not code.code.strip():
+            problems.append(f"{where}: пустой фрагмент кода")
 
     if has_digits and not (slide.source_note and slide.source_note.strip()):
         problems.append(f"{where}: на слайде есть цифры, а source_note не указан")
@@ -440,7 +458,7 @@ def visual_from_dict(data: dict | None, where: str) -> Visual | None:
     if data is None:
         return None
     data = _lift_flattened_visual(data)
-    _check_keys(data, {"kind", "caption", "table", "chart"}, {"kind"}, where)
+    _check_keys(data, {"kind", "caption", "table", "chart", "code"}, {"kind"}, where)
 
     table = None
     if data.get("table") is not None:
@@ -466,7 +484,20 @@ def visual_from_dict(data: dict | None, where: str) -> Visual | None:
             unit=c.get("unit"), highlight_index=c.get("highlight_index"), axis_titles=axis_titles,
         )
 
-    return Visual(kind=data["kind"], caption=data.get("caption"), table=table, chart=chart)
+    code = None
+    raw_code = data.get("code")
+    if isinstance(raw_code, str):
+        # Модель прислала код строкой: берётся как есть, но на слайд всё
+        # равно встанет фрагмент источника (`writer._ensure_visual`).
+        code = CodeBlock(language="", code=raw_code)
+    elif isinstance(raw_code, dict):
+        _check_keys(raw_code, {"language", "code", "caption"}, set(), f"{where}.code")
+        code = CodeBlock(
+            language=str(raw_code.get("language") or ""), code=str(raw_code.get("code") or ""),
+            caption=raw_code.get("caption"),
+        )
+
+    return Visual(kind=data["kind"], caption=data.get("caption"), table=table, chart=chart, code=code)
 
 
 # `layout_id` (Task 23) — номер раскладки, которую агент выбрал сам,
@@ -573,9 +604,13 @@ def _visual_to_dict(visual: Visual | None) -> dict | None:
             "unit": c.unit, "highlight_index": c.highlight_index,
             "axis_titles": list(c.axis_titles) if c.axis_titles else None,
         }
+    code = None
+    if visual.code is not None:
+        c = visual.code
+        code = {"language": c.language, "code": c.code, "caption": c.caption, "truncated": c.truncated}
     return {
         "kind": visual.kind, "caption": visual.caption, "photo_name": visual.photo_name,
-        "table": table, "chart": chart,
+        "table": table, "chart": chart, "code": code,
     }
 
 
@@ -592,9 +627,16 @@ def _visual_from_debug_dict(data: dict | None) -> Visual | None:
             unit=c.get("unit"), highlight_index=c.get("highlight_index"),
             axis_titles=tuple(c["axis_titles"]) if c.get("axis_titles") else None,
         )
+    code = None
+    if data.get("code"):
+        c = data["code"]
+        code = CodeBlock(
+            language=c.get("language") or "", code=c["code"], caption=c.get("caption"),
+            truncated=bool(c.get("truncated")),
+        )
     return Visual(
         kind=data["kind"], caption=data.get("caption"), photo_name=data.get("photo_name"),
-        table=table, chart=chart,
+        table=table, chart=chart, code=code,
     )
 
 
