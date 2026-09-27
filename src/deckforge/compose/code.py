@@ -55,9 +55,13 @@ _PT_PER_INCH = 72.0
 _MIN_PLATE_DELTA = 0.04
 
 
-def mono_family(profile) -> str:
-    """Моногарнитура шаблона (`type_scale.mono`, снята разбором), иначе
+def mono_family(profile, slot=None) -> str:
+    """Моногарнитура слота кода (`PatternSlot.font_family`, задача T1),
+    иначе шаблона (`type_scale.mono`, снята разбором), иначе
     системная."""
+    own = getattr(slot, "font_family", None) if getattr(slot, "mono", False) else None
+    if own:
+        return own
     mono = list(getattr(getattr(profile, "type_scale", None), "mono", None) or [])
     return mono[0] if mono else FALLBACK_MONO
 

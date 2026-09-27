@@ -44,6 +44,7 @@ import re
 from collections import defaultdict
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image
 
@@ -74,7 +75,7 @@ from deckforge.template.typography import TypeScale, is_mono_family
 ROLES = frozenset({
     "headline", "subhead", "body", "bullet", "card_title", "card_body",
     "kpi_value", "kpi_label", "quote", "caption", "source", "image", "icon",
-    "chart", "table",
+    "chart", "table", "code",
 })
 
 # Роли, не несущие текста как такового — их max_chars/wraps не имеют смысла
@@ -82,7 +83,7 @@ ROLES = frozenset({
 # действительно есть текст, который надо будет уместить.
 _NON_TEXT_ROLES = frozenset({"image", "icon", "table", "chart"})
 
-KINDS = ("cards", "two_col", "kpi", "section", "image", "table", "bullets")
+KINDS = ("cards", "two_col", "kpi", "section", "image", "table", "bullets", "quote", "team", "timeline", "code")
 
 # Kind'ы, для которых допустимо не иметь слота headline (бриф, тест
 # `test_every_pattern_has_a_headline_slot_or_is_marked_decorative`): "section"
@@ -90,7 +91,12 @@ KINDS = ("cards", "two_col", "kpi", "section", "image", "table", "bullets")
 # — слайд, где смысл несёт картинка, а не текстовая иерархия. Для остальных
 # kind'ов отсутствие headline — брак раскладки (см. `_mine_slide`: такой
 # кандидат отбрасывается на шаге оценки, а не просачивается без роли).
-_HEADLINE_EXEMPT_KINDS = frozenset({"section", "image"})
+#
+# "quote" и "team" (задача T1): цитата VK Education (слайд 19) это крупный
+# текст высказывания и подпись автора, команда (слайд 20) это сетка фото с
+# именами. Заголовка у них нет по замыслу дизайнера, и выбрасывать их за
+# это значило терять единственные образцы этих видов в шаблоне.
+_HEADLINE_EXEMPT_KINDS = frozenset({"section", "image", "quote", "team"})
 
 # Плейсхолдеры колонтитулов: на слайде-примере это оформление, не слот.
 _CHROME_PH_TYPES = frozenset({"sldNum", "dt", "ftr", "hdr"})
@@ -200,6 +206,12 @@ class PatternSlot:
     # шаблоне нет, и рамка этой картинки лучшее место под наш график того
     # же размера. Ставится только у роли `image`, см. `mark_chart_frames`.
     chart_frame: bool = False
+    # Место набрано моноширинной гарнитурой (слот `code`, задача T1):
+    # сборка блока кода ставит туда текст той же гарнитурой и кеглем.
+    # `font_family`: гарнитура примера (`a:latin/@typeface`), `None`, если
+    # на примере она не задана явно.
+    mono: bool = False
+    font_family: str | None = None
 
     @property
     def keeps_sample_text(self) -> bool:
@@ -588,6 +600,12 @@ class _TierInfo:
     align: str
     color_hex: str | None
     anchor: str = "t"
+    # Подпись показателя, отделённая от числа в той же рамке
+    # (`_split_number_heads`): её роль `kpi_label`, где бы она ни стояла.
+    number_label: bool = False
+    # Текст набран моноширинной гарнитурой (`_is_code_sample`): место под
+    # код, роль `code`.
+    code: bool = False
 
 
 _TIER_ORDER = ("micro", "caption", "body", "h2", "h1", "display")
@@ -606,12 +624,19 @@ def _mine_slide(
 
     refs = list(walk_shapes(root, canvas, include_groups=False))
     refs = _resolve_slide_boxes(pkg, refs, layout_part, canvas)
+    # Линии слайда до отсева невидимого: у коннектора нулевая высота, и
+    # `_visible` его выбрасывает, а ось таймлайна VK WorkSpace (слайд 26)
+    # нарисована именно им.
+    lines = _slide_lines(refs)
     refs = [r for r in refs if _visible(r)]
     if not refs:
         return None
 
     rels = pkg.rels(slide_part)
-    content, decor = _split_content_decor(refs, rels, logo_target, bg_targets)
+    content, decor = _split_content_decor(
+        refs, rels, logo_target, bg_targets,
+        is_photo=lambda ref: _is_sample_photo(pkg, _picture_target(ref.element, rels), photo_cache),
+    )
     if not content:
         return None
     if len(decor) > _MAX_DECOR_SHAPES:
@@ -622,15 +647,8 @@ def _mine_slide(
         # держит: самая насыщенная из трёх учебных шаблонов — около 30 фигур.
         return None
 
-    if any(_is_code_sample(ref.element) for ref in content):
-        # Слайд «Оформление кода» VK Education: жёлтый Consolas на чёрной
-        # плашке. Как раскладка two_col он подходил под любые два столбца
-        # текста, и наш текст ложился моноширинным по чёрному (живой прогон
-        # 27 сентября 2026, слайды 2 и 11). Кода в презентациях по брифу
-        # нет, такой слайд-пример не раскладка.
-        return None
-
     tiers = [_tier_info(ref, canvas, scale, theme) for ref in content]
+    content, tiers = _split_number_heads(content, tiers, canvas, scale)
 
     repeat, repeat_roles_by_index = _find_repeat(content, tiers)
     grid_cells: dict[int, tuple[int, int]] = {}
@@ -641,6 +659,15 @@ def _mine_slide(
         repeat, _grid_roles, grid_cells = _find_grid(content, tiers)
     slots = _finalize_roles(content, tiers, repeat_roles_by_index, canvas, scale)
     slots = _promote_photo_placeholders(slots, decor, canvas)
+    # Коробки поправляются до ролей и вида: подпись под крупным числом
+    # узнаётся по уже обрезанной рамке числа (`_pair_kpi_labels`).
+    slots = _trim_tall_headline(_snap_to_margins(slots, grid), canvas)
+    slots = _clip_to_frame(slots, grid, canvas)
+    slots = _trim_nested_frames(slots, canvas)
+    repeat_members = set(repeat_roles_by_index or grid_cells)
+    slots = _pair_kpi_labels(slots, repeat_members)
+    if not any(s.role == "headline" for s in slots) and repeat is None:
+        slots = _mark_quote(slots)
 
     if repeat is not None:
         # slot_roles достраивается ФИНАЛЬНЫМИ ролями (не предварительными
@@ -656,6 +683,9 @@ def _mine_slide(
         # Сетка показателей (число с подписью в каждой ячейке) остаётся
         # показателями, а не карточками: так её видел разбор и до сеток.
         kind, kind_confidence = "kpi", 0.45
+    special = _special_kind(slots, repeat, lines, repeat_members)
+    if special is not None:
+        kind, kind_confidence = special
 
     if "headline" not in roles_present and kind not in _HEADLINE_EXEMPT_KINDS:
         # Раскладка без заголовка (и не героического типа section/image) —
@@ -665,7 +695,6 @@ def _mine_slide(
         # СТРУКТУРНО, не совпадением на трёх учебных файлах.
         return None
 
-    slots = _trim_tall_headline(_snap_to_margins(slots, grid), canvas)
     if _slots_overlap(slots) or not _within_margins(slots, grid):
         return None
 
@@ -924,6 +953,7 @@ def _has_chart(element) -> bool:
 
 def _split_content_decor(
     refs: list[ShapeRef], rels: dict[str, str], logo_target: str | None, bg_targets: set[str],
+    is_photo: Callable[[ShapeRef], bool] | None = None,
 ) -> tuple[list[ShapeRef], list[ShapeRef]]:
     """Контентные шейпы (несут текст, картинку, таблицу) отдельно от декора
     (`noFill` без текста, линии, фоновые плашки, логотип — бриф, Step 2,
@@ -1024,13 +1054,76 @@ def _split_content_decor(
     # майнинг отбрасывал весь слайд (шесть раскладок карточек из 29
     # слайдов, разбор 27 сентября 2026). Фото в рамку шириной в два
     # процента холста всё равно не поставить.
+    #
+    # Картинка, на которой лежит текст или плейсхолдер, тоже декор (задача
+    # T1): это фон, иллюстрация или рамка устройства, а не место под фото.
+    # VK Tech рисует кольца диаграмм, мокап телефона и ценовые карточки
+    # картинками под текстом, ЛЦТ2026 ставит плейсхолдер экрана внутрь
+    # картинки-телефона. Как слот такая картинка налезала на текст, и
+    # разбор отбрасывал 17 слайдов VK Tech целиком.
+    #
+    # Галерея одинаковых фото (команда VK Education, слайд 20: восемь
+    # портретов) остаётся местами под фото все вместе: иначе единица
+    # повтора «фото + имя + должность» теряла фото у семи человек из восьми.
     if pictures:
-        largest = max(pictures, key=lambda r: r.box.width * r.box.height)
+        text_boxes = [r.box for r in content if r.kind == "shape" and r.box is not None]
+        free = [r for r in pictures if not _under_text(r.box, text_boxes) and not _is_line(r.box)]
+        slots = _photo_gallery(free, is_photo) or _largest_photo(free)
+        slot_ids = {id(r) for r in slots}
         for ref in pictures:
-            is_slot = ref is largest and ref.box.width >= _PHOTO_SLOT_MIN_WIDTH
-            (content if is_slot else decor).append(ref)
+            (content if id(ref) in slot_ids else decor).append(ref)
 
     return content, decor
+
+
+# Картинка вытянута сильнее этого (длина к толщине): это линия, ось
+# таймлайна VK Tech (слайды 47, 48) нарисована картинкой 0.79 × 0.014
+# холста. Место под фото из линии не выйдет.
+_LINE_ASPECT = 10.0
+
+
+def _is_line(box: Box) -> bool:
+    short, long = sorted((box.width, box.height))
+    return short <= 0 or long / short >= _LINE_ASPECT
+
+
+# Доля площади текстовой рамки, лежащая на картинке, с которой картинка
+# считается подложкой под этот текст. Тот же порог, что у наложения слотов
+# (`_slots_overlap`): треть рамки уже не касание краем.
+_TEXT_OVER_PICTURE_SHARE = 0.3
+
+
+def _under_text(box: Box, text_boxes: list[Box]) -> bool:
+    """Лежит ли на картинке текстовая рамка (или плейсхолдер) заметной
+    частью своей площади."""
+    for text in text_boxes:
+        inter = box.intersect(text)
+        if inter is not None and text.area > 0 and inter.area / text.area > _TEXT_OVER_PICTURE_SHARE:
+            return True
+    return False
+
+
+def _largest_photo(pictures: list[ShapeRef]) -> list[ShapeRef]:
+    if not pictures:
+        return []
+    largest = max(pictures, key=lambda r: r.box.width * r.box.height)
+    return [largest] if largest.box.width >= _PHOTO_SLOT_MIN_WIDTH else []
+
+
+def _photo_gallery(pictures: list[ShapeRef], is_photo: Callable[[ShapeRef], bool] | None) -> list[ShapeRef]:
+    """Самая многочисленная группа одинаковых по размеру фотографий не уже
+    места под фото, если их хотя бы `_MIN_GRID_UNITS`: портреты команды,
+    галерея. Только фотографии (`_is_sample_photo`): одинаковые картинки
+    фирменной графики в карточках VK Tech (слайды 15, 54) не место под фото
+    пользователя, для них остаётся правило «самая крупная»."""
+    if is_photo is None:
+        return []
+    wide = [r for r in pictures if r.box.width >= _PHOTO_SLOT_MIN_WIDTH and is_photo(r)]
+    if len(wide) < _MIN_GRID_UNITS:
+        return []
+    groups = _group_by_size(list(range(len(wide))), [r.box for r in wide])
+    best = max(groups, key=len)
+    return [wide[i] for i in best] if len(best) >= _MIN_GRID_UNITS else []
 
 
 # --- типографический разбор контентного шейпа ------------------------------
@@ -1215,7 +1308,97 @@ def _tier_info(ref: ShapeRef, canvas: Canvas, scale: TypeScale, theme: ThemeInfo
     color_hex = _dominant_color(ref.element, theme)
     return _TierInfo(step=step, size_pt=size_pt, numeric=numeric, bulleted=bulleted,
                       text=text if stripped else None, align=align, color_hex=color_hex,
-                      anchor=anchor)
+                      anchor=anchor, code=bool(stripped) and _is_code_sample(ref.element))
+
+
+def _text_lines(element, canvas: Canvas) -> list[tuple[str, float | None]]:
+    """(текст, кегль) каждой строки рамки: строки делят и абзацы, и мягкий
+    перенос `a:br` (у VK WorkSpace число и подпись стоят в одном абзаце
+    через перенос). Кегль строки: кегль самого длинного её run'а, `None`,
+    если явного `sz` нет."""
+    tx_body = element.find(qn("p:txBody"))
+    if tx_body is None:
+        return []
+    out: list[tuple[str, float | None]] = []
+    for p in tx_body.findall(qn("a:p")):
+        parts: list[str] = []
+        best: tuple[int, float | None] = (0, None)
+        for child in p:
+            tag = local_name(child)
+            if tag == "br":
+                out.append(("".join(parts), best[1]))
+                parts, best = [], (0, None)
+            elif tag == "r":
+                t_el = child.find(qn("a:t"))
+                text = (t_el.text or "") if t_el is not None else ""
+                parts.append(text)
+                r_pr = child.find(qn("a:rPr"))
+                sz = r_pr.get("sz") if r_pr is not None else None
+                if sz is not None and len(text) >= best[0]:
+                    best = (len(text), round(int(sz) / 100 * canvas.norm * 2) / 2)
+        out.append(("".join(parts), best[1]))
+    return out
+
+
+def _split_number_heads(
+    content: list[ShapeRef], tiers: list[_TierInfo | None], canvas: Canvas, scale: TypeScale,
+) -> tuple[list[ShapeRef], list[_TierInfo | None]]:
+    """Показатель «число + подпись» в одной рамке (VK WorkSpace, слайды 17
+    и 18: «ххх%» и под ним «данные показателя») делится на два места:
+    число сверху (первый абзац) и подпись под ним (задача T1). Одной
+    рамкой он читался абзацем `body`, и раскладка показателей не находила
+    ни одного `kpi_value`.
+
+    Делится только рамка, у которой первый абзац число или маска числа, а
+    кегль числа не меньше кегля подписи. Обе половины остаются одной фигурой
+    примера (`source_shape_id` тот же): это место одной рамки, поделённое
+    по строкам. Индексы `content`/`tiers` остаются согласованными: подпись
+    идёт отдельной записью со своей коробкой и типографикой."""
+    out_refs: list[ShapeRef] = []
+    out_tiers: list[_TierInfo | None] = []
+    for ref, tier in zip(content, tiers):
+        split = _number_head(ref, tier, canvas, scale)
+        if split is None:
+            out_refs.append(ref)
+            out_tiers.append(tier)
+            continue
+        (value_box, value_tier), (label_box, label_tier) = split
+        out_refs += [replace(ref, box=value_box), replace(ref, box=label_box)]
+        out_tiers += [value_tier, label_tier]
+    return out_refs, out_tiers
+
+
+def _number_head(ref: ShapeRef, tier: _TierInfo | None, canvas: Canvas, scale: TypeScale):
+    if tier is None or tier.numeric or tier.bulleted or not tier.text or ref.box is None:
+        return None
+    paragraphs = [(t, sz) for t, sz in _text_lines(ref.element, canvas) if t.strip()]
+    if len(paragraphs) < 2:
+        return None
+    head, head_size = paragraphs[0]
+    head = head.strip()
+    if len(head) > 12 or not (_NUMERIC_RE.match(head) or _NUMBER_MASK_RE.match(head)):
+        return None
+    if len(_WORD_RE.findall(" ".join(t for t, _sz in paragraphs[1:]))) < 2:
+        # «10» и «млн» строкой ниже: единица числа, а не подпись к нему
+        # (VK Education, схема на слайде 13).
+        return None
+    rest_sizes = [sz for _t, sz in paragraphs[1:] if sz is not None]
+    label_size = max(set(rest_sizes), key=rest_sizes.count) if rest_sizes else tier.size_pt
+    head_size = head_size or tier.size_pt
+    if head_size < label_size:
+        return None
+    box = ref.box
+    line = head_size / 72 * _LINE_HEIGHT_EM / canvas.height_in
+    value_h = min(line, box.height * 0.6)
+    value_box = Box(box.left, box.top, box.width, value_h)
+    label_box = Box(box.left, box.top + value_h, box.width, box.height - value_h)
+    label_text = "\n".join(t for t, _sz in paragraphs[1:])
+    value_tier = replace(tier, step=_nearest_step(scale, head_size), size_pt=head_size, numeric=True, text=head)
+    label_tier = replace(
+        tier, step=_nearest_step(scale, label_size), size_pt=label_size, numeric=False, text=label_text,
+        number_label=True,
+    )
+    return (value_box, value_tier), (label_box, label_tier)
 
 
 # --- поиск повтора (бриф, Step 2, п.4) --------------------------------------
@@ -1298,6 +1481,8 @@ def _prelim_repeat_role(tier: _TierInfo | None, ref: ShapeRef) -> str:
         return "icon" if square_ish and ref.box.width < 0.08 else "image"
     if tier is None:
         return "body"
+    if tier.number_label:
+        return "kpi_label"
     if tier.numeric:
         return "kpi_value"
     if _TIER_RANK[tier.step] >= _TIER_RANK["h2"]:
@@ -1344,7 +1529,7 @@ def _find_repeat(
     role_groups: dict[tuple, list[int]] = defaultdict(list)
     for i, (ref, tier) in enumerate(zip(content, tiers)):
         key = ("picture",) if ref.kind == "picture" else (tier.step, tier.numeric, tier.bulleted) if tier else None
-        if key is None:
+        if key is None or (tier is not None and tier.code):
             continue
         role_groups[key].append(i)
 
@@ -1522,7 +1707,7 @@ def _find_grid(
             continue
         if ref.kind == "picture":
             groups[("picture",)].append(i)
-        elif tier is not None:
+        elif tier is not None and not tier.code:
             groups[(tier.step, tier.numeric, tier.bulleted)].append(i)
     best: tuple[int, list[int], list[float], list[float], float] | None = None
     for idxs in groups.values():
@@ -1847,9 +2032,18 @@ def _finalize_roles(
     n = len(content)
     roles: list[str | None] = [None] * n
 
+    # 0. Код (задача T1): рамка, набранная моноширинной гарнитурой, это
+    # место под блок кода. Раньше такой слайд выбрасывался целиком: жёлтый
+    # Consolas примера ложился под обычный текст (прогон 27 сентября 2026).
+    # Теперь место помечено ролью `code`, и обычный текст туда не пойдёт.
+    for i, t in enumerate(tiers):
+        if t is not None and t.code:
+            roles[i] = "code"
+
     # 1. Повтор — предварительные роли уже решены на этапе поиска повтора.
     for i, role in repeat_roles_by_index.items():
-        roles[i] = role
+        if roles[i] is None:
+            roles[i] = role
 
     # 2. Картинки/таблицы вне повтора.
     for i, ref in enumerate(content):
@@ -1860,6 +2054,11 @@ def _finalize_roles(
         elif ref.kind == "picture":
             square_ish = ref.box is not None and 0.8 <= (ref.box.width / max(ref.box.height, 1e-9)) <= 1.25
             roles[i] = "icon" if square_ish and ref.box.width < 0.08 else "image"
+        elif _is_empty_picture_placeholder(ref, tiers[i]):
+            # Пустой плейсхолдер рисунка это место под фото, а не абзац:
+            # ЛЦТ2026 (слайды 7, 14, 19) и VK Education (слайд 6) ставят их
+            # на полслайда, и как `body` они обещали писателю сотни слов.
+            roles[i] = "image"
 
     # 3. headline — самый верхний нерепитящийся текстовый шейп в
     # title-ступени (h1/display), либо явный плейсхолдер заголовка.
@@ -1875,7 +2074,11 @@ def _finalize_roles(
         roles[headline_idx] = "headline"
 
     # 4. KPI: числовой нерепитящийся слот -> kpi_value, ближайший
-    # некрупный текст рядом -> kpi_label.
+    # некрупный текст рядом -> kpi_label. Подпись, отделённая от числа той
+    # же рамки (`_split_number_heads`), подпись по построению.
+    for i, t in enumerate(tiers):
+        if roles[i] is None and t is not None and t.number_label:
+            roles[i] = "kpi_label"
     kpi_indices = [
         i for i, t in enumerate(tiers)
         if roles[i] is None and t is not None and t.numeric
@@ -1925,6 +2128,13 @@ def _finalize_roles(
 _LINE_HEIGHT_EM = 1.25
 
 
+def _is_empty_picture_placeholder(ref: ShapeRef, tier: _TierInfo | None) -> bool:
+    return (
+        ref.kind == "shape" and ref.is_placeholder and ref.ph_type == "pic"
+        and (tier is None or not (tier.text or "").strip())
+    )
+
+
 def _build_slot(ref: ShapeRef, tier: _TierInfo | None, role: str, canvas: Canvas, scale: TypeScale) -> PatternSlot:
     if tier is not None:
         size_pt = tier.size_pt
@@ -1946,12 +2156,31 @@ def _build_slot(ref: ShapeRef, tier: _TierInfo | None, role: str, canvas: Canvas
         height_in = ref.box.height * canvas.height_in
         wraps = line_height_in > 0 and (height_in / line_height_in) >= 1.5
 
+    mono = role == "code"
     return PatternSlot(
         role=role, box=ref.box, size_pt=round(size_pt, 1), color_hex=color_hex,
         align=align, max_chars=max_chars, wraps=wraps, sample_text=text,
         anchor=tier.anchor if tier is not None else "t",
         source_shape_id=ref.shape_id or None,
+        mono=mono, font_family=_latin_family(ref.element) if mono else None,
     )
+
+
+def _latin_family(element) -> str | None:
+    """Гарнитура самого длинного run'а рамки (`a:latin/@typeface`)."""
+    tx_body = element.find(qn("p:txBody"))
+    if tx_body is None:
+        return None
+    best: tuple[int, str | None] = (0, None)
+    for r in tx_body.iter(qn("a:r")):
+        t_el = r.find(qn("a:t"))
+        chars = len((t_el.text or "").strip()) if t_el is not None else 0
+        r_pr = r.find(qn("a:rPr"))
+        latin = r_pr.find(qn("a:latin")) if r_pr is not None else None
+        family = latin.get("typeface") if latin is not None else None
+        if family and chars > best[0]:
+            best = (chars, family)
+    return best[1]
 
 
 # --- вместимость слота: честная минимальная оценка (бриф, "Требования к
@@ -2098,6 +2327,189 @@ def _classify_kind(
     return "bullets", 0.3
 
 
+# --- особые виды (задача T1) -------------------------------------------------
+
+# Подпись под крупным числом: не дальше этого от низа его рамки и не
+# дальше этого от его левого края, доли холста.
+_KPI_LABEL_GAP = 0.03
+# Число крупнее подписи хотя бы во столько раз: иначе это строка текста,
+# а не показатель с подписью.
+_KPI_LABEL_SIZE_RATIO = 1.5
+_KPI_LABEL_ROLES = frozenset({"card_title", "card_body", "body", "caption", "subhead"})
+
+
+def _pair_kpi_labels(slots: list[PatternSlot], repeat_members: set[int]) -> list[PatternSlot]:
+    """Текст сразу под крупным числом его подпись: у VK Tech (слайд 42) под
+    «7» и «10» стоит «Описание», и шаг ролей брал его заголовком карточки,
+    отчего раскладка показателей не находилась; у VK Education (слайд 18)
+    под «33%» и «23%» пояснение. Нумерация («1», «2», «3» у карточек VK
+    Education) не показатели, её подписи остаются телом карточек."""
+    values = [s.sample_text.strip() for s in slots if s.role == "kpi_value" and s.sample_text]
+    if _is_numbering(values):
+        return slots
+    out = list(slots)
+    taken: set[int] = set()
+    for i, value in enumerate(slots):
+        if value.role != "kpi_value" or _DATE_RE.match((value.sample_text or "").strip()):
+            # Под годом стоит событие, а не подпись показателя: таймлайн
+            # VK Education (слайд 42) держит пары «год + тело».
+            continue
+        best: tuple[float, int] | None = None
+        for j, label in enumerate(slots):
+            if j in taken or label.role not in _KPI_LABEL_ROLES:
+                continue
+            if label.size_pt <= 0 or value.size_pt < label.size_pt * _KPI_LABEL_SIZE_RATIO:
+                continue
+            gap = label.box.top - value.box.bottom
+            if not (-0.005 <= gap <= _KPI_LABEL_GAP) or abs(label.box.left - value.box.left) > _KPI_LABEL_GAP:
+                continue
+            if best is None or gap < best[0]:
+                best = (gap, j)
+        if best is not None:
+            taken.add(best[1])
+            out[best[1]] = replace(out[best[1]], role="kpi_label")
+    return out
+
+
+def _is_numbering(texts: list[str]) -> bool:
+    """Небольшие числа подряд (1, 2, 3 или 02…06, когда «01» стал
+    заголовком): нумерация шагов, а не данные. ЛЦТ2026, слайд 4."""
+    if len(texts) < 2 or not all(t.isdigit() for t in texts):
+        return False
+    numbers = sorted(int(t) for t in texts)
+    return numbers[-1] <= 20 and numbers == list(range(numbers[0], numbers[0] + len(numbers)))
+
+
+# Цитата: высказывание не короче стольких слов, подпись автора не длиннее.
+_QUOTE_MIN_WORDS = 6
+_QUOTE_AUTHOR_MAX_WORDS = 15
+_QUOTE_MARKS = "«\"“„'"
+
+
+def _mark_quote(slots: list[PatternSlot]) -> list[PatternSlot]:
+    """Слайд без заголовка из двух текстов, крупного высказывания и
+    подписи под ним (VK Education, слайд 19: «VK активно развивается…» и
+    «Владимир Кириенко, генеральный директор VK»): высказывание получает
+    роль `quote`, подпись `caption`. Высказывание узнаётся по кавычкам либо
+    по тому, что оно не мельче и заметно длиннее подписи."""
+    text = [i for i, s in enumerate(slots) if s.role not in _NON_TEXT_ROLES]
+    if len(text) != 2:
+        return slots
+    big, small = sorted(text, key=lambda i: (-slots[i].size_pt, -len(slots[i].sample_text or "")))
+    quote, author = slots[big], slots[small]
+    q_words = len(_WORD_RE.findall(quote.sample_text or ""))
+    a_words = len(_WORD_RE.findall(author.sample_text or ""))
+    marked = (quote.sample_text or "").lstrip()[:1] in _QUOTE_MARKS
+    if author.box.top <= quote.box.top or not (1 <= a_words <= _QUOTE_AUTHOR_MAX_WORDS):
+        return slots
+    if not marked and (q_words < _QUOTE_MIN_WORDS or quote.size_pt < author.size_pt):
+        return slots
+    out = list(slots)
+    out[big] = replace(quote, role="quote")
+    out[small] = replace(author, role="caption")
+    return out
+
+
+# Год, квартал, дата или месяц в месте числа: единицы повтора с ними это
+# вехи таймлайна, а не карточки.
+_DATE_RE = re.compile(
+    r"^(?:дата|date|(?:19|20)\d\d|[qQ][1-4]|[1-4]\s?кв\.?|\d{1,2}[./]\d{1,2}(?:[./]\d{2,4})?"
+    r"|(?:янв|фев|мар|апр|май|мая|июн|июл|авг|сен|окт|ноя|дек)\w*)(?:\s.*)?$",
+    re.IGNORECASE,
+)
+# Линия таймлайна перекрывает не меньше этой доли ряда единиц вдоль оси и
+# лежит не дальше этого от них поперёк, доли холста.
+_TIMELINE_LINE_COVER = 0.6
+_TIMELINE_LINE_GAP = 0.1
+_MIN_TIMELINE_UNITS = 3
+
+
+def _slide_lines(refs: list[ShapeRef]) -> list[Box]:
+    """Коробки линий слайда: коннекторы и вытянутые фигуры или картинки без
+    текста (`_is_line`)."""
+    out = []
+    for ref in refs:
+        if ref.box is None or Box(0.0, 0.0, 1.0, 1.0).intersect(
+            replace(ref.box, width=max(ref.box.width, 1e-4), height=max(ref.box.height, 1e-4))
+        ) is None:
+            continue
+        if ref.kind == "connector" or (
+            ref.kind in ("shape", "picture") and _is_line(ref.box)
+            and not (ref.kind == "shape" and _shape_text(ref.element).strip())
+        ):
+            out.append(ref.box)
+    return out
+
+
+def _special_kind(
+    slots: list[PatternSlot], repeat: RepeatSpec | None, lines: list[Box], repeat_members: set[int],
+) -> tuple[str, float] | None:
+    """Вид, который классы `_classify_kind` не называют, а устройство
+    слайда называет прямо: код, цитата, команда, таймлайн. Уверенность не
+    ниже 0.6: переспрашивать модель про них незачем, в её словаре видов их
+    и нет."""
+    roles = {s.role for s in slots}
+    if "code" in roles:
+        return "code", 1.0
+    if "quote" in roles and "headline" not in roles:
+        return "quote", 0.6
+    if repeat is not None and "image" in repeat.slot_roles and repeat.group_size >= 2:
+        # Повтор «фото + имя + должность»: команда (VK Education, слайд 20).
+        return "team", 0.8
+    if repeat is not None and repeat.count >= _MIN_TIMELINE_UNITS and _is_timeline(slots, repeat, lines, repeat_members):
+        return "timeline", 0.8
+    plain = sum(1 for s in slots if s.role in ("body", "bullet"))
+    if {"kpi_value", "kpi_label"} <= roles and not roles & {"card_title", "card_body", "bullet"} and plain <= 1:
+        # Числа с подписями и не больше одного вводного абзаца: показатели, а не
+        # раздел (VK Tech 42: «7» и «10» с подписями) и не список (VK
+        # WorkSpace 17: два «ххх%» в столбик).
+        return "kpi", 0.6
+    return None
+
+
+def _is_timeline(
+    slots: list[PatternSlot], repeat: RepeatSpec, lines: list[Box], repeat_members: set[int],
+) -> bool:
+    """Единицы повтора стоят вдоль линии (VK WorkSpace 26: коннектор через
+    весь слайд; VK Tech 47 и 48: линия нарисована картинкой), вдоль цепочки
+    стрелок между единицами (VK WorkSpace 27, ЛЦТ2026 25), либо в месте
+    числа у них даты (VK Education 42: годы)."""
+    members = [slots[i] for i in repeat_members if i < len(slots)]
+    if not members:
+        return False
+    dates = [
+        s for s in members
+        if s.sample_text and len(_WORD_RE.findall(s.sample_text)) <= 3 and _DATE_RE.match(s.sample_text.strip())
+    ]
+    if len(dates) >= _MIN_TIMELINE_UNITS:
+        return True
+    horizontal = repeat.axis == "x"
+    lo = min(s.box.left if horizontal else s.box.top for s in members)
+    hi = max(s.box.right if horizontal else s.box.bottom for s in members)
+    band_lo = min(s.box.top if horizontal else s.box.left for s in members) - _TIMELINE_LINE_GAP
+    band_hi = max(s.box.bottom if horizontal else s.box.right for s in members) + _TIMELINE_LINE_GAP
+    chain: list[float] = []
+    for box in lines:
+        along = box.width >= box.height if horizontal else box.height >= box.width
+        if not along:
+            continue
+        start, end = (box.left, box.right) if horizontal else (box.top, box.bottom)
+        across = box.top + box.height / 2 if horizontal else box.left + box.width / 2
+        if not band_lo <= across <= band_hi:
+            continue
+        cover = max(0.0, min(end, hi) - max(start, lo))
+        if cover >= _TIMELINE_LINE_COVER * (hi - lo):
+            return True
+        if cover > 0:
+            chain.append(across)
+    # Цепочка стрелок: не меньше стольких коротких линий на одной высоте,
+    # сколько промежутков между единицами.
+    for across in chain:
+        if sum(1 for other in chain if abs(other - across) <= _GRID_TOLERANCE) >= repeat.count - 1:
+            return True
+    return False
+
+
 # --- проверки качества (бриф, "Требования к работе") ------------------------
 
 
@@ -2172,6 +2584,11 @@ def _snap_to_margins(slots: list[PatternSlot], grid: Grid) -> list[PatternSlot]:
     snapped = []
     for slot in slots:
         box = slot.box
+        if slot.role in _PICTURE_SLOT_ROLES and _bleeds(box):
+            # Фото в край холста так и задумано: сдвиг к полю оставил бы
+            # белую полосу у края.
+            snapped.append(slot)
+            continue
         dx = 0.0
         left_gap = grid.margin_left - box.left
         right_gap = box.right - right_bound
@@ -2194,6 +2611,94 @@ def _snap_to_margins(slots: list[PatternSlot], grid: Grid) -> list[PatternSlot]:
     return snapped
 
 
+# Картинка ближе этого к краю холста считается выпущенной в край.
+_BLEED_EDGE = 0.005
+# Текстовая рамка, вылезшая за поле, обрезается по полю, пока от неё
+# остаётся не меньше этой доли ширины. Больше срезать: текст примера
+# расчитан на другую рамку, и это уже не та раскладка.
+_MIN_CLIPPED_TEXT_SHARE = 0.5
+
+
+def _bleeds(box: Box) -> bool:
+    return box.left <= _BLEED_EDGE or box.right >= 1 - _BLEED_EDGE
+
+
+def _clip_to_frame(slots: list[PatternSlot], grid: Grid, canvas: Canvas) -> list[PatternSlot]:
+    """Рамки за краем холста и за полями обрезаются, а не губят слайд
+    (задача T1). Место под картинку (`image`/`icon`) обрезается по холсту:
+    фото на полслайда в край (VK Education 6, 31, 32, 34; ЛЦТ2026 14) так и
+    задумано. Текстовая рамка обрезается по полям: у крупных показателей
+    VK Education (слайд 18) рамка «43%» шириной 0.44 начинается на 0.67
+    холста и кончается за его краем, а текст в ней короткий и левый."""
+    out = []
+    left_bound, right_bound = grid.margin_left, 1 - grid.margin_right
+    for slot in slots:
+        box = slot.box
+        if slot.role in _PICTURE_SLOT_ROLES:
+            inside = Box(0.0, 0.0, 1.0, 1.0).intersect(box)
+            out.append(replace(slot, box=inside) if inside is not None and inside != box else slot)
+            continue
+        left, right = max(box.left, left_bound), min(box.right, right_bound)
+        if (left, right) == (box.left, box.right) or right - left < box.width * _MIN_CLIPPED_TEXT_SHARE:
+            out.append(slot)
+            continue
+        top = max(box.top, 0.0)
+        bottom = min(box.bottom, 1.0)
+        clipped = Box(left, top, right - left, bottom - top)
+        max_chars = slot.max_chars and estimate_slot_chars(clipped, canvas, slot.size_pt)
+        out.append(replace(slot, box=clipped, max_chars=max_chars))
+    return out
+
+
+def _trim_nested_frames(slots: list[PatternSlot], canvas: Canvas) -> list[PatternSlot]:
+    """Текстовая рамка, в которую ниже её первой строки заходит другая
+    текстовая рамка, обрезается по верху той (задача T1). Так дизайнер
+    ставит двухуровневую подпись: ЛЦТ2026 (слайды 22, 23) кладёт пояснение
+    пункта внутрь рамки его заголовка, у низа, а на слайдах 8 и 28 рамка
+    пояснения начинается внутри рамки заголовка и уходит ниже; VK WorkSpace (слайд 6) пишет
+    заголовок карточки в рамку на всю карточку, а текст карточки ставит
+    внутрь неё; у VK Tech (слайд 42) подпись «Описание» заходит в рамку
+    крупного «7». Наложением это не считается, пока над вложенной рамкой
+    во внешней остаётся строка её текста. Картинки не трогаются: текст
+    поверх картинки решает `_split_content_decor`."""
+    out = list(slots)
+    for i, outer in enumerate(slots):
+        if outer.role in _NON_TEXT_ROLES or outer.size_pt <= 0:
+            continue
+        a = outer.box
+        inner_tops, side_lefts = [], []
+        for j, other in enumerate(slots):
+            b = other.box
+            if j == i or other.role in _NON_TEXT_ROLES:
+                continue
+            inter = a.intersect(b)
+            if inter is None or inter.area / b.area <= 0.3:
+                continue
+            if b.left >= a.left - 0.01 and b.right <= a.right + 0.01 and b.top > a.top:
+                inner_tops.append(b.top)
+            elif inter.height >= 0.7 * b.height and b.left > a.left and b.right >= a.right - 0.005:
+                # Значок у правого края рамки: дата у заголовка колонки
+                # VK WorkSpace (слайд 11) заходит в его рамку справа.
+                side_lefts.append(b.left)
+        if not inner_tops:
+            if side_lefts and min(side_lefts) - a.left >= a.width * _MIN_CLIPPED_TEXT_SHARE:
+                box = replace(a, width=min(side_lefts) - a.left)
+                out[i] = replace(
+                    outer, box=box, max_chars=outer.max_chars and estimate_slot_chars(box, canvas, outer.size_pt),
+                )
+            continue
+        height = min(inner_tops) - a.top
+        # Строка текста внешней рамки должна остаться. Крупное число бывает
+        # набрано в рамку ниже своей строки (VK Tech, «7» кеглем 221), и
+        # тогда хватает большей части рамки.
+        line = outer.size_pt / 72 * _LINE_HEIGHT_EM / canvas.height_in
+        if height < min(line, a.height * 0.6):
+            continue
+        box = replace(a, height=height)
+        out[i] = replace(outer, box=box, max_chars=outer.max_chars and estimate_slot_chars(box, canvas, outer.size_pt))
+    return out
+
+
 def _within_margins(slots: list[PatternSlot], grid: Grid) -> bool:
     """Допуск чуть уже, чем у потребительской проверки "слоты в полях"
     (брифом — тест `test_slots_respect_template_margins`, допуск 0.01): раз
@@ -2203,6 +2708,10 @@ def _within_margins(slots: list[PatternSlot], grid: Grid) -> bool:
     случайно протащить слот, который здесь прошёл, но там не пройдёт."""
     tol = 0.01
     for slot in slots:
+        if slot.role in _PICTURE_SLOT_ROLES:
+            # Место под картинку вправе уходить в край холста (`_clip_to_
+            # frame` уже обрезало его по холсту).
+            continue
         if slot.box.left < grid.margin_left - tol:
             return False
         if slot.box.right > 1 - grid.margin_right + tol:
@@ -2690,12 +3199,23 @@ def _decor_prst_geom(element) -> tuple[str | None, float | None]:
 # --- дедупликация (бриф, Step 2, п.8) ---------------------------------------
 
 
+# Текст финального слайда: «Спасибо за внимание!», «Вопросы?».
+_CLOSING_TEXT_RE = re.compile(r"спасибо|благодар|thank|вопрос", re.IGNORECASE)
+
+
 def _dedup_signature(pattern: Pattern) -> tuple:
     slots_sig = tuple(sorted(
         (s.role, round(s.box.left, 2), round(s.box.top, 2), round(s.box.width, 2), round(s.box.height, 2))
         for s in pattern.slots
     ))
-    return pattern.kind, slots_sig
+    # Финал с «Спасибо за внимание!» не схлопывается с пустым слайдом той
+    # же раскладки: у VK Education слайд 52 и пустые 53-55 совпали по
+    # рамкам, как только место под QR стало картинкой, и текст финала,
+    # по которому планировщик узнаёт финал, пропал из профиля.
+    closing = any(
+        s.role == "headline" and _CLOSING_TEXT_RE.search(s.sample_text or "") for s in pattern.slots
+    )
+    return pattern.kind, slots_sig, closing
 
 
 def _dedup(patterns: list[Pattern]) -> list[Pattern]:

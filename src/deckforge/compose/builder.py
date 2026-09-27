@@ -3761,6 +3761,7 @@ def _pattern_from_model(model) -> Pattern:
             anchor=s.anchor, purpose=s.purpose, content_hint=s.content_hint,
             max_words=s.max_words, ordinal=s.ordinal, fixed=s.fixed,
             schema_confidence=s.schema_confidence, source_shape_id=s.source_shape_id,
+            mono=getattr(s, "mono", False), font_family=getattr(s, "font_family", None),
             chart_frame=getattr(s, "chart_frame", False),
         )
         for s in model.slots

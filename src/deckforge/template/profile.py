@@ -251,6 +251,15 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # по своему ключу, который тоже перестаёт совпадать).
 # Детерминированная версия 2, а не 1: `source_density` паттерна (задача R)
 # снимается детерминированно и влилась одновременно с разделением кеша.
+# Версия 8 (задача T1, разбор не выбрасывает нужные слайды-примеры):
+# картинка под текстом стала декором, рамки за краем холста и за полями
+# обрезаются, вложенные рамки подписей обрезаются по внутренней, пустой
+# плейсхолдер рисунка стал местом под фото, «число + подпись» в одной
+# рамке делится на `kpi_value` и `kpi_label`; новые виды `quote`, `team`,
+# `timeline`, `code` (слот `code` с `PatternSlot.mono`/`font_family`), финал
+# со «Спасибо» не схлопывается с пустыми слайдами той же раскладки.
+# Раскладок: VK Tech 42 вместо 26, VK WorkSpace 28 вместо 22, VK Education
+# 42 вместо 32, ЛЦТ2026 25 вместо 17.
 # Версия 7 (задача C, VK WorkSpace): значок не место под фото, рамка
 # заголовка обрезается по месту под ней, слот на процент шире полей
 # сужается до них, «ХХ»/«ххх%» считаются числом, «Иллюстрация» местом под
@@ -270,7 +279,7 @@ def _shape_vocab_entry_model(entry: ShapeVocabEntry) -> ShapeVocabEntryModel:
 # 2 -> 3: `PatternSlot.chart_frame` (картинка примера сама график) и
 # `chart_rules` (правила оформления диаграмм, которые шаблон пишет текстом),
 # оба снимаются без модели; старый кеш отдал бы их пустыми молча.
-DETERMINISTIC_SCHEMA_VERSION = 7
+DETERMINISTIC_SCHEMA_VERSION = 8
 MODEL_SCHEMA_VERSION = 1
 PROFILE_SCHEMA_VERSION = DETERMINISTIC_SCHEMA_VERSION * 1000 + MODEL_SCHEMA_VERSION
 
@@ -564,6 +573,10 @@ class PatternSlotModel(BaseModel):
     # Картинка примера сама изображает график (`patterns.PatternSlot.
     # chart_frame`): рамка под наш график того же размера.
     chart_frame: bool = False
+    # Место под код (`patterns.PatternSlot.mono`/`font_family`): гарнитура
+    # примера моноширинная, сборка ставит код ею же.
+    mono: bool = False
+    font_family: str | None = None
 
 
 class ChartRulesModel(BaseModel):
@@ -619,7 +632,7 @@ def _pattern_slot_model(slot: PatternSlot) -> PatternSlotModel:
         anchor=slot.anchor, purpose=slot.purpose, content_hint=slot.content_hint,
         max_words=slot.max_words, ordinal=slot.ordinal, fixed=slot.fixed,
         schema_confidence=slot.schema_confidence, source_shape_id=slot.source_shape_id,
-        chart_frame=slot.chart_frame,
+        chart_frame=slot.chart_frame, mono=slot.mono, font_family=slot.font_family,
     )
 
 

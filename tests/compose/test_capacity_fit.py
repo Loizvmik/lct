@@ -204,9 +204,12 @@ def test_ladder_spare_avoids_the_neighbours_look(profile):
     pool = [chosen, same, by_id["slide44"], by_id["slide26"], other]
 
     ordered = _ladder(profile, pool, {look_key(same)})._diverse(pool[1:4])
-    assert ordered[0] is by_id["slide26"], "сначала облик, которого нет у соседа"
+    # С задачи T1 пример 44 разбор видит таймлайном, и его облик тоже не
+    # соседский: первым встаёт любой из двух, но не облик соседа.
+    assert ordered[0] in (by_id["slide26"], by_id["slide44"]), "сначала облик, которого нет у соседа"
+    assert look_key(ordered[0]) != look_key(same)
 
-    ladder = _ladder(profile, pool, {look_key(same), look_key(by_id["slide26"])})
+    ladder = _ladder(profile, pool, {look_key(same), look_key(by_id["slide26"]), look_key(by_id["slide44"])})
     assert other in ladder.spares(), "все запасные повторяют соседей: добавлен кандидат другого облика"
 
 

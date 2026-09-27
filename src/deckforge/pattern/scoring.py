@@ -103,7 +103,8 @@ def matches(token: str, form: PatternForm) -> bool:
     if token == "timeline":
         # Длинный ряд с точкой или засечкой на каждую единицу: таймлайн
         # или Гант (VK Education, примеры 42 и 43), а не сетка карточек.
-        return form.repeated and form.units >= 5 and form.decor >= form.units
+        # Вид `timeline` разбор теперь ставит сам (линия, стрелки, даты).
+        return form.kind == "timeline" or (form.repeated and form.units >= 5 and form.decor >= form.units)
     if token == "image":
         return form.kind == "image" or form.has_image
     if token in ("cards", "kpi", "quote", "bullets"):

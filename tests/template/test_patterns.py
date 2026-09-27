@@ -74,17 +74,24 @@ def test_two_column_pattern_has_symmetric_slots(profile_fixture):
 
 
 def test_every_pattern_has_a_headline_slot_or_is_marked_decorative(profile_fixture):
+    """Без заголовка вправе быть героические виды и те, где заголовка нет
+    по замыслу: цитата и команда (задача T1)."""
     for name in ALL_TEMPLATES:
         for pattern in profile_fixture(name).patterns:
             roles = {slot.role for slot in pattern.slots}
-            assert "headline" in roles or pattern.kind in {"section", "image", "closing"}
+            assert "headline" in roles or pattern.kind in {"section", "image", "closing", "quote", "team"}
 
 
 def test_slots_respect_template_margins(profile_fixture):
+    """Текстовые места в полях шаблона. Место под картинку вправе уходить
+    в край холста (фото на полслайда, задача T1), но не за него."""
     for name in ALL_TEMPLATES:
         grid = profile_fixture(name).grid
         for pattern in profile_fixture(name).patterns:
             for slot in pattern.slots:
+                if slot.role in ("image", "icon"):
+                    assert 0.0 <= slot.box.left and slot.box.right <= 1.0 + 1e-9
+                    continue
                 assert slot.box.left >= grid.margin_left - 0.01
                 assert slot.box.right <= 1 - grid.margin_right + 0.01
 
@@ -803,17 +810,19 @@ def test_an_asset_sheet_slide_is_not_mined_as_a_pattern(profile_fixture):
             assert len(pattern.decor) <= _MAX_DECOR_SHAPES, (name, pattern.pattern_id, len(pattern.decor))
 
 
-def test_a_code_sample_slide_is_not_mined_as_a_pattern(profile_fixture):
+def test_a_code_sample_slide_is_mined_as_a_code_pattern(profile_fixture):
     """VK Education, слайд «Оформление кода»: жёлтый Consolas на чёрной
     плашке. Как раскладка two_col он принимал любые два столбца текста, и
     наш текст ложился моноширинным по чёрному (живой прогон 27 сентября
-    2026). Ни один паттерн не снят со слайда с моноширинным текстом."""
+    2026). С задачи T1 такой слайд даёт раскладку вида `code`: место кода
+    помечено ролью `code` и моноширинной гарнитурой, обычный текст туда не
+    пойдёт, а плашка остаётся в декоре."""
     from deckforge.template.patterns import _is_code_sample
+    from deckforge.template.typography import is_mono_family
     from deckforge.ooxml.package import PptxPackage
     from deckforge.ooxml.walk import walk_shapes
 
     profile = profile_fixture("Шаблон презентации VK Education.pptx")
-    mined = {n for p in profile.patterns for n in p.source_slide_index}
     with PptxPackage.open(TEMPLATES_DIR / "Шаблон презентации VK Education.pptx") as pkg:
         canvas = pkg.canvas()
         code_slides = {
@@ -822,7 +831,19 @@ def test_a_code_sample_slide_is_not_mined_as_a_pattern(profile_fixture):
             if any(_is_code_sample(r.element) for r in walk_shapes(pkg.xml(name), canvas))
         }
     assert code_slides, "в шаблоне есть слайд с примером кода: тест не о чем"
-    assert not (code_slides & mined), code_slides & mined
+    for pattern in profile.patterns:
+        if not code_slides & set(pattern.source_slide_index):
+            continue
+        assert pattern.kind == "code"
+        code = [s for s in pattern.slots if s.role == "code"]
+        assert len(code) == 1
+        assert code[0].mono and is_mono_family(code[0].font_family)
+        assert code[0].size_pt > 0 and code[0].box.area > 0
+        assert any(s.role == "headline" for s in pattern.slots)
+        assert any(d.has_fill and d.box.area >= code[0].box.area for d in pattern.decor), "плашка кода в декоре"
+    assert any(p.kind == "code" for p in profile.patterns)
+    # Место кода только у раскладки кода.
+    assert all(p.kind == "code" for p in profile.patterns if any(s.role == "code" for s in p.slots))
 
 
 
