@@ -161,9 +161,11 @@ def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: i
         "cover": p.pattern_id != cover_id or position == 0,
         "fixed_headline": position == last or not has_fixed_headline(p),
         "headline": _has_headline(p),
-        "form": block in _allowed_blocks(intent) and (
-            intent.is_hero or position == last or not is_cover_like(p, profile)
-        ),
+        "form": block in _allowed_blocks(intent),
+        # Обложечная раскладка под содержанием читается как ещё одна
+        # обложка (задача V5). Ослабляется последней: бедный шаблон без
+        # иных раскладок всё равно должен собраться.
+        "hero_layout": intent.is_hero or position == last or not is_cover_like(p, profile),
     }
     if intent.is_hero:
         # Героическому слайду героическая раскладка: разделитель на
@@ -232,7 +234,7 @@ def not_plain_content(form: PatternForm) -> bool:
 
 # Порядок ослабления: от наименее важного к самому важному. Место
 # финальной и титульной раскладки не ослабляется никогда.
-_RELAX_ORDER = ("units", "capabilities", "form", "visual", "fixed_headline", "headline")
+_RELAX_ORDER = ("units", "capabilities", "form", "visual", "fixed_headline", "headline", "hero_layout")
 
 RELAX_TITLES = {
     "units": "единиц содержания больше, чем мест у любой раскладки",
@@ -241,6 +243,7 @@ RELAX_TITLES = {
     "capabilities": "у раскладок нет мест под содержание слайда или остаётся пустота на месте фото примера",
     "fixed_headline": "осталась только раскладка с постоянным заголовком",
     "headline": "осталась только раскладка без заголовка",
+    "hero_layout": "остались только раскладки обложки или финала",
 }
 
 

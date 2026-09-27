@@ -240,3 +240,16 @@ def test_a_list_gets_no_more_items_than_the_place_has_lines(profile):
         blocks=[BulletBlock(items=["Сквозная медиана: 31,5 часа", "Чистая работа: 28 минут"][: main.units])],
     )
     assert _clone(profile, spec, "slide13").reason is None
+
+
+def test_relaxing_the_form_does_not_bring_covers_back(profile):
+    """Живой прогон visual 29 сентября 2026: пункт с одним показателем не
+    нашёл раскладки нужной формы, ограничение формы ослабили, и вместе с
+    ним вернулась обложка примера 2. Запрет обложки ослабляется последним."""
+    forms = forms_of(profile)
+    covers = {p.pattern_id for p in profile.patterns if is_cover_like(p, profile)}
+    kpi = SlideIntent(index=1, outline_kind="context", intent="Главная цифра", items=1, form="kpi")
+
+    found = candidates_for(kpi, profile, forms, position=1, last=11, cover_id=cover_pattern_id(profile))
+
+    assert found.pattern_ids and not covers & set(found.pattern_ids), found
