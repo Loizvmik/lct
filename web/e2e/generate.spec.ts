@@ -133,3 +133,25 @@ test("пустая форма, черновик и проверка числа �
     await expect(page.getByRole("heading", { level: 2, name: label })).toBeVisible();
   }
 });
+
+// Задача D2: фото примера приходят с сервера из контент-пакета, подпись
+// правится, лишнее убирается, неподходящий файл отвергается до загрузки.
+test("фотографии на экране задания", async ({ page }) => {
+  await page.goto("/templates/ui-test-template/brief");
+  const items = page.locator(".photo-item");
+  await expect(items).toHaveCount(0);
+  await page.getByRole("button", { name: "Пример: заявки" }).click();
+  await expect(items).toHaveCount(2);
+  await expect(items.first().locator("img")).toBeVisible();
+  const caption = page.getByRole("textbox", { name: "Подпись к фото 1" });
+  await expect(caption).not.toHaveValue("");
+  await caption.fill("Согласующий смотрит заявку");
+  await page.getByRole("button", { name: /Убрать фото/ }).last().click();
+  await expect(items).toHaveCount(1);
+  await page.getByLabel("Выбрать фотографии").setInputFiles({
+    name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("не фото"),
+  });
+  await expect(page.getByText("подходят только файлы .jpg и .png")).toBeVisible();
+  await page.getByRole("button", { name: "Очистить поля" }).click();
+  await expect(items).toHaveCount(0);
+});

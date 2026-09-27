@@ -11,6 +11,7 @@ import {
   assetUrl,
   exportUrl,
   JobResponse,
+  jobState,
   JOB_STATUS_LABELS,
   LADDER_TITLES,
   MODE_LABELS,
@@ -61,7 +62,31 @@ export function jobFacts(job: JobResponse): { label: string; value: string }[] {
       value: shared.map((s) => SHARED_STAGE_LABELS[s] ?? s).join(", "),
     });
   }
+  const photos = job.photos;
+  if (photos && photos.sent > 0) {
+    facts.push({
+      label: "Фотографии",
+      value: photos.embedded == null
+        ? `${photos.sent} прислано, ${photos.planned} распределено`
+        : `${photos.embedded} из ${photos.sent} на слайдах`,
+    });
+  }
   return facts;
+}
+
+// Что сделано запасным путём у задания «готово с предупреждениями».
+// Список показывается только у такого задания: у обычного он пуст.
+export function WarningList({ job }: { job: JobResponse }) {
+  const warnings = job.warnings ?? [];
+  if (jobState(job) !== "done_with_warnings" || warnings.length === 0) return null;
+  return (
+    <>
+      <p className="field-label">Предупреждения</p>
+      <ul className="warning-list">
+        {warnings.map((text) => <li key={text}>{text}</li>)}
+      </ul>
+    </>
+  );
 }
 
 export default function VariantCard({
@@ -98,14 +123,15 @@ export default function VariantCard({
     .map(([rung, count]) => `${count} ${LADDER_TITLES[rung] ?? rung}`);
   if (ladderParts.length) facts.push({ label: "Как собраны слайды", value: ladderParts.join(", ") });
   const structural = job?.structural?.[variant.variant] ?? [];
+  const withWarnings = job != null && jobState(job) === "done_with_warnings";
 
   return (
-    <article className="variant-card">
+    <article className={`variant-card${withWarnings ? " warn" : ""}`}>
       <header>
         <div>
           <h2>{label}</h2>
           <p className="muted small">{VARIANT_DESCRIPTIONS[variant.variant]}</p>
-          {job?.status === "done_with_warnings" && (
+          {withWarnings && (
             <span className="pill status-pill warn">{JOB_STATUS_LABELS.done_with_warnings}</span>
           )}
         </div>
@@ -151,6 +177,7 @@ export default function VariantCard({
             ))}
           </dl>
         )}
+        {job && <WarningList job={job} />}
         {structural.length > 0 && (
           <>
             <p className="field-label">Нужен другой текст или раскладка</p>

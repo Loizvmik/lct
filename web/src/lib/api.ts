@@ -5,8 +5,8 @@ export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
 export type Stage = "parse" | "outline" | "write" | "compose" | "audit" | "export";
-// `done_with_warnings` сервер пока не отдаёт (появится с задачей надёжности):
-// интерфейс заранее считает его готовым результатом, «готово с замечаниями».
+// Сервер отдаёт `status: "done"` и отдельно `outcome`; `done_with_warnings`
+// здесь состояние для интерфейса, его собирает `jobState` из этих двух полей.
 export type JobStatus = "running" | "done" | "done_with_warnings" | "error";
 export type VariantName = "dense" | "airy" | "visual";
 
@@ -84,6 +84,20 @@ export interface JobResponse {
   // Задача U: по вариантам сколько слайдов какой ступенью лестницы сборки
   // собрано (ключи: `LADDER_TITLES`).
   ladder?: Record<string, Record<string, number>> | null;
+  // Задача W: итог готового задания. `done_with_warnings`, если что-то
+  // сделано запасным путём (жёсткий потолок бюджета, фото не легло);
+  // `warnings` перечисляет, что именно.
+  outcome?: "done" | "done_with_warnings" | null;
+  warnings?: string[];
+  // Задача D2: сколько фото пришло, сколько распределено, сколько в файле.
+  photos?: { sent: number; planned: number; embedded: number | null; notes: string[] } | null;
+}
+
+// Состояние задания для интерфейса: готовое с предупреждениями отличается
+// от просто готового, хотя сервер у обоих держит `status: "done"`.
+export function jobState(job: Pick<JobResponse, "status" | "outcome">): JobStatus {
+  if (job.status === "done" && job.outcome === "done_with_warnings") return "done_with_warnings";
+  return job.status;
 }
 
 export interface FindingBox {
@@ -165,6 +179,33 @@ export async function getProfile(templateId: string): Promise<TemplateUploadResp
   return asJson(response);
 }
 
+// Задача D2: фотографии пользователя. Загружаются сразу при выборе, задание
+// потом ссылается на них по `photo_id`.
+export interface UploadedPhoto {
+  photo_id: string;
+  name: string;
+  caption: string | null;
+  url: string;
+}
+
+export const MAX_PHOTOS = 10;
+export const MAX_PHOTO_BYTES = 10 * 1024 * 1024;
+
+export async function uploadPhotos(files: File[], captions: string[] = []): Promise<UploadedPhoto[]> {
+  const form = new FormData();
+  files.forEach((file, index) => {
+    form.append("files", file);
+    form.append("captions", captions[index] ?? "");
+  });
+  const response = await fetch(`${API_BASE}/api/photos`, { method: "POST", body: form });
+  return (await asJson<{ photos: UploadedPhoto[] }>(response)).photos;
+}
+
+export async function loadExamplePhotos(example: string): Promise<UploadedPhoto[]> {
+  const response = await fetch(`${API_BASE}/api/examples/${encodeURIComponent(example)}/photos`, { method: "POST" });
+  return (await asJson<{ photos: UploadedPhoto[] }>(response)).photos;
+}
+
 export interface CreateDeckRequest {
   template_id: string;
   brief: string;
@@ -173,6 +214,7 @@ export interface CreateDeckRequest {
   language?: string;
   target_slides?: number;
   autofix?: boolean;
+  photos?: { photo_id: string; caption?: string }[];
 }
 
 export async function createDeck(
@@ -279,7 +321,7 @@ export function isJobFinished(status: JobStatus | undefined | null): boolean {
 export const JOB_STATUS_LABELS: Record<JobStatus, string> = {
   running: "Идёт",
   done: "Готово",
-  done_with_warnings: "Готово с замечаниями",
+  done_with_warnings: "Готово с предупреждениями",
   error: "Ошибка",
 };
 

@@ -8,6 +8,10 @@
 - `POST /api/decks/batch` — то же с `styles` (по умолчанию все три):
   по заданию на стиль, параллельно, структура считается один раз;
   возвращает `batch_id` и `job_ids`.
+- `POST /api/photos` — фотографии пользователя (multipart `files`, до 10
+  jpg/png по 10 МБ, `captions` по порядку файлов), возвращает `photo_id`;
+  задание ссылается на них полем `photos`. `POST /api/examples/{name}/
+  photos` загружает так же фото контент-пакета примера из `fixtures/`.
 - `GET /api/jobs` — список заданий (стиль, стадия, режим, секунды),
   `?batch_id=` оставляет только задания пакета.
 - `GET /api/jobs/{id}` — прогресс по этапам (снимок), `GET /api/jobs/{id}/
@@ -26,16 +30,20 @@
 `<img>`, а не байты внутри JSON-ответа.
 """
 from __future__ import annotations
+import asyncio
 import json
 from pathlib import Path
+from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from deckforge.api import schemas
-from deckforge.api.jobs import JobError, JobRecord, JobStore, STAGES, VariantState, finding_id, fix_deck
+from deckforge.api.jobs import (
+    MAX_PHOTO_BYTES, JobError, JobRecord, JobStore, PhotoRecord, PhotoRejected, STAGES, VariantState, finding_id, fix_deck,
+)
 from deckforge.audit.findings import Finding
 
 _FORMAT_ATTR = {"pptx": "pptx_path", "pdf": "pdf_path", "html": "html_path"}
@@ -77,11 +85,20 @@ def _variant_summary(store: JobStore, state: VariantState) -> schemas.VariantSum
     )
 
 
+def _photos_response(store: JobStore, records: list[PhotoRecord]) -> schemas.PhotoUploadResponse:
+    return schemas.PhotoUploadResponse(photos=[
+        schemas.UploadedPhoto(
+            photo_id=r.photo_id, name=r.name, caption=r.caption, url=quote(_png_url(store, r.path)),
+        )
+        for r in records
+    ])
+
+
 def _job_args(request: schemas.DeckInput) -> dict:
     return dict(
         template_id=request.template_id, brief=request.brief, sources=request.sources,
         title=request.title, language=request.language, target_slides=request.target_slides,
-        autofix=request.autofix,
+        autofix=request.autofix, photos=[p.model_dump() for p in request.photos],
     )
 
 
@@ -135,6 +152,30 @@ def create_app(store: JobStore | None = None) -> FastAPI:
         except JobError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         return schemas.ProfileResponse(template_id=template_id, profile=json.loads(record.profile.to_json()))
+
+    @app.post("/api/photos", response_model=schemas.PhotoUploadResponse)
+    async def upload_photos(
+        files: list[UploadFile] = File(...), captions: list[str] = Form(default=[]),
+        store: JobStore = Depends(get_store),
+    ) -> schemas.PhotoUploadResponse:
+        # Читается на байт больше предела: этого хватает, чтобы отличить
+        # «ровно 10 МБ» от «больше», не держа в памяти весь лишний файл.
+        payload = [(f.filename or "photo", await f.read(MAX_PHOTO_BYTES + 1)) for f in files]
+        try:
+            records = await asyncio.to_thread(store.save_photos, payload, list(captions))
+        except PhotoRejected as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        return _photos_response(store, records)
+
+    @app.post("/api/examples/{name}/photos", response_model=schemas.PhotoUploadResponse)
+    async def upload_example_photos(name: str, store: JobStore = Depends(get_store)) -> schemas.PhotoUploadResponse:
+        try:
+            records = await asyncio.to_thread(store.save_example_photos, name)
+        except PhotoRejected as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except JobError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _photos_response(store, records)
 
     @app.post("/api/decks", response_model=schemas.DeckCreateResponse)
     async def create_deck(

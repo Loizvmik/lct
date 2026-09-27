@@ -7,11 +7,12 @@
 import Link from "next/link";
 import { useParams } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import VariantCard, { jobFacts } from "@/components/VariantCard";
+import VariantCard, { jobFacts, WarningList } from "@/components/VariantCard";
 import {
   getVariants,
   isJobDone,
   JobResponse,
+  jobState,
   JOB_STATUS_LABELS,
   listJobs,
   STAGE_LABELS,
@@ -42,16 +43,17 @@ function StageTrack({ job }: { job: JobResponse }) {
 // готово, но результат ещё не пришёл.
 function JobColumn({ job, loadingResult }: { job: JobResponse; loadingResult: boolean }) {
   const facts = jobFacts(job);
-  const statusClass = { running: "", done: "done", done_with_warnings: "warn", error: "error" }[job.status];
+  const state = jobState(job);
+  const statusClass = { running: "", done: "done", done_with_warnings: "warn", error: "error" }[state];
   return (
-    <article className="variant-card" aria-busy={job.status === "running"}>
+    <article className={`variant-card${state === "done_with_warnings" ? " warn" : ""}`} aria-busy={job.status === "running"}>
       <header>
         <div>
           <h2>{VARIANT_LABELS[job.style]}</h2>
           <p className="muted small">{VARIANT_DESCRIPTIONS[job.style]}</p>
         </div>
         <span className={`pill status-pill ${statusClass}`}>
-          {JOB_STATUS_LABELS[job.status]}
+          {JOB_STATUS_LABELS[state]}
         </span>
       </header>
       <div className="body">
@@ -67,6 +69,7 @@ function JobColumn({ job, loadingResult }: { job: JobResponse; loadingResult: bo
             {facts.map((fact) => <div key={fact.label}><dt>{fact.label}</dt><dd>{fact.value}</dd></div>)}
           </dl>
         )}
+        <WarningList job={job} />
       </div>
     </article>
   );
@@ -119,6 +122,7 @@ export default function BatchPage() {
 
   const ordered = [...jobs].sort((a, b) => VARIANT_ORDER.indexOf(a.style) - VARIANT_ORDER.indexOf(b.style));
   const running = ordered.filter((j) => j.status === "running").length;
+  const withWarnings = ordered.filter((j) => jobState(j) === "done_with_warnings").length;
   const several = ordered.length > 1;
 
   return (
@@ -134,6 +138,9 @@ export default function BatchPage() {
 
       <p className="muted" role="status" aria-live="polite">
         {running > 0 ? <><span className="spinner" /> Ещё собираются: {running} из {ordered.length}.</> : "Все задания завершены."}
+        {withWarnings > 0 && (
+          <> <span className="pill status-pill warn">{JOB_STATUS_LABELS.done_with_warnings}: {withWarnings} из {ordered.length}</span></>
+        )}
       </p>
 
       <div className="row-actions">
