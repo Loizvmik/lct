@@ -24,11 +24,11 @@ _DEFAULT_WEIGHTS = {
     "overflow": 1000.0, "consecutive_repeat": 500.0, "repeated_pattern": 30.0,
     "style_mismatch": 20.0, "density_mismatch": 10.0, "pattern_quality": 5.0,
     "decor": 10.0, "orphan_image": 15.0, "cover_miss": 50.0, "short_headline": 60.0, "sample_photo_void": 200.0,
-    "chart_fit": 25.0,
+    "chart_fit": 25.0, "batch_overlap": 60.0,
 }
 _DEFAULT_STYLES = {
     "dense": {
-        "target_density": 0.80, "prefer": ["table", "cards", "two_col", "kpi", "bullets"],
+        "target_density": 0.80, "prefer": ["table", "two_col", "bullets", "cards", "kpi"],
         "words_per_item": 16, "min_words_per_item": 8, "decor_weight": 0.5, "dividers": False,
     },
     "airy": {
@@ -36,7 +36,7 @@ _DEFAULT_STYLES = {
         "words_per_item": 9, "min_words_per_item": 4, "decor_weight": 0.5, "dividers": True,
     },
     "visual": {
-        "target_density": 0.55, "prefer": ["image", "photo_text", "chart", "diagram", "cards"],
+        "target_density": 0.55, "prefer": ["chart", "image", "diagram", "kpi", "photo_text", "cards"],
         "words_per_item": 10, "min_words_per_item": 4, "decor_weight": 2.0, "dividers": False,
     },
 }
@@ -86,6 +86,21 @@ class StylePolicy:
     # Во сколько раз стиль строже к месту под график (`scoring.chart_fit`):
     # visual предпочитает родной график и картинку-график сильнее прочих.
     chart_weight: float = 1.0
+    # Предел слов на единицу списка или карточки поверх места раскладки:
+    # visual пишет подписи (5-8 слов), а не абзацы. `None`: предел места.
+    max_words_per_item: int | None = None
+    # Пункты структуры, которые стиль показывает подписями, а не фразами
+    # (visual: дорожная карта таймлайном, шаги схемой): для них нижняя
+    # граница слов на единицу `label_words`, и тесные раскладки-схемы
+    # (событие таймлайна VK Education в два слова) им доступны.
+    label_kinds: tuple[str, ...] = ()
+    label_words: int = 2
+    # Предпочтения по виду пункта структуры поверх общих `prefer`: у
+    # visual дорожная карта таймлайном, а не любой схемой.
+    prefer_for: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+    def prefer_of(self, outline_kind: str) -> tuple[str, ...]:
+        return dict(self.prefer_for).get(outline_kind, self.prefer)
 
     def weight(self, name: str) -> float:
         return float(self.weights.get(name, _DEFAULT_WEIGHTS.get(name, 0.0)))
@@ -135,4 +150,26 @@ def load_style(style, path: Path | None = None) -> StylePolicy:
         weights={k: float(v) for k, v in weights.items()},
         diversity=_load_diversity(str(path or STYLES_YAML_PATH)),
         chart_weight=float(raw.get("chart_weight", 1.0)),
+        max_words_per_item=int(raw["max_words_per_item"]) if raw.get("max_words_per_item") else None,
+        label_kinds=tuple(raw.get("label_kinds") or ()),
+        label_words=int(raw.get("label_words", 2)),
+        prefer_for=tuple(sorted((str(k), tuple(v)) for k, v in (raw.get("prefer_for") or {}).items())),
     )
+
+
+# Цель различимости пакета (задача D3): доля пунктов содержания, на
+# которых облики раскладок двух стилей совпадают, не выше этой.
+_DEFAULT_MAX_OVERLAP = 0.4
+
+
+@lru_cache(maxsize=4)
+def _load_batch(path: str) -> float:
+    try:
+        data = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    except Exception:  # noqa: BLE001: без конфига работают запасные числа
+        return _DEFAULT_MAX_OVERLAP
+    return float((data.get("batch") or {}).get("max_overlap", _DEFAULT_MAX_OVERLAP))
+
+
+def batch_max_overlap(path: Path | None = None) -> float:
+    return _load_batch(str(path or STYLES_YAML_PATH))
