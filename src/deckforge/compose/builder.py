@@ -2906,30 +2906,25 @@ def _fix_cloned_contrast(slide, ref, profile: TemplateProfile, canvas: Canvas, a
 
     Фон ищется в том же порядке, что у аудита: своя заливка фигуры, самая
     маленькая залитая фигура под ней, фон слайда, фон макета. Цвет без
-    явной заливки у run берётся унаследованным (лейаут, мастер): шаблон
-    подбирал его под свой фон, но не всегда под фон этого примера."""
+    явной заливки у run не трогается: аудит его тоже не судит, а
+    унаследованный цвет шаблон подбирал под свой фон."""
     run = ref.element.find(".//" + qn("a:r"))
     r_pr = run.find(qn("a:rPr")) if run is not None else None
     fill = r_pr.find(qn("a:solidFill")) if r_pr is not None else None
+    if fill is None:
+        return
     scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
-    if fill is not None:
-        color = resolve_color(fill, scheme, clr_map)
-        color_hex = color.hex if isinstance(color, Color) else None
-    else:
-        # ЛЦТ2026, пример 15 «Пункты»: плейсхолдеры наследуют белый текст
-        # мастера, а фон слайда светлый. Наш текст выходил белым по белому
-        # (прогон 27 сентября 2026), аудит унаследованный цвет не судит.
-        color_hex = inherited_text_color(slide, ref.element, scheme, clr_map)
-    if color_hex is None or r_pr is None:
+    color = resolve_color(fill, scheme, clr_map)
+    if not isinstance(color, Color):
         return
     bg_luminance = _clone_background_luminance(slide, ref, profile, canvas)
-    ratio = _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(color_hex))
-    size = int(r_pr.get("sz")) / 100 if r_pr.get("sz") else (inherited_text_size(slide, ref.element) or 0.0)
+    ratio = _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(color.hex))
+    size = int(r_pr.get("sz")) / 100 if r_pr.get("sz") else 0.0
     cfg = audit_config.template
     is_large = size >= cfg.large_text_pt or (r_pr.get("b") == "1" and size >= cfg.large_bold_pt)
     if ratio >= (cfg.min_contrast_large if is_large else cfg.min_contrast_small):
         return
-    better = _best_contrast_color(color_hex, bg_luminance, profile)
+    better = _best_contrast_color(color.hex, bg_luminance, profile)
     for rpr in ref.element.iter(qn("a:rPr")):
         for old_fill in rpr.findall(qn("a:solidFill")):
             rpr.remove(old_fill)
@@ -2986,7 +2981,27 @@ def _box_background_luminance(
     bg = resolve_color(bg_fill, scheme, clr_map) if bg_fill is not None else None
     if isinstance(bg, Color):
         return _relative_luminance(bg.hex)
+    picture = _slide_picture_background(slide)
+    if picture is not None:
+        return picture
     return slide_background_luminance(slide, profile)
+
+
+def _slide_picture_background(slide) -> float | None:
+    """Яркость своей картинки-фона слайда (`p:bg/a:blipFill`). ЛЦТ2026,
+    пример 15 «Пункты»: лейаут тёмно-фиолетовый, а сам слайд залит светлой
+    картинкой. По фону лейаута контраст считал фон тёмным и красил текст
+    клона белым по белому (прогон 27 сентября 2026)."""
+    blip = slide._element.find(  # noqa: SLF001
+        qn("p:cSld") + "/" + qn("p:bg") + "/" + qn("p:bgPr") + "/" + qn("a:blipFill") + "/" + qn("a:blip")
+    )
+    rid = blip.get(qn("r:embed")) if blip is not None else None
+    try:
+        with Image.open(io.BytesIO(slide.part.related_part(rid).blob)) as img:
+            r, g, b = img.convert("RGB").resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
+    except Exception:  # noqa: BLE001: нет картинки, emf, битый файл: решает фон лейаута
+        return None
+    return _relative_luminance(f"#{r:02X}{g:02X}{b:02X}")
 
 
 def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Canvas) -> float:

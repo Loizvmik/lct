@@ -80,13 +80,10 @@ def test_two_line_headline_grows_plate_down(profile):
     assert not _plate_title_overlaps(slide, canvas, profile)
 
 
-def test_inherited_white_text_on_light_example_is_recolored(profile):
-    """Пример 15 «Пункты»: плейсхолдеры наследуют белый текст мастера, фон
-    слайда светлый. Клон обязан перекрасить наш текст, раз своего цвета у
-    run нет."""
-    from deckforge.audit.config import AuditConfig as _Cfg
-    from deckforge.compose.clone import inherited_text_color
-
+def test_light_picture_background_keeps_dark_text(profile):
+    """Пример 15 «Пункты»: лейаут тёмно-фиолетовый, а слайд залит светлой
+    картинкой (`p:bg/a:blipFill`). Контраст клона считал фон по лейауту и
+    перекрашивал чёрный текст примера в белый: белым по белому."""
     prs = Presentation(str(TEMPLATE))
     sources = sample_slides_by_number(prs)
     builder._clear_sample_slides(prs)
@@ -95,13 +92,6 @@ def test_inherited_white_text_on_light_example_is_recolored(profile):
     slide = clone_example_slide(prs, sources[15], builder._find_layout(prs, pattern.layout_id))
     matched = match_slots(slide, pattern.slots, canvas)
     ref = next(matched[i] for i, s in enumerate(pattern.slots) if s.role != "headline" and matched[i] is not None)
-    bind_text(ref.element, [Paragraph("Бюджет 2,4 млн рублей")])
-    scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
-    bg = builder._clone_background_luminance(slide, ref, profile, canvas)
-    before = inherited_text_color(slide, ref.element, scheme, clr_map)
-    assert builder._contrast_ratio_from_luminance(bg, builder._relative_luminance(before)) < 3, "тест не о чем"
 
-    builder._fix_cloned_contrast(slide, ref, profile, canvas, _Cfg.load())
-
-    after = inherited_text_color(slide, ref.element, scheme, clr_map)
-    assert builder._contrast_ratio_from_luminance(bg, builder._relative_luminance(after)) >= 3
+    assert builder._clone_background_luminance(slide, ref, profile, canvas) > 0.5
+    assert builder._slide_picture_background(slide) is not None
