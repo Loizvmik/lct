@@ -154,6 +154,7 @@ def static_cost(
     ):
         cost += w("orphan_image")
     cost += photo_void_cost(pattern, intent, style)
+    cost += photo_fit_cost(pattern, intent, style)
     if intent.required_visual == "chart":
         cost += w("chart_fit") * style.chart_weight * chart_fit(form)
     if position == 0 and cover_id is not None and pattern.pattern_id != cover_id:
@@ -238,3 +239,40 @@ def photo_void_cost(pattern, intent: SlideIntent, style: StylePolicy) -> float:
     пришлось ослабить: выше любого несовпадения стиля."""
     void = photo_void(pattern, intent)
     return style.weight("sample_photo_void") if void > MAX_PHOTO_VOID else 0.0
+
+
+
+# Во сколько раз пропорции фото и рамки могут расходиться без штрафа:
+# кадрирование по центру срезает до трети стороны, лицо и экран остаются.
+PHOTO_ASPECT_TOLERANCE = 1.5
+# Рамка под фото меньше этой доли холста: место иконки, а не фото.
+MIN_PHOTO_FRAME_AREA = 0.04
+
+
+def photo_aspect_mismatch(photo_aspect: float, frame_aspect: float) -> float:
+    """Во сколько раз пропорции расходятся: 1 совпадают, 2 одна сторона
+    вдвое длиннее, чем у другой. Порядок аргументов неважен."""
+    return max(photo_aspect / frame_aspect, frame_aspect / photo_aspect)
+
+
+def photo_fit_cost(pattern, intent: SlideIntent, style: StylePolicy) -> float:
+    """Штраф раскладке под фото пользователя за рамку, в которую оно не
+    ляжет: пропорции расходятся больше `PHOTO_ASPECT_TOLERANCE` (широкий
+    скриншот в рамке телефона VK Education, пример 30, обрезался до
+    полоски) или рамка размером с иконку. Растёт с расхождением, но не
+    выше двух весов: совсем без рамки фото пропадёт, это хуже.
+
+    Рамки раскладок (`SlideIntent.photo_frames`: пропорции в пикселях
+    холста и доля холста) меряет вызывающий код по профилю: планировщик
+    координат не знает."""
+    frames = intent.photo_frames or {}
+    frame = frames.get(pattern.pattern_id)
+    if not intent.photo or frame is None:
+        return 0.0
+    frame_aspect, frame_area = frame
+    cost = style.weight("photo_aspect") if frame_area < MIN_PHOTO_FRAME_AREA else 0.0
+    if intent.photo_aspect and frame_aspect:
+        mismatch = photo_aspect_mismatch(intent.photo_aspect, frame_aspect)
+        if mismatch > PHOTO_ASPECT_TOLERANCE:
+            cost += style.weight("photo_aspect") * min(2.0, mismatch / PHOTO_ASPECT_TOLERANCE)
+    return cost

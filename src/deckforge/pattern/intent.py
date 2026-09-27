@@ -10,6 +10,7 @@
 (`items`, если модель структуры его назвала, иначе число `needs`, иначе
 типичное для вида пункта)."""
 from __future__ import annotations
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 # Объём колоды по ТЗ: 10-15 слайдов. Разделители airy не выводят за верх.
@@ -54,6 +55,15 @@ class SlideIntent:
     form: str | None = None
     photo: str | None = None
     photo_caption: str | None = None
+    # Пропорции фото пользователя (ширина / высота), если их удалось
+    # прочесть: планировщик не ставит широкий скриншот в рамку телефона
+    # (`scoring.photo_fit_cost`). Пиксели читает вызывающий код, не план.
+    photo_aspect: float | None = None
+    # Рамки под фото раскладок шаблона: `pattern_id` -> (ширина / высота в
+    # пикселях холста, доля холста). Меряет вызывающий код по профилю
+    # (`compose.builder.photo_frames`), планировщик координат не знает.
+    # Только у слайда с фото.
+    photo_frames: Mapping[str, tuple[float, float]] | None = field(default=None, compare=False)
     # Разделитель стиля airy: текста не пишет никто, заголовок статичный.
     divider: bool = False
     label: str | None = None
@@ -99,13 +109,19 @@ def _items_of(slide) -> int:
     return _DEFAULT_ITEMS.get(slide.kind, 3)
 
 
-def intents_from_outline(outline, photos: dict[int, tuple[str, str | None]] | None = None) -> list[SlideIntent]:
+def intents_from_outline(
+    outline, photos: dict[int, tuple[str, str | None]] | None = None,
+    photo_aspects: dict[str, float] | None = None,
+    photo_frames: Mapping[str, tuple[float, float]] | None = None,
+) -> list[SlideIntent]:
     """Намерения по пунктам структуры. `photos`: номер пункта -> (имя файла
     фото, подпись), распределение фотографий контент-пакета до планирования
     (`plan.photos.assign_photos` по скелету структуры): слайд с фото обязан
     получить раскладку с местом под картинку, а это решается здесь, а не
-    после текста."""
+    после текста. `photo_aspects`: имя файла -> ширина / высота;
+    `photo_frames`: рамки под фото раскладок (см. поле `SlideIntent`)."""
     photos = photos or {}
+    photo_aspects = photo_aspects or {}
     result: list[SlideIntent] = []
     for i, slide in enumerate(outline.slides):
         form = getattr(slide, "form", None)
@@ -114,6 +130,8 @@ def intents_from_outline(outline, photos: dict[int, tuple[str, str | None]] | No
             index=i, outline_kind=slide.kind, intent=slide.intent, needs=tuple(slide.needs),
             items=_items_of(slide), form=form if form in FORMS else None,
             photo=photo[0] if photo else None, photo_caption=photo[1] if photo else None,
+            photo_aspect=photo_aspects.get(photo[0]) if photo else None,
+            photo_frames=photo_frames if photo else None,
             visual_intent=getattr(slide, "visual_intent", None),
         ))
     return result
