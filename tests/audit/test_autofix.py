@@ -220,3 +220,21 @@ def test_every_fixable_check_id_is_in_supported_checks():
     assert not offenders, (
         f"check_id с fixable=True вне SUPPORTED_CHECKS (apply_fixes тихо их пропустит): {offenders}"
     )
+
+
+def test_margin_fix_moves_only_sideways(deck_with):
+    """L06 проверяет только левое и правое поле, а починка прижимала и к
+    верхнему: у VK Tech `grid.margin_top` около 0.235 (смесь заголовков и
+    тел), и заголовок с 5% высоты уезжал вниз на карточки (живой прогон
+    27 сентября, slide24 и slide14: наложение заголовка и карточек)."""
+    path = deck_with(lambda s: _add_text(s, 0.05, 0.3, 4.0, 0.5, "Заголовок у верхнего края", size_pt=24, family="Play"))
+    assert PROFILE.grid.margin_top * PROFILE.canvas_height_emu > Inches(0.3), "фикстуре нужно верхнее поле ниже надписи"
+    findings = _findings_by_check(path, "L06")
+    assert findings, "фикстура обязана воспроизводить L06"
+
+    result = apply_fixes(path, PROFILE, findings, {"f0": findings[0]})
+    assert result.applied == ["f0"]
+
+    shape = list(Presentation(str(path)).slides[0].shapes)[-1]
+    assert shape.top == Inches(0.3)
+    assert "L06" not in _ids(run_deterministic(path, PROFILE, CONFIG))
