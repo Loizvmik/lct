@@ -30,7 +30,7 @@ from pptx.opc.packuri import PackURI
 from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import NS, qn
-from deckforge.ooxml.walk import ShapeRef, walk_shapes
+from deckforge.ooxml.walk import ShapeRef, inherit_placeholder_boxes, walk_shapes
 from deckforge.template.patterns import DecorShape, PatternSlot
 
 # Порог совпадения коробки слота из профиля с фигурой клона (IoU). Коробки
@@ -236,24 +236,15 @@ def slide_refs(slide, canvas: Canvas) -> list[ShapeRef]:
     без своего `a:xfrm` получает коробку плейсхолдера лейаута (по idx, затем
     по типу): тот же порядок наследования, по которому майнинг снимал
     коробки слотов (`patterns._resolve_slide_boxes`), иначе заголовок почти
-    любого примера не нашёлся бы вовсе."""
+    любого примера не нашёлся бы вовсе. Без коробки у лейаута коробка
+    берётся у мастера."""
     refs = list(walk_shapes(slide._element, canvas))  # noqa: SLF001
     if not any(r.box is None and r.is_placeholder for r in refs):
         return refs
-    layout_refs = list(walk_shapes(slide.slide_layout._element, canvas))  # noqa: SLF001
-    by_idx = {r.ph_idx: r.box for r in layout_refs if r.is_placeholder and r.box is not None and r.ph_idx is not None}
-    by_type: dict[str | None, Box] = {}
-    for r in layout_refs:
-        if r.is_placeholder and r.box is not None and r.ph_type not in by_type:
-            by_type[r.ph_type] = r.box
-    out = []
-    for r in refs:
-        if r.box is None and r.is_placeholder:
-            box = by_idx.get(r.ph_idx) or by_type.get(r.ph_type)
-            if box is not None:
-                r = replace(r, box=box)
-        out.append(r)
-    return out
+    layout = slide.slide_layout
+    layout_refs = list(walk_shapes(layout._element, canvas))  # noqa: SLF001
+    master_refs = list(walk_shapes(layout.slide_master._element, canvas))  # noqa: SLF001
+    return inherit_placeholder_boxes(refs, layout_refs, master_refs)
 
 
 def _has_text_body(element) -> bool:

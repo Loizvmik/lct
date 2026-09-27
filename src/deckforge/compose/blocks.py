@@ -126,7 +126,7 @@ def assign_content(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> list[
 
 
 def assign_content_with_drops(
-    slide_spec: SlideSpec, pattern: Pattern, grid: Grid,
+    slide_spec: SlideSpec, pattern: Pattern, grid: Grid, *, cards_as_text: bool = False,
 ) -> tuple[list[SlotContent], list[DroppedContent]]:
     """Раскладывает `slide_spec` по слотам `pattern` и ВТОРЫМ значением
     возвращает то, что в эту раскладку не поместилось ПО РОЛЯМ: контент,
@@ -136,7 +136,14 @@ def assign_content_with_drops(
 
     Находки о том, что контент не влез по РАЗМЕРУ, а не по отсутствию
     слота, по-прежнему пишет `builder.py` при замере — здесь только
-    соответствие ролей."""
+    соответствие ролей.
+
+    `cards_as_text`: карточки, которым в раскладке нет повтора, ложатся
+    текстом в место под тело (заголовок карточки жирным абзацем). Так
+    делает сборка с нуля, последняя ступень лестницы: у незнакомого
+    шаблона без карточных раскладок иначе от слайда оставался заголовок.
+    Клон и выбор раскладки флаг не ставят: для них потеря карточек повод
+    взять другую раскладку."""
     by_role = _slots_by_role(pattern, slide_spec)
     result: list[SlotContent] = []
     drops: list[DroppedContent] = []
@@ -161,7 +168,7 @@ def assign_content_with_drops(
             _drop(drops, "subhead", slide_spec.subhead)
 
     for block in slide_spec.blocks:
-        result.extend(_assign_block(block, by_role, pattern, grid, drops))
+        result.extend(_assign_block(block, by_role, pattern, grid, drops, cards_as_text=cards_as_text))
 
     source_slot = _take_one(by_role, "source") or _take_one(by_role, "caption")
     if slide_spec.source_note:
@@ -225,7 +232,7 @@ def _take_one(by_role: dict[str, list[PatternSlot]], role: str) -> PatternSlot |
 
 def _assign_block(
     block: Block, by_role: dict[str, list[PatternSlot]], pattern: Pattern, grid: Grid,
-    drops: list[DroppedContent],
+    drops: list[DroppedContent], *, cards_as_text: bool = False,
 ) -> list[SlotContent]:
     if isinstance(block, TextBlock):
         # "card_body" — запасной вариант: во многих намайненных "bullets"-
@@ -253,6 +260,15 @@ def _assign_block(
         return _assign_quote(block, by_role, drops)
 
     if isinstance(block, CardBlock):
+        if cards_as_text and not (expand_repeat(pattern, len(block.items), grid) if pattern.repeat else []):
+            slot = _take_one(by_role, "body") or _take_one(by_role, "bullet") or _take_one(by_role, "card_body")
+            if slot is not None:
+                paragraphs = []
+                for card in block.items:
+                    if card.title:
+                        paragraphs.append(Paragraph(card.title, bold=True))
+                    paragraphs.append(Paragraph(card.body))
+                return [SlotContent(slot, "body", paragraphs)]
         return _assign_cards(block, pattern, grid, drops)
 
     if isinstance(block, KpiBlock):

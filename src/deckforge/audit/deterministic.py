@@ -67,7 +67,7 @@ from deckforge.ooxml.color import Color, UnresolvedColor, resolve_color
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import local_name, qn
 from deckforge.ooxml.package import PptxPackage
-from deckforge.ooxml.walk import ShapeRef, walk_shapes
+from deckforge.ooxml.walk import ShapeRef, inherit_placeholder_boxes, walk_shapes
 from deckforge.template.naming import contrast_ratio
 from deckforge.template.typography import fill_scale_gaps
 from deckforge.template.profile import TemplateProfile
@@ -247,6 +247,24 @@ def _build_context_inmemory(index: int, slide, canvas: Canvas, profile: Template
     return _context_from_root(index, slide, slide._element, canvas, profile)  # noqa: SLF001 — тот же приём, что и `compose.builder._clear_sample_slides`/`_remove_last_slide` (см. их докстроки)
 
 
+def _slide_refs_with_inherited_boxes(slide, root, canvas: Canvas) -> list[ShapeRef]:
+    """Фигуры слайда; плейсхолдер без своего `a:xfrm` получает коробку
+    лейаута или мастера (`walk.inherit_placeholder_boxes`). Без этого
+    заголовок, унаследовавший место от мастера, для аудита не существовал:
+    слайд из заголовка и текста в плейсхолдерах встроенного шаблона
+    PowerPoint получал I03 «слайд пуст»."""
+    refs = list(walk_shapes(root, canvas, include_groups=False))
+    if not any(r.box is None and r.is_placeholder for r in refs):
+        return refs
+    try:
+        layout = slide.slide_layout
+        layout_refs = list(walk_shapes(layout._element, canvas, include_groups=False))  # noqa: SLF001
+        master_refs = list(walk_shapes(layout.slide_master._element, canvas, include_groups=False))  # noqa: SLF001
+    except Exception:  # noqa: BLE001 — слайд без лейаута: проверяем то, что есть
+        return refs
+    return inherit_placeholder_boxes(refs, layout_refs, master_refs)
+
+
 def _context_from_root(index: int, slide, root, canvas: Canvas, profile: TemplateProfile) -> _SlideContext:
     id_to_pptx = {}
     for shape in _flatten_pptx_shapes(slide.shapes):
@@ -259,7 +277,7 @@ def _context_from_root(index: int, slide, root, canvas: Canvas, profile: Templat
     clr_map = dict(profile.theme.clr_map)
 
     items: list[_Item] = []
-    for ref in walk_shapes(root, canvas, include_groups=False):
+    for ref in _slide_refs_with_inherited_boxes(slide, root, canvas):
         if ref.box is None or ref.kind == "group":
             continue
         item = _make_item(ref, id_to_pptx.get(ref.shape_id), scheme, clr_map)

@@ -13,7 +13,7 @@ p:cxnSp/p:grpSp с сохранением документного порядк�
 атрибутам xfrm/ph — поэтому обход написан прямо по lxml-дереву.
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterator, Sequence
 
 from lxml import etree
@@ -268,3 +268,52 @@ def walk_shapes(
     """
     sp_tree = sp_tree_of(tree_root)
     yield from _walk_container(sp_tree, canvas, (), 0, include_groups)
+
+
+# Тип плейсхолдера мастера, от которого наследует плейсхолдер лейаута. У
+# мастера по спецификации только заголовок, текст и колонтитулы; всё прочее
+# (`obj`, `subTitle`, `pic`, `tbl`...) берёт коробку текстового места.
+_MASTER_PH_TYPE = {"title": "title", "ctrTitle": "title", "dt": "dt", "ftr": "ftr", "sldNum": "sldNum", "hdr": "hdr"}
+
+
+def master_ph_type(ph_type: str | None) -> str:
+    return _MASTER_PH_TYPE.get(ph_type or "body", "body")
+
+
+def inherit_placeholder_boxes(
+    refs: Sequence[ShapeRef], layout_refs: Sequence[ShapeRef], master_refs: Sequence[ShapeRef] = (),
+) -> list[ShapeRef]:
+    """Плейсхолдер слайда без своего `a:xfrm` получает коробку по цепочке
+    наследования OOXML: плейсхолдер лейаута (по `idx`, затем по типу), а
+    если и у того нет `a:xfrm`, плейсхолдер мастера того же рода.
+
+    Второе звено нужно не для красоты: у лейаутов встроенного шаблона
+    PowerPoint и у многих экспортов из Google Slides `p:spPr` плейсхолдеров
+    пустой, коробка есть только у мастера. Без него заголовок и текст
+    такого слайда оставались без координат, майнинг считал слайд пустым и
+    не снимал с него ни одной раскладки."""
+    if not any(r.box is None and r.is_placeholder for r in refs):
+        return list(refs)
+    layout_by_idx = {r.ph_idx: r for r in layout_refs if r.is_placeholder and r.ph_idx is not None}
+    box_by_idx = {i: r.box for i, r in layout_by_idx.items() if r.box is not None}
+    box_by_type: dict[str | None, Box] = {}
+    for r in layout_refs:
+        if r.is_placeholder and r.box is not None and r.ph_type not in box_by_type:
+            box_by_type[r.ph_type] = r.box
+    master_by_type: dict[str, Box] = {}
+    for r in master_refs:
+        if r.is_placeholder and r.box is not None:
+            master_by_type.setdefault(master_ph_type(r.ph_type), r.box)
+
+    out = []
+    for r in refs:
+        if r.box is None and r.is_placeholder:
+            box = box_by_idx.get(r.ph_idx) or box_by_type.get(r.ph_type)
+            if box is None:
+                layout_ref = layout_by_idx.get(r.ph_idx)
+                kind = layout_ref.ph_type if layout_ref is not None else r.ph_type
+                box = master_by_type.get(master_ph_type(kind))
+            if box is not None:
+                r = replace(r, box=box)
+        out.append(r)
+    return out

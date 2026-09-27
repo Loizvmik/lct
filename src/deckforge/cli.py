@@ -455,6 +455,11 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
         out.append(f"  ! Верность шаблону не посчитана: {exc}")
     out.append(f"  находки по серьёзности: {by_severity or '(нет)'}")
     out.append(f"  находки по видам: {dict(sorted(by_check.items()))}")
+    if deck.meta.get("font_substitutions"):
+        out.append(
+            f"  ! шрифта шаблона нет в системе, вместимость посчитана по замене с запасом: "
+            f"{deck.meta['font_substitutions']}"
+        )
     slide_findings = [s for v in deck.slides for s in v.findings]
     if slide_findings:
         out.append(f"  находки сборки (усечения/переполнения): {len(slide_findings)}")

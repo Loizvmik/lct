@@ -52,7 +52,7 @@ from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import local_name, qn
 from deckforge.ooxml.package import PptxPackage
-from deckforge.ooxml.walk import ShapeRef, walk_shapes
+from deckforge.ooxml.walk import ShapeRef, inherit_placeholder_boxes, walk_shapes
 from deckforge.template.assets import AssetCatalog
 from deckforge.template.grid import TITLE_PH_TYPES, Grid, cluster
 # Task 7 повторное ревью, находка №4 ("Определение тёмного фона слабее, чем
@@ -91,6 +91,9 @@ KINDS = ("cards", "two_col", "kpi", "section", "image", "table", "bullets")
 # kind'ов отсутствие headline — брак раскладки (см. `_mine_slide`: такой
 # кандидат отбрасывается на шаге оценки, а не просачивается без роли).
 _HEADLINE_EXEMPT_KINDS = frozenset({"section", "image"})
+
+# Плейсхолдеры колонтитулов: на слайде-примере это оформление, не слот.
+_CHROME_PH_TYPES = frozenset({"sldNum", "dt", "ftr", "hdr"})
 
 
 # Постоянный текст шаблона («Спасибо за внимание!», «Вопросы?») короткий и
@@ -835,29 +838,16 @@ def _resolve_slide_boxes(
     ещё до того, как мог бы стать headline. Резолвится по `ph_idx` (слайд
     ссылается на плейсхолдер лейаута именно по нему), а без совпадения
     `idx` — по `ph_type` как более мягкий фолбэк (та же асимметрия,
-    что у `layouts._resolve_placeholder_box`)."""
+    что у `layouts._resolve_placeholder_box`), а без коробки у лейаута —
+    от мастера (`walk.inherit_placeholder_boxes`)."""
     if layout_part is None:
         return refs
-    unresolved = [r for r in refs if r.box is None and r.is_placeholder]
-    if not unresolved:
+    if not any(r.box is None and r.is_placeholder for r in refs):
         return refs
-
-    layout_root = pkg.xml(layout_part)
-    layout_refs = list(walk_shapes(layout_root, canvas, include_groups=False))
-    by_idx = {r.ph_idx: r.box for r in layout_refs if r.is_placeholder and r.box is not None and r.ph_idx is not None}
-    by_type: dict[str | None, Box] = {}
-    for r in layout_refs:
-        if r.is_placeholder and r.box is not None and r.ph_type not in by_type:
-            by_type[r.ph_type] = r.box
-
-    resolved = []
-    for r in refs:
-        if r.box is not None or not r.is_placeholder:
-            resolved.append(r)
-            continue
-        new_box = by_idx.get(r.ph_idx) or by_type.get(r.ph_type)
-        resolved.append(replace(r, box=new_box) if new_box is not None else r)
-    return resolved
+    layout_refs = list(walk_shapes(pkg.xml(layout_part), canvas, include_groups=False))
+    master = pkg.related(layout_part, "slideMaster")
+    master_refs = list(walk_shapes(pkg.xml(master[0]), canvas, include_groups=False)) if master else []
+    return inherit_placeholder_boxes(refs, layout_refs, master_refs)
 
 
 def _visible(ref: ShapeRef) -> bool:
@@ -951,7 +941,16 @@ def _split_content_decor(
         elif ref.kind == "graphic_frame":
             content.append(ref)
         elif ref.kind == "shape":
-            if ref.is_placeholder:
+            if ref.is_placeholder and ref.ph_type in _CHROME_PH_TYPES:
+                # Колонтитул (номер слайда, дата, нижний колонтитул) на
+                # слайде-примере: PowerPoint кладёт его копией на каждый
+                # слайд, когда включены «Номер слайда» и «Колонтитулы». Это
+                # оформление шаблона, а не место под содержание: как слот он
+                # лежал у самого края, вылезал за поля сетки, и майнинг
+                # отбрасывал весь слайд (синтетический корпоративный шаблон:
+                # ноль раскладок из восьми примеров).
+                decor.append(ref)
+            elif ref.is_placeholder:
                 # Task 7 повторное ревью, находка №1 (главная причина
                 # обеднённого урожая на контрольном ЛЦТ2026): пустой
                 # ПЛЕЙСХОЛДЕР — контентный слот с известной геометрией, а не
