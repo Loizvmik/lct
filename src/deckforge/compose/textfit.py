@@ -477,3 +477,23 @@ def _write_font_cache(part_name: str, font_bytes: bytes) -> Path:
         _CACHE_DIR.mkdir(parents=True, exist_ok=True)
         path.write_bytes(font_bytes)
     return path
+
+
+def mono_advance(font_family: str, default: float) -> float:
+    """Ширина знака моногарнитуры в долях кегля, замером её файла.
+
+    Меряется, только если нашёлся файл под этим именем и он в самом деле
+    моноширинный (узкая «i» шириной с «0»): запасная гарнитура цепочки
+    подмены пропорциональная, и её средняя ширина знака занизила бы строку
+    кода. Иначе `default`: рендер подставит свою моно, их знак 0,55-0,6
+    кегля."""
+    font_path, font_source = _resolve_font(font_family)
+    if font_path is None or font_source != "exact":
+        return default
+    key = str(font_path)
+    size_px = 100
+    zero = _line_width_pt(key, size_px, "0" * 10)
+    narrow = _line_width_pt(key, size_px, "i" * 10)
+    if zero <= 0 or abs(zero - narrow) > zero * 0.02:
+        return default
+    return zero / (10 * size_px)

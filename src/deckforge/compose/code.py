@@ -9,9 +9,12 @@
 (`type_scale.mono`) или системной, и меткой языка мелко.
 
 Кегль подбирается так, чтобы самая длинная строка легла в ширину, а все
-строки в высоту: от кегля слота вниз по шкале шаблона до 10 pt. Переносов
-нет: перенос внутри строки кода меняет её смысл на глаз, поэтому
-переполнение ниже 10 pt честная находка, а не перенос.
+строки в высоту: от кегля слота вниз по шкале шаблона до 9 pt, ширина
+знака замером моногарнитуры (`textfit.mono_advance`). Перенос внутри
+строки кода меняет её смысл на глаз, поэтому он только крайний случай:
+строка, не легшая в ширину и на 9 pt, переносится по пробелу с отступом
+продолжения (`wrap_code_lines`), а не обрезается краем плашки. Плашка по
+высоте кода, а не во всю рамку места.
 
 Фигуры кода называются с префиксом `CODE_SHAPE_NAME`: по нему аудит
 узнаёт код и не судит его как текст (стена текста, кегль вне шкалы)."""
@@ -24,6 +27,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Emu, Pt
 
+from deckforge.compose.textfit import mono_advance
 from deckforge.compose.colorpick import _relative_luminance, best_contrast_text_color_for_luminance
 from deckforge.ooxml.geometry import Box
 from deckforge.ooxml.ns import qn
@@ -35,7 +39,10 @@ CODE_SHAPE_NAME = "DeckForge Code"
 # Моногарнитура, если своей у шаблона нет. Consolas стоит в Office на
 # Windows и macOS; LibreOffice подменит её своей моно через fontconfig.
 FALLBACK_MONO = "Consolas"
-MIN_CODE_PT = 10.0
+# Не мельче 9 pt: мельче код с проектора не читается. Было 10, и строка
+# правила на 66 знаков на плашке в полслайда VK Education обрезалась
+# краем (рендер 28 сентября 2026), хотя на 9 pt ложилась.
+MIN_CODE_PT = 9.0
 MAX_CODE_PT = 18.0
 # Ширина знака моногарнитуры в долях кегля: у Consolas 0,55, у Menlo и
 # Courier New 0,6. Берётся большее, чтобы строка не вылезла за рамку.
@@ -47,6 +54,8 @@ MONO_ADVANCE = 0.6
 # вылезала из плашки (рендер 28 сентября 2026).
 CODE_LINE_SPACING = 1.0
 CODE_LINE_HEIGHT = 1.2
+# Отступ строки-продолжения сверх отступа исходной строки, пробелов.
+CONTINUATION_INDENT = 4
 # Поля плашки вокруг кода, дюймы.
 _PAD_IN = 0.15
 _EMU_PER_INCH = 914400
@@ -70,9 +79,10 @@ def code_lines(code: CodeBlock) -> list[str]:
     return code.code.splitlines() or [""]
 
 
-def fits_at(lines: list[str], size_pt: float, width_in: float, height_in: float) -> bool:
+def fits_at(lines: list[str], size_pt: float, width_in: float, height_in: float,
+            advance: float = MONO_ADVANCE) -> bool:
     longest = max((len(line) for line in lines), default=0)
-    width_ok = longest * MONO_ADVANCE * size_pt / _PT_PER_INCH <= width_in + 1e-6
+    width_ok = longest * advance * size_pt / _PT_PER_INCH <= width_in + 1e-6
     height_ok = len(lines) * size_pt * CODE_LINE_HEIGHT / _PT_PER_INCH <= height_in + 1e-6
     return width_ok and height_ok
 
@@ -83,18 +93,65 @@ class CodeSize:
     fits: bool
 
 
-def code_size(lines: list[str], width_in: float, height_in: float, start_pt: float, scale: list[float] = ()) -> CodeSize:
+def code_size(lines: list[str], width_in: float, height_in: float, start_pt: float, scale: list[float] = (),
+              advance: float = MONO_ADVANCE) -> CodeSize:
     """Кегль кода: от `start_pt` (кегль слота, не больше 18) вниз по
-    ступеням шкалы шаблона и дальше по целым пунктам до 10 pt, первый, на
-    котором код лёг. Не лёг и на 10 pt: 10 pt и `fits=False`."""
+    ступеням шкалы шаблона и дальше по целым пунктам до 9 pt, первый, на
+    котором код лёг. Не лёг и на 9 pt: 9 pt и `fits=False`."""
     top = max(MIN_CODE_PT, min(MAX_CODE_PT, start_pt or MAX_CODE_PT))
     candidates = {top, MIN_CODE_PT}
     candidates |= {s for s in scale if MIN_CODE_PT <= s <= top}
     candidates |= {float(s) for s in range(int(MIN_CODE_PT), int(top) + 1)}
     for size in sorted(candidates, reverse=True):
-        if fits_at(lines, size, width_in, height_in):
+        if fits_at(lines, size, width_in, height_in, advance):
             return CodeSize(size, True)
     return CodeSize(MIN_CODE_PT, False)
+
+
+def wrap_code_lines(lines: list[str], max_chars: int) -> list[str]:
+    """Строки длиннее `max_chars` переносятся по последнему пробелу, что
+    влезает; продолжение с отступом исходной строки плюс
+    `CONTINUATION_INDENT`, чтобы глаз видел, что это та же строка. Без
+    пробела в пределах ширины строка рвётся по ширине: обрезанный краем
+    плашки код хуже разорванного."""
+    out: list[str] = []
+    for line in lines:
+        if len(line) <= max_chars:
+            out.append(line)
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        cont = " " * (indent + CONTINUATION_INDENT)
+        if len(cont) >= max_chars // 2:
+            cont = " " * min(indent, max_chars // 4)
+        rest = line
+        while len(rest) > max_chars:
+            lead = len(rest) - len(rest.lstrip(" "))
+            cut = rest.rfind(" ", lead + 1, max_chars + 1)
+            if cut <= lead:
+                piece, tail = rest[:max_chars], rest[max_chars:]
+            else:
+                piece, tail = rest[:cut].rstrip(), rest[cut + 1:].lstrip(" ")
+            out.append(piece)
+            rest = cont + tail
+        out.append(rest)
+    return out
+
+
+def fit_code_lines(lines: list[str], width_in: float, height_in: float, start_pt: float,
+                   scale: list[float] = (), advance: float = MONO_ADVANCE) -> tuple[list[str], CodeSize]:
+    """Строки и кегль кода для рамки: кегль по самой длинной строке
+    (`code_size`), а если она не легла в ширину и на 9 pt, строки
+    переносятся под ширину 9 pt и кегль подбирается заново."""
+    size = code_size(lines, width_in, height_in, start_pt, scale, advance)
+    if size.fits:
+        return lines, size
+    max_chars = int((width_in + 1e-6) / (advance * MIN_CODE_PT / _PT_PER_INCH))
+    if max_chars < 8:
+        return lines, size
+    wrapped = wrap_code_lines(lines, max_chars)
+    if wrapped == lines:
+        return lines, size
+    return wrapped, code_size(wrapped, width_in, height_in, start_pt, scale, advance)
 
 
 # Фигура крупнее этой доли холста считается фоном (картинка-подложка
@@ -229,6 +286,8 @@ def add_code_block(
     """Код с нуля на рамке `box` (доли холста): плашка, код, метка языка,
     подпись под плашкой. Возвращает находки (не лёг и на 10 pt)."""
     canvas_w, canvas_h = profile.canvas_width_emu, profile.canvas_height_emu
+    # Плашка не выходит за холст, даже если место под код заходило за край.
+    box = Box(0.0, 0.0, 1.0, 1.0).intersect(box) or box
     left, top = round(box.left * canvas_w), round(box.top * canvas_h)
     width, height = max(1, round(box.width * canvas_w)), max(1, round(box.height * canvas_h))
     findings: list[str] = []
@@ -249,18 +308,21 @@ def add_code_block(
     inner_w = max(1, width - 2 * pad)
     inner_h = max(1, plate_h - 2 * pad - label_h)
     body_pt = profile.type_scale_pt("body", 14.0) or 14.0
-    size = code_size(lines, inner_w / _EMU_PER_INCH, inner_h / _EMU_PER_INCH, body_pt, _scale_pt(profile))
+    lines, size = fit_code_lines(
+        lines, inner_w / _EMU_PER_INCH, inner_h / _EMU_PER_INCH, body_pt, _scale_pt(profile),
+        mono_advance(family, MONO_ADVANCE),
+    )
     if not size.fits:
         findings.append(
             f"фрагмент кода ({len(lines)} строк, до {max(len(x) for x in lines)} знаков) не лёг в рамку "
             f"и на {MIN_CODE_PT:g} pt"
         )
-    else:
-        # Плашка по высоте кода, а не всей рамки: шесть строк на плашке во
-        # всю высоту слайда оставляют под кодом пустой цветной прямоугольник.
-        need_h = round(len(lines) * size.size_pt * CODE_LINE_HEIGHT / _PT_PER_INCH * _EMU_PER_INCH)
-        inner_h = min(inner_h, need_h + round(size.size_pt * 0.5 / _PT_PER_INCH * _EMU_PER_INCH))
-        plate_h = inner_h + 2 * pad + label_h
+    # Плашка по высоте кода, а не всей рамки: шесть строк на плашке во всю
+    # высоту слайда оставляют под кодом пустой цветной прямоугольник. Так и
+    # когда код не лёг: тогда нужная высота больше рамки, и плашка по рамке.
+    need_h = round(len(lines) * size.size_pt * CODE_LINE_HEIGHT / _PT_PER_INCH * _EMU_PER_INCH)
+    inner_h = min(inner_h, need_h + round(size.size_pt * 0.5 / _PT_PER_INCH * _EMU_PER_INCH))
+    plate_h = inner_h + 2 * pad + label_h
 
     fill, text_color = plate_colors(profile, bg_luminance)
     plate = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Emu(left), Emu(top), Emu(width), Emu(plate_h))
@@ -336,9 +398,11 @@ def fill_code_shape(element, code: CodeBlock, profile, box_width_in: float, box_
     insets = _insets_in(tx_body)
     width_in = max(0.1, box_width_in - insets[0] - insets[2])
     height_in = max(0.1, box_height_in - insets[1] - insets[3])
-    lines = code_lines(code)
-    size = code_size(lines, width_in, height_in, start_pt, _scale_pt(profile))
-    _fill_lines(tf, lines, mono_family(profile), size.size_pt, None)
+    family = mono_family(profile)
+    lines, size = fit_code_lines(
+        code_lines(code), width_in, height_in, start_pt, _scale_pt(profile), mono_advance(family, MONO_ADVANCE),
+    )
+    _fill_lines(tf, lines, family, size.size_pt, None)
     if fill is not None:
         for r_pr in tx_body.iter(qn("a:rPr")):
             if r_pr.find(qn("a:solidFill")) is None:
