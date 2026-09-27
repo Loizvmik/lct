@@ -18,7 +18,7 @@ from deckforge.ooxml.geometry import Box
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.plan.spec import (
-    Block, BulletBlock, Card, CardBlock, DeckSpec, Kpi, KpiBlock, QuoteBlock, SlideSpec, TextBlock,
+    Block, BulletBlock, Card, CardBlock, DeckSpec, Kpi, KpiBlock, QuoteBlock, SlideSpec, TeamBlock, TextBlock,
 )
 from deckforge.template.grid import Grid
 from deckforge.template.patterns import DecorShape, Pattern, PatternSlot
@@ -275,6 +275,16 @@ def _assign_block(
 
     if isinstance(block, KpiBlock):
         return _assign_kpis(block, by_role, drops)
+
+    if isinstance(block, TeamBlock):
+        # Команда вне формы с нуля (клон раскладки, обычная сборка с нуля)
+        # ложится карточками «имя, роль». Раньше блок молча пропадал, и
+        # на слайде VK Tech оставалась одна подпись «4 роли» без имён.
+        cards = CardBlock(items=[
+            Card(title=m.name.strip(), body=m.role.strip()) if m.role.strip() else Card(body=m.name.strip())
+            for m in block.items if m.name.strip()
+        ])
+        return _assign_block(cards, by_role, pattern, grid, drops, cards_as_text=cards_as_text) if cards.items else []
 
     return []
 

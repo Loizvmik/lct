@@ -196,3 +196,50 @@ def test_team_block_round_trips_and_normalize_keeps_scratch_forms(profile_fixtur
     profile = profile_fixture(TEMPLATES[0].name)
     out = normalize_deck(DeckSpec(title="T", language="ru", slides=[kpi_slide]), profile)
     assert out.slides[0] is kpi_slide
+
+
+_VK_TECH = Path("dataset/templates/VK Tech шаблон.pptx")
+
+
+def test_heavy_decor_layout_is_not_a_carrier(profile_fixture):
+    """VK Tech, пример 41: восемь полос-градиентов и две пустые «таблетки»
+    (28% холста). Носителем формы с нуля такая раскладка не берётся."""
+    from deckforge.pattern.candidates import is_scratch_carrier
+    profile = profile_fixture(_VK_TECH.name)
+    forms = forms_of(profile)
+    assert not is_scratch_carrier(forms["slide41"])
+    assert any(is_scratch_carrier(f) for f in forms.values())
+
+
+@pytest.mark.parametrize("pattern_id", [None, "slide41"])
+def test_team_always_shows_every_name_and_role(profile_fixture, pattern_id):
+    """Команда на VK Tech выводит имя и роль каждого участника, даже если
+    слайд попал на раскладку без места под форму (пример 41): тогда
+    участники ложатся карточками «имя, роль», а не пропадают."""
+    profile = profile_fixture(_VK_TECH.name)
+    slide = _slide(profile, "team")
+    if pattern_id is not None:
+        slide.pattern_id, slide.alternatives = pattern_id, ()
+        slide.meta["scratch_form"] = "team"
+    spec = DeckSpec(title="Команда", language="ru", slides=[slide])
+    out = builder.build_deck(spec, profile, _VK_TECH, Variant.dense, user_photos=PHOTOS)
+    texts = " \n".join(_texts(Presentation(str(out)).slides[0]))
+    for member in _TEAM.items:
+        assert member.name in texts, (texts, spec.slides[0].findings)
+        assert member.role in texts, (texts, spec.slides[0].findings)
+
+
+def test_team_block_outside_the_form_lands_as_name_and_role_cards(profile_fixture):
+    """Обычная сборка с нуля (форма не легла ни на один носитель) кладёт
+    команду карточками: блок команды не пропадает молча."""
+    from deckforge.audit.config import AuditConfig as _Config
+    profile = profile_fixture(_VK_TECH.name)
+    prs = Presentation(str(_VK_TECH))
+    builder._clear_sample_slides(prs)
+    pattern = next(builder._pattern_from_model(m) for m in profile.patterns if m.pattern_id == "slide9")
+    spec = SlideSpec(index=1, kind=pattern.kind, headline="Пилот вели четыре человека", blocks=[_TEAM],
+                     pattern_id="slide9")
+    builder.place_slide(prs, spec, pattern, profile, _Config.load())
+    texts = " \n".join(_texts(prs.slides[-1]))
+    for member in _TEAM.items:
+        assert member.name in texts and member.role in texts, texts

@@ -64,7 +64,7 @@ from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import walk_shapes
 from deckforge.pattern.forms import CODE_TIER_SLOT, code_target_slot, forms_of
-from deckforge.pattern.candidates import is_scratch_carrier
+from deckforge.pattern.candidates import has_light_decor, is_scratch_carrier
 from deckforge.pattern.intent import MAX_SLIDES
 from deckforge.pattern.planner import MAX_ALTERNATIVES
 from deckforge.pattern.scoring import look_key
@@ -601,12 +601,13 @@ def _carriers_of(slide_spec: SlideSpec, candidates: list[Pattern], by_id: dict[s
 def _form_spares(patterns: list[Pattern], forms: dict) -> list[Pattern]:
     """Запасные носители формы, чей клон не принят: сначала носители
     планировщика (`is_scratch_carrier`), потом прочие раскладки содержания
-    без своей таблицы и графика. У WorkSpace носители-разделители места под
-    команду не дают, а раскладка пунктов (пример 10) даёт."""
+    без своей таблицы и графика и с лёгким декором (`has_light_decor`). У
+    WorkSpace носители-разделители места под команду не дают, а раскладка
+    пунктов даёт."""
     plain = [
         p for p in patterns
         if (f := forms.get(p.pattern_id)) is not None and f.slide_class == "content_pattern"
-        and not f.has_table and not f.has_chart
+        and not f.has_table and not f.has_chart and has_light_decor(f)
     ]
     return sorted(plain, key=lambda p: not is_scratch_carrier(forms[p.pattern_id]))
 

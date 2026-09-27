@@ -113,6 +113,11 @@ class PatternForm:
     # места нет. `code_lines`: сколько строк кода место держит.
     code_tier: int | None = None
     code_lines: int = _CODE_LINES_DEFAULT
+    # Доля холста под декором примера без фона во весь слайд и есть ли
+    # декор на единицу повтора. По ним `candidates.is_scratch_carrier`
+    # отсекает носители, чья графика спорит с формой с нуля.
+    decor_share: float = 0.0
+    unit_decor: bool = False
 
     @property
     def main(self) -> FormPart | None:
@@ -285,6 +290,19 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
         chart_tier=_chart_tier(pattern, parts),
         slide_class=getattr(pattern, "slide_class", "content_pattern"),
         code_tier=code_tier, code_lines=code_lines,
+        decor_share=_decor_share(pattern.decor),
+        unit_decor=any(getattr(d, "repeat_group", False) for d in pattern.decor),
+    )
+
+
+# Фон во весь слайд декором не считается: он есть почти у каждой раскладки.
+_BACKDROP_SHARE = 0.9
+
+
+def _decor_share(decor) -> float:
+    return sum(
+        d.box.width * d.box.height for d in decor
+        if not (d.box.width >= _BACKDROP_SHARE and d.box.height >= _BACKDROP_SHARE)
     )
 
 

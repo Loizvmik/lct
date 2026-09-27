@@ -246,8 +246,24 @@ def is_scratch_carrier(form: PatternForm) -> bool:
         return False
     if form.has_table or form.has_chart or form.chart_tier == CHART_TIER_FRAME:
         return False
+    if not has_light_decor(form):
+        return False
     main = form.main
     return main is None or main.block in ("text", "bullets")
+
+
+# Декор носителя не больше этой доли холста (без фона во весь слайд).
+# VK Tech, пример 41: восемь полос-градиентов и две пустые «таблетки» на
+# 28% холста, и команда с нуля терялась среди них (живой прогон
+# full-coverage, слайд 10).
+MAX_CARRIER_DECOR_SHARE = 0.10
+
+
+def has_light_decor(form: PatternForm) -> bool:
+    """Графика раскладки не спорит с формой с нуля: нет декора на единицу
+    повтора, а прочий декор (без фона) занимает не больше
+    `MAX_CARRIER_DECOR_SHARE` холста."""
+    return not form.unit_decor and form.decor_share <= MAX_CARRIER_DECOR_SHARE
 
 
 def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: int, cover_id: str | None,
