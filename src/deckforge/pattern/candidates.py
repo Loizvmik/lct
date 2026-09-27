@@ -41,8 +41,10 @@ def is_closing_pattern(p, profile) -> bool:
     слайда-примера («Спасибо за внимание!» с QR-кодом у VK Education). Ей
     место только на последнем слайде колоды: на втором слайде она
     выглядела концом презентации (27 сентября 2026)."""
-    if p.kind not in ("section", "closing") or not p.source_slide_index:
+    if not p.source_slide_index:
         return False
+    if p.kind not in ("section", "closing"):
+        return _closing_by_text(p, profile)
     if any(_THANKS_RE.search(sl.sample_text or "") for sl in p.slots):
         # У VK Education «Спасибо за внимание!» стоит на слайде 52, а
         # похожие слайды 53–55 схлопнуты в другой паттерн: по одному номеру
@@ -50,6 +52,30 @@ def is_closing_pattern(p, profile) -> bool:
         return True
     last = max((n for q in profile.patterns for n in q.source_slide_index), default=None)
     return last is not None and min(p.source_slide_index) == last
+
+
+# Заголовок финала: «Спасибо за внимание!», «Вопросы?». Уже, чем
+# `_THANKS_RE`: «Контакты» бывает и обычным слайдом с карточками.
+_CLOSING_HEADLINE_RE = re.compile(r"спасибо|благодар|thank|вопрос", re.IGNORECASE)
+# Финал по тексту ищется только в последней трети шаблона: «Вопросы для
+# обсуждения» в начале колоды не финал.
+_CLOSING_TAIL_SHARE = 2 / 3
+
+
+def _closing_by_text(p, profile) -> bool:
+    """Финал любого вида по тексту заголовка и месту в шаблоне (задача T1):
+    «Спасибо за внимание» VK WorkSpace (слайд 29) разбор видит двумя
+    колонками из-за подписей спикеров, у VK Education (слайд 52) списком.
+    Вид раскладки финал не отличает, текст и место отличают."""
+    head = next((s for s in p.slots if s.role == "headline"), None)
+    if head is None or not _CLOSING_HEADLINE_RE.search(head.sample_text or ""):
+        return False
+    last = max((n for q in profile.patterns for n in q.source_slide_index), default=None)
+    return last is not None and min(p.source_slide_index) >= last * _CLOSING_TAIL_SHARE
+
+
+# Роли, которые обложка несёт кроме подписи: заголовок и картинки.
+_COVER_FRAME_ROLES = frozenset({"headline", "image", "icon"})
 
 
 def cover_pattern_id(profile) -> str | None:
@@ -63,6 +89,21 @@ def cover_pattern_id(profile) -> str | None:
         p for p in profile.patterns
         if p.kind in _HERO_KINDS and p.source_slide_index and not is_closing_pattern(p, profile)
         and any(s.role == "headline" for s in p.slots) and p.repeat is None
+    ]
+    # Место под фото у раскладки-картинки обложку не делает (задача T1), как
+    # и у `is_cover_like`: с тех пор как разбор перестал выбрасывать фото в
+    # край холста, «текст + фото» VK Education (пример 6) и ЛЦТ2026 (пример
+    # 14) шли обложкой раньше настоящей. На титульном лейауте не мешает.
+    title_layouts = {
+        l.layout_id for l in (getattr(profile, "layouts", None) or ()) if getattr(l, "kind", None) == "title"
+    }
+    # Три подзаголовка у картинки (VK Tech, пример 28) тоже не обложка, а
+    # содержание, которое геометрия сочла разделом.
+    heroes = [
+        p for p in heroes
+        if getattr(p, "layout_id", None) in title_layouts
+        or (not (p.kind == "image" and any(s.role == "image" for s in p.slots))
+            and sum(s.role not in _COVER_FRAME_ROLES for s in p.slots) <= 1)
     ]
     if not heroes:
         return None

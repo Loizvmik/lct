@@ -76,9 +76,15 @@ def test_repeat_cost_doubles_and_the_third_repeat_beats_any_style_mismatch():
 
 
 def test_two_examples_with_one_geometry_share_a_look(vk_education):
-    looks = {p.pattern_id: look_key(p) for p in vk_education.patterns}
+    """Примеры 21 и 44 VK Education: одна геометрия (кружки с номерами и
+    тексты под ними). С задачи T1 пример 44 разбор видит таймлайном (этапы
+    вдоль линии), и облик у них разный уже по виду; при одном виде он
+    совпадает."""
+    by_id = {p.pattern_id: p for p in vk_education.patterns}
+    looks = {pid: look_key(p) for pid, p in by_id.items()}
 
-    assert looks["slide21"] == looks["slide44"]
+    assert by_id["slide44"].kind == "timeline"
+    assert looks["slide21"] == look_key(by_id["slide44"].model_copy(update={"kind": by_id["slide21"].kind}))
     assert looks["slide21"] != looks["slide42"]
 
 

@@ -36,6 +36,10 @@ from dataclasses import dataclass, field
 SLIDE_KINDS = (
     "cards", "two_col", "kpi", "section", "image", "table", "bullets",
     "quote", "photo_text", "kpi_caption",
+    # Задача T1: виды, которые разбор шаблона снимает геометрией. Вид
+    # слайда берётся из выбранной раскладки, и без них проверка плана
+    # считала бы такой слайд браком.
+    "team", "timeline", "code",
 )
 
 

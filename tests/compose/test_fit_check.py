@@ -28,11 +28,11 @@ def test_absurdly_long_text_overflows_the_slot(PROFILE):
 
 
 def test_role_absent_in_kind_degrades_honestly_instead_of_failing(PROFILE):
-    """`kpi_value` не существует ни в одной раскладке `bullets` этого
+    """`quote` не существует ни в одной раскладке `bullets` этого
     шаблона (см. kinds/roles в докстроке модуля) — инструмент обязан
     честно деградировать (`fits=True` с пометкой), а не упасть и не соврать
     "не влезает" на пустом месте."""
-    result = measure_fit("что угодно", "kpi_value", PROFILE, "bullets")
+    result = measure_fit("что угодно", "quote", PROFILE, "bullets")
     assert result["fits"] is True
     assert "note" in result
 
