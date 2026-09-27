@@ -2573,7 +2573,7 @@ def place_slide_by_clone(
         if overflow is not None:
             _remove_last_slide(prs)
             return CloneOutcome(overflow, "FONT_BUDGET")
-        _fix_cloned_contrast(slide, ref, profile, canvas, audit_config)
+        _fix_cloned_contrast(slide, ref, profile, canvas, audit_config, inherited_pt=content.slot.size_pt)
 
     keep = [ref.element for _, ref in bound]
     table_ref = matched.get(index_of.get(id(table_slot), -1)) if table_slot is not None else None
@@ -2841,7 +2841,10 @@ def _fit_cloned_text(
     return None
 
 
-def _fix_cloned_contrast(slide, ref, profile: TemplateProfile, canvas: Canvas, audit_config: AuditConfig) -> None:
+def _fix_cloned_contrast(
+    slide, ref, profile: TemplateProfile, canvas: Canvas, audit_config: AuditConfig,
+    *, inherited_pt: float | None = None,
+) -> None:
     """Текст клона обязан читаться. Шаблоны нередко набирают текст-образец
     светло-серым, как подсказку «здесь будет текст» (VK Tech: описания
     карточек серым по белому, 3.2:1), и наш текст в том же цвете аудит
@@ -2864,7 +2867,11 @@ def _fix_cloned_contrast(slide, ref, profile: TemplateProfile, canvas: Canvas, a
         return
     bg_luminance = _clone_background_luminance(slide, ref, profile, canvas)
     ratio = _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(color.hex))
-    size = int(r_pr.get("sz")) / 100 if r_pr.get("sz") else 0.0
+    # Кегль без `sz` у run наследуется от плейсхолдера: берётся кегль слота
+    # примера. Иначе заголовок в 48pt считался мелким текстом с порогом
+    # 4,5:1, и фирменный синий VK Education (4,1:1 к белому) перекрашивался
+    # в чёрный (живой прогон full-coverage 27 сентября 2026, слайды 7 и 8).
+    size = int(r_pr.get("sz")) / 100 if r_pr.get("sz") else float(inherited_pt or 0.0)
     cfg = audit_config.template
     is_large = size >= cfg.large_text_pt or (r_pr.get("b") == "1" and size >= cfg.large_bold_pt)
     if ratio >= (cfg.min_contrast_large if is_large else cfg.min_contrast_small):

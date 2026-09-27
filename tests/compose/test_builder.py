@@ -1316,3 +1316,34 @@ def test_when_every_clone_is_underfilled_the_fullest_wins_and_it_is_reported(mon
     assert calls[-1] == ("clone", "b")
     assert len(prs.slides) == 1
     assert any("слайд заполнен на 18%: содержания мало для любой раскладки" in n for n in notes)
+
+
+def test_cloned_headline_keeps_brand_blue_when_its_size_is_inherited():
+    """Заголовок VK Education (слайд 7) набран `dk2` = #0077FF без `sz` у
+    run: кегль 48pt наследуется от плейсхолдера. Как мелкий текст (порог
+    4,5:1) синий 4,1:1 к белому перекрашивался в чёрный; как крупный
+    (порог 3:1) он остаётся фирменным."""
+    from types import SimpleNamespace
+
+    from deckforge.compose.builder import _fix_cloned_contrast
+    from deckforge.ooxml.ns import qn
+
+    vk = Path("dataset/templates/Шаблон презентации VK Education.pptx")
+    vk_profile = TemplateProfile.from_file(vk, cache_dir=None)
+    prs = Presentation(str(vk))
+    slide = prs.slides[6]
+    title = next(sh for sh in slide.shapes if sh.shape_id == 276)
+    canvas = Canvas(prs.slide_width, prs.slide_height)
+    ref = SimpleNamespace(element=title._element, box=Box(
+        title.left / canvas.width_emu, title.top / canvas.height_emu,
+        title.width / canvas.width_emu, title.height / canvas.height_emu,
+    ))
+
+    def fill_tag():
+        fill = title._element.find(".//" + qn("a:rPr")).find(qn("a:solidFill"))
+        return fill[0].tag, fill[0].get("val")
+
+    _fix_cloned_contrast(slide, ref, vk_profile, canvas, AuditConfig.load(), inherited_pt=48.0)
+    assert fill_tag() == (qn("a:schemeClr"), "dk2")
+    _fix_cloned_contrast(slide, ref, vk_profile, canvas, AuditConfig.load())
+    assert fill_tag()[0] == qn("a:srgbClr"), "без кегля слота прежнее поведение: мелкий текст"
