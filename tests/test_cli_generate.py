@@ -6,6 +6,7 @@ sdd/task-12-report.md`).
 рендера картинок (аудит по картинке без модели честно пропускает и рендер:
 незачем рендерить превью, которые некому смотреть)."""
 from __future__ import annotations
+from difflib import SequenceMatcher
 import json
 from pathlib import Path
 
@@ -132,7 +133,15 @@ def test_generate_plans_layouts_per_style_before_the_text(monkeypatch, capsys, t
     assert captured[cli_module.Variant.dense] != captured[cli_module.Variant.visual]
     for style, planned in captured.items():
         written = json.loads(next(out_dir.glob(f"*__{style.value}-deck.json")).read_text(encoding="utf-8"))
-        same = sum(a == b["pattern_id"] for a, b in zip(planned, written["slides"]))
+        # По порядку, а не по номеру: писатель вправе убрать тонкий дубль
+        # (`writer._drop_thin_duplicates`), и сдвиг на один слайд не смена
+        # раскладок. Короткую колоду dense (задача D3: соседние пункты
+        # слиты) такой сдвиг иначе валил бы целиком.
+        same = sum(
+            block.size for block in SequenceMatcher(
+                a=planned, b=[s["pattern_id"] for s in written["slides"]], autojunk=False,
+            ).get_matching_blocks()
+        )
         # Три четверти слайдов остаются на раскладке планировщика: у
         # остальных лестница сборки берёт запасную, когда текст фиктивного
         # писателя не ложится в тесную раскладку (подписи под иконками).

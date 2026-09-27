@@ -91,6 +91,10 @@ class JobResponse(BaseModel):
     # запасным путём. `status` при этом "done": интерфейс ждёт ровно его.
     outcome: Literal["done", "done_with_warnings"] | None = None
     warnings: list[str] = Field(default_factory=list)
+    # Задача D3: различимость вариантов пакета: по парам стилей доля
+    # пунктов содержания с одним обликом раскладки, число обликов у стиля,
+    # облики по слайдам. `None` у одиночного задания и пока планов меньше двух.
+    distinct: dict | None = None
 
 
 class FindingModel(BaseModel):

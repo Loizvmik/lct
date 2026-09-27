@@ -58,6 +58,10 @@ from deckforge.template.profile import TemplateProfile
 from deckforge.export.html import to_html_report
 from deckforge.workflow.budget import RunBudget, load_policy
 from deckforge.workflow.visual_stage import run_visual_stage
+from deckforge.pattern.distinct import distinctness, slide_looks
+from deckforge.pattern.planner import BATCH_ORDER, batch_looks, merge_looks
+from deckforge.pattern.shape import shape_for_style
+from deckforge.plan.data_types import visual_intents
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
 
@@ -233,6 +237,9 @@ class JobRecord:
     # ключом стиля, та же форма `{стиль: сводка}`, что читает интерфейс.
     budget: RunBudget | None = None
     visual_audit: dict[str, dict] | None = None
+    # Задача D3: общий для пакета учёт раскладок стилей (`PlanShare`), у
+    # одиночного задания `None`.
+    plan_share: "PlanShare | None" = None
     _subscribers: list[asyncio.Queue] = field(default_factory=list)
     _stage_started: float | None = None
 
@@ -276,6 +283,8 @@ class JobRecord:
             },
             # Задача U: сколько слайдов какой ступенью лестницы собрано.
             "ladder": {name: ladder_counts(state.deck_spec) for name, state in self.variants.items()},
+            # Задача D3: различимость вариантов пакета по обликам раскладок.
+            "distinct": self.plan_share.summary() if self.plan_share is not None else None,
         }
 
     def subscribe(self) -> asyncio.Queue:
@@ -354,6 +363,60 @@ class OutlineShare:
         return outline, self._owner != job_id
 
 
+# Сколько задание пакета ждёт планы соседей, идущих раньше по порядку
+# `BATCH_ORDER`. Планирование миллисекунды, а структура у пакета общая, так
+# что соседи доходят до него почти одновременно; предел нужен на случай
+# отменённого задания, которое свой план так и не опубликует.
+PLAN_WAIT_SECONDS = 30.0
+
+
+class PlanShare:
+    """Раскладки стилей одного пакета (задача D3).
+
+    Три варианта одного содержания обязаны различаться глазом. Каждый
+    стиль планирует раскладки, зная облики, которые соседи уже поставили
+    на те же пункты структуры, и платит за совпадение
+    (`pattern.planner.plan_patterns`, `taken`). Порядок `BATCH_ORDER`:
+    dense, airy, visual; следующий ждёт план предыдущего. Задание, упавшее
+    до плана, отпускает ждущих (`abandon`), и они планируют без его
+    обликов. Всё в одном цикле событий, без потоков: события и словари
+    здесь не делятся между потоками."""
+
+    def __init__(self, styles: list[str]) -> None:
+        self.order = [s for s in BATCH_ORDER if s in styles] + [s for s in styles if s not in BATCH_ORDER]
+        self._ready = {s: asyncio.Event() for s in self.order}
+        self._taken: dict[str, dict[int, set[str]]] = {}
+        self.looks: dict[str, list[dict]] = {}
+
+    async def before(self, style: str) -> dict[int, set[str]]:
+        """Облики стилей, идущих раньше `style`, по пунктам структуры."""
+        earlier = self.order[: self.order.index(style)] if style in self.order else []
+        for name in earlier:
+            try:
+                await asyncio.wait_for(self._ready[name].wait(), timeout=PLAN_WAIT_SECONDS)
+            except asyncio.TimeoutError:
+                continue
+        return merge_looks(*(self._taken[name] for name in earlier if name in self._taken))
+
+    def publish(self, style: str, assignments, profile) -> None:
+        self._taken[style] = batch_looks(assignments, profile)
+        self.looks[style] = slide_looks(assignments, profile)
+        self.abandon(style)
+
+    def abandon(self, style: str) -> None:
+        event = self._ready.get(style)
+        if event is not None:
+            event.set()
+
+    def summary(self) -> dict | None:
+        """Сводка различимости, когда планов хотя бы два; облики по стилям
+        рядом, чтобы видеть, из чего доля."""
+        if len(self.looks) < 2:
+            return None
+        ordered = {s: self.looks[s] for s in self.order if s in self.looks}
+        return {**distinctness(ordered), "looks": ordered}
+
+
 class JobStore:
     """Реестр задач и шаблонов процесса (в памяти — см. докстроку модуля
     про то, что переживает и что не переживает перезапуск)."""
@@ -403,6 +466,7 @@ class JobStore:
         language: str, target_slides: int | None, autofix: bool,
         style: str | GenerationStyle = GenerationStyle.dense,
         batch_id: str | None = None, outline_share: OutlineShare | None = None,
+        plan_share: PlanShare | None = None,
     ) -> JobRecord:
         """Одно задание, одна презентация одного стиля. Без `outline_share`
         задание считает структуру само."""
@@ -416,7 +480,7 @@ class JobStore:
         job_dir.mkdir(parents=True, exist_ok=True)
         job = JobRecord(
             job_id=job_id, template_id=template_id, dir=job_dir, profile=template.profile,
-            style=chosen.value, batch_id=batch_id,
+            style=chosen.value, batch_id=batch_id, plan_share=plan_share,
         )
         self.jobs[job_id] = job
         asyncio.create_task(_run_job(
@@ -442,8 +506,9 @@ class JobStore:
         self.get_template(job_args["template_id"])
         batch_id = uuid4().hex
         share = OutlineShare()
+        plans = PlanShare([style.value for style in chosen])
         jobs = [
-            self.create_job(style=style, batch_id=batch_id, outline_share=share, **job_args)
+            self.create_job(style=style, batch_id=batch_id, outline_share=share, plan_share=plans, **job_args)
             for style in chosen
         ]
         return batch_id, jobs
@@ -535,6 +600,8 @@ async def _run_job(
         job.finish()
     except Exception as exc:  # noqa: BLE001 — любая причина отказа обязана дойти до пользователя API,
         # не остаться молчаливым "running" навсегда
+        if job.plan_share is not None:
+            job.plan_share.abandon(job.style)
         job.budget.stop()
         job.finish(error=str(exc) or type(exc).__name__)
 
@@ -550,9 +617,12 @@ async def _run_variant(
     Контрольные точки режима после структуры: `after_write` после текста,
     `after_compose` перед аудитом по картинке."""
     started = budget.clock()
+    intents, taken = await _styled_intents(job, variant, outline, sources)
     _assignments, contracts = await asyncio.to_thread(
-        plan_contracts, intents_from_outline(outline), profile, variant,
+        plan_contracts, intents, profile, variant, taken=taken,
     )
+    if job.plan_share is not None:
+        job.plan_share.publish(variant.value, _assignments, profile)
     budget.record("plan", budget.clock() - started)
 
     started = budget.clock()
@@ -622,6 +692,17 @@ async def _run_variant(
     # объект, общего лока с соседними заданиями не нужно.
     await _visual_audit_variant(job, variant.value, profile, sources, budget)
     budget.stop()
+
+
+async def _styled_intents(job: JobRecord, variant: Variant, outline: Outline, sources: list[SourceDoc]):
+    """Намерения слайдов под стиль (`pattern.shape`) и облики соседей по
+    пакету, которые спланировали раньше (задача D3). Ожидание соседей
+    внутри бюджета стадии plan: доли секунды."""
+    intents = shape_for_style(
+        intents_from_outline(outline), variant.value, visual_intents(sources), profile=job.profile,
+    )
+    taken = await job.plan_share.before(variant.value) if job.plan_share is not None else None
+    return intents, taken
 
 
 async def _audit_variant(job: JobRecord, variant_name: str, profile: TemplateProfile, config: AuditConfig, autofix: bool) -> None:
@@ -702,10 +783,17 @@ async def _visual_audit_variant(
             await asyncio.to_thread(
                 to_html_report, state.deck_spec, profile, state.pptx_path, state.html_path,
                 visual=outcome.result, budget=budget.summary(),
-                risky_slides=summary.get("risk"), fidelity=fidelity_obj,
+                risky_slides=summary.get("risk"), fidelity=fidelity_obj, distinct=_batch_distinct(job),
             )
         except Exception:  # noqa: BLE001: HTML без оценок лучше, чем упавшее задание
             pass
+
+
+def _batch_distinct(job: JobRecord) -> dict | None:
+    """Сводка различимости пакета для HTML-отчёта (задача D3). К экспорту
+    планы соседей уже есть: планирование идёт до текста и занимает доли
+    секунды."""
+    return job.plan_share.summary() if job.plan_share is not None else None
 
 
 async def _export_variant(job: JobRecord, variant_name: str, profile: TemplateProfile) -> None:
@@ -729,7 +817,7 @@ async def _export_variant(job: JobRecord, variant_name: str, profile: TemplatePr
         state.fidelity = None
     bundle = await asyncio.to_thread(
         export_bundle, state.pptx_path, profile, out_dir, deck_spec=state.deck_spec, budget=budget_summary,
-        fidelity=fidelity_report,
+        fidelity=fidelity_report, distinct=_batch_distinct(job),
     )
     state.pdf_path = bundle.pdf
     state.html_path = bundle.html
