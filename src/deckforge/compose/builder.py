@@ -2582,6 +2582,8 @@ def place_slide_by_clone(
         if overflow is not None:
             _remove_last_slide(prs)
             return CloneOutcome(overflow, "FONT_BUDGET")
+        if content.slot.role == "headline":
+            _fit_title_plate(slide, ref, bound_elements, canvas, family)
         _fix_cloned_contrast(slide, ref, profile, canvas, audit_config, inherited_pt=content.slot.size_pt)
 
     keep = [ref.element for _, ref in bound]
@@ -2802,6 +2804,59 @@ def _shrink_frame_away_from_decor(slide, ref, bound_elements: list, canvas: Canv
     return replace(ref, box=shrunk)
 
 
+_BOLD_WIDTH_SLACK = 1.2
+
+
+def _fit_title_plate(slide, ref, bound_elements: list, canvas: Canvas, family: str = "") -> None:
+    """ADAPT: заголовок на плашке-«таблетке» уже рамки (ЛЦТ2026: плашка на
+    четверть слайда, рамка плейсхолдера на восемь десятых). Аудит мерит
+    рамку по всей ширине, и полузакрытая плашка давала L02 на каждом клоне
+    (прогон 27 сентября 2026: 9 слайдов из 14 ушли в сборку с нуля). Рамка
+    сужается до ширины текста, плашка растёт под неё с теми же полями."""
+    box = ref.box
+    plates = [
+        r for r in slide_refs(slide, canvas)
+        if r.box is not None and r.kind == "shape" and not r.is_placeholder and r.element not in bound_elements
+        and not shape_text(r.element).strip() and r.box.left <= box.left + 0.005 and r.box.top <= box.top + 0.005
+        and r.box.bottom >= box.bottom - 0.005 and box.left < r.box.right < box.right - 0.005
+    ]
+    text = shape_text(ref.element).strip()
+    if not plates or not text:
+        return
+    plate = min(plates, key=lambda r: r.box.area)
+    style = text_style(ref.element)
+    size = style.size_pt or inherited_text_size(slide, ref.element)
+    if not size:
+        return
+    left_in, _t, right_in, _b = style.insets_in
+    # Замер не знает начертания, а заголовок жирный; без Montserrat в
+    # системе замер идёт по Arial. Рендер переносил строку, которую замер
+    # клал в одну (прогон 27 сентября 2026, запас 1.12 не хватил).
+    full_in = (box.width * canvas.width_in - left_in - right_in) / _BOLD_WIDTH_SLACK
+    fam = style.family or family
+    lines = measure(text, fam, size, full_in).lines
+    need_in = full_in
+    for step in range(1, 40):
+        width_in = full_in * step / 40
+        if measure(text, fam, size, width_in).lines <= lines:
+            need_in = width_in * _BOLD_WIDTH_SLACK
+            break
+    title_w = min(box.width, max(plate.box.right - box.left, (need_in + left_in + right_in) / canvas.width_in))
+    pad = box.left - plate.box.left
+    # Рамку сузил логотип справа (`_shrink_frame_away_from_decor`), и
+    # заголовок встал в две строки: без роста плашки вторая строка висела
+    # над ней (прогон 27 сентября 2026). Рост вниз, наверху поле слайда.
+    _t_in, bottom_in = style.insets_in[1], style.insets_in[3]
+    spacing = {"line_spacing": style.line_spacing} if style.line_spacing else {}
+    need_h = measure(text, fam, size, full_in, **spacing).height_in + _t_in + bottom_in
+    dh = max(0.0, need_h / canvas.height_in - box.height)
+    set_shape_box(ref.element, replace(box, width=title_w, height=box.height + dh), canvas)
+    set_shape_box(
+        plate.element,
+        replace(plate.box, width=max(plate.box.width, title_w + 2 * pad), height=plate.box.height + dh), canvas,
+    )
+
+
 def _fit_cloned_text(
     slide, slide_spec: SlideSpec, content: SlotContent, ref, profile: TemplateProfile, family: str, canvas: Canvas,
     *, budget: FontBudget | None = None,
@@ -2942,7 +2997,27 @@ def _box_background_luminance(
     bg = resolve_color(bg_fill, scheme, clr_map) if bg_fill is not None else None
     if isinstance(bg, Color):
         return _relative_luminance(bg.hex)
+    picture = _slide_picture_background(slide)
+    if picture is not None:
+        return picture
     return slide_background_luminance(slide, profile)
+
+
+def _slide_picture_background(slide) -> float | None:
+    """Яркость своей картинки-фона слайда (`p:bg/a:blipFill`). ЛЦТ2026,
+    пример 15 «Пункты»: лейаут тёмно-фиолетовый, а сам слайд залит светлой
+    картинкой. По фону лейаута контраст считал фон тёмным и красил текст
+    клона белым по белому (прогон 27 сентября 2026)."""
+    blip = slide._element.find(  # noqa: SLF001
+        qn("p:cSld") + "/" + qn("p:bg") + "/" + qn("p:bgPr") + "/" + qn("a:blipFill") + "/" + qn("a:blip")
+    )
+    rid = blip.get(qn("r:embed")) if blip is not None else None
+    try:
+        with Image.open(io.BytesIO(slide.part.related_part(rid).blob)) as img:
+            r, g, b = img.convert("RGB").resize((1, 1), Image.Resampling.BOX).getpixel((0, 0))
+    except Exception:  # noqa: BLE001: нет картинки, emf, битый файл: решает фон лейаута
+        return None
+    return _relative_luminance(f"#{r:02X}{g:02X}{b:02X}")
 
 
 def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Canvas) -> float:

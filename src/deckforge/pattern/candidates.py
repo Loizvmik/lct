@@ -66,7 +66,16 @@ def cover_pattern_id(profile) -> str | None:
     ]
     if not heroes:
         return None
-    return min(heroes, key=lambda p: (min(p.source_slide_index), p.pattern_id)).pattern_id
+    # Пример на титульном лейауте важнее места: у ЛЦТ2026 первым героическим
+    # стоит слайд 2 «Вводные» (обращение к участникам хакатона), а обложка
+    # на лейауте «Титульный слайд» только седьмая. Прогон 27 сентября 2026
+    # ставил «Вводные» обложкой во всех трёх стилях.
+    title_layouts = {
+        l.layout_id for l in (getattr(profile, "layouts", None) or ()) if getattr(l, "kind", None) == "title"
+    }
+    return min(
+        heroes, key=lambda p: (getattr(p, "layout_id", None) not in title_layouts, min(p.source_slide_index), p.pattern_id),
+    ).pattern_id
 
 
 def has_fixed_headline(p) -> bool:
