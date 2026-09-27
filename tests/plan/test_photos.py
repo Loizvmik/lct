@@ -305,7 +305,7 @@ def test_every_photo_missing_from_the_file_gets_a_named_reason():
     warnings = missing_photo_warnings(["a.jpg", "b.jpg", "c.jpg"], {"c.jpg"}, report, deck)
 
     assert len(warnings) == 2
-    assert warnings[0].startswith("фото 'a.jpg' не на слайдах: ") and "модель не нашла" in warnings[0]
+    assert warnings[0] == "фото 'a.jpg' не на слайдах: модель не нашла слайда, который оно иллюстрирует"
     assert warnings[1].startswith("фото 'b.jpg' не на слайдах: ") and "нет слота под фото" in warnings[1]
     assert missing_photo_warnings(["c.jpg"], {"c.jpg"}, report, deck) == []
 

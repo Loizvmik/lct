@@ -380,6 +380,8 @@ def missing_photo_warnings(
                 (n for n in report.notes if "не размещены" in n or "не выполнялось" in n), None,
             )
             reason = note or "модель не нашла слайда, который оно иллюстрирует"
+            # Своя строка отчёта уже называет фото: второй раз имя не нужно.
+            reason = reason.removeprefix(f"Фото {name!r} не поставлено: ")
         else:
             finding = next((f for f in findings if repr(name) in f and "фото" in f), None)
             reason = _without_slide_prefix(finding) if finding else "раскладка слайда не дала рамки под фото"
