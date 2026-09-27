@@ -40,13 +40,13 @@ from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.findings import Finding
-from deckforge.compose.builder import build_deck, count_embedded_photos, ladder_counts
+from deckforge.compose.builder import build_deck, embedded_photo_names, ladder_counts, photo_aspects, photo_frames
 from deckforge.export.bundle import export_bundle
 from deckforge.pattern.intent import intents_from_outline
 from deckforge.plan.contracts import plan_contracts
-from deckforge.plan.outline import Outline, SourceDoc, build_outline, outline_to_dict
+from deckforge.plan.outline import Outline, SourceDoc, build_outline, fallback_warning, outline_to_dict
 from deckforge.plan.photos import (
-    ContentPhoto, PhotoAssignmentReport, assign_photos_to_outline, load_content_pack_photos,
+    ContentPhoto, PhotoAssignmentReport, assign_photos_to_outline, load_content_pack_photos, missing_photo_warnings,
 )
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import GenerationStyle, Variant
@@ -740,6 +740,8 @@ async def _run_job(
         (outline, photo_by_slide, photo_report), reused = await outline_share.get(job.job_id, compute_outline)
         if reused:
             job.budget.mark_reused("outline")
+        if (outline_note := fallback_warning(outline)) is not None:
+            job.budget.warn(outline_note)
         if photos:
             job.photos = {
                 "sent": len(photos), "planned": photo_report.placed_count, "embedded": None,
@@ -764,6 +766,7 @@ async def _run_job(
         await _run_variant(
             job, style, outline, profile, template.path, source_docs, config, autofix, job.budget,
             photo_by_slide=photo_by_slide, user_photos={p.name: p.path for p in photos},
+            photo_report=photo_report,
         )
 
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
@@ -794,7 +797,7 @@ async def _run_variant(
     job: JobRecord, variant: Variant, outline: Outline, profile: TemplateProfile, template_path: Path,
     sources: list[SourceDoc], config: AuditConfig, autofix: bool, budget: RunBudget,
     *, photo_by_slide: dict[int, tuple[str, str | None]] | None = None,
-    user_photos: dict[str, Path] | None = None,
+    user_photos: dict[str, Path] | None = None, photo_report: PhotoAssignmentReport | None = None,
 ) -> None:
     """Всё после структуры для стиля задания, в бюджете задания: раскладки
     на всю колоду (`pattern.plan_patterns`, миллисекунды, без модели),
@@ -803,7 +806,9 @@ async def _run_variant(
     Контрольные точки режима после структуры: `after_write` после текста,
     `after_compose` перед аудитом по картинке."""
     started = budget.clock()
-    intents, taken = await _styled_intents(job, variant, outline, sources, photo_by_slide)
+    intents, taken = await _styled_intents(
+        job, variant, outline, sources, photo_by_slide, await asyncio.to_thread(photo_aspects, user_photos),
+    )
     _assignments, contracts = await asyncio.to_thread(
         plan_contracts, intents, profile, variant, taken=taken,
     )
@@ -862,10 +867,17 @@ async def _run_variant(
     if user_photos and job.photos is not None:
         # Факт по байтам файла, не план распределения: раскладка могла не
         # дать слота, и тогда фото честно не легло (`count_embedded_photos`).
-        embedded = await asyncio.to_thread(count_embedded_photos, dest, user_photos)
+        placed = await asyncio.to_thread(embedded_photo_names, dest, user_photos)
+        embedded = len(placed)
         job.photos["embedded"] = embedded
         if embedded < len(user_photos):
             budget.warn(f"фотографий на слайдах {embedded} из {len(user_photos)} присланных")
+            # Каждое непоставленное фото с причиной: без имени «1 из 3» не
+            # говорит пользователю, какое фото пропало и почему.
+            for note in missing_photo_warnings(
+                list(user_photos), placed, photo_report or PhotoAssignmentReport(), variant_deck,
+            ):
+                budget.warn(note)
     budget.record("compose", budget.clock() - started)
 
     budget.decide_mode("after_compose")
@@ -890,6 +902,7 @@ async def _run_variant(
 async def _styled_intents(
     job: JobRecord, variant: Variant, outline: Outline, sources: list[SourceDoc],
     photo_by_slide: dict[int, tuple[str, str | None]] | None = None,
+    aspects: dict[str, float] | None = None,
 ):
     """Намерения слайдов под стиль (`pattern.shape`) и облики соседей по
     пакету, которые спланировали раньше (задача D3). Ожидание соседей
@@ -897,7 +910,9 @@ async def _styled_intents(
     фото пользователя по слайдам, чтобы стиль знал, где нужна раскладка с
     картинкой."""
     intents = shape_for_style(
-        intents_from_outline(outline, photo_by_slide), variant.value, visual_intents(sources), profile=job.profile,
+        intents_from_outline(
+            outline, photo_by_slide, aspects, photo_frames(job.profile) if photo_by_slide else None,
+        ), variant.value, visual_intents(sources), profile=job.profile,
     )
     taken = await job.plan_share.before(variant.value) if job.plan_share is not None else None
     return intents, taken

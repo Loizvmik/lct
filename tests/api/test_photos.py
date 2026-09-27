@@ -162,6 +162,9 @@ def test_job_with_photos_puts_them_into_the_deck(photo_job: dict) -> None:
     # Второе фото не легло: это видно в предупреждениях, а итог честный.
     assert result["outcome"] == "done_with_warnings"
     assert any("фотографий на слайдах 1 из 2" in w for w in result["warnings"])
+    # И какое именно фото не легло, с причиной (задача T4).
+    second = photo_job["seen"]["photos"][1].name
+    assert any(w.startswith(f"фото {second!r} не на слайдах: ") for w in result["warnings"]), result["warnings"]
 
 
 

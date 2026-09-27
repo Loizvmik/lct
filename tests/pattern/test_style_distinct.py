@@ -144,6 +144,24 @@ def test_visual_charts_every_numeric_series_and_dense_tables_it():
     assert sum(it.form == "chart" for it in shape_for_style(taken, "visual", [vi])) == 1
 
 
+def test_visual_never_puts_a_chart_on_the_agenda():
+    """Задача T4 (проверка bf3b1cd): повестка со словами ряда не получает
+    график и в стиле visual."""
+    from deckforge.plan.data_types import VisualIntent
+
+    words = set(__import__("deckforge.plan.series", fromlist=["stems"]).stems("ожидание согласования заявок"))
+    vi = VisualIntent(type="chart", required=False, reason="ряд", data_ref="d1", chart_kind="bar",
+                      data=_dataset(words))
+    intents = [
+        SlideIntent(index=0, outline_kind="title", intent="Тема"),
+        SlideIntent(index=1, outline_kind="agenda", intent="Ожидание согласования заявок", items=4),
+        SlideIntent(index=2, outline_kind="case", intent="Пилот", items=3),
+        SlideIntent(index=3, outline_kind="closing", intent="Итог"),
+    ]
+    shaped = shape_for_style(intents, "visual", [vi])
+    assert shaped[1].form is None and shaped[1].visual_intent is None
+
+
 def test_distinctness_counts_by_content_item_not_by_slide_number():
     def s(pos, outline, look, hero=False):
         return {"position": pos, "outline": outline, "pattern_id": look, "kind": "cards", "look": look, "hero": hero}

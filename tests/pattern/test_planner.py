@@ -175,3 +175,41 @@ def test_a_headline_frame_too_short_for_a_conclusion_loses_to_a_normal_one():
     plan = plan_patterns(_outline(["title", "problem", "closing"]), prof, "dense")
 
     assert plan[1].pattern_id == "normal"
+
+
+def test_a_wide_screenshot_goes_to_a_wide_frame_not_to_a_phone():
+    """Задача T4: широкий скриншот (2,1:1) не ставится в рамку телефона
+    (0,46:1, VK Education пример 30), если есть рамка по пропорциям.
+    Рамки меряет вызывающий код, планировщик получает их числами."""
+    phone = pattern("phone", "photo_text", [headline(), slot("bullet"), slot("image")], source=30)
+    wide = pattern("wide", "photo_text", [headline(), slot("bullet"), slot("image")], source=33, score=0.6)
+    prof = profile(section("cover", source=1), phone, wide, bullets("l1"), bullets("l2", source=21))
+    frames = {"phone": (0.46, 0.15), "wide": (1.9, 0.3)}
+    intents = intents_from_outline(
+        _outline(["title", "case", "problem", "closing"]), {1: ("screen.png", None)}, {"screen.png": 2.13}, frames,
+    )
+
+    plan = plan_patterns(intents, prof, "visual")
+
+    assert plan[1].pattern_id == "wide"
+
+
+def test_photo_fit_cost_counts_aspect_mismatch_and_icon_sized_frames():
+    from dataclasses import replace
+
+    from deckforge.pattern.scoring import photo_aspect_mismatch, photo_fit_cost
+    from deckforge.pattern.style import load_style
+
+    style = load_style("visual")
+    p = pattern("p", "photo_text", [headline(), slot("image")])
+    base = SlideIntent(index=1, outline_kind="case", intent="", photo="a.jpg", photo_aspect=1.5)
+
+    def cost(frame):
+        return photo_fit_cost(p, replace(base, photo_frames={"p": frame}), style)
+
+    assert photo_aspect_mismatch(2.0, 1.0) == photo_aspect_mismatch(1.0, 2.0) == 2.0
+    assert cost((1.4, 0.3)) == 0.0
+    assert cost((0.5, 0.3)) > 0.0
+    assert cost((0.3, 0.3)) >= cost((0.5, 0.3))
+    assert cost((1.4, 0.01)) > 0.0
+    assert photo_fit_cost(p, SlideIntent(index=1, outline_kind="case", intent=""), style) == 0.0

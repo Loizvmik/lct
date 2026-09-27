@@ -24,7 +24,7 @@ _DEFAULT_WEIGHTS = {
     "overflow": 1000.0, "consecutive_repeat": 500.0, "repeated_pattern": 30.0,
     "style_mismatch": 20.0, "density_mismatch": 10.0, "pattern_quality": 5.0,
     "decor": 10.0, "orphan_image": 15.0, "cover_miss": 50.0, "short_headline": 60.0, "sample_photo_void": 200.0,
-    "chart_fit": 25.0, "batch_overlap": 60.0,
+    "chart_fit": 25.0, "batch_overlap": 60.0, "photo_aspect": 80.0,
 }
 _DEFAULT_STYLES = {
     "dense": {

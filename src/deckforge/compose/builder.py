@@ -1230,6 +1230,23 @@ def _chart_spec(slide_spec: SlideSpec, pattern: Pattern, chart) -> ChartSpec:
     )
 
 
+def _cover_crop(native_width: int, native_height: int, width: int, height: int) -> tuple[float, float, float, float] | None:
+    """Доли кадрирования (слева, справа, сверху, снизу), при которых фото
+    `native_width x native_height` заполняет рамку `width x height` без
+    искажения, срезая поровну с двух сторон лишнего измерения. `None`:
+    пропорции неизвестны или совпадают."""
+    if not (native_width and native_height and width > 0 and height > 0):
+        return None
+    photo, frame = native_width / native_height, width / height
+    if abs(photo - frame) / frame < 0.005:
+        return None
+    if photo > frame:
+        cut = (1 - frame / photo) / 2
+        return cut, cut, 0.0, 0.0
+    cut = (1 - photo / frame) / 2
+    return 0.0, 0.0, cut, cut
+
+
 def _contain_box(
     left: int, top: int, width: int, height: int, native_width: float, native_height: float,
 ) -> tuple[int, int, int, int]:
@@ -1299,13 +1316,17 @@ def _place_picture_visual(
                 f"({user_photo_path}) не читается ({exc}) — не вставлена."
             )
             return
-        pic_left, pic_top, pic_width, pic_height = (
-            _contain_box(left, top, width, height, native_width, native_height)
-            if native_width and native_height else (left, top, width, height)
+        # Фото пользователя занимает рамку целиком и кадрируется по центру,
+        # как в клоне (`clone.replace_picture`): вписанное с полями оно
+        # оставляло пустые полосы, а растянутое искажало лицо и экран.
+        # Рамку не по пропорциям планировщик штрафует (`scoring.photo_fit_
+        # cost`), сюда она доходит, только если лучшей не нашлось.
+        picture = slide.shapes.add_picture(
+            io.BytesIO(data), Emu(left), Emu(top), Emu(max(1, width)), Emu(max(1, height)),
         )
-        slide.shapes.add_picture(
-            io.BytesIO(data), Emu(pic_left), Emu(pic_top), Emu(max(1, pic_width)), Emu(max(1, pic_height)),
-        )
+        crop = _cover_crop(native_width, native_height, width, height)
+        if crop is not None:
+            picture.crop_left, picture.crop_right, picture.crop_top, picture.crop_bottom = crop
         return
 
     catalog = list(profile.assets.photos if kind == "photo" else profile.assets.icons)
@@ -1329,6 +1350,59 @@ def _place_picture_visual(
     slide.shapes.add_picture(
         io.BytesIO(data), Emu(pic_left), Emu(pic_top), Emu(max(1, pic_width)), Emu(max(1, pic_height)),
     )
+
+
+def photo_aspects(user_photos: dict[str, Path] | None) -> dict[str, float]:
+    """Пропорции (ширина / высота) фото пользователя по имени файла, для
+    планировщика раскладок (`pattern.scoring.photo_fit_cost`). Читается
+    только заголовок файла; нечитаемое фото пропускается, его судьбу
+    решит вставка с находкой."""
+    aspects: dict[str, float] = {}
+    for name, path in (user_photos or {}).items():
+        try:
+            with Image.open(path) as img:
+                width, height = img.size
+        except Exception:  # noqa: BLE001: битый файл не повод ронять план
+            continue
+        if width > 0 and height > 0:
+            aspects[name] = width / height
+    return aspects
+
+
+def photo_frames(profile: TemplateProfile) -> dict[str, tuple[float, float]]:
+    """Рамка под фото каждой раскладки с местом `image`: пропорции в
+    пикселях холста (коробки слотов в долях, поэтому умножаются на
+    пропорции холста) и доля холста. Для штрафа планировщика за фото не по
+    рамке (`pattern.scoring.photo_fit_cost`), который сам коробок не видит."""
+    width, height = profile.canvas_width_emu, profile.canvas_height_emu
+    canvas_aspect = width / height if width and height else 16 / 9
+    frames: dict[str, tuple[float, float]] = {}
+    for pattern in profile.patterns:
+        slot = _visual_slot(pattern, "image")
+        if slot is None or slot.box.width <= 0 or slot.box.height <= 0:
+            continue
+        frames[pattern.pattern_id] = (
+            slot.box.width / slot.box.height * canvas_aspect, slot.box.width * slot.box.height,
+        )
+    return frames
+
+
+def embedded_photo_names(pptx_path: Path, user_photos: dict[str, Path]) -> set[str]:
+    """Имена фото пользователя, чьи байты лежат в собранном файле (тот же
+    признак по sha256, что у `count_embedded_photos`): по ним видно, какое
+    именно фото не дошло до слайдов."""
+    digests: dict[str, str] = {}
+    for name, path in (user_photos or {}).items():
+        try:
+            digests[name] = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+        except OSError:
+            continue
+    found = set()
+    with zipfile.ZipFile(pptx_path) as zf:
+        for member in zf.namelist():
+            if member.startswith("ppt/media/"):
+                found.add(hashlib.sha256(zf.read(member)).hexdigest())
+    return {name for name, digest in digests.items() if digest in found}
 
 
 def count_embedded_photos(pptx_path: Path, user_photos: dict[str, Path]) -> int:
@@ -1813,17 +1887,35 @@ def _resolve_pattern(
     проставлен или его раскладки нет в профиле."""
     ranked = _ranked_candidates(slide_spec, patterns, profile, variant, history)
     if not slide_spec.pattern_id:
-        return ranked
+        return _photo_first(slide_spec, ranked)
     preferred = next((p for p in ranked if p.pattern_id == slide_spec.pattern_id), None)
     if preferred is None:
-        return ranked
+        return _photo_first(slide_spec, ranked)
     # Запасные планировщика (задача U) сразу за выбранной, в его порядке
     # стоимости: вторая ступень лестницы берёт их, а не собственный рейтинг
     # сборки, который считает иначе и не знает про соседей по колоде.
     by_id = {p.pattern_id: p for p in ranked}
     backups = [by_id[pid] for pid in slide_spec.alternatives if pid in by_id and pid != preferred.pattern_id]
     taken = {preferred.pattern_id, *(p.pattern_id for p in backups)}
-    return [preferred, *backups, *(p for p in ranked if p.pattern_id not in taken)]
+    return _photo_first(slide_spec, [preferred, *backups, *(p for p in ranked if p.pattern_id not in taken)])
+
+
+def _photo_first(slide_spec: SlideSpec, ranked: list[Pattern]) -> list[Pattern]:
+    """Слайду с фото пользователя раскладки с местом под картинку идут
+    раньше остальных, порядок внутри групп прежний. Иначе лестница после
+    отказа клона уходила на запасную без рамки, и фото терялось (VK
+    Education, 27 сентября 2026: пример 26 отклонён, собран пример 17)."""
+    with_frame = [p for p in ranked if _holds_photo(slide_spec, p)]
+    return with_frame + [p for p in ranked if not _holds_photo(slide_spec, p)]
+
+
+def _holds_photo(slide_spec: SlideSpec, pattern: Pattern) -> bool:
+    """Раскладка не теряет фото слайда: фото пользователя нет вовсе или у
+    раскладки есть место `image`."""
+    visual = slide_spec.visual
+    if visual is None or visual.kind != "photo" or not visual.photo_name:
+        return True
+    return _visual_slot(pattern, "image") is not None
 
 
 # ---------------------------------------------------------------------------
@@ -2062,7 +2154,10 @@ def _clone_candidates(
         if cloned is None:
             continue
         clone_notes, fill = cloned
-        if fill >= fill_min:
+        loses_photo = not _holds_photo(slide_spec, pattern) and any(
+            _holds_photo(slide_spec, item[2]) for item in underfilled
+        )
+        if fill >= fill_min and not loses_photo:
             notes.extend(clone_notes)
             return pattern, position
         _remove_last_slide(prs)
@@ -2072,7 +2167,9 @@ def _clone_candidates(
             f"(порог {fill_min:.0%}) — ищем раскладку плотнее."
         )
     if underfilled:
-        fill, position, pattern = max(underfilled, key=lambda item: (item[0], -item[1]))
+        fill, position, pattern = max(
+            underfilled, key=lambda item: (_holds_photo(slide_spec, item[2]), item[0], -item[1]),
+        )
         rebuilt = _try_clone(
             prs, slide_spec, pattern, profile, canvas, audit_config, source_slides, notes,
             bullet_char=bullet_char, user_photos=user_photos,
@@ -2392,7 +2489,7 @@ class _Ladder:
             if cloned is None:
                 continue
             clone_notes, fill = cloned
-            if fill >= self.fill_min:
+            if fill >= self.fill_min and not self._loses_photo(pattern):
                 self.notes.extend(clone_notes)
                 return pattern
             _remove_last_slide(self.prs)
@@ -2404,10 +2501,21 @@ class _Ladder:
             )
         return self.accept_best() if settle else None
 
+    def _loses_photo(self, pattern: Pattern) -> bool:
+        """Клон без рамки под фото пользователя, когда клон с рамкой уже
+        был: плотность его не оправдывает, фото на нём пропадёт."""
+        return not _holds_photo(self.slide_spec, pattern) and any(
+            _holds_photo(self.slide_spec, item[2]) for item in self.underfilled
+        )
+
     def accept_best(self) -> Pattern | None:
         if not self.underfilled:
             return None
-        _fill, _position, pattern = max(self.underfilled, key=lambda item: (item[0], -item[1]))
+        # Фото пользователя важнее плотности: пустоватый клон с рамкой под
+        # фото лучше плотного без неё, где фото пропадёт (`_holds_photo`).
+        _fill, _position, pattern = max(
+            self.underfilled, key=lambda item: (_holds_photo(self.slide_spec, item[2]), item[0], -item[1]),
+        )
         self.underfilled = []
         rebuilt = self._clone(self.slide_spec, pattern)
         if rebuilt is None:
@@ -2868,6 +2976,13 @@ def place_slide_by_clone(
     native = _native_repeat_contents(pattern, clean)
     if native is None:
         return CloneOutcome("элементов больше, чем единиц повтора в примере", "UNITS_OVER_REPEAT")
+    # Слайд с визуалом не судится: график и таблица встают в крупное
+    # текстовое место раскладки (`charts.chart_target_slot`), и оно не пустое.
+    void = _empty_optional_area(pattern, native) if slide_spec.visual is None else 0.0
+    if void > _MAX_EMPTY_OPTIONAL_AREA:
+        return CloneOutcome(
+            f"необязательное текстовое место без содержания, пустеет {void:.0%} холста", "EMPTY_OPTIONAL",
+        )
 
     slide = clone_example_slide(prs, source_slide, layout)
     matched = match_slots(slide, pattern.slots, canvas)
@@ -3029,6 +3144,39 @@ def _native_repeat_contents(pattern: Pattern, contents: list[SlotContent]) -> li
 
 
 _ORDINAL_RE = re.compile(r"\d{1,2}\.?")
+
+
+# Текстовые места раскладки вне повтора, которые содержание может не
+# занять: без текста клон их удаляет вместе с подложкой.
+_OPTIONAL_TEXT_ROLES = frozenset({"body", "bullets", "subhead", "caption", "quote"})
+# Больше этой доли холста пустоты на месте незанятого текстового места
+# раскладка не берётся: ЛЦТ2026, пример 20, левая рамка на треть слайда
+# оставалась пустой, когда содержание легло только в строки справа.
+_MAX_EMPTY_OPTIONAL_AREA = 0.30
+
+
+def _empty_optional_area(pattern: Pattern, contents: list[SlotContent]) -> float:
+    """Доля холста, которая опустеет в клоне: незанятые текстовые места
+    вне повтора вместе с подложкой, в которой стоит их центр (карточка
+    крупнее своей надписи, и пустеет вся карточка). Места с постоянным
+    текстом шаблона (`keeps_sample_text`) не считаются: они не пустеют."""
+    bound = {id(c.slot) for c in contents}
+    repeat_roles = set(pattern.repeat.slot_roles) if pattern.repeat is not None else set()
+    total = 0.0
+    for slot in pattern.slots:
+        if id(slot) in bound or slot.role not in _OPTIONAL_TEXT_ROLES or slot.role in repeat_roles:
+            continue
+        if getattr(slot, "keeps_sample_text", False):
+            continue
+        cx, cy = slot.box.left + slot.box.width / 2, slot.box.top + slot.box.height / 2
+        plates = [
+            d.box.width * d.box.height for d in pattern.decor
+            if d.kind == "shape" and getattr(d, "has_fill", False) and not d.repeat_group
+            and d.box.left <= cx <= d.box.left + d.box.width and d.box.top <= cy <= d.box.top + d.box.height
+            and d.box.width * d.box.height < 0.5
+        ]
+        total += max([slot.box.width * slot.box.height, *plates])
+    return total
 
 
 def _sample_text_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
@@ -3839,10 +3987,18 @@ def _align_scattered_units(
     if len(units) < 2:
         return contents, []
     boxes = [contents[i].slot.box for i in units]
-    if max(b.top for b in boxes) - min(b.top for b in boxes) <= _ROW_TOLERANCE:
+    # Ряд всегда ниже нижней кромки заголовка плюс зазор, где бы заголовок
+    # ни стоял: на WorkSpace (примеры 3, 4, 17) заголовок сбоку или ниже
+    # плашки «Кейс», и «выше самого верхнего места» ставило ряд над ним.
+    headline_bottom = max(
+        (c.slot.box.top + c.slot.box.height for c in contents if c.role_hint == "headline"), default=None,
+    )
+    floor = headline_bottom + grid.gutter if headline_bottom is not None else 0.0
+    aligned = max(b.top for b in boxes) - min(b.top for b in boxes) <= _ROW_TOLERANCE
+    if aligned and min(b.top for b in boxes) >= floor - 1e-6:
         return contents, []
     others = [c.slot.box for k, c in enumerate(contents) if k not in units]
-    top = min(b.top for b in boxes)
+    top = max(min(b.top for b in boxes), floor)
     above = [b.top + b.height for b in others if b.top < top]
     if above:
         top = max(top, max(above) + grid.gutter)

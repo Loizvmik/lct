@@ -593,6 +593,12 @@ def _with_photo(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
     if not contract.photo:
         return slide
     if slide.visual is not None and slide.visual.kind in ("table", "chart", "code"):
+        # Место под визуал занято данными: фото не ложится, но и не
+        # пропадает молча, находка доходит до предупреждений задания.
+        what = {"chart": "графиком", "table": "таблицей"}.get(slide.visual.kind, "кодом")
+        slide.findings.append(
+            f"Слайд {contract.slide_id}: фото {contract.photo!r} не поставлено: место под визуал занято {what}."
+        )
         return slide
     caption = (slide.visual.caption if slide.visual is not None else None) or contract.photo_caption
     return replace(slide, visual=Visual(kind="photo", caption=caption, photo_name=contract.photo))

@@ -87,6 +87,39 @@ def test_build_outline_falls_back_on_malformed_json():
     assert MIN_SLIDES <= len(outline.slides) <= MAX_SLIDES
 
 
+def test_fallback_skeleton_after_a_model_failure_names_the_reason():
+    """Задача T4: запасной скелет при отказе модели виден в предупреждениях
+    задания, а не теряется в `except`."""
+    from deckforge.plan.outline import fallback_warning
+
+    failed = build_outline("бриф", [], profile=None, llm=_FakeLLM(RuntimeError("сеть недоступна")), target_slides=12)
+    assert failed.fallback_reason and "сеть недоступна" in failed.fallback_reason
+    assert fallback_warning(failed) == f"структура собрана без модели: {failed.fallback_reason}"
+
+    ok = build_outline("бриф", [], profile=None, llm=_FakeLLM(_valid_outline_json(12)), target_slides=12)
+    assert ok.fallback_reason is None and fallback_warning(ok) is None
+    # Без модели вовсе это не отказ: предупреждать не о чем.
+    assert build_outline("бриф", [], profile=None, llm=None, target_slides=12).fallback_reason is None
+
+
+def test_short_outline_is_not_padded_with_empty_points():
+    """Задача T4: повторы «Дополнительный контекст» до цели писатель
+    заполнял водой. Добивка не больше одного пункта «Что дальше», и только
+    если есть материал."""
+    from deckforge.plan.outline import NEXT_STEPS_INTENT
+
+    llm = _FakeLLM(_valid_outline_json(8))
+    sources = [SourceDoc(name="s", text="текст")]
+    outline = build_outline("бриф", sources, profile=None, llm=llm, target_slides=15)
+    intents = [s.intent for s in outline.slides]
+    assert "Дополнительный контекст" not in intents
+    assert len(outline.slides) <= 9
+    assert intents.count(NEXT_STEPS_INTENT) <= 1
+
+    bare = build_outline("бриф", [], profile=None, llm=_FakeLLM(_valid_outline_json(8)), target_slides=15)
+    assert len(bare.slides) == 8 and NEXT_STEPS_INTENT not in [s.intent for s in bare.slides]
+
+
 class _RecordingLLM(LLMProvider):
     """Запоминает `messages` последнего вызова — нужен, чтобы проверить, ЧТО
     именно код кладёт в payload модели (Task 18: `available_forms`), не
