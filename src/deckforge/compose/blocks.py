@@ -33,6 +33,8 @@ class Paragraph:
     # Жирный абзац: заголовок карточки, склеенный с её телом, когда у
     # единицы повтора нет своего слота под заголовок (см. `_assign_cards`).
     bold: bool = False
+    # Курсив: текст цитаты, собранной с нуля (`compose.quote`).
+    italic: bool = False
 
 
 @dataclass
