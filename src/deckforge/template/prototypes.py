@@ -71,6 +71,15 @@ _INSTRUCTION_RE = re.compile(r"как\s+(пользоваться|работат
 # карточки VK Tech с иконкой в каждой (слайд 20) обычная раскладка.
 _ASSET_SHEET_RE = re.compile(r"иконк|пиктограм|иллюстрац|логотип|\bicons?\b|ассет", re.IGNORECASE)
 _ASSET_MIN_PICTURES = 8
+# Схема-образец: слайд «Оформление схем» VK Education (13-14) состоит из
+# блоков-рыб «Текстовый блок», «Подпись», соединённых стрелками, без
+# повтора. Как раскладка содержания он получал три текста из девяти мест,
+# остальные блоки и стрелки оставались пустыми (замер 28 сентября 2026).
+# Признак: не меньше трёх мест с текстом-рыбой дизайнера и нет повтора.
+_PLACEHOLDER_SAMPLE_RE = re.compile(
+    r"^\s*(текстовый\s+блок|подпись|заголовок|текст|text\s*block|caption|label)\s*$", re.IGNORECASE,
+)
+_INSTRUCTION_MIN_PLACEHOLDERS = 3
 
 
 @dataclass(frozen=True)
@@ -214,6 +223,12 @@ def slide_class_of(pattern: Pattern, rules: ChartRules | None, prototype_slides:
     if pictures >= _ASSET_MIN_PICTURES and _ASSET_SHEET_RE.search(texts):
         return "asset_sheet"
     if _INSTRUCTION_RE.search(headline):
+        return "instruction"
+    placeholders = sum(
+        1 for sl in pattern.slots
+        if sl.role != "headline" and _PLACEHOLDER_SAMPLE_RE.match(" ".join((sl.sample_text or "").split()))
+    )
+    if placeholders >= _INSTRUCTION_MIN_PLACEHOLDERS and pattern.repeat is None:
         return "instruction"
     return "content_pattern"
 

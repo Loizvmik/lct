@@ -99,11 +99,22 @@ def test_palette_is_taken_from_the_bars_not_from_the_background():
     assert image_palette(_png([], transparent=False)) == []
 
 
-def _pattern(headline: str, *, pictures: int = 0, texts=(), source: int = 10):
+def _pattern(headline: str, *, pictures: int = 0, texts=(), source: int = 10, repeat=None):
     slots = [SimpleNamespace(role="headline", sample_text=headline, chart_frame=False, box=Box(0, 0, 1, 0.1))]
     slots += [SimpleNamespace(role="body", sample_text=t, chart_frame=False, box=Box(0, 0.2, 1, 0.1)) for t in texts]
     decor = [SimpleNamespace(kind="picture") for _ in range(pictures)]
-    return SimpleNamespace(pattern_id="p", source_slide_index=[source], slots=slots, decor=decor)
+    return SimpleNamespace(pattern_id="p", source_slide_index=[source], slots=slots, decor=decor, repeat=repeat)
+
+
+def test_diagram_of_placeholder_blocks_is_an_instruction_not_a_layout():
+    """«Оформление схем» VK Education: блоки-рыбы «Текстовый блок» и
+    «Подпись» со стрелками, без повтора. Под содержание не годится: три
+    текста из девяти мест, остальные блоки и стрелки остаются пустыми.
+    Те же рыбы в единицах повтора (карточки) остаются раскладкой."""
+    fish = ["Подпись", "Текстовый блок", "Текстовый \nблок", "Текст выравниваем по центру"]
+    assert slide_class_of(_pattern("Оформление схем", texts=fish), None, set()) == "instruction"
+    assert slide_class_of(_pattern("Оформление схем", texts=fish, repeat=object()), None, set()) == "content_pattern"
+    assert slide_class_of(_pattern("Шаги", texts=["Подпись", "Срок 3 недели", "Бюджет"]), None, set()) == "content_pattern"
 
 
 def test_slide_classes_need_a_strong_signal():
