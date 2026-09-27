@@ -448,6 +448,9 @@ _MIN_REPEAT_COUNT = 2
 # середины шкалы", раз содержательные пороги качества уже отработали
 # раньше.
 _MIN_SCORE = 0.35
+# Картинка уже этой доли ширины холста не место под фото, а значок: тот
+# же порог, которым каталог ассетов узнаёт иконку (`assets._ICON_MAX_WIDTH`).
+_PHOTO_SLOT_MIN_WIDTH = 0.08
 # Больше стольких декоративных фигур на слайде-примере — это лист ассетов
 # (иконки, палитра образцов), а не раскладка; см. проверку в `_mine_slide`.
 _MAX_DECOR_SHAPES = 60
@@ -493,6 +496,10 @@ _BG_AREA_SHARE = 0.5
 _WCAG_DARK_THRESHOLD = 0.5
 
 _NUMERIC_RE = re.compile(r"^[+-]?\d[\d\s.,]{0,7}[%xXхХкKмMмлрдтыс+]{0,3}$")
+# Число-маска дизайнера вместо цифр: «ХХ», «ххх%», «x%» (VK WorkSpace,
+# слайды «Графики» и показателей). Без неё место крупного числа читалось
+# подзаголовком, и у шаблона не находилось ни одной раскладки показателей.
+_NUMBER_MASK_RE = re.compile(r"^(?:[xXхХ]{2,4}|[xXхХ]{1,4}\s?%)$")
 
 _BG_FILL_TAGS = frozenset({"noFill", "solidFill", "gradFill", "grpFill", "pattFill", "blipFill"})
 
@@ -658,7 +665,7 @@ def _mine_slide(
         # СТРУКТУРНО, не совпадением на трёх учебных файлах.
         return None
 
-    slots = _snap_to_margins(slots, grid)
+    slots = _trim_tall_headline(_snap_to_margins(slots, grid), canvas)
     if _slots_overlap(slots) or not _within_margins(slots, grid):
         return None
 
@@ -1010,10 +1017,18 @@ def _split_content_decor(
     # декором — потерять одно место под фотографию на слайде, где их и так
     # несколько. Самая крупная картинка остаётся слотом, чтобы
     # пользовательские фотографии не лишились дома совсем.
+    #
+    # Самая крупная, но мельче значка, тоже декор: у VK WorkSpace на
+    # карточках только значки-стрелки, и крупнейший из них становился
+    # местом под фото внутри карточки. Слот наезжал на текст карточки, и
+    # майнинг отбрасывал весь слайд (шесть раскладок карточек из 29
+    # слайдов, разбор 27 сентября 2026). Фото в рамку шириной в два
+    # процента холста всё равно не поставить.
     if pictures:
         largest = max(pictures, key=lambda r: r.box.width * r.box.height)
         for ref in pictures:
-            (content if ref is largest else decor).append(ref)
+            is_slot = ref is largest and ref.box.width >= _PHOTO_SLOT_MIN_WIDTH
+            (content if is_slot else decor).append(ref)
 
     return content, decor
 
@@ -1193,7 +1208,7 @@ def _tier_info(ref: ShapeRef, canvas: Canvas, scale: TypeScale, theme: ThemeInfo
         # шрифта на конкретном примере.
         step = "h1"
 
-    numeric = bool(_NUMERIC_RE.match(stripped)) and len(stripped) <= 12
+    numeric = bool(_NUMERIC_RE.match(stripped) or _NUMBER_MASK_RE.match(stripped)) and len(stripped) <= 12
     bulleted = _has_bullets(ref.element)
     align = _dominant_align(ref.element, scale)
     anchor = _vertical_anchor(ref.element)
@@ -1786,7 +1801,8 @@ def _columns(slots: list[PatternSlot]) -> list[list[int]]:
 # прогон 27 сентября 2026).
 _PHOTO_PLACEHOLDER_RE = re.compile(
     r"^\s*(вставить|вставь(те)?|добавить|добавь(те)?|место\s+под|place|insert|add)?\s*"
-    r"(фото(графи[юя])?|изображение|картинк[ау]|логотип|photo|image|picture|logo)\s*(сюда|здесь|here)?\s*$",
+    r"(фото(графи[юя])?|изображение|иллюстраци[яю]|картинк[ау]|логотип|photo|image|picture|illustration|logo)"
+    r"\s*(сюда|здесь|here)?\s*$",
     re.IGNORECASE,
 )
 
@@ -2085,6 +2101,36 @@ def _classify_kind(
 # --- проверки качества (бриф, "Требования к работе") ------------------------
 
 
+def _trim_tall_headline(slots: list[PatternSlot], canvas: Canvas) -> list[PatternSlot]:
+    """Рамка заголовка с текстом у верха, в которую снизу заходит другое
+    место, обрезается по верху этого места. У VK WorkSpace рамка заголовка
+    рассчитана на две строки, а подпись «Текст описания» стоит под первой
+    строкой; перекрытие отбрасывало единственную раскладку показателей и
+    слайд с тремя столбцами списков (разбор 27 сентября 2026). Обрезка
+    только пока в рамке остаётся строка заголовка: иначе это настоящее
+    наложение."""
+    heads = [i for i, s in enumerate(slots) if s.role == "headline" and s.anchor == "t" and s.size_pt > 0]
+    if not heads:
+        return slots
+    out = list(slots)
+    for i in heads:
+        head = out[i].box
+        below = [
+            s.box.top for j, s in enumerate(out)
+            if j != i and head.top < s.box.top < head.bottom
+            and s.box.left < head.right and s.box.right > head.left
+        ]
+        if not below:
+            continue
+        line = out[i].size_pt / 72 * _LINE_HEIGHT_EM / canvas.height_in
+        height = min(below) - head.top
+        if height < line:
+            continue
+        box = replace(head, height=height)
+        out[i] = replace(out[i], box=box, max_chars=estimate_slot_chars(box, canvas, out[i].size_pt))
+    return out
+
+
 def _slots_overlap(slots: list[PatternSlot]) -> bool:
     """Есть ли пара слотов, чьи боксы пересекаются заметной площадью —
     брифом: "слоты налезают друг на друга... в набор попадать не должна".
@@ -2129,6 +2175,14 @@ def _snap_to_margins(slots: list[PatternSlot], grid: Grid) -> list[PatternSlot]:
         dx = 0.0
         left_gap = grid.margin_left - box.left
         right_gap = box.right - right_bound
+        span = right_bound - grid.margin_left
+        near = 0 < left_gap <= _MARGIN_SNAP_TOLERANCE or 0 < right_gap <= _MARGIN_SNAP_TOLERANCE
+        if near and 0 < box.width - span <= _MARGIN_SNAP_TOLERANCE:
+            # Рамка шире промежутка между полями (заголовок «Графики» VK
+            # WorkSpace на процент шире): сдвиг выталкивает её за другое
+            # поле, и слайд отбрасывался целиком. Рамка сужается до полей.
+            snapped.append(replace(slot, box=replace(box, left=grid.margin_left, width=span)))
+            continue
         if 0 < left_gap <= _MARGIN_SNAP_TOLERANCE:
             dx = left_gap
         elif 0 < right_gap <= _MARGIN_SNAP_TOLERANCE:
@@ -2708,9 +2762,17 @@ def mark_chart_frames(pattern: Pattern) -> Pattern:
         replace(s, chart_frame=True) if s.role == "image" and s.box.area >= CHART_FRAME_MIN_AREA else s
         for s in pattern.slots
     ]
-    if all(a is b for a, b in zip(slots, pattern.slots)):
+    # Второй график-картинка примера (VK WorkSpace slide20: два бублика)
+    # в декоре: место под график одно, а крупная картинка в декоре это
+    # данные образца. Без пометки она оставалась рядом с нашим графиком
+    # и фото (живой прогон 27 сентября 2026, слайды 2, 3 и 6).
+    decor = [
+        replace(d, sample_photo=True) if d.kind == "picture" and d.box.area >= CHART_FRAME_MIN_AREA else d
+        for d in pattern.decor
+    ]
+    if all(a is b for a, b in zip(slots, pattern.slots)) and all(a is b for a, b in zip(decor, pattern.decor)):
         return pattern
-    return replace(pattern, slots=slots)
+    return replace(pattern, slots=slots, decor=decor)
 
 
 def chart_target_slot(slots) -> tuple[object | None, int | None]:
