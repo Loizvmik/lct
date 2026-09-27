@@ -27,7 +27,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 
 from deckforge.compose.builder import Variant, _place_picture_visual, build_deck
 from deckforge.ooxml.geometry import Box
-from deckforge.plan.spec import DeckSpec, SlideSpec, Visual
+from deckforge.plan.spec import DeckSpec, SlideSpec, TextBlock, Visual
 from deckforge.template.patterns import Capacity, Pattern, PatternSlot
 from deckforge.template.profile import TemplateProfile
 
@@ -82,9 +82,10 @@ def profile() -> TemplateProfile:
     ],
     ids=["slot-wide-photo-tall", "slot-tall-photo-wide"],
 )
-def test_user_photo_is_contained_not_stretched(new_slide, profile, tmp_path, slot_box, native_size):
-    """L07 (аудит: искажённые пропорции) — вписанная фотография несёт то
-    же соотношение сторон, что исходный файл, независимо от формы слота."""
+def test_user_photo_fills_the_frame_cropped_at_center_not_stretched(new_slide, profile, tmp_path, slot_box, native_size):
+    """Фото пользователя занимает рамку целиком и кадрируется по центру,
+    без полей и без искажения (L07): видимая часть кадра несёт пропорции
+    рамки, срез поровну с двух сторон лишнего измерения."""
     slide = new_slide()
     pattern = _pattern_with_image_slot(slot_box)
     slide_spec = SlideSpec(
@@ -98,18 +99,18 @@ def test_user_photo_is_contained_not_stretched(new_slide, profile, tmp_path, slo
     pics = _picture_shapes(slide)
     assert len(pics) == 1
     pic = pics[0]
-    native_aspect = native_size[0] / native_size[1]
-    assert pic.width / pic.height == pytest.approx(native_aspect, rel=0.02)
-
-    # "Contain": ни одна сторона картинки не может выйти за слот.
     slot_left = round(slot_box.left * profile.canvas_width_emu)
     slot_top = round(slot_box.top * profile.canvas_height_emu)
     slot_width = round(slot_box.width * profile.canvas_width_emu)
     slot_height = round(slot_box.height * profile.canvas_height_emu)
-    assert pic.left >= slot_left - 1
-    assert pic.top >= slot_top - 1
-    assert pic.left + pic.width <= slot_left + slot_width + 1
-    assert pic.top + pic.height <= slot_top + slot_height + 1
+    assert (pic.left, pic.top) == (pytest.approx(slot_left, abs=2), pytest.approx(slot_top, abs=2))
+    assert (pic.width, pic.height) == (pytest.approx(slot_width, abs=2), pytest.approx(slot_height, abs=2))
+
+    assert pic.crop_left == pytest.approx(pic.crop_right)
+    assert pic.crop_top == pytest.approx(pic.crop_bottom)
+    visible_w = native_size[0] * (1 - pic.crop_left - pic.crop_right)
+    visible_h = native_size[1] * (1 - pic.crop_top - pic.crop_bottom)
+    assert visible_w / visible_h == pytest.approx(slot_width / slot_height, rel=0.02)
     assert not slide_spec.findings
 
 
@@ -208,6 +209,51 @@ def test_missing_user_photos_mapping_entry_falls_back_to_template_catalog(new_sl
 
     # У VK Education есть каталог фото — ассет каталога подставлен как и раньше.
     assert len(_picture_shapes(slide)) == 1
+
+
+def test_a_denser_clone_without_a_frame_does_not_win_over_a_framed_one(monkeypatch):
+    """Задача T4: клон раскладки с рамкой под фото вышел пустоватым, а
+    следующий, без рамки, плотным. Раньше брался плотный, и фото пропадало
+    (VK Education, 27 сентября 2026); теперь берётся клон с рамкой."""
+    from deckforge.audit.config import AuditConfig
+    from deckforge.compose import builder
+
+    framed = _pattern_with_image_slot(Box(left=0.5, top=0.2, width=0.4, height=0.6))
+    plain = _pattern_without_image_slot()
+    fills = {"with-image": 0.10, "no-image": 0.60}
+    monkeypatch.setattr(builder, "_try_clone", lambda prs, spec, pattern, *a, **kw: ([], fills[pattern.pattern_id]))
+    monkeypatch.setattr(builder, "_remove_last_slide", lambda prs: None)
+    photo = SlideSpec(
+        index=1, kind="photo_text", headline="Демо", blocks=[TextBlock(text="Абзац")],
+        visual=Visual(kind="photo", photo_name="demo.jpg"),
+    )
+
+    chosen = builder._clone_candidates(
+        None, photo, [framed, plain], None, None, AuditConfig.load(), [],
+        bullet_char="•", user_photos={"demo.jpg": Path("demo.jpg")}, source_slides=None,
+    )
+    assert chosen is not None and chosen[0] is framed
+    assert builder._photo_first(photo, [plain, framed]) == [framed, plain]
+
+    # Без фото пользователя порядок и выбор прежние: плотный клон.
+    no_photo = SlideSpec(index=1, kind="bullets", headline="Демо", blocks=[TextBlock(text="Абзац")])
+    chosen = builder._clone_candidates(
+        None, no_photo, [framed, plain], None, None, AuditConfig.load(), [],
+        bullet_char="•", user_photos=None, source_slides=None,
+    )
+    assert chosen is not None and chosen[0] is plain
+
+
+def test_photo_frames_and_aspects_are_measured_for_the_planner(tmp_path, profile):
+    from deckforge.compose.builder import photo_aspects, photo_frames
+
+    wide = _make_photo(tmp_path, "wide.png", (1920, 900))
+    aspects = photo_aspects({"wide.png": wide, "broken.jpg": tmp_path / "missing.jpg"})
+    assert aspects == {"wide.png": pytest.approx(1920 / 900)}
+    frames = photo_frames(profile)
+    assert frames, "у VK Education есть раскладки с рамкой под фото"
+    # Пример 30: рамка телефона, узкая и высокая.
+    assert frames["slide30"][0] < 0.7
 
 
 def test_user_photo_flows_through_build_deck_end_to_end(tmp_path):

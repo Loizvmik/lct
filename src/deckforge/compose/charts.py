@@ -134,11 +134,56 @@ def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile, protot
         frame = slide.shapes.add_chart(_KIND_TO_XL[spec.kind], left, top, width, height, chart_data)
 
     _style_chart(slide, frame.chart, spec, profile, palette, bg_luminance)
-    rules = rules_of_prototype(prototype) if prototype is not None else getattr(profile, "chart_rules", None)
+    if prototype is not None:
+        rules = rules_of_prototype(prototype)
+    else:
+        # Без образца график в стиле шаблона, а не офисный по умолчанию
+        # (WorkSpace, 27 сентября 2026: сетка, рамка, стандартные столбцы).
+        rules = template_style_rules(getattr(profile, "chart_rules", None))
+        _strip_chart_frame(frame.chart)
     apply_chart_rules(frame.chart, spec, rules)
-    if getattr(rules, "data_labels", False):
-        _show_values(frame.chart, spec)
+    if getattr(rules, "data_labels", False) and spec.kind != "scatter":
+        # У точечного графика python-pptx подписей значений не умеет.
+        _show_values(frame.chart, spec, size_pt=profile.type_scale_pt("caption", 12.0))
     return frame
+
+
+def template_style_rules(rules) -> "_Rules":
+    """Правила графика, собранного без образца шаблона: зазор и
+    перекрытие из правил шаблона, если он их называет, а сетка всегда
+    убрана и значения подписаны на самих столбиках. Сетка и ось-линейка
+    делают график офисным, а подпись значения читается без неё."""
+    return _Rules(
+        gap_width=getattr(rules, "gap_width", None), overlap=getattr(rules, "overlap", None),
+        no_gridlines=True, data_labels=True,
+    )
+
+
+def _strip_chart_frame(chart) -> None:
+    """Без рамки и заливки у области диаграммы и области построения:
+    график лежит прямо на слайде, как графики в примерах шаблонов."""
+    space = chart._chartSpace  # noqa: SLF001
+    plot_area = space.find(qn("c:chart") + "/" + qn("c:plotArea"))
+    for owner in (space, plot_area):
+        if owner is None:
+            continue
+        sp_pr = owner.find(qn("c:spPr"))
+        if sp_pr is None:
+            # Порядок детей по схеме: у chartSpace `c:spPr` сразу после
+            # `c:chart`, у plotArea перед `c:extLst`, если он есть.
+            sp_pr = owner.makeelement(qn("c:spPr"), {})
+            if owner is space:
+                space.find(qn("c:chart")).addnext(sp_pr)
+            elif (ext := owner.find(qn("c:extLst"))) is not None:
+                ext.addprevious(sp_pr)
+            else:
+                owner.append(sp_pr)
+        for child in list(sp_pr):
+            sp_pr.remove(child)
+        sp_pr.append(sp_pr.makeelement(qn("a:noFill"), {}))
+        line = sp_pr.makeelement(qn("a:ln"), {})
+        line.append(line.makeelement(qn("a:noFill"), {}))
+        sp_pr.append(line)
 
 
 def _add_scatter(slide, left, top, width, height, spec: ChartSpec):
@@ -413,7 +458,7 @@ def rules_of_prototype(prototype) -> _Rules:
     )
 
 
-def _show_values(chart, spec: ChartSpec) -> None:
+def _show_values(chart, spec: ChartSpec, size_pt: float | None = None) -> None:
     """Подписи значений на столбиках и точках: шаблон просит «метки данных
     вместо вертикальной оси» (VK Education, слайд 51). Ось значений
     остаётся: без неё аудит (I05) не узнает единицу, а у длинного ряда она
@@ -423,6 +468,9 @@ def _show_values(chart, spec: ChartSpec) -> None:
     labels = plot.data_labels
     labels.show_value = True
     labels.number_format_is_linked = True
+    if size_pt is not None:
+        # Кегль подписи шаблона (caption), а не 18 пт по умолчанию.
+        labels.font.size = Pt(size_pt)
     if spec.kind in ("bar", "bar_h"):
         labels.position = XL_LABEL_POSITION.OUTSIDE_END
     elif spec.kind == "line":

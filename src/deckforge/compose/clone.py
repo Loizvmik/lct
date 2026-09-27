@@ -985,6 +985,7 @@ def prune_unfilled(
     protected = list(protect)
     removed = 0
     emptied_groups: list = []
+    text_boxes: list[Box] = []
     for ref in refs:
         if id(ref.element) in keep_ids or ref.element.getparent() is None:
             continue
@@ -993,6 +994,8 @@ def prune_unfilled(
                 group = _top_group(ref.element)
                 if group is not None:
                     emptied_groups.append(group)
+                if ref.box is not None and ref.kind == "shape":
+                    text_boxes.append(ref.box)
             remove_shape(ref.element)
             removed += 1
             continue
@@ -1008,6 +1011,8 @@ def prune_unfilled(
             group = _top_group(ref.element) if slot_hit else None
             if group is not None:
                 emptied_groups.append(group)
+            if slot_hit and ref.kind == "shape":
+                text_boxes.append(ref.box)
             remove_shape(ref.element)
             removed += 1
     # Карточка-группа, из которой ушли все надписи, остаётся пустой рамкой
@@ -1021,7 +1026,9 @@ def prune_unfilled(
             continue
         remove_shape(group)
         removed += 1
-    return removed
+    # Подложка снятой надписи (WorkSpace, пример 3: «Заметка» на белой
+    # плашке) без неё остаётся пустым прямоугольником.
+    return removed + remove_orphan_plates(slide, canvas, text_boxes, keep=keep)
 
 
 def _top_group(element):
@@ -1048,12 +1055,32 @@ def remove_stray_text(slide, canvas: Canvas, *, keep: Iterable = (), badge_boxes
     каждую надпись (перекрытые, за полями, слишком мелкие), а в клоне они
     остались бы текстом-рыбой шаблона. Значки (номер шага в кружке) живут
     в декоре и сохраняются по коробке; самозаполняемые плейсхолдеры (номер
-    слайда, дата, колонтитул) не трогаются."""
+    слайда, дата, колонтитул) не трогаются.
+
+    Вместе с надписью уходит плашка, на которой она стояла, если на плашке
+    больше ничего не осталось (`remove_orphan_plates`): «Вставить фото» и
+    «Вставить QR» VK Tech без фото пользователя оставляли белый квадрат.
+    Фигуры целиком за краем холста (пустая текстовая рамка справа от
+    слайда-примера 26 VK Education) тоже уходят: на показе их не видно, а
+    аудит L01 отклонял из-за них весь клон, и фото слайда терялось.
+    Подсказки плейсхолдеров лейаута, которых на слайде нет, прячутся
+    (`hide_layout_prompts`)."""
     keep_ids = {id(el) for el in keep}
     badges = list(badge_boxes)
     removed = 0
+    removed_boxes: list[Box] = []
+    whole = Box(0.0, 0.0, 1.0, 1.0)
     for ref in slide_refs(slide, canvas):
-        if ref.kind != "shape" or id(ref.element) in keep_ids:
+        if id(ref.element) in keep_ids or ref.element.getparent() is None:
+            continue
+        if (
+            ref.box is not None and ref.box.area > 0 and whole.intersect(ref.box) is None
+            and not ref.is_placeholder and ref.kind in ("shape", "picture", "connector")
+        ):
+            remove_shape(ref.element)
+            removed += 1
+            continue
+        if ref.kind != "shape":
             continue
         if not shape_text(ref.element).strip():
             continue
@@ -1063,7 +1090,74 @@ def remove_stray_text(slide, canvas: Canvas, *, keep: Iterable = (), badge_boxes
             continue
         remove_shape(ref.element)
         removed += 1
+        if ref.box is not None:
+            removed_boxes.append(ref.box)
+    removed += remove_orphan_plates(slide, canvas, removed_boxes, keep=keep)
+    # Рыба лейаута, которую LibreOffice рисует поверх опустевших мест
+    # (`hide_layout_prompts`), тоже текст-образец и уходит здесь же.
+    hide_layout_prompts(slide, canvas)
     return removed
+
+
+# Плашка крупнее этой доли холста не считается подложкой одной надписи:
+# это панель раскладки, и решать её судьбу должен планировщик
+# (`sample_photo_void`/пустота), а не уборка клона.
+_MAX_PLATE_AREA = 0.35
+
+
+def _center_in(box: Box, outer: Box) -> bool:
+    cx, cy = box.left + box.width / 2, box.top + box.height / 2
+    return outer.left <= cx <= outer.right and outer.top <= cy <= outer.bottom
+
+
+def remove_orphan_plates(slide, canvas: Canvas, removed_boxes: Iterable[Box], *, keep: Iterable = ()) -> int:
+    """Убирает подложки, с которых клон снял надпись примера, если на них
+    не осталось ни текста, ни картинки, ни таблицы. Подложка: фигура без
+    текста (не плейсхолдер), в которой стоял центр снятой надписи. Центр, а
+    не вложенность: «Вставить QR» VK Tech шире своего квадрата. Плашка под
+    нашим текстом или под иконкой не трогается: на ней что-то осталось."""
+    boxes = [b for b in removed_boxes if b is not None]
+    if not boxes:
+        return 0
+    keep_ids = {id(el) for el in keep}
+    refs = [r for r in slide_refs(slide, canvas) if r.element.getparent() is not None and r.box is not None]
+    removed = 0
+    for ref in refs:
+        if ref.kind != "shape" or ref.is_placeholder or id(ref.element) in keep_ids:
+            continue
+        if ref.element.getparent() is None or shape_text(ref.element).strip():
+            continue
+        if not 0 < ref.box.area <= _MAX_PLATE_AREA or not any(_center_in(b, ref.box) for b in boxes):
+            continue
+        inside = [
+            other for other in refs
+            if other.element is not ref.element and other.element.getparent() is not None
+            and _center_in(other.box, ref.box) and other.box.area < ref.box.area
+        ]
+        # Мелкое без текста на плашке (уголок-значок «Заметки» WorkSpace)
+        # её собственное украшение и уходит с ней; текст, крупная картинка
+        # или таблица значат, что плашка ещё несёт содержание.
+        if any(_carries_content(other, ref.box) for other in inside):
+            continue
+        for other in inside:
+            if id(other.element) not in keep_ids:
+                remove_shape(other.element)
+                removed += 1
+        remove_shape(ref.element)
+        removed += 1
+    return removed
+
+
+# Картинка или фигура без текста меньше этой доли плашки: её украшение.
+_ORNAMENT_SHARE = 0.15
+
+
+def _carries_content(ref: ShapeRef, plate: Box) -> bool:
+    if ref.kind in ("shape", "group") and shape_text(ref.element).strip():
+        return True
+    if ref.kind == "graphic_frame":
+        return True
+    return ref.kind == "picture" and ref.box.area >= _ORNAMENT_SHARE * plate.area
 
 
 def remove_sample_frames(slide, *, keep: Iterable = ()) -> int:
@@ -1213,6 +1307,20 @@ def hide_layout_photos(slide, photo_ids: Iterable[str], canvas: Canvas) -> int:
     ]
     if not hidden:
         return 0
+    _detach_layout_graphics(slide, canvas, ids)
+    return len(hidden)
+
+
+def _detach_layout_graphics(slide, canvas: Canvas, skip_pic_ids: set[str] = frozenset()) -> None:
+    """Выключает у слайда графику лейаута и мастера (`showMasterSp="0"`)
+    и копирует на слайд под его фигуры всё видимое оформление, кроме
+    плейсхолдеров и картинок лейаута с id из `skip_pic_ids`. Слайд, у
+    которого графика уже выключена, не трогается: копия уже сделана."""
+    if slide._element.get("showMasterSp") == "0":  # noqa: SLF001
+        return
+    layout = slide.slide_layout
+    layout_tree = layout.shapes._spTree  # noqa: SLF001
+    ids = skip_pic_ids
     owners = [(layout, layout_tree)]
     if layout._element.get("showMasterSp") != "0":  # noqa: SLF001
         master = layout.slide_master
@@ -1247,7 +1355,35 @@ def hide_layout_photos(slide, photo_ids: Iterable[str], canvas: Canvas) -> int:
             sp_tree.insert(0, dup)
         anchor = dup
     slide._element.set("showMasterSp", "0")  # noqa: SLF001
-    return len(hidden)
+
+
+# Плейсхолдеры, чей текст на слайде не нужен вовсе или приходит сам.
+_PROMPT_EXEMPT_PH = frozenset({"title", "ctrTitle", "dt", "ftr", "sldNum", "hdr"})
+
+
+def hide_layout_prompts(slide, canvas: Canvas) -> bool:
+    """Прячет подсказки плейсхолдеров лейаута, которых на слайде нет.
+
+    LibreOffice, в отличие от PowerPoint, рисует нестандартные
+    плейсхолдеры лейаута с их текстом-подсказкой на каждом слайде этого
+    лейаута. У ЛЦТ2026 («Проблема и решение», пример 24) это «Решение» и
+    «Ваше предложение решения данной проблемы»: в примере их закрывают
+    белые карточки, а клон при двух карточках из трёх убирает третью, и
+    рыба лейаута выходит на слайд. Графика лейаута выключается тем же
+    приёмом, что у `hide_layout_photos`, оформление копируется на слайд.
+    Возвращает, выключалась ли графика."""
+    present = set()
+    for ph in slide._element.iter(qn("p:ph")):  # noqa: SLF001
+        present.add(ph.get("idx", "0"))
+    for el in slide.slide_layout.shapes._spTree:  # noqa: SLF001
+        ph = el.find(".//" + qn("p:nvPr") + "/" + qn("p:ph"))
+        if ph is None or ph.get("type", "body") in _PROMPT_EXEMPT_PH:
+            continue
+        if ph.get("idx", "0") in present or not shape_text(el).strip():
+            continue
+        _detach_layout_graphics(slide, canvas)
+        return True
+    return False
 
 
 def _is_placeholder_el(el) -> bool:
