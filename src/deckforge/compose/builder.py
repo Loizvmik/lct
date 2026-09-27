@@ -310,6 +310,7 @@ def build_deck(
                 room=max_slides - len(spec.slides), bullet_char=bullet_char, user_photos=user_photos,
                 image_bytes=image_bytes, source_slides=source_slides, look=look,
                 avoid_looks=_crowded_looks(spec.slides, position - 1, placed_looks, by_id, diversity),
+                language=spec.language,
             )
         placed_looks.append(look_key(outcome.pattern))
         slide_spec.findings.extend(outcome.notes)
@@ -545,7 +546,30 @@ def _scratch_form(slide_spec: SlideSpec) -> str | None:
     """Форма, которую строить с нуля, если планировщик так назначил
     (`meta["scratch_form"]`) и её содержание написано. Писатель не
     справился (запасной слайд пунктами): обычная лестница."""
-    form = slide_spec.meta.get("scratch_form")
+    return _form_with_content(slide_spec, slide_spec.meta.get("scratch_form"))
+
+
+def _ladder_form(slide_spec: SlideSpec) -> str | None:
+    """Форма слайда для последней ступени лестницы: назначенная
+    планировщиком или видная по содержанию, если оно целиком из неё.
+
+    Планировщик ставит форму на родную раскладку шаблона (показатели
+    WorkSpace, команда VK Education), и `meta["scratch_form"]` тогда нет.
+    Если клон родной раскладки отклонён, обычная сборка с нуля раскладывает
+    показатели по местам под текст мелким кеглем, а таблицу теряет;
+    сборка формы с нуля строит их как надо. Слайд с чем-то кроме формы
+    идёт обычным путём: форма с нуля остальные блоки не кладёт."""
+    form = _scratch_form(slide_spec)
+    if form is not None:
+        return form
+    blocks = slide_spec.blocks
+    for block_type, name in ((KpiBlock, "kpi"), (QuoteBlock, "quote"), (TeamBlock, "team")):
+        if blocks and all(isinstance(b, block_type) for b in blocks):
+            return _form_with_content(slide_spec, name)
+    return _form_with_content(slide_spec, "table") if not blocks else None
+
+
+def _form_with_content(slide_spec: SlideSpec, form: str | None) -> str | None:
     blocks = slide_spec.blocks
     if form == "kpi" and any(isinstance(b, KpiBlock) and b.items for b in blocks):
         return form
@@ -688,6 +712,7 @@ def _place_scratch_form(
     prs, slide_spec: SlideSpec, form: str, carriers: list[Pattern], profile: TemplateProfile, canvas: Canvas,
     audit_config: AuditConfig, *, bullet_char: str, user_photos: dict[str, Path] | None,
     image_bytes: Callable[[str], bytes | None] | None, look: "TemplateLook | None", language: str | None,
+    why: str = "своей раскладки у шаблона нет",
 ) -> "LadderOutcome | None":
     """Форма с нуля на носителях по очереди, до `_MAX_LAYOUT_ATTEMPTS`:
     первый, где форма легла без находок аудита, принимается; иначе тот,
@@ -696,17 +721,22 @@ def _place_scratch_form(
     как до задачи T3)."""
     notes: list[str] = []
     best: tuple[int, int, Pattern] | None = None
-    tried = carriers[:_MAX_LAYOUT_ATTEMPTS]
-    for attempt, pattern in enumerate(tried, start=1):
+    # Предел `_MAX_LAYOUT_ATTEMPTS` считает носители, где форма легла:
+    # носитель без места отказывает сразу, и у WorkSpace первые три такие.
+    placed_count = 0
+    for attempt, pattern in enumerate(carriers, start=1):
+        if placed_count >= _MAX_LAYOUT_ATTEMPTS:
+            break
         trial = replace(slide_spec, findings=[])
         placed = place_slide(
             prs, trial, pattern, profile, audit_config, bullet_char=bullet_char, user_photos=user_photos,
             image_bytes=image_bytes, look=look, scratch_form=form, language=language,
         )
         errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index) if placed else []
+        placed_count += bool(placed)
         if placed and not errors:
             notes.extend(trial.findings)
-            return _scratch_outcome(slide_spec, form, pattern, notes)
+            return _scratch_outcome(slide_spec, form, pattern, notes, why=why)
         _remove_last_slide(prs)
         if placed:
             ids = ", ".join(sorted({f.check_id for f in errors}))
@@ -724,15 +754,17 @@ def _place_scratch_form(
         image_bytes=image_bytes, look=look, scratch_form=form, language=language,
     )
     notes.extend(trial.findings)
-    return _scratch_outcome(slide_spec, form, best[2], notes)
+    return _scratch_outcome(slide_spec, form, best[2], notes, why=why)
 
 
-def _scratch_outcome(slide_spec: SlideSpec, form: str, pattern: Pattern, notes: list[str]) -> "LadderOutcome":
+def _scratch_outcome(
+    slide_spec: SlideSpec, form: str, pattern: Pattern, notes: list[str], *, why: str = "своей раскладки у шаблона нет",
+) -> "LadderOutcome":
     slide_spec.meta["ladder_rung"] = "scratch"
     slide_spec.meta["ladder_path"] = "scratch_form"
     notes.append(
         f"Слайд {slide_spec.index}: форма «{form}» собрана с нуля на раскладке-носителе "
-        f"{pattern.pattern_id!r}: своей раскладки у шаблона нет."
+        f"{pattern.pattern_id!r}: {why}."
     )
     return LadderOutcome(pattern, notes, "scratch")
 
@@ -1042,7 +1074,9 @@ def _table_frame_box(
         if ob.right <= slot_box.left + 0.01 and ob.bottom > top and ob.top < bottom \
                 and not (ob.width >= _BACKGROUND_SHARE and ob.height >= _BACKGROUND_SHARE):
             left = max(left, ob.right + _TABLE_GAP)
-    left = min(left, slot_box.left)
+    # Таблица примера у края холста (WorkSpace, пример 14: рамка Google
+    # Slides от x=0) в поле не заходит: поле сетки остаётся левой границей.
+    left = min(left, max(slot_box.left, grid.margin_left))
     for other in obstacles:
         ob = other.box
         if ob.right <= left or ob.left >= right or ob.bottom <= top or ob.top >= bottom:
@@ -2431,6 +2465,8 @@ class _Ladder:
     look: TemplateLook | None
     # Облики, которых запасной раскладке лучше избегать (`_crowded_looks`).
     avoid_looks: frozenset[str] = frozenset()
+    # Язык колоды: кавычки цитаты, собранной с нуля (`compose.quote`).
+    language: str | None = None
     notes: list[str] = field(default_factory=list)
     failures: list[Failure] = field(default_factory=list)
     path: list[str] = field(default_factory=list)
@@ -2658,6 +2694,26 @@ class _Ladder:
         return self.done("split", pattern, tail=tail)
 
     def scratch(self) -> LadderOutcome:
+        form = _ladder_form(self.slide_spec)
+        if form is not None:
+            # Форма из `SCRATCH_FORMS`, чей клон не принят: показатели,
+            # таблицу, цитату и команду сборка строит сама на тех же
+            # кандидатах как на носителях (родная раскладка формы даёт
+            # заголовок и фирменную графику). Обычная сборка с нуля
+            # разложила бы их по местам под текст.
+            outcome = _place_scratch_form(
+                self.prs, self.slide_spec, form, self.candidates, self.profile, self.canvas, self.audit_config,
+                bullet_char=self.kw["bullet_char"], user_photos=self.kw["user_photos"],
+                image_bytes=self.kw["image_bytes"], look=self.look, language=self.language,
+                why="клон раскладки не принят",
+            )
+            if outcome is not None:
+                self.notes.extend(outcome.notes)
+                if self.path and self.path[-1] == "scratch":
+                    self.path[-1] = "scratch_form"
+                else:
+                    self.path.append("scratch_form")
+                return self.done("scratch", outcome.pattern)
         pattern = _scratch_candidates(
             self.prs, self.slide_spec, self.candidates, self.profile, self.canvas, self.audit_config, self.notes,
             bullet_char=self.kw["bullet_char"], user_photos=self.kw["user_photos"],
@@ -2682,7 +2738,7 @@ def _place_with_ladder(
     audit_config: AuditConfig, *, forms: dict, repair: SlideRepair | None, room: int, bullet_char: str,
     user_photos: dict[str, Path] | None, image_bytes: Callable[[str], bytes | None] | None,
     source_slides: dict[int, object] | None, look: TemplateLook | None = None,
-    policy: RepairPolicy | None = None, avoid_looks: frozenset[str] = frozenset(),
+    policy: RepairPolicy | None = None, avoid_looks: frozenset[str] = frozenset(), language: str | None = None,
 ) -> LadderOutcome:
     """Лестница отказов одного слайда (раздел 11), с задачи V3 зависящая
     от причины отказа (разделы 12-13 идей четвёртой редакции).
@@ -2708,7 +2764,7 @@ def _place_with_ladder(
             "bullet_char": bullet_char, "user_photos": user_photos, "image_bytes": image_bytes,
             "source_slides": source_slides,
         },
-        look=look, avoid_looks=avoid_looks,
+        look=look, avoid_looks=avoid_looks, language=language,
     )
     ladder.path.append("clone")
     first = ladder.clone_original(candidates[:1], settle=False)
@@ -2716,7 +2772,12 @@ def _place_with_ladder(
         return ladder.done("clone", first)
     can_clone = any(_clone_source(p, source_slides) for p in candidates[:_MAX_CLONE_ATTEMPTS])
     main = ladder.main = primary(ladder.failures)
-    if not can_clone or main is None:
+    if not can_clone or main is None or _ladder_form(slide_spec) is not None:
+        # Форма (показатели, таблица, цитата, команда), чью раскладку клон
+        # не принял, дальше строится с нуля (`_Ladder.scratch`): запасная
+        # раскладка из текстовых мест разложила бы показатели строками
+        # «значение — подпись» (VK Tech, пример 9), а сокращать и делить
+        # в форме нечего.
         ladder.path.append("scratch")
         return ladder.scratch()
 

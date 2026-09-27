@@ -1,8 +1,12 @@
-"""Задача T3: сборка с нуля показателей, таблицы, цитаты и команды на
-раскладке-носителе. На каждом шаблоне датасета: форма встаёт в свободное
-место носителя, без выхода за холст (L01), наложений (L02) и захода в поля
-(L06). Профиль разбирается без модели (`from_file(cache_dir=None)`),
-носитель выбирает планировщик тем же расчётом, что в пайплайне."""
+"""Задача T3: показатели, таблица, цитата и команда на каждом шаблоне
+датасета. После разбора видов (задача T1) у части шаблонов есть родная
+раскладка формы (показатели WorkSpace, цитата и команда VK Education), и
+планировщик берёт её; где нет, берёт носитель, и форму строит сборка. Тесты
+проверяют итог, а не путь: форма на слайде, крупные числа в ряд, таблица
+нарисована, у команды имена, без выхода за холст (L01), наложений (L02) и
+захода в поля (L06). Профиль разбирается без модели (`from_file(
+cache_dir=None)`), раскладку выбирает тот же расчёт, что в пайплайне
+(`candidates_for`)."""
 from __future__ import annotations
 from pathlib import Path
 
@@ -14,7 +18,7 @@ from deckforge.audit.deterministic import run_deterministic
 from deckforge.compose import builder
 from deckforge.compose.quote import quote_marks
 from deckforge.compose.team import initials, member_photos
-from deckforge.pattern.candidates import _carriers, cover_pattern_id, is_closing_pattern
+from deckforge.pattern.candidates import candidates_for, cover_pattern_id, is_closing_pattern
 from deckforge.pattern.forms import forms_of
 from deckforge.pattern.intent import SlideIntent
 from deckforge.plan.normalize import normalize_deck
@@ -60,15 +64,15 @@ def _slide(profile, form: str, index: int = 1) -> SlideSpec:
     forms = forms_of(profile)
     closing = frozenset(p.pattern_id for p in profile.patterns if is_closing_pattern(p, profile))
     intent = SlideIntent(index=index, outline_kind="data", intent="x", items=3, form=form)
-    found = _carriers(intent, form, profile, forms, position=index, last=index + 1,
-                      cover_id=cover_pattern_id(profile), closing_ids=closing)
+    found = candidates_for(intent, profile, forms, position=index, last=index + 1,
+                           cover_id=cover_pattern_id(profile), closing_ids=closing)
     kinds = {p.pattern_id: p.kind for p in profile.patterns}
     blocks, visual, headline = _FORMS[form]
     pid = found.pattern_ids[0]
     return SlideSpec(
         index=index, kind=kinds[pid], headline=headline, blocks=list(blocks), visual=visual,
         source_note="Замер пилота, январь–июнь 2026", pattern_id=pid, alternatives=tuple(found.pattern_ids[1:4]),
-        meta={"scratch_form": form},
+        meta={"scratch_form": found.scratch_form} if found.scratch_form else {},
     )
 
 
@@ -84,10 +88,15 @@ def built(request, profile_fixture):
     return spec, Presentation(str(out)), findings
 
 
-def test_forms_are_built_from_scratch_on_every_template(built):
+def test_every_form_lands_and_plain_scratch_is_not_used(built):
+    """Клон родной раскладки мог не пройти, но тогда форма строится с нуля
+    (`ladder_path` кончается на `scratch_form`), а не обычной сборкой с
+    нуля, которая раскладывала показатели мелким кеглем и теряла таблицу."""
     spec, _prs, _findings = built
     for slide in spec.slides:
-        assert slide.meta.get("ladder_path") == "scratch_form", (slide.meta, slide.findings)
+        path = slide.meta.get("ladder_path", "")
+        assert slide.meta.get("ladder_rung") != "scratch" or path.endswith("scratch_form"), (slide.meta, slide.findings)
+        assert not any("не отрисован" in f for f in slide.findings), slide.findings
 
 
 def test_no_overflow_overlap_or_margin_breach(built):
@@ -100,17 +109,28 @@ def _texts(slide) -> list[str]:
     return [s.text_frame.text for s in slide.shapes if s.has_text_frame and s.text_frame.text.strip()]
 
 
+def _paragraphs(slide):
+    """(фигура, текст абзаца, кегль первого run) по всем абзацам слайда:
+    клон кладёт значение и подпись показателя в одну фигуру двумя
+    абзацами, сборка с нуля в две фигуры."""
+    for shape in slide.shapes:
+        if not shape.has_text_frame:
+            continue
+        for p in shape.text_frame.paragraphs:
+            sizes = [r.font.size.pt for r in p.runs if r.font.size is not None]
+            yield shape, p.text, sizes[0] if sizes else None
+
+
 def test_kpi_values_are_large_and_on_one_row(built):
     _spec, prs, _findings = built
     slide = prs.slides[0]
-    values = [s for s in slide.shapes if s.has_text_frame and s.text_frame.text in {k.value for k in _KPI.items}]
-    assert len(values) == 3
-    tops = {round(s.top / 10000) for s in values}
-    assert len(tops) == 1
-    labels = [s for s in slide.shapes if s.has_text_frame and s.text_frame.text in {k.label for k in _KPI.items}]
-    value_pt = values[0].text_frame.paragraphs[0].runs[0].font.size.pt
-    label_pt = labels[0].text_frame.paragraphs[0].runs[0].font.size.pt
-    assert value_pt >= 1.5 * label_pt
+    found = list(_paragraphs(slide))
+    values = [(sh, pt) for sh, text, pt in found if text in {k.value for k in _KPI.items}]
+    labels = [(sh, pt) for sh, text, pt in found if text in {k.label for k in _KPI.items}]
+    assert len(values) >= 2 and len(values) == len(labels), [t for _s, t, _p in found]
+    assert len({round(sh.top / 10000) for sh, _pt in values}) == 1
+    assert all(v_pt is not None and l_pt is not None for (_s, v_pt), (_t, l_pt) in zip(values, labels))
+    assert min(pt for _s, pt in values) >= 1.5 * max(pt for _s, pt in labels)
 
 
 def test_table_is_drawn_in_the_free_place(built):
@@ -130,16 +150,17 @@ def test_quote_is_italic_in_language_quotes_with_author(built):
     assert shape.text_frame.paragraphs[0].runs[0].font.italic
 
 
-def test_team_cards_have_photo_or_initials(built):
+def test_team_cards_have_names_and_photo_or_initials(built):
     _spec, prs, _findings = built
     slide = prs.slides[3]
-    texts = _texts(slide)
+    texts = " \n".join(_texts(slide))
     for member in _TEAM.items:
         assert member.name in texts
-    # Фото слайда уходит первому участнику по порядку, остальным кружки.
+    # Фото слайда уходит первому участнику по порядку, остальным кружки
+    # с инициалами (или фото родного повтора шаблона, если он есть).
     pictures = [s for s in slide.shapes if s.shape_type == 13]
-    assert pictures
-    assert {"ИП", "МК", "ДО"} <= set(texts)
+    circles = {"ИП", "МК", "ДО"} <= set(_texts(slide))
+    assert pictures and (circles or len(pictures) >= len(_TEAM.items))
 
 
 def test_member_photo_found_by_caption(tmp_path):
