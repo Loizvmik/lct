@@ -15,7 +15,7 @@
 Координат в контракте нет: роли, слова, знаки, число единиц."""
 from __future__ import annotations
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from deckforge.pattern.forms import MIN_HEADLINE_CHARS, FormPart, Limit, form_of, list_item_limit
 from deckforge.pattern.style import load_style
@@ -240,6 +240,25 @@ def _chart_takes_main(intent, form) -> bool:
     return intent.required_visual == "chart" and form is not None and form.chart_tier == CHART_TIER_TEXT
 
 
+def _style_capped(slots: tuple[SlotContract, ...], policy) -> tuple[SlotContract, ...]:
+    """Предел слов стиля поверх места раскладки (`StylePolicy.max_words_per_item`):
+    visual пишет подписи в пять-восемь слов, а не абзацы, хотя место
+    карточки держит и двадцать (задача D3). Только у повтора из двух и
+    больше единиц: одиночный абзац подписью не бывает."""
+    cap = getattr(policy, "max_words_per_item", None)
+    if not cap:
+        return slots
+    out = []
+    for slot in slots:
+        if slot.block in ("cards", "bullets") and slot.count >= 2 and slot.item.max_words > cap:
+            item = slot.item
+            slot = replace(slot, item=TextSpec(
+                target_words=min(item.target_words, max(1, cap - 2)), max_words=cap, max_chars=item.max_chars,
+            ))
+        out.append(slot)
+    return tuple(out)
+
+
 def build_contract(assignment, profile, style=None) -> SlideContract:
     """Контракт одного слайда из назначения планировщика."""
     intent = assignment.intent
@@ -263,7 +282,10 @@ def build_contract(assignment, profile, style=None) -> SlideContract:
         pattern_id=assignment.pattern_id,
         kind=assignment.kind,
         headline=_headline_spec(form),
-        slots=tuple(_content_slots(intent, form)) if not intent.divider and not _chart_takes_main(intent, form) else (),
+        slots=_style_capped(
+            tuple(_content_slots(intent, form)) if not intent.divider and not _chart_takes_main(intent, form) else (),
+            policy,
+        ),
         subhead=TextSpec.of(form.subhead) if form is not None and form.subhead is not None and not intent.divider else None,
         evidence=tuple(intent.needs),
         required_visual=intent.required_visual,
@@ -385,12 +407,13 @@ def contract_fill(slide: SlideSpec, contract: SlideContract) -> tuple[int, int]:
     return ok, total
 
 
-def plan_contracts(outline_or_intents, profile, style, *, beam_width: int | None = None):
+def plan_contracts(outline_or_intents, profile, style, *, beam_width: int | None = None, taken=None):
     """Раскладки на всю колоду стиля и контракты под них: один вызов на
-    стиль для пайплайна (CLI, API). Без модели, миллисекунды."""
+    стиль для пайплайна (CLI, API). Без модели, миллисекунды. `taken`:
+    облики соседей по пакету (`pattern.planner.plan_patterns`)."""
     from deckforge.pattern.planner import DEFAULT_BEAM_WIDTH, plan_patterns
 
     assignments = plan_patterns(
-        outline_or_intents, profile, style, beam_width=beam_width or DEFAULT_BEAM_WIDTH,
+        outline_or_intents, profile, style, beam_width=beam_width or DEFAULT_BEAM_WIDTH, taken=taken,
     )
     return assignments, build_contracts(assignments, profile, style)

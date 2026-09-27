@@ -62,6 +62,18 @@ class SlideIntent:
     # есть, чтобы числа графика и таблицы были числами источника, а не
     # пересказом модели.
     visual_intent: object | None = field(default=None, compare=False)
+    # Номера пунктов структуры, которые слайд покрывает, если стиль слил
+    # соседние пункты в один слайд (`pattern.shape`, dense). Пусто: один
+    # пункт `index`. Нужны метрике различимости пакета: стили сравниваются
+    # по пункту содержания, а не по номеру слайда, иначе разделители airy
+    # и слияния dense сдвигали бы позиции и совпадения терялись бы даром.
+    covers: tuple[int, ...] = ()
+
+    @property
+    def outline_indices(self) -> tuple[int, ...]:
+        if self.divider:
+            return ()
+        return self.covers or (self.index,)
 
     @property
     def is_hero(self) -> bool:

@@ -87,7 +87,7 @@ def to_html(
     deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
     *, visual: "VisualAuditResult | AuditReport | None" = None,
     budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
-    fidelity: "FidelityReport | None" = None,
+    fidelity: "FidelityReport | None" = None, distinct: dict | None = None,
 ) -> Path:
     """Собирает `out` — единый `.html` без внешних запросов. Возвращает `out`
     (интерфейс брифа); подробности деградаций — `to_html_report` ниже, для
@@ -110,7 +110,7 @@ def to_html(
     шаблону), тоже необязательный — см. `_fidelity_html`."""
     return to_html_report(
         deck_spec, profile, pptx_path, out, visual=visual, budget=budget, risky_slides=risky_slides,
-        fidelity=fidelity,
+        fidelity=fidelity, distinct=distinct,
     ).path
 
 
@@ -118,7 +118,7 @@ def to_html_report(
     deck_spec: DeckSpec, profile: TemplateProfile, pptx_path: Path, out: Path,
     *, visual: "VisualAuditResult | AuditReport | None" = None,
     budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
-    fidelity: "FidelityReport | None" = None,
+    fidelity: "FidelityReport | None" = None, distinct: dict | None = None,
 ) -> HtmlExportResult:
     pptx_path = Path(pptx_path)
     out = Path(out)
@@ -154,7 +154,7 @@ def to_html_report(
     document = _wrap_document(
         deck_spec, profile, canvas, slides_html, fonts_css,
         deck_score=deck_score, content_avg=content_avg, design_avg=design_avg,
-        budget=budget, risky_slides=risky_slides, fidelity=fidelity,
+        budget=budget, risky_slides=risky_slides, fidelity=fidelity, distinct=distinct,
     )
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(document, encoding="utf-8")
@@ -1139,11 +1139,28 @@ def _ladder_html(deck_spec: DeckSpec) -> str:
     return f'<div id="build-ladder">{_esc(text)}</div>'
 
 
+def _distinct_html(distinct: dict | None) -> str:
+    """Задача D3: насколько варианты пакета различимы (`pattern.distinct`):
+    по парам стилей доля пунктов содержания с одним обликом раскладки и
+    число обликов у каждого стиля. Пусто у одиночного задания."""
+    if not distinct or not distinct.get("pairs"):
+        return ""
+    pairs = ", ".join(
+        f"{name} {round(100 * p['overlap'])}% ({p['same']} из {p['positions']})"
+        for name, p in distinct["pairs"].items()
+    )
+    looks = ", ".join(f"{style} {n}" for style, n in (distinct.get("unique_looks") or {}).items())
+    verdict = "в цели" if distinct.get("ok") else "выше цели"
+    limit = round(100 * float(distinct.get("limit", 0.4)))
+    text = f"Различие вариантов: совпадение раскладок {pairs}; {verdict} {limit}%. Разных раскладок: {looks}"
+    return f'<div id="batch-distinct">{_esc(text)}</div>'
+
+
 def _wrap_document(
     deck_spec: DeckSpec, profile: TemplateProfile, canvas: Canvas, slides_html: list[str], fonts_css: str,
     *, deck_score: dict | None = None, content_avg: float | None = None, design_avg: float | None = None,
     budget: dict | None = None, risky_slides: dict[int, dict] | None = None,
-    fidelity: "FidelityReport | None" = None,
+    fidelity: "FidelityReport | None" = None, distinct: dict | None = None,
 ) -> str:
     width_px = round(canvas.width_in * 96)
     height_px = round(canvas.height_in * 96)
@@ -1155,6 +1172,7 @@ def _wrap_document(
     run_budget_html = _run_budget_html(budget, risky_slides)
     fidelity_html = _fidelity_html(fidelity)
     ladder_html = _ladder_html(deck_spec)
+    distinct_html = _distinct_html(distinct)
 
     return f"""<!DOCTYPE html>
 <html lang="{_esc(lang)}">
@@ -1246,6 +1264,14 @@ body.overview #template-fidelity {{ display: block; }}
   padding: 4px 10px; border-radius: 12px;
 }}
 body.overview #build-ladder {{ display: block; }}
+/* Задача D3: различимость вариантов пакета, под лестницей сборки. */
+#batch-distinct {{
+  display: none; position: fixed; left: 16px; top: 140px; z-index: 10;
+  max-width: min(70vw, 640px);
+  font: 12px var(--font-fallback); color: #fff; background: rgba(0,0,0,.55);
+  padding: 4px 10px; border-radius: 12px;
+}}
+body.overview #batch-distinct {{ display: block; }}
 /* Задача V3: почему слайд собран не клоном, только в режиме обзора. */
 .slide-ladder {{
   display: none; position: absolute; left: 8px; bottom: 8px; z-index: 4; max-width: 90%;
@@ -1304,7 +1330,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 }}
 @media print {{
   html, body {{ background: #fff; }}
-  #hud, #help, #deck-score, #run-budget, #template-fidelity {{ display: none !important; }}
+  #hud, #help, #deck-score, #run-budget, #template-fidelity, #batch-distinct {{ display: none !important; }}
   body.overview #grid {{ display: none !important; }}
   #viewport {{ position: static; display: block; }}
   #stage {{ display: none; }}
@@ -1325,6 +1351,7 @@ body.overview #grid {{ display: grid; grid-template-columns: repeat(auto-fill, m
 {run_budget_html}
 {fidelity_html}
 {ladder_html}
+{distinct_html}
 <div id="grid"></div>
 <div class="print-pages" aria-hidden="true">
 {slides_joined}

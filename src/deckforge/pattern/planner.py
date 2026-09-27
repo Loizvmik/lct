@@ -11,6 +11,7 @@
 Детерминированно и без модели: одинаковые входы дают одну колоду, поиск на
 15 слайдах и 40 раскладках занимает миллисекунды (раздел 7.3)."""
 from __future__ import annotations
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 from deckforge.pattern.candidates import (
@@ -113,13 +114,33 @@ def _as_intents(outline_or_intents) -> list[SlideIntent]:
     return intents_from_outline(outline_or_intents)
 
 
+def _batch_penalty(intent: SlideIntent, look: str, taken: Mapping[int, set[str]] | None, policy: StylePolicy) -> float:
+    """Штраф за облик, который сосед по пакету уже поставил на тот же пункт
+    содержания (задача D3). Героические слайды не штрафуются: обложка и
+    финал заданы шаблоном, и совпадать им положено. Слайды с графиком или
+    таблицей тоже: место под них выбирает качество места
+    (`scoring.chart_fit`), и отнять у visual родной график примера ради
+    различия значило бы показать числа хуже."""
+    if not taken or intent.is_hero or intent.required_visual in ("chart", "table"):
+        return 0.0
+    if any(look in taken.get(i, ()) for i in intent.outline_indices):
+        return policy.weight("batch_overlap")
+    return 0.0
+
+
 def plan_patterns(
     outline, profile, style, *, beam_width: int = DEFAULT_BEAM_WIDTH, policy: StylePolicy | None = None,
+    taken: Mapping[int, set[str]] | None = None,
 ) -> list[PatternAssignment]:
     """Раскладка на каждый слайд колоды стиля `style`. `outline`:
     `plan.outline.Outline` или готовый список `SlideIntent` (с фото).
     Разделители airy добавляются здесь: им тоже нужна раскладка, и повтор
-    у них считается наравне с остальными."""
+    у них считается наравне с остальными.
+
+    `taken`: облики раскладок, которые соседние стили пакета уже назначили
+    пунктам структуры (номер пункта -> облики, `batch_looks`). Совпадение
+    по пункту штрафуется весом `batch_overlap`: три варианта одного
+    содержания обязаны различаться глазом, а не только словами."""
     policy = policy or load_style(style)
     intents = _as_intents(outline)
     cover_id = cover_pattern_id(profile)
@@ -150,6 +171,7 @@ def plan_patterns(
     # ниже `TIGHT_OVERFLOW`): только они считаются альтернативой, ради
     # которой разнообразие запрещает повтор.
     roomy: list[set[str]] = []
+    looks = {pid: look_key(p) for pid, p in patterns.items()}
     for position, intent in enumerate(intents):
         found = candidates_for(
             intent, profile, forms, position=position, last=last, cover_id=cover_id, closing_ids=closing_ids,
@@ -158,7 +180,7 @@ def plan_patterns(
             (pid, static_cost(
                 intent, patterns[pid], forms[pid], policy, position=position, last=last,
                 cover_id=cover_id, closing_ids=closing_ids,
-            ))
+            ) + _batch_penalty(intent, looks[pid], taken, policy))
             for pid in found.pattern_ids
         ]
         scored.sort(key=lambda pair: (pair[1], pair[0]))
@@ -169,7 +191,6 @@ def plan_patterns(
     # Повтор считается по облику раскладки, а не по `pattern_id` (задача
     # V2, `scoring.look_key`): два примера с одной геометрией для глаза одна
     # раскладка.
-    looks = {pid: look_key(p) for pid, p in patterns.items()}
     beams = [_Beam(cost=0.0, ids=(), uses={})]
     width = max(1, beam_width)
     for scored, fits in zip(per_slide, roomy):
@@ -291,3 +312,50 @@ def _same_form_alternatives(
 def _has_chart(slide) -> bool:
     visual = getattr(slide, "visual", None)
     return visual is not None and visual.kind == "chart" and visual.chart is not None
+
+
+def batch_looks(assignments: list[PatternAssignment], profile) -> dict[int, set[str]]:
+    """Облики раскладок колоды по пунктам структуры: вход `taken` для
+    следующего стиля пакета. Героические слайды не входят: им совпадать
+    положено (`_batch_penalty`)."""
+    patterns = {p.pattern_id: p for p in profile.patterns}
+    out: dict[int, set[str]] = {}
+    for a in assignments:
+        if a.intent.is_hero or a.pattern_id not in patterns:
+            continue
+        look = look_key(patterns[a.pattern_id])
+        for i in a.intent.outline_indices:
+            out.setdefault(i, set()).add(look)
+    return out
+
+
+def merge_looks(*maps: Mapping[int, set[str]]) -> dict[int, set[str]]:
+    out: dict[int, set[str]] = {}
+    for m in maps:
+        for i, looks in m.items():
+            out.setdefault(i, set()).update(looks)
+    return out
+
+
+# Порядок планирования стилей пакета: каждый следующий видит облики
+# предыдущих. Плотный первым: у него меньше всего свободы (таблицы и
+# колонки под много единиц), визуальный последним: у него больше всего
+# нарядных раскладок на выбор.
+BATCH_ORDER = ("dense", "airy", "visual")
+
+
+def plan_batch(
+    intents_by_style: Mapping[str, list[SlideIntent]], profile, *, beam_width: int = DEFAULT_BEAM_WIDTH,
+) -> dict[str, list[PatternAssignment]]:
+    """Раскладки для нескольких стилей одного пакета, по очереди
+    `BATCH_ORDER`: каждый стиль штрафуется за облики соседей на тех же
+    пунктах. Для CLI и тестов; API делает то же по заданиям
+    (`api.jobs.PlanShare`)."""
+    order = [s for s in BATCH_ORDER if s in intents_by_style]
+    order += [s for s in intents_by_style if s not in order]
+    taken: dict[int, set[str]] = {}
+    out: dict[str, list[PatternAssignment]] = {}
+    for style in order:
+        out[style] = plan_patterns(intents_by_style[style], profile, style, beam_width=beam_width, taken=taken)
+        taken = merge_looks(taken, batch_looks(out[style], profile))
+    return out

@@ -26,7 +26,11 @@ from deckforge.audit.report import AuditReport
 from deckforge.audit.visual import run_visual
 from deckforge.compose.builder import LADDER_TITLES, build_deck, count_embedded_photos, ladder_counts
 from deckforge.pattern.intent import intents_from_outline
-from deckforge.plan.contracts import plan_contracts
+from deckforge.plan.contracts import build_contracts, plan_contracts
+from deckforge.pattern.distinct import distinctness, slide_looks
+from deckforge.pattern.planner import plan_batch
+from deckforge.pattern.shape import shape_for_style
+from deckforge.plan.data_types import visual_intents
 from deckforge.plan.outline import build_outline, load_content_pack, outline_to_dict
 from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_photos
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
@@ -270,6 +274,19 @@ def _cmd_generate(args: argparse.Namespace) -> int:
         photos=photos, photo_report=photo_report, sources=sources,
         writer_max_workers=writer_max_workers, metrics=getattr(args, "metrics", None),
     )
+    # Задача D3: раскладки всех стилей назначаются до параллельной части,
+    # по очереди dense, airy, visual: каждый следующий платит за облики,
+    # которые соседи поставили на те же пункты. Миллисекунды, без модели.
+    shaped = {
+        style.value: shape_for_style(intents, style.value, visual_intents(sources), profile=profile) for style in styles
+    }
+    ctx["planned"] = plan_batch(shaped, profile)
+    distinct = distinctness({name: slide_looks(plan, profile) for name, plan in ctx["planned"].items()}) \
+        if len(styles) > 1 else None
+    ctx["distinct"] = distinct
+    if distinct is not None:
+        pairs = ", ".join(f"{k} {v['overlap']:.0%}" for k, v in distinct["pairs"].items())
+        print(f"Различие вариантов по раскладкам: {pairs}; обликов {distinct['unique_looks']}")
     with ThreadPoolExecutor(max_workers=len(styles)) as pool:
         futures = [pool.submit(_generate_variant, style, budgets[style], ctx) for style in styles]
         outputs = [future.result() for future in futures]
@@ -349,7 +366,11 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
     out: list[str] = []
 
     step_started = time.monotonic()
-    assignments, contracts = plan_contracts(ctx["intents"], profile, variant)
+    planned = (ctx.get("planned") or {}).get(variant.value)
+    if planned is not None:
+        assignments, contracts = planned, build_contracts(planned, profile, variant)
+    else:
+        assignments, contracts = plan_contracts(ctx["intents"], profile, variant)
     planned_at = time.monotonic()
     budget.record("plan", planned_at - step_started)
     unique = len({a.pattern_id for a in assignments if a.pattern_id})

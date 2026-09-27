@@ -62,6 +62,13 @@ def overflow(intent: SlideIntent, form: PatternForm, style: StylePolicy) -> floa
     count = min(needs, units) or 1
     limit = list_item_limit(main, count)
     floor = style.min_words_per_item
+    if intent.outline_kind in style.label_kinds:
+        # Подписи (задача D3): мерка места та, что клон примет ужатым
+        # кеглем, а не родным: замер клона таймлайна дал родному кеглю
+        # ноль слов, а два слова события клон принимает.
+        floor = style.label_words
+        per_unit = limit.max_words
+        return unit_gap + (max(0.0, (floor - per_unit) / floor) if floor and per_unit else 0.0)
     if limit.native_words is not None:
         per_unit = limit.native_words
         floor = max(floor, NATIVE_SHARE * style.words_per_item)
@@ -93,6 +100,10 @@ def matches(token: str, form: PatternForm) -> bool:
         return form.has_chart or form.has_table or is_chart_frame(form)
     if token == "diagram":
         return form.repeated and form.decor >= max(form.units, 1)
+    if token == "timeline":
+        # Длинный ряд с точкой или засечкой на каждую единицу: таймлайн
+        # или Гант (VK Education, примеры 42 и 43), а не сетка карточек.
+        return form.repeated and form.units >= 5 and form.decor >= form.units
     if token == "image":
         return form.kind == "image" or form.has_image
     if token in ("cards", "kpi", "quote", "bullets"):
@@ -103,11 +114,12 @@ def matches(token: str, form: PatternForm) -> bool:
 def style_mismatch(intent: SlideIntent, form: PatternForm, style: StylePolicy) -> float:
     """0 для первого предпочтения стиля, до 0,5 для последнего, 1 вне
     списка. Героические слайды стиль не оценивает: у них одна форма."""
-    if intent.is_hero or not style.prefer:
+    prefer = style.prefer_of(intent.outline_kind)
+    if intent.is_hero or not prefer:
         return 0.0
-    for i, token in enumerate(style.prefer):
+    for i, token in enumerate(prefer):
         if matches(token, form):
-            return 0.5 * i / len(style.prefer)
+            return 0.5 * i / len(prefer)
     return 1.0
 
 
