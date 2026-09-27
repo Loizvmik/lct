@@ -18,6 +18,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from deckforge.template.patterns import (
+    decor_share,
     CHART_TIER_TEXT, CHARS_PER_WORD, chart_target_slot, keeps_sample_text, slot_char_capacity,
 )
 
@@ -290,20 +291,10 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
         chart_tier=_chart_tier(pattern, parts),
         slide_class=getattr(pattern, "slide_class", "content_pattern"),
         code_tier=code_tier, code_lines=code_lines,
-        decor_share=_decor_share(pattern.decor),
+        decor_share=decor_share(pattern.decor),
         unit_decor=any(getattr(d, "repeat_group", False) for d in pattern.decor),
     )
 
-
-# Фон во весь слайд декором не считается: он есть почти у каждой раскладки.
-_BACKDROP_SHARE = 0.9
-
-
-def _decor_share(decor) -> float:
-    return sum(
-        d.box.width * d.box.height for d in decor
-        if not (d.box.width >= _BACKDROP_SHARE and d.box.height >= _BACKDROP_SHARE)
-    )
 
 
 def code_target_slot(pattern, parts=None):

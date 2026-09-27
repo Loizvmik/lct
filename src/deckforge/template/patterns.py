@@ -124,6 +124,21 @@ _IMPERATIVE_RE = re.compile(r"\w+(?:ите|йте|ьте)")
 _WORD_RE = re.compile(r"\w+(?:-\w+)*")
 
 
+# Фон во весь слайд декором не считается: он есть почти у каждой раскладки.
+_BACKDROP_SHARE = 0.9
+
+
+def decor_share(decor) -> float:
+    """Доля холста под декором раскладки без фона во весь слайд: мерка
+    «тяжести» графики для выбора носителя формы с нуля
+    (`pattern.candidates.has_light_decor`). Здесь, а не в `pattern/`: слой
+    планировщика координат не знает."""
+    boxes = [b for b in (getattr(d, "box", None) for d in decor) if b is not None]
+    return sum(
+        b.width * b.height for b in boxes if not (b.width >= _BACKDROP_SHARE and b.height >= _BACKDROP_SHARE)
+    )
+
+
 def is_fixed_phrase(text: str | None) -> bool:
     """Может ли текст примера быть постоянным текстом шаблона, а не
     подсказкой дизайнера или рыбой. Общая проверка для схемы слотов
