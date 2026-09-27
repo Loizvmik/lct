@@ -40,11 +40,12 @@ from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.findings import Finding
-from deckforge.compose.builder import build_deck, ladder_counts
+from deckforge.compose.builder import build_deck, count_embedded_photos, ladder_counts
 from deckforge.export.bundle import export_bundle
 from deckforge.pattern.intent import intents_from_outline
 from deckforge.plan.contracts import plan_contracts
 from deckforge.plan.outline import Outline, SourceDoc, build_outline, outline_to_dict
+from deckforge.plan.photos import ContentPhoto, PhotoAssignmentReport, assign_photos_to_outline
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import GenerationStyle, Variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, WriteClock, write_slides
@@ -77,10 +78,58 @@ DONE_WITH_WARNINGS = "done_with_warnings"
 # перерисовку HTML-отчёта с оценками модели.
 VISUAL_AUDIT_TAIL_SECONDS = 5.0
 
+# Фотографии пользователя через API (задача D2): те же форматы, что умеет
+# вставлять сборка (`plan.photos._PHOTO_EXTENSIONS`), и пределы, при которых
+# одна загрузка не забивает диск и память процесса.
+MAX_PHOTOS_PER_UPLOAD = 10
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
+_PHOTO_FORMATS = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG"}
+
 
 class JobError(ValueError):
     """Ошибка, чей текст безопасно показать пользователю API как есть
     (400/404) — не голое исключение из глубины пайплайна."""
+
+
+class PhotoRejected(JobError):
+    """Файл фотографии отвергнут до сохранения. `status` отличает «слишком
+    большой» (413) от «не та картинка» (415) и «слишком много» (400):
+    интерфейсу так проще сказать человеку, что именно поправить."""
+
+    def __init__(self, message: str, status: int) -> None:
+        super().__init__(message)
+        self.status = status
+
+
+def _safe_photo_name(filename: str) -> str:
+    """Имя файла без каталогов: имя приходит от клиента и не вправе
+    выбирать, куда на диске лечь."""
+    name = Path((filename or "").replace("\\", "/")).name.strip()
+    return name if name and name not in (".", "..") else "photo.jpg"
+
+
+def _checked_photo(filename: str, data: bytes) -> str:
+    """Формат фото (PNG/JPEG) или `PhotoRejected`. Проверяются и
+    расширение, и содержимое: сборка вставляет байты как есть, и файл с
+    чужим расширением сломал бы её уже после минут генерации."""
+    import PIL.Image
+
+    if len(data) > MAX_PHOTO_BYTES:
+        raise PhotoRejected(
+            f"Фотография {filename!r} больше {MAX_PHOTO_BYTES // (1024 * 1024)} МБ.", 413,
+        )
+    wanted = _PHOTO_FORMATS.get(Path(filename or "").suffix.lower())
+    if wanted is None:
+        raise PhotoRejected(f"Фотография {filename!r}: нужен файл .jpg или .png.", 415)
+    try:
+        with PIL.Image.open(BytesIO(data)) as image:
+            actual = image.format
+            image.verify()
+    except Exception as exc:  # noqa: BLE001 — любой сбой разбора значит «не картинка»
+        raise PhotoRejected(f"Фотография {filename!r} не читается как картинка.", 415) from exc
+    if actual != wanted:
+        raise PhotoRejected(f"Фотография {filename!r}: расширение не совпадает с содержимым ({actual}).", 415)
+    return actual
 
 
 def finding_id(finding: Finding) -> str:
@@ -177,6 +226,17 @@ class TemplateRecord:
 
 
 @dataclass
+class PhotoRecord:
+    """Загруженная фотография (`POST /api/photos`). `name` исходное имя
+    файла: планировщик фото видит его как подсказку о содержимом, так же
+    как имя файла в `photos/` контент-пакета CLI."""
+    photo_id: str
+    name: str
+    path: Path
+    caption: str | None = None
+
+
+@dataclass
 class VariantState:
     variant: Variant
     deck_spec: DeckSpec
@@ -233,6 +293,9 @@ class JobRecord:
     # ключом стиля, та же форма `{стиль: сводка}`, что читает интерфейс.
     budget: RunBudget | None = None
     visual_audit: dict[str, dict] | None = None
+    # Задача D2: сколько фото пришло, сколько распределил планировщик и
+    # сколько физически легло в файл; `None`, если задание без фото.
+    photos: dict | None = None
     _subscribers: list[asyncio.Queue] = field(default_factory=list)
     _stage_started: float | None = None
 
@@ -265,6 +328,7 @@ class JobRecord:
             "outcome": outcome,
             "warnings": warnings,
             "visual_audit": self.visual_audit,
+            "photos": self.photos,
             # Задача R: находки, которые автопочинка не трогает, потому что
             # нужен другой текст или другая раскладка, по вариантам.
             "structural": {
@@ -345,8 +409,9 @@ class OutlineShare:
         self._task: asyncio.Future | None = None
         self._owner: str | None = None
 
-    async def get(self, job_id: str, compute) -> tuple[Outline, bool]:
-        """Структура и признак «получена готовой» (не этим заданием)."""
+    async def get(self, job_id: str, compute) -> tuple[object, bool]:
+        """Результат `compute` (структура и распределение фото по ней) и
+        признак «получен готовым» (не этим заданием)."""
         if self._task is None:
             self._owner = job_id
             self._task = asyncio.ensure_future(compute())
@@ -362,6 +427,7 @@ class JobStore:
         self.root = root if root is not None else _artifacts_root()
         self.templates: dict[str, TemplateRecord] = {}
         self.jobs: dict[str, JobRecord] = {}
+        self.photos: dict[str, PhotoRecord] = {}
 
     # -- шаблоны -----------------------------------------------------
 
@@ -396,6 +462,58 @@ class JobStore:
             raise JobError(f"Шаблон {template_id!r} не найден.")
         return record
 
+    # -- фотографии ----------------------------------------------------
+
+    def save_photos(self, files: list[tuple[str, bytes]], captions: list[str | None]) -> list[PhotoRecord]:
+        """Проверить и сохранить пачку фотографий. Сначала проверяется вся
+        пачка, потом пишется на диск: отказ на пятом файле не должен
+        оставлять четыре сохранённых, о которых клиент не узнает."""
+        if not files:
+            raise PhotoRejected("Не прислано ни одной фотографии.", 400)
+        if len(files) > MAX_PHOTOS_PER_UPLOAD:
+            raise PhotoRejected(
+                f"Фотографий {len(files)}, а за одну загрузку можно не больше {MAX_PHOTOS_PER_UPLOAD}.", 400,
+            )
+        checked = []
+        for name, data in files:
+            _checked_photo(name, data)
+            checked.append((_safe_photo_name(name), data))
+        records = []
+        for i, (name, data) in enumerate(checked):
+            photo_id = uuid4().hex
+            pdir = self.root / "photos" / photo_id
+            pdir.mkdir(parents=True, exist_ok=True)
+            path = pdir / name
+            path.write_bytes(data)
+            caption = ((captions[i] if i < len(captions) else None) or "").strip() or None
+            record = PhotoRecord(photo_id=photo_id, name=name, path=path, caption=caption)
+            self.photos[photo_id] = record
+            records.append(record)
+        return records
+
+    def resolve_photos(self, refs: list[dict] | None) -> list[ContentPhoto]:
+        """Ссылки задания `{photo_id, caption?}` в `ContentPhoto`, как их
+        читает CLI из `photos/` контент-пакета. Подпись из задания главнее
+        подписи при загрузке: человек мог поправить её уже после. Имя фото
+        для модели уникально в пределах задания: две `IMG_0001.jpg` с
+        разных телефонов иначе стали бы одной."""
+        photos: list[ContentPhoto] = []
+        taken: set[str] = set()
+        for ref in refs or []:
+            record = self.photos.get(ref["photo_id"])
+            if record is None:
+                raise JobError(f"Фотография {ref['photo_id']!r} не найдена: загрузите её заново.")
+            name = record.name
+            stem, suffix = Path(name).stem, Path(name).suffix
+            n = 2
+            while name in taken:
+                name = f"{stem}-{n}{suffix}"
+                n += 1
+            taken.add(name)
+            caption = (ref.get("caption") or "").strip() or record.caption
+            photos.append(ContentPhoto(name=name, path=record.path, caption=caption))
+        return photos
+
     # -- задания -------------------------------------------------------
 
     def create_job(
@@ -403,10 +521,12 @@ class JobStore:
         language: str, target_slides: int | None, autofix: bool,
         style: str | GenerationStyle = GenerationStyle.dense,
         batch_id: str | None = None, outline_share: OutlineShare | None = None,
+        photos: list[dict] | None = None,
     ) -> JobRecord:
         """Одно задание, одна презентация одного стиля. Без `outline_share`
         задание считает структуру само."""
         template = self.get_template(template_id)
+        content_photos = self.resolve_photos(photos)
         try:
             chosen = GenerationStyle.parse(style)
         except ValueError as exc:
@@ -423,6 +543,7 @@ class JobStore:
             job=job, template=template, brief=brief, sources=sources, title=title,
             language=language, target_slides=target_slides, autofix=autofix,
             outline_share=outline_share if outline_share is not None else OutlineShare(),
+            photos=content_photos,
         ))
         return job
 
@@ -440,6 +561,7 @@ class JobStore:
         except ValueError as exc:
             raise JobError(str(exc)) from exc
         self.get_template(job_args["template_id"])
+        self.resolve_photos(job_args.get("photos"))
         batch_id = uuid4().hex
         share = OutlineShare()
         jobs = [
@@ -472,6 +594,7 @@ class JobStore:
 async def _run_job(
     *, job: JobRecord, template: TemplateRecord, brief: str, sources: list[str], title: str | None,
     language: str, target_slides: int | None, autofix: bool, outline_share: OutlineShare,
+    photos: list[ContentPhoto] | None = None,
 ) -> None:
     # Бюджет задания создаётся первым делом: пять минут ТЗ считаются от
     # начала генерации, всё, что было до (загрузка и разбор шаблона),
@@ -487,16 +610,34 @@ async def _run_job(
         job.enter_stage("outline")
         source_docs = [SourceDoc(name=f"source-{i + 1}.md", text=text) for i, text in enumerate(sources)]
 
-        async def compute_outline() -> Outline:
-            return await asyncio.to_thread(
+        photos = photos or []
+
+        async def compute_outline() -> tuple[Outline, dict, PhotoAssignmentReport]:
+            outline = await asyncio.to_thread(
                 build_outline, brief, source_docs, profile,
                 _in_budget(_build_role_provider("outline"), "outline", job.budget), target_slides,
                 title=title or "Презентация", language=language,
             )
+            # Фото распределяются по пунктам структуры до раскладок, как в
+            # CLI: слайду с фото планировщик обязан дать место под картинку.
+            # Один вызов модели на пакет, поэтому внутри общего расчёта.
+            started = job.budget.clock()
+            photo_llm = (
+                _in_budget(_build_role_provider("photo_picker"), "photo_picker", job.budget) if photos else None
+            )
+            by_slide, report = await asyncio.to_thread(assign_photos_to_outline, outline, photos, photo_llm)
+            if photos:
+                job.budget.record("photos", job.budget.clock() - started)
+            return outline, by_slide, report
 
-        outline, reused = await outline_share.get(job.job_id, compute_outline)
+        (outline, photo_by_slide, photo_report), reused = await outline_share.get(job.job_id, compute_outline)
         if reused:
             job.budget.mark_reused("outline")
+        if photos:
+            job.photos = {
+                "sent": len(photos), "planned": photo_report.placed_count, "embedded": None,
+                "notes": list(photo_report.notes),
+            }
 
         # Структура на диск рядом с результатом задания; план стиля
         # (раскладки и текст) ляжет в `<стиль>/deck.json`.
@@ -515,6 +656,7 @@ async def _run_job(
         job.enter_stage("write")
         await _run_variant(
             job, style, outline, profile, template.path, source_docs, config, autofix, job.budget,
+            photo_by_slide=photo_by_slide, user_photos={p.name: p.path for p in photos},
         )
 
         # Ярлык на последний прогон рядом с каталогами заданий: их имена —
@@ -542,6 +684,8 @@ async def _run_job(
 async def _run_variant(
     job: JobRecord, variant: Variant, outline: Outline, profile: TemplateProfile, template_path: Path,
     sources: list[SourceDoc], config: AuditConfig, autofix: bool, budget: RunBudget,
+    *, photo_by_slide: dict[int, tuple[str, str | None]] | None = None,
+    user_photos: dict[str, Path] | None = None,
 ) -> None:
     """Всё после структуры для стиля задания, в бюджете задания: раскладки
     на всю колоду (`pattern.plan_patterns`, миллисекунды, без модели),
@@ -551,7 +695,7 @@ async def _run_variant(
     `after_compose` перед аудитом по картинке."""
     started = budget.clock()
     _assignments, contracts = await asyncio.to_thread(
-        plan_contracts, intents_from_outline(outline), profile, variant,
+        plan_contracts, intents_from_outline(outline, photo_by_slide), profile, variant,
     )
     budget.record("plan", budget.clock() - started)
 
@@ -585,7 +729,7 @@ async def _run_variant(
     # текстом под контракт раскладки; модель зовёт починка, не сборка.
     repairer = repairer_for(budget, profile, _build_writer(), sources, variant, total=len(variant_deck.slides))
     built_path = await asyncio.to_thread(
-        build_deck, variant_deck, profile, template_path, variant, repair=repairer,
+        build_deck, variant_deck, profile, template_path, variant, repair=repairer, user_photos=user_photos,
     )
     dest_dir = job.dir / variant.value
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -603,6 +747,13 @@ async def _run_variant(
     except Exception:  # noqa: BLE001 — отладочный артефакт не вправе ронять генерацию
         pass
     job.variants[variant.value] = VariantState(variant=variant, deck_spec=variant_deck, pptx_path=dest)
+    if user_photos and job.photos is not None:
+        # Факт по байтам файла, не план распределения: раскладка могла не
+        # дать слота, и тогда фото честно не легло (`count_embedded_photos`).
+        embedded = await asyncio.to_thread(count_embedded_photos, dest, user_photos)
+        job.photos["embedded"] = embedded
+        if embedded < len(user_photos):
+            budget.warn(f"фотографий на слайдах {embedded} из {len(user_photos)} присланных")
     budget.record("compose", budget.clock() - started)
 
     budget.decide_mode("after_compose")

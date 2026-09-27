@@ -26,6 +26,26 @@ class ProfileResponse(BaseModel):
     profile: dict
 
 
+class PhotoRef(BaseModel):
+    """Фотография задания: `photo_id` из `POST /api/photos` и подпись,
+    если человек поправил её после загрузки."""
+
+    photo_id: str
+    caption: str | None = Field(None, max_length=300)
+
+
+class UploadedPhoto(BaseModel):
+    photo_id: str
+    name: str
+    caption: str | None = None
+    # URL файла под `/artifacts/`, для превью в интерфейсе.
+    url: str
+
+
+class PhotoUploadResponse(BaseModel):
+    photos: list[UploadedPhoto]
+
+
 class DeckInput(BaseModel):
     """Поля, общие для одного задания и пакета стилей."""
 
@@ -40,6 +60,9 @@ class DeckInput(BaseModel):
     # экран выбора в интерфейсе остаётся для случая, когда человек хочет
     # вмешаться (см. `POST /api/decks/{id}/fix`).
     autofix: bool = True
+    # Задача D2: фотографии пользователя, тот же путь, что `photos/`
+    # контент-пакета в CLI. Без них поведение прежнее.
+    photos: list[PhotoRef] = Field(default_factory=list, max_length=10)
 
 
 class DeckCreateRequest(DeckInput):
@@ -91,6 +114,9 @@ class JobResponse(BaseModel):
     # запасным путём. `status` при этом "done": интерфейс ждёт ровно его.
     outcome: Literal["done", "done_with_warnings"] | None = None
     warnings: list[str] = Field(default_factory=list)
+    # Задача D2: `{sent, planned, embedded, notes}` у задания с фото:
+    # сколько пришло, сколько распределил планировщик, сколько легло в файл.
+    photos: dict | None = None
 
 
 class FindingModel(BaseModel):

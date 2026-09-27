@@ -46,6 +46,8 @@ def test_rejected_template_gives_a_readable_error(client: TestClient) -> None:
 def test_generation_reports_progress_by_stage(job_result: dict) -> None:
     assert job_result["status"] == "done", job_result
     assert job_result["stages"] == STAGES_IN_ORDER
+    # Задание без фото: сводки фото нет, поведение прежнее (задача D2).
+    assert job_result["photos"] is None
 
 
 def test_one_job_returns_one_presentation_of_its_style(client: TestClient, deck_id: str, job_result: dict) -> None:
