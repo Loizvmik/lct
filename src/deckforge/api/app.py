@@ -10,7 +10,8 @@
   возвращает `batch_id` и `job_ids`.
 - `POST /api/photos` — фотографии пользователя (multipart `files`, до 10
   jpg/png по 10 МБ, `captions` по порядку файлов), возвращает `photo_id`;
-  задание ссылается на них полем `photos`.
+  задание ссылается на них полем `photos`. `POST /api/examples/{name}/
+  photos` загружает так же фото контент-пакета примера из `fixtures/`.
 - `GET /api/jobs` — список заданий (стиль, стадия, режим, секунды),
   `?batch_id=` оставляет только задания пакета.
 - `GET /api/jobs/{id}` — прогресс по этапам (снимок), `GET /api/jobs/{id}/
@@ -41,7 +42,7 @@ from fastapi.staticfiles import StaticFiles
 
 from deckforge.api import schemas
 from deckforge.api.jobs import (
-    MAX_PHOTO_BYTES, JobError, JobRecord, JobStore, PhotoRejected, STAGES, VariantState, finding_id, fix_deck,
+    MAX_PHOTO_BYTES, JobError, JobRecord, JobStore, PhotoRecord, PhotoRejected, STAGES, VariantState, finding_id, fix_deck,
 )
 from deckforge.audit.findings import Finding
 
@@ -82,6 +83,15 @@ def _variant_summary(store: JobStore, state: VariantState) -> schemas.VariantSum
         content_avg=state.content_avg, design_avg=state.design_avg,
         fidelity=state.fidelity,
     )
+
+
+def _photos_response(store: JobStore, records: list[PhotoRecord]) -> schemas.PhotoUploadResponse:
+    return schemas.PhotoUploadResponse(photos=[
+        schemas.UploadedPhoto(
+            photo_id=r.photo_id, name=r.name, caption=r.caption, url=quote(_png_url(store, r.path)),
+        )
+        for r in records
+    ])
 
 
 def _job_args(request: schemas.DeckInput) -> dict:
@@ -155,10 +165,17 @@ def create_app(store: JobStore | None = None) -> FastAPI:
             records = await asyncio.to_thread(store.save_photos, payload, list(captions))
         except PhotoRejected as exc:
             raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
-        return schemas.PhotoUploadResponse(photos=[
-            schemas.UploadedPhoto(photo_id=r.photo_id, name=r.name, caption=r.caption, url=quote(_png_url(store, r.path)))
-            for r in records
-        ])
+        return _photos_response(store, records)
+
+    @app.post("/api/examples/{name}/photos", response_model=schemas.PhotoUploadResponse)
+    async def upload_example_photos(name: str, store: JobStore = Depends(get_store)) -> schemas.PhotoUploadResponse:
+        try:
+            records = await asyncio.to_thread(store.save_example_photos, name)
+        except PhotoRejected as exc:
+            raise HTTPException(status_code=exc.status, detail=str(exc)) from exc
+        except JobError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return _photos_response(store, records)
 
     @app.post("/api/decks", response_model=schemas.DeckCreateResponse)
     async def create_deck(

@@ -45,7 +45,9 @@ from deckforge.export.bundle import export_bundle
 from deckforge.pattern.intent import intents_from_outline
 from deckforge.plan.contracts import plan_contracts
 from deckforge.plan.outline import Outline, SourceDoc, build_outline, outline_to_dict
-from deckforge.plan.photos import ContentPhoto, PhotoAssignmentReport, assign_photos_to_outline
+from deckforge.plan.photos import (
+    ContentPhoto, PhotoAssignmentReport, assign_photos_to_outline, load_content_pack_photos,
+)
 from deckforge.plan.spec import DeckSpec, deck_spec_to_dict
 from deckforge.plan.variants import GenerationStyle, Variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, WriteClock, write_slides
@@ -61,6 +63,10 @@ from deckforge.workflow.budget import RunBudget, load_policy
 from deckforge.workflow.visual_stage import run_visual_stage
 
 APP_YAML_PATH = Path(__file__).resolve().parents[3] / "config" / "app.yaml"
+
+# Контент-пакеты примеров: кнопки примеров в интерфейсе берут отсюда фото,
+# чтобы не держать вторую копию картинок в `web/public`.
+EXAMPLE_PACKS_DIR = APP_YAML_PATH.parents[1] / "fixtures" / "content-packs"
 
 STAGES: tuple[str, ...] = ("parse", "outline", "write", "compose", "audit", "export")
 
@@ -490,6 +496,19 @@ class JobStore:
             self.photos[photo_id] = record
             records.append(record)
         return records
+
+    def save_example_photos(self, name: str) -> list[PhotoRecord]:
+        """Фото контент-пакета примера как обычная загрузка: те же проверки
+        и те же `photo_id`. Имя пакета сверяется со списком каталогов, а не
+        склеивается в путь: иначе `../` открыл бы чужие файлы."""
+        packs = {p.name: p for p in EXAMPLE_PACKS_DIR.iterdir() if p.is_dir()} if EXAMPLE_PACKS_DIR.is_dir() else {}
+        pack = packs.get(name)
+        if pack is None:
+            raise JobError(f"Пример {name!r} не найден.")
+        photos = load_content_pack_photos(pack)
+        if not photos:
+            return []
+        return self.save_photos([(p.name, p.path.read_bytes()) for p in photos], [p.caption for p in photos])
 
     def resolve_photos(self, refs: list[dict] | None) -> list[ContentPhoto]:
         """Ссылки задания `{photo_id, caption?}` в `ContentPhoto`, как их

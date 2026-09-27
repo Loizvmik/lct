@@ -82,6 +82,16 @@ def test_upload_keeps_file_inside_its_folder(store: jobs.JobStore) -> None:
     assert record.path.parent.parent == store.root / "photos"
 
 
+def test_example_photos_come_from_the_content_pack(client: TestClient) -> None:
+    response = client.post("/api/examples/queue-latency/photos")
+    assert response.status_code == 200, response.text
+    photos = response.json()["photos"]
+    assert sorted(p["name"] for p in photos) == sorted(p.name for p in PHOTOS_DIR.glob("*.jpg"))
+    assert all(p["caption"] for p in photos)
+    assert client.post("/api/examples/..%2F..%2Fsrc/photos").status_code == 404
+    assert client.post("/api/examples/нет-такого/photos").status_code == 404
+
+
 def test_unknown_photo_id_is_rejected(client: TestClient, template_id: str) -> None:
     response = client.post("/api/decks", json={
         "template_id": template_id, "brief": "x", "photos": [{"photo_id": "нет-такого"}],
