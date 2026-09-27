@@ -1908,7 +1908,16 @@ def _build_provenance(
         " ни к одному мастеру не привязанные)."
     )
 
-    if theme.font_scheme_degraded:
+    if not usage.fonts:
+        # Ни один run не назвал гарнитуру: весь текст наследует тему, и
+        # «подтверждать» её нечем. Гарнитуры взяты из темы или, если тема
+        # без шрифтов, запасные (`typography.theme_families`).
+        lines.append(
+            f"Текст слайдов не задаёт гарнитуру явно, он наследует тему; гарнитуры шаблона "
+            f"(`{', '.join(type_scale.families)}`) взяты из схемы шрифтов темы"
+            + (" (тема шрифтов не задаёт, это запасная гарнитура)." if not (theme.major_font or theme.minor_font).strip() else ".")
+        )
+    elif theme.font_scheme_degraded:
         share = f"{theme.theme_font_share:.1%}" if theme.theme_font_share is not None else "неизвестно сколько"
         lines.append(
             f"Схема шрифтов темы (`a:fontScheme`, `{theme.scheme_name or 'Office'}`, "
@@ -1993,10 +2002,15 @@ def _build_warnings(
             "фактического текста слайдов, а не из txStyles — доверять txStyles этого шаблона нельзя."
         )
 
-    if theme.font_scheme_degraded:
+    if theme.font_scheme_degraded and usage.fonts:
         warnings.append(
             "Схема шрифтов темы (`a:fontScheme`) — заглушка Google-экспорта (Office/Arial=Arial) "
             "и проигнорирована при определении гарнитур дизайн-системы."
+        )
+    if not (theme.major_font or theme.minor_font).strip() and not usage.fonts:
+        warnings.append(
+            f"Тема не задаёт шрифтов, и текст слайдов их не называет: сборка пишет запасной "
+            f"гарнитурой `{', '.join(type_scale.families)}`."
         )
 
     if theme.is_stock_office_palette:

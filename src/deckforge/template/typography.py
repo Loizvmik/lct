@@ -51,6 +51,7 @@ from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import walk_shapes
 from deckforge.template.grid import BODY_PH_TYPES, TITLE_PH_TYPES, cluster
+from deckforge.template.theme import pick_primary_master, read_theme
 from deckforge.template.usage import FontUsage, Usage
 
 # Шаг округления нормированного кегля — тот же, что в usage.py
@@ -267,6 +268,9 @@ def build_type_scale(pkg: PptxPackage, canvas: Canvas, usage: Usage) -> TypeScal
         _line_spacing(pkg, canvas)
     )
     families, mono, families_total, family_variants = _families_and_mono(usage.fonts)
+    if not families:
+        families = theme_families(pkg)
+        families_total = len(families)
 
     total_runs = usage.total_runs or 1
     bold_is_idiomatic = usage.bold_runs / total_runs >= _IDIOMATIC_STYLE_SHARE
@@ -492,6 +496,36 @@ def _families_and_mono(
     )
     family_variants = {name: sorted(grouped_variants[name]) for name in qualifying}
     return qualifying[:2], mono, len(qualifying), family_variants
+
+
+# Гарнитура, когда шаблон не называет ни одной: ни в тексте, ни в теме.
+# Arial есть везде, где откроют .pptx, и под неё откалиброван запасной
+# замер (`compose.textfit`, Liberation Sans метрически совместим).
+FALLBACK_FAMILY = "Arial"
+
+
+def theme_families(pkg: PptxPackage) -> list[str]:
+    """Гарнитуры, когда текст слайдов не несёт ни одного явного `a:latin`:
+    весь текст наследует шрифт темы, значит он и есть гарнитура шаблона.
+    Сначала минорная (ею набран основной текст, сборка берёт первую для
+    тела), потом мажорная. Тема без шрифтов (пустой `typeface`) даёт
+    `FALLBACK_FAMILY`: пустое имя гарнитуры сборка записала бы в каждый
+    run, и PowerPoint подставил бы что угодно.
+
+    Без этой ступени незнакомый шаблон, где никто не задавал шрифт руками
+    (встроенный шаблон PowerPoint, большинство корпоративных), получал
+    пустой список гарнитур: сборка писала Arial вместо Georgia темы, а
+    аудит T01 считал чужой любую гарнитуру."""
+    try:
+        theme = read_theme(pkg, pick_primary_master(pkg))
+    except Exception:  # noqa: BLE001 — нет мастера/темы: та же запасная гарнитура
+        return [FALLBACK_FAMILY]
+    out: list[str] = []
+    for raw in (theme.minor_font, theme.major_font):
+        name = _normalize_family(raw.strip()) if raw and raw.strip() else ""
+        if name and not name.startswith("+") and name not in out:
+            out.append(name)
+    return out or [FALLBACK_FAMILY]
 
 
 def _is_mono(family: str) -> bool:
