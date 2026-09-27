@@ -76,7 +76,13 @@ class NumericSeries:
 
     @property
     def timelike(self) -> bool:
-        return all(_TIME_RE.match(c.strip()) for c in self.categories)
+        return timelike_labels(self.categories)
+
+
+def timelike_labels(labels) -> bool:
+    """Подписи читаются как время (кварталы, годы, месяцы, даты)."""
+    labels = [c.strip() for c in labels if c and c.strip()]
+    return bool(labels) and all(_TIME_RE.match(c) for c in labels)
 
 
 _THOUSANDS_RE = re.compile(r"^[+-]?\d{1,3}(,\d{3})+$")

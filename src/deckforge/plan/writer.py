@@ -598,6 +598,15 @@ def _with_photo(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
     return replace(slide, visual=Visual(kind="photo", caption=caption, photo_name=contract.photo))
 
 
+def _with_scratch_form(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
+    """Пометка для сборки: форму слайда (показатели, таблицу, цитату,
+    команду) строить с нуля на раскладке-носителе (`pattern.candidates.
+    SCRATCH_FORMS`). Нормализация такой слайд не трогает."""
+    if contract.scratch_form:
+        slide.meta["scratch_form"] = contract.scratch_form
+    return slide
+
+
 def _write_one_slide(
     contract: SlideContract, profile, prompt_body: str, source_text: str, total: int, llm: LLMProvider | None,
     *, agent_max_steps: int = AGENT_MAX_STEPS_DEFAULT, style: str | None = None, log: list[dict] | None = None,
@@ -679,7 +688,7 @@ def _write_one_slide(
             )
     if contract.gap_note:
         slide.findings.append(contract.gap_note)
-    slide = _with_photo(slide, contract)
+    slide = _with_scratch_form(_with_photo(slide, contract), contract)
     ok, places = contract_fill(slide, contract)
     entry.update(ok=ok, places=places)
     if log is not None:
@@ -740,9 +749,9 @@ def write_slides(
                     future.cancel()
                     abandoned += 1
                     contract = contracts[i]
-                    slides[i] = _divider_slide(contract) if contract.is_divider else _with_photo(
+                    slides[i] = _divider_slide(contract) if contract.is_divider else _with_scratch_form(_with_photo(
                         _fallback_slide(contract, reason=TIME_OUT_REASON), contract,
-                    )
+                    ), contract)
     finally:
         pool.shutdown(wait=clock is None, cancel_futures=True)
 

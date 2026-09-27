@@ -91,7 +91,23 @@ class QuoteBlock:
     author: str | None = None
 
 
-Block = TextBlock | BulletBlock | CardBlock | KpiBlock | QuoteBlock
+@dataclass(frozen=True)
+class TeamMember:
+    """Участник команды: имя и роль словами источника. Фото сюда не
+    пишется: его подбирает сборка по подписям к файлам контент-пакета
+    (`compose.team`), план о пикселях не знает."""
+    name: str
+    role: str = ""
+
+
+@dataclass(frozen=True)
+class TeamBlock:
+    """Команда: карточки «фото + имя + роль». Ни в одном шаблоне датасета
+    нет раскладки под людей, поэтому блок строит сборка с нуля."""
+    items: list[TeamMember]
+
+
+Block = TextBlock | BulletBlock | CardBlock | KpiBlock | QuoteBlock | TeamBlock
 
 
 @dataclass(frozen=True)
@@ -305,6 +321,12 @@ def slide_spec_problems(slide: SlideSpec) -> list[str]:
         elif isinstance(block, QuoteBlock):
             if not block.text.strip():
                 problems.append(f"{where}: пустая цитата")
+        elif isinstance(block, TeamBlock):
+            if not block.items:
+                problems.append(f"{where}: TeamBlock без участников")
+            for i, member in enumerate(block.items):
+                if not member.name.strip():
+                    problems.append(f"{where}: пустое имя участника {i}")
 
     if slide.visual is not None:
         table = slide.visual.table
@@ -416,6 +438,13 @@ def block_from_dict(data: dict, where: str) -> Block:
     if kind == "quote":
         _check_keys(data, {"type", "text", "author"}, {"type", "text"}, where)
         return QuoteBlock(text=data["text"], author=data.get("author"))
+    if kind == "team":
+        _check_keys(data, {"type", "items"}, {"type", "items"}, where)
+        members = []
+        for i, m in enumerate(data["items"]):
+            _check_keys(m, {"name", "role"}, {"name"}, f"{where}.items[{i}]")
+            members.append(TeamMember(name=str(m["name"]), role=str(m.get("role") or "")))
+        return TeamBlock(items=members)
     raise SpecValidationError([f"{where}: неизвестный тип блока {kind!r}"])
 
 
@@ -573,6 +602,8 @@ def _block_to_dict(block: Block) -> dict:
         return {"type": "kpi", "items": [{"value": k.value, "label": k.label} for k in block.items]}
     if isinstance(block, QuoteBlock):
         return {"type": "quote", "text": block.text, "author": block.author}
+    if isinstance(block, TeamBlock):
+        return {"type": "team", "items": [{"name": m.name, "role": m.role} for m in block.items]}
     raise TypeError(f"deck_spec_to_dict: неизвестный тип блока {type(block).__name__}")
 
 
@@ -588,6 +619,8 @@ def _block_from_debug_dict(data: dict) -> Block:
         return KpiBlock(items=[Kpi(value=k["value"], label=k["label"]) for k in data["items"]])
     if kind == "quote":
         return QuoteBlock(text=data["text"], author=data.get("author"))
+    if kind == "team":
+        return TeamBlock(items=[TeamMember(name=m["name"], role=m.get("role", "")) for m in data["items"]])
     raise ValueError(f"deck_spec_from_debug_dict: неизвестный тип блока в дампе {kind!r}")
 
 

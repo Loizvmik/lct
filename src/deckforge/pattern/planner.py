@@ -12,7 +12,7 @@
 15 слайдах и 40 раскладках занимает миллисекунды (раздел 7.3)."""
 from __future__ import annotations
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from deckforge.pattern.candidates import (
     RELAX_TITLES, candidates_for, compatible_kinds, cover_pattern_id, has_fixed_headline, not_plain_content,
@@ -63,6 +63,9 @@ class PatternAssignment:
     # выбранной отклонён. Порядок тот же, каким планировщик их оценивал,
     # чтобы сборка не подбирала замену своим, иным расчётом.
     alternatives: tuple[str, ...] = ()
+    # Форма, которую сборка строит с нуля на этой раскладке-носителе
+    # (`candidates.SCRATCH_FORMS`): у шаблона нет раскладки её вида.
+    scratch_form: str | None = None
 
     def gap_note(self) -> str | None:
         if not self.relaxed:
@@ -167,6 +170,7 @@ def plan_patterns(
 
     per_slide: list[list[tuple[str, float]]] = []
     relaxed: list[tuple[str, ...]] = []
+    scratch: list[str | None] = []
     # Раскладки, где содержанию слайда хватает места (`scoring.overflow`
     # ниже `TIGHT_OVERFLOW`): только они считаются альтернативой, ради
     # которой разнообразие запрещает повтор.
@@ -176,17 +180,22 @@ def plan_patterns(
         found = candidates_for(
             intent, profile, forms, position=position, last=last, cover_id=cover_id, closing_ids=closing_ids,
         )
+        # Носитель формы с нуля оценивается как слайд без единиц: место под
+        # форму считает сборка, а вместимость текстового места носителя к
+        # показателям или таблице отношения не имеет.
+        costed = replace(intent, items=0, photo=None) if found.scratch_form else intent
         scored = [
             (pid, static_cost(
-                intent, patterns[pid], forms[pid], policy, position=position, last=last,
+                costed, patterns[pid], forms[pid], policy, position=position, last=last,
                 cover_id=cover_id, closing_ids=closing_ids,
             ) + _batch_penalty(intent, looks[pid], taken, policy))
             for pid in found.pattern_ids
         ]
         scored.sort(key=lambda pair: (pair[1], pair[0]))
         per_slide.append(scored)
-        roomy.append({pid for pid in found.pattern_ids if overflow(intent, forms[pid], policy) < TIGHT_OVERFLOW})
+        roomy.append({pid for pid in found.pattern_ids if overflow(costed, forms[pid], policy) < TIGHT_OVERFLOW})
         relaxed.append(found.relaxed)
+        scratch.append(found.scratch_form)
 
     # Повтор считается по облику раскладки, а не по `pattern_id` (задача
     # V2, `scoring.look_key`): два примера с одной геометрией для глаза одна
@@ -236,7 +245,8 @@ def plan_patterns(
         PatternAssignment(
             position=i, intent=intent, pattern_id=pid, kind=patterns[pid].kind,
             cost=round(static[i][pid], 3), relaxed=relaxed[i],
-            alternatives=_same_form_alternatives(per_slide[i], pid, patterns, forms),
+            alternatives=_same_form_alternatives(per_slide[i], pid, patterns, forms, carrier=bool(scratch[i])),
+            scratch_form=scratch[i],
         )
         for i, (intent, pid) in enumerate(zip(intents, best.ids))
     ]
@@ -293,6 +303,7 @@ def repick_pattern(
 
 def _same_form_alternatives(
     scored: list[tuple[str, float]], chosen: str, patterns: dict, forms: dict[str, PatternForm],
+    *, carrier: bool = False,
 ) -> tuple[str, ...]:
     """Запасные раскладки выбранной: того же вида И той же главной формы
     (карточки, список, показатели). Одного вида мало: у VK Education вид
@@ -304,6 +315,10 @@ def _same_form_alternatives(
         main = forms[pid].main
         return main.block if main is not None else None
 
+    if carrier:
+        # Носителю формы с нуля годится любой другой носитель: форма у них
+        # общая (строит сборка), а место под неё сборка мерит сама.
+        return tuple(other for other, _cost in scored if other != chosen)[:MAX_ALTERNATIVES]
     want_kind, want_block = patterns[chosen].kind, block(chosen)
     return tuple(
         other for other, _cost in scored

@@ -16,7 +16,7 @@
 переэкспортирует их для старых вызовов."""
 from __future__ import annotations
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from deckforge.pattern.forms import (
     MAX_PHOTO_VOID, PatternForm, SlideRequirements, capabilities_of, unmet_requirements,
@@ -161,6 +161,52 @@ class Candidates:
     pattern_ids: tuple[str, ...]
     # Какие ограничения пришлось ослабить, чтобы кандидаты вообще нашлись.
     relaxed: tuple[str, ...] = ()
+    # Форма, которую сборка построит с нуля на раскладке-носителе
+    # (`SCRATCH_FORMS`), или `None`: раскладка держит содержание сама.
+    scratch_form: str | None = None
+
+
+# Формы, которые сборка умеет построить с нуля (`compose.kpi`,
+# `compose.tables`, `compose.quote`, `compose.team`), если своей раскладки
+# в шаблоне нет. Раньше их ослабляли до карточек: крупные числа выходили
+# текстом, таблица сравнения четырьмя карточками мелким шрифтом, цитата
+# абзацем или финальной раскладкой. Код сюда не входит: у него свой
+# путь (задача T2: `code_tier`, `has_code_place`, сборка `compose.code`).
+SCRATCH_FORMS = ("kpi", "table", "quote", "team")
+
+
+def scratch_form_of(intent: SlideIntent) -> str | None:
+    if intent.is_hero or intent.form not in SCRATCH_FORMS:
+        return None
+    return intent.form
+
+
+def holds_form_natively(form_name: str, form: PatternForm, p) -> bool:
+    """Раскладка шаблона своего вида для формы: показатели, цитата,
+    таблица, повтор карточек с фото для команды. Кода не держит ни одна."""
+    main = form.main
+    block = main.block if main is not None else None
+    if form_name in ("kpi", "quote"):
+        return block == form_name
+    if form_name == "table":
+        return form.has_table
+    if form_name == "team":
+        return capabilities_of(p, form).card_has_image
+    return False
+
+
+def is_scratch_carrier(form: PatternForm) -> bool:
+    """Раскладка-носитель для формы с нуля: текстовая (абзац или список,
+    без повтора) или разделитель, на слайде содержания, без чужой таблицы
+    и графика. Её место под текст и займёт форма; заголовок, подзаголовок,
+    фон и фирменная графика остаются шаблонными. Обложка и финал носителем
+    не бывают: их отсекают общие проверки (`cover`, `place`, `hero_layout`)."""
+    if form.repeated or form.slide_class != "content_pattern":
+        return False
+    if form.has_table or form.has_chart or form.chart_tier == CHART_TIER_FRAME:
+        return False
+    main = form.main
+    return main is None or main.block in ("text", "bullets")
 
 
 def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: int, cover_id: str | None,
@@ -298,6 +344,61 @@ def candidates_for(
             closing=p.pattern_id in closing_ids, profile=profile,
         )
         table.append((p.pattern_id, checks))
+    scratch = scratch_form_of(intent)
+    plain = _relaxed(table, profile)
+    if scratch is not None and not _has_native(table, scratch, forms, profile):
+        carriers = _carriers(intent, scratch, profile, forms, position=position, last=last, cover_id=cover_id,
+                             closing_ids=closing_ids)
+        # Носителя без ослаблений нет (шаблон из одних карточек), а обычная
+        # раскладка есть: пусть форма ляжет по её местам, как до задачи T3.
+        if carriers.relaxed and not plain.relaxed:
+            return plain
+        return carriers
+    return plain
+
+
+# Проверки, без которых раскладка своей формы не считается: число единиц
+# и возможности ослабляются и у неё (пять показателей на раскладке под
+# четыре: клон ряда шаблона лучше ряда с нуля).
+_NATIVE_SOFT = frozenset({"units", "capabilities"})
+
+
+def _has_native(table, scratch: str, forms: dict[str, PatternForm], profile) -> bool:
+    by_id = {p.pattern_id: p for p in profile.patterns}
+    for pid, checks in table:
+        if not holds_form_natively(scratch, forms[pid], by_id[pid]):
+            continue
+        if all(v for name, v in checks.items() if name not in _NATIVE_SOFT):
+            return True
+    return False
+
+
+def _carriers(
+    intent: SlideIntent, scratch: str, profile, forms: dict[str, PatternForm], *, position: int, last: int,
+    cover_id: str | None, closing_ids: frozenset[str],
+) -> Candidates:
+    """Раскладки-носители формы `scratch` (`is_scratch_carrier`). Проверки
+    те же, что у обычного слайда, но про место под саму форму не
+    спрашивают: форму строит сборка. Фото команды тоже ставит она, в
+    карточки участников, поэтому место под фото у носителя не нужно."""
+    neutral = replace(intent, form=None, items=0, photo=None, photo_caption=None)
+    table = []
+    for p in profile.patterns:
+        form = forms[p.pattern_id]
+        checks = _checks(
+            neutral, form, p, position=position, last=last, cover_id=cover_id,
+            closing=p.pattern_id in closing_ids, profile=profile,
+        )
+        checks["form"] = is_scratch_carrier(form)
+        checks["visual"] = not not_plain_content(form)
+        checks["units"] = True
+        checks["capabilities"] = form.headline is not None
+        table.append((p.pattern_id, checks))
+    found = _relaxed(table, profile)
+    return replace(found, scratch_form=scratch)
+
+
+def _relaxed(table, profile) -> Candidates:
     for step in range(len(_RELAX_ORDER) + 1):
         ignore = set(_RELAX_ORDER[:step])
         ok = [

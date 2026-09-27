@@ -71,7 +71,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from deckforge.audit.findings import Finding, Severity
 from deckforge.plan.outline import SourceDoc
 from deckforge.plan.spec import (
-    BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock,
+    BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TeamBlock, TextBlock,
 )
 from deckforge.provider.base import VisionProvider
 from deckforge.provider.scheduler import OutOfTime, ScheduledProvider
@@ -327,6 +327,8 @@ def _block_text(block) -> str:
         return "; ".join(f"{k.value} — {k.label}" for k in block.items)
     if isinstance(block, QuoteBlock):
         return f"«{block.text}»" + (f" — {block.author}" if block.author else "")
+    if isinstance(block, TeamBlock):
+        return "; ".join(f"{m.name} — {m.role}" if m.role else m.name for m in block.items)
     return ""
 
 
@@ -421,6 +423,11 @@ def _role_candidates(slide: SlideSpec) -> list[tuple[str, str]]:
             out.append(("quote", block.text))
             if block.author:
                 out.append(("quote_author", block.author))
+        elif isinstance(block, TeamBlock):
+            for member in block.items:
+                out.append(("card_title", member.name))
+                if member.role:
+                    out.append(("card_body", member.role))
     return out
 
 

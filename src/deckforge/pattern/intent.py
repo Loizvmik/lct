@@ -40,8 +40,10 @@ _MAX_ITEMS = 8
 # Формы, которые модель структуры может заказать явно. Цитату и показатель
 # код сам не назначает: выдуманная цитата и число без источника хуже
 # обычного списка. Код (задача T2) назначает слой фрагментов источников
-# (`plan.code`), не модель: выдуманный код хуже пересказа.
-FORMS = ("quote", "kpi", "table", "chart", "code")
+# (`plan.code`), не модель: выдуманный код хуже пересказа. `team` модель не
+# заказывает: её получает пункт «команда» (`intents_from_outline`), люди
+# показываются людьми, а не карточками с фамилиями.
+FORMS = ("quote", "kpi", "table", "chart", "code", "team")
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,8 @@ def intents_from_outline(outline, photos: dict[int, tuple[str, str | None]] | No
     result: list[SlideIntent] = []
     for i, slide in enumerate(outline.slides):
         form = getattr(slide, "form", None)
+        if form is None and slide.kind == "team":
+            form = "team"
         photo = photos.get(i)
         result.append(SlideIntent(
             index=i, outline_kind=slide.kind, intent=slide.intent, needs=tuple(slide.needs),

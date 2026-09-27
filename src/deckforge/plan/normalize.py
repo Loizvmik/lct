@@ -76,6 +76,11 @@ def normalize_deck(
         held = _held_by_invariant(slide, invariants[i] if i < len(invariants) else None)
         if held is not None:
             slides.append(held)
+        elif slide.meta.get("scratch_form"):
+            # Форму строит сборка с нуля (`pattern.candidates.SCRATCH_FORMS`):
+            # показатели у шаблона без раскладки показателей и должны
+            # остаться показателями, а не стать абзацем.
+            slides.append(slide)
         elif i in keep:
             slides.append(_blockless_as_section(slide, kinds) or slide)
         else:

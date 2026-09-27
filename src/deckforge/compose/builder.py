@@ -47,6 +47,9 @@ from deckforge.compose.clone import (
     table_cell_styles, template_row_heights_emu, text_style,
 )
 from deckforge.compose.decor import apply_decor
+from deckforge.compose.kpi import kpi_layout
+from deckforge.compose.quote import quote_layout
+from deckforge.compose.team import member_photos, place_member_photos, team_layout
 from deckforge.compose.failure import (
     Failure, FontBudget, RepairPolicy, classify, condense_to_theses, font_budget, from_findings, primary,
     repair_policy,
@@ -65,7 +68,9 @@ from deckforge.pattern.intent import MAX_SLIDES
 from deckforge.pattern.planner import MAX_ALTERNATIVES
 from deckforge.pattern.scoring import look_key
 from deckforge.pattern.style import load_style
-from deckforge.plan.spec import BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock
+from deckforge.plan.spec import (
+    BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TeamBlock, TextBlock,
+)
 from deckforge.plan.variants import Variant
 from deckforge.settings import Settings
 from deckforge.template.grid import ColumnAxis, Grid
@@ -161,6 +166,7 @@ _ROLE_COLOR = {
     "headline": "on_surface", "subhead": "muted", "body": "on_surface", "bullets": "on_surface",
     "card_title": "on_surface", "card_body": "on_surface", "kpi_value": "brand", "kpi_label": "muted",
     "quote": "on_surface", "quote_author": "muted", "source": "muted", "caption": "muted",
+    "quote_mark": "accent",
 }
 
 
@@ -292,12 +298,19 @@ def build_deck(
                 "паттерна этого шаблона и ни одного лейаута с заголовком — слайд не собран."
             )
             continue
-        outcome = _place_with_ladder(
-            prs, slide_spec, candidates, profile, canvas, audit_config, forms=forms, repair=repair,
-            room=max_slides - len(spec.slides), bullet_char=bullet_char, user_photos=user_photos,
-            image_bytes=image_bytes, source_slides=source_slides, look=look,
-            avoid_looks=_crowded_looks(spec.slides, position - 1, placed_looks, by_id, diversity),
-        )
+        form = _scratch_form(slide_spec)
+        outcome = _place_scratch_form(
+            prs, slide_spec, form, _carriers_of(slide_spec, candidates, by_id), profile, canvas, audit_config,
+            bullet_char=bullet_char, user_photos=user_photos, image_bytes=image_bytes, look=look,
+            language=spec.language,
+        ) if form is not None else None
+        if outcome is None:
+            outcome = _place_with_ladder(
+                prs, slide_spec, candidates, profile, canvas, audit_config, forms=forms, repair=repair,
+                room=max_slides - len(spec.slides), bullet_char=bullet_char, user_photos=user_photos,
+                image_bytes=image_bytes, source_slides=source_slides, look=look,
+                avoid_looks=_crowded_looks(spec.slides, position - 1, placed_looks, by_id, diversity),
+            )
         placed_looks.append(look_key(outcome.pattern))
         slide_spec.findings.extend(outcome.notes)
         _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
@@ -343,7 +356,16 @@ def place_slide(
     prs, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, audit_config: AuditConfig,
     *, bullet_char: str = "•", user_photos: dict[str, Path] | None = None,
     image_bytes: Callable[[str], bytes | None] | None = None, look: "TemplateLook | None" = None,
-) -> None:
+    scratch_form: str | None = None, language: str | None = None,
+) -> bool:
+    """Собирает слайд с нуля на лейауте раскладки `pattern`.
+
+    `scratch_form` (`pattern.candidates.SCRATCH_FORMS`): раскладка лишь
+    носитель, от неё заголовок, фон и фирменная графика, а показатели,
+    таблицу, цитату или команду сборка строит сама в свободном месте
+    (`_place_form`). Возвращает, легла ли форма: `False`, если места под
+    неё на носителе не нашлось (слайд всё равно добавлен, решает
+    вызывающий). Без формы всегда `True`."""
     layout = _find_layout(prs, pattern.layout_id)
     if layout is None:
         raise BuildError(f"лейаут {pattern.layout_id!r} не найден в открытом шаблоне")
@@ -368,12 +390,23 @@ def place_slide(
     # (`filled_repeat_units`). Находка ручной проверки: слайду с одним
     # заголовком досталась раскладка на три карточки, и три пустые белые
     # плашки 4×4 дюйма заняли больше половины слайда.
-    contents, drops = assign_content_with_drops(slide_spec, pattern, grid, cards_as_text=True)
+    frame_spec = _frame_spec(slide_spec) if scratch_form is not None else slide_spec
+    contents, drops = assign_content_with_drops(frame_spec, pattern, grid, cards_as_text=True)
     _note_drops(slide_spec, pattern, drops)
     decor = expand_decor(
-        pattern, _repeat_item_count(slide_spec), grid, filled_repeat_units(pattern, contents),
+        pattern, _repeat_item_count(frame_spec), grid, filled_repeat_units(pattern, contents),
     )
-    if look is not None:
+    form_done = True
+    form_cards = []
+    if scratch_form is not None:
+        decor = [d for d in decor if not d.sample_photo]
+        region, decor = _form_region(slide, contents, decor, grid, profile)
+        form_done, form_contents, form_decor, form_cards = _form_parts(
+            slide_spec, scratch_form, region, profile, grid, look, user_photos, language,
+        )
+        contents = contents + form_contents
+        decor = [*decor, *form_decor]
+    elif look is not None:
         # Сборка с нуля в стиле шаблона (задача U): разбросанные по слотам
         # примера подписи встают в один ряд по сетке и получают плашку
         # карточки шаблона, если она у раскладки есть.
@@ -448,17 +481,260 @@ def place_slide(
         color_hex = None
         if look is not None:
             content, color_hex = look.restyle(content, profile, bg_luminance, audit_config.template.min_contrast_large)
+        if color_hex is None and content.role_hint in _LARGE_ACCENT_ROLES:
+            color_hex = _large_accent(content.role_hint, profile, bg_luminance, audit_config.template.min_contrast_large)
         _draw_slot(
             slide, slide_spec, content, profile, family, bullet_char, canvas_width_emu, canvas_height_emu,
             bg_luminance, color_hex=color_hex,
         )
 
-    _place_visual(
-        slide, slide_spec, pattern, profile, user_photos, sole_content=_only_frame_text(contents),
-        min_photo_width=_MIN_SCRATCH_PHOTO_WIDTH if look is not None else 0.0,
-        free_box=_free_visual_box(contents, grid), occupied=[c.slot.box for c in contents],
-    )
+    if scratch_form is None:
+        _place_visual(
+            slide, slide_spec, pattern, profile, user_photos, sole_content=_only_frame_text(contents),
+            min_photo_width=_MIN_SCRATCH_PHOTO_WIDTH if look is not None else 0.0,
+            free_box=_free_visual_box(contents, grid), occupied=[c.slot.box for c in contents],
+        )
+    elif scratch_form == "table" and form_done and region is not None:
+        _place_table_visual(
+            slide, slide_spec, pattern, profile, slide_spec.visual.table, sole_content=True, free_box=region,
+        )
+    elif form_cards:
+        for name in place_member_photos(slide, form_cards, canvas_width_emu, canvas_height_emu):
+            slide_spec.findings.append(f"Слайд {slide_spec.index}: фото участника «{name}» не читается, стоит кружок без фото.")
     _remove_empty_placeholders(slide)
+    return form_done
+
+
+# ---------------------------------------------------------------------------
+# Формы с нуля на раскладке-носителе (задача T3): показатели, таблица,
+# цитата, команда у шаблона без раскладки их вида
+# ---------------------------------------------------------------------------
+
+# Место под форму не меньше этих долей холста: ряд показателей в полосу
+# высотой в строку и таблица в четверть ширины не читаются.
+_FORM_MIN_HEIGHT = 0.22
+_FORM_MIN_WIDTH = 0.4
+_FORM_GAP = 0.02
+
+
+# Роли крупного текста цветом палитры: число показателя и кавычка-декор.
+# Для крупного кегля WCAG требует контраст 3:1, а не 4.5:1, и синий бренд
+# VK Tech (#0077FF на белом, 4.0) проходит: мерка мелкого текста красила
+# показатели чёрным.
+_LARGE_ACCENT_ROLES = {"kpi_value": ("brand",), "quote_mark": ("accent", "brand")}
+
+
+def _large_accent(role: str, profile: TemplateProfile, bg_luminance: float, min_contrast: float) -> str | None:
+    for name in _LARGE_ACCENT_ROLES[role]:
+        color = profile.palette_roles.get(name)
+        if color and _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(color)) >= min_contrast:
+            return color
+    return None
+
+
+def _on_color(fill_hex: str, profile: TemplateProfile, min_contrast: float = 3.0) -> str:
+    """Цвет крупной надписи на заливке `fill_hex`: белый, если читается,
+    иначе самый контрастный цвет палитры."""
+    lum = _relative_luminance(fill_hex)
+    if _contrast_ratio_from_luminance(lum, 1.0) >= min_contrast:
+        return "#FFFFFF"
+    return _best_contrast_color("#FFFFFF", lum, profile)
+
+
+def _scratch_form(slide_spec: SlideSpec) -> str | None:
+    """Форма, которую строить с нуля, если планировщик так назначил
+    (`meta["scratch_form"]`) и её содержание написано. Писатель не
+    справился (запасной слайд пунктами): обычная лестница."""
+    form = slide_spec.meta.get("scratch_form")
+    blocks = slide_spec.blocks
+    if form == "kpi" and any(isinstance(b, KpiBlock) and b.items for b in blocks):
+        return form
+    if form == "quote" and any(isinstance(b, QuoteBlock) and b.text.strip() for b in blocks):
+        return form
+    if form == "team" and any(isinstance(b, TeamBlock) and b.items for b in blocks):
+        return form
+    if form == "table" and slide_spec.visual is not None and slide_spec.visual.table is not None \
+            and slide_spec.visual.table.rows:
+        return form
+    return None
+
+
+def _carriers_of(slide_spec: SlideSpec, candidates: list[Pattern], by_id: dict[str, Pattern]) -> list[Pattern]:
+    """Носители формы: раскладка планировщика, его запасные (они того же
+    рода, `planner._same_form_alternatives`), потом прочие кандидаты."""
+    ordered = [by_id[pid] for pid in (slide_spec.pattern_id, *slide_spec.alternatives) if pid in by_id]
+    seen: set[str] = set()
+    out = []
+    for p in [*ordered, *candidates]:
+        if p.pattern_id not in seen:
+            seen.add(p.pattern_id)
+            out.append(p)
+    return out
+
+
+def _frame_spec(slide_spec: SlideSpec) -> SlideSpec:
+    """Слайд без содержания формы: на носитель ложатся заголовок,
+    подзаголовок и источник, остальное строит `_form_parts`."""
+    return replace(slide_spec, blocks=[], visual=None, findings=[])
+
+
+def _is_backdrop(box: Box) -> bool:
+    return box.width >= _BACKGROUND_SHARE and box.height >= _BACKGROUND_SHARE
+
+
+def _cut_region(region: Box, obstacle: Box) -> Box:
+    """Место без `obstacle`: срез с той стороны, где остаётся больше
+    площади."""
+    if region.intersect(obstacle) is None:
+        return region
+    options = []
+    if obstacle.bottom + _FORM_GAP < region.bottom:
+        top = obstacle.bottom + _FORM_GAP
+        options.append(Box(region.left, top, region.width, region.bottom - top))
+    if obstacle.top - _FORM_GAP > region.top:
+        options.append(Box(region.left, region.top, region.width, obstacle.top - _FORM_GAP - region.top))
+    if obstacle.right + _FORM_GAP < region.right:
+        left = obstacle.right + _FORM_GAP
+        options.append(Box(left, region.top, region.right - left, region.height))
+    if obstacle.left - _FORM_GAP > region.left:
+        options.append(Box(region.left, region.top, obstacle.left - _FORM_GAP - region.left, region.height))
+    if not options:
+        return Box(region.left, region.top, 0.0, 0.0)
+    return max(options, key=lambda b: b.width * b.height)
+
+
+def _form_region(
+    slide, contents: list[SlotContent], decor: list[DecorShape], grid: Grid, profile: TemplateProfile,
+) -> tuple[Box | None, list[DecorShape]]:
+    """Свободное место носителя под форму и декор, который остаётся.
+
+    Место то же, что у таблицы без своего слота (`_free_visual_box`): под
+    заголовком, справа от текста или над ним. Залитые плашки примера,
+    которые в него заходят, были подложкой его текста: без текста они
+    пустые рамки и убираются. Фирменная графика примера и лейаута (картинки,
+    линии, фигуры лейаута) не убирается, а вырезается из места."""
+    region = _free_visual_box(contents, grid)
+    if region is None:
+        return None, decor
+    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
+    kept, obstacles = [], []
+    for d in decor:
+        if _is_backdrop(d.box) or region.intersect(d.box) is None:
+            kept.append(d)
+        elif d.kind == "shape" and d.has_fill and not d.badge_text:
+            continue
+        else:
+            kept.append(d)
+            obstacles.append(d.box)
+    layout = [
+        r.box for r in walk_shapes(slide.slide_layout._element, canvas)  # noqa: SLF001
+        if r.box is not None and not r.is_placeholder and not _is_backdrop(r.box)
+        and (r.kind == "picture" or (r.kind == "shape" and not shape_text(r.element).strip()))
+    ]
+    for ob in sorted([*obstacles, *layout], key=lambda b: -(b.width * b.height)):
+        region = _cut_region(region, ob)
+    if region.height < _FORM_MIN_HEIGHT or region.width < _FORM_MIN_WIDTH:
+        return None, kept
+    return region, kept
+
+
+def _form_parts(
+    slide_spec: SlideSpec, form: str, region: Box | None, profile: TemplateProfile, grid: Grid,
+    look: "TemplateLook | None", user_photos: dict[str, Path] | None, language: str | None,
+) -> tuple[bool, list[SlotContent], list[DecorShape], list]:
+    """Места, декор и карточки участников формы в `region`. Первое
+    значение: легла ли форма."""
+    extra = [b for b in slide_spec.blocks if not isinstance(b, (KpiBlock, QuoteBlock, TeamBlock))]
+    if extra:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: форма «{form}» собрана с нуля, остальные блоки слайда "
+            f"({len(extra)}) на носитель не легли."
+        )
+    if region is None:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: на раскладке-носителе нет свободного места под форму «{form}»."
+        )
+        return False, [], [], []
+    family = _primary_family(profile)
+    plaque = look.card_plaque if look is not None else None
+    if form == "kpi":
+        block = next(b for b in slide_spec.blocks if isinstance(b, KpiBlock))
+        contents, decor = kpi_layout(block, region, profile, grid, family, plaque)
+        return bool(contents), contents, decor, []
+    if form == "quote":
+        block = next(b for b in slide_spec.blocks if isinstance(b, QuoteBlock))
+        palette = profile.palette_roles
+        contents = quote_layout(
+            block, region, profile, family, language, with_mark=bool(palette.get("accent") or palette.get("brand")),
+        )
+        return bool(contents), contents, [], []
+    if form == "team":
+        block = next(b for b in slide_spec.blocks if isinstance(b, TeamBlock))
+        visual = slide_spec.visual
+        own = [visual.photo_name] if visual is not None and visual.photo_name else []
+        photos = member_photos(block.items, user_photos, own)
+        brand = profile.palette_roles.get("brand")
+        contents, decor, cards = team_layout(
+            block, region, profile, grid, photos, brand_hex=brand,
+            initials_hex=_on_color(brand, profile) if brand else "#FFFFFF",
+            plaque=plaque, family=family,
+        )
+        return bool(contents), contents, decor, cards
+    # Таблица: рисуется после текста (`_place_table_visual` в месте формы).
+    return True, [], [], []
+
+
+def _place_scratch_form(
+    prs, slide_spec: SlideSpec, form: str, carriers: list[Pattern], profile: TemplateProfile, canvas: Canvas,
+    audit_config: AuditConfig, *, bullet_char: str, user_photos: dict[str, Path] | None,
+    image_bytes: Callable[[str], bytes | None] | None, look: "TemplateLook | None", language: str | None,
+) -> "LadderOutcome | None":
+    """Форма с нуля на носителях по очереди, до `_MAX_LAYOUT_ATTEMPTS`:
+    первый, где форма легла без находок аудита, принимается; иначе тот,
+    где она легла с наименьшим их числом. Ни на одном не легла: `None`, и
+    слайд идёт обычной лестницей (форма разложится по местам раскладки,
+    как до задачи T3)."""
+    notes: list[str] = []
+    best: tuple[int, int, Pattern] | None = None
+    tried = carriers[:_MAX_LAYOUT_ATTEMPTS]
+    for attempt, pattern in enumerate(tried, start=1):
+        trial = replace(slide_spec, findings=[])
+        placed = place_slide(
+            prs, trial, pattern, profile, audit_config, bullet_char=bullet_char, user_photos=user_photos,
+            image_bytes=image_bytes, look=look, scratch_form=form, language=language,
+        )
+        errors = audit_slide_layout(prs.slides[-1], canvas, profile, audit_config, index=slide_spec.index) if placed else []
+        if placed and not errors:
+            notes.extend(trial.findings)
+            return _scratch_outcome(slide_spec, form, pattern, notes)
+        _remove_last_slide(prs)
+        if placed:
+            ids = ", ".join(sorted({f.check_id for f in errors}))
+            notes.append(f"Слайд {slide_spec.index}: форма «{form}» на носителе {pattern.pattern_id!r}: {ids}.")
+            if best is None or (len(errors), attempt) < best[:2]:
+                best = (len(errors), attempt, pattern)
+        else:
+            notes.append(f"Слайд {slide_spec.index}: у носителя {pattern.pattern_id!r} нет места под форму «{form}».")
+    if best is None:
+        slide_spec.findings.extend(notes)
+        return None
+    trial = replace(slide_spec, findings=[])
+    place_slide(
+        prs, trial, best[2], profile, audit_config, bullet_char=bullet_char, user_photos=user_photos,
+        image_bytes=image_bytes, look=look, scratch_form=form, language=language,
+    )
+    notes.extend(trial.findings)
+    return _scratch_outcome(slide_spec, form, best[2], notes)
+
+
+def _scratch_outcome(slide_spec: SlideSpec, form: str, pattern: Pattern, notes: list[str]) -> "LadderOutcome":
+    slide_spec.meta["ladder_rung"] = "scratch"
+    slide_spec.meta["ladder_path"] = "scratch_form"
+    notes.append(
+        f"Слайд {slide_spec.index}: форма «{form}» собрана с нуля на раскладке-носителе "
+        f"{pattern.pattern_id!r}: своей раскладки у шаблона нет."
+    )
+    return LadderOutcome(pattern, notes, "scratch")
 
 
 def _only_frame_text(contents: list[SlotContent]) -> bool:
@@ -3428,6 +3704,10 @@ class TemplateLook:
     синими 36 у клонов."""
     headline_colors: tuple[str, ...] = ()
     headline_pt: float | None = None
+    # Плашка карточки шаблона (задача T3): самая частая залитая фигура
+    # групп повтора. Под ней формы с нуля (показатели, участники) выглядят
+    # карточками шаблона, а не голым текстом на фоне.
+    card_plaque: DecorShape | None = None
 
     def headline_color(self, bg_luminance: float, min_contrast: float) -> str | None:
         for hex_color in self.headline_colors:
@@ -3487,7 +3767,38 @@ def template_look(
     return TemplateLook(
         headline_colors=tuple(c for c, _n in colors.most_common()),
         headline_pt=float(sizes.most_common(1)[0][0]) if sizes else None,
+        card_plaque=_card_plaque(patterns),
     )
+
+
+# Формы плашки карточки: прямоугольник (`None`: без `a:prstGeom` его и
+# рисует `compose.decor`) и скруглённые прямоугольники.
+_CARD_PLAQUE_PRSTS = frozenset({None, "rect", "roundRect", "round1Rect", "round2SameRect", "snip1Rect"})
+
+
+def _card_plaque(patterns: list[Pattern]) -> DecorShape | None:
+    """Самая частая плашка карточки среди раскладок шаблона: залитая
+    сплошным цветом фигура группы повтора, не линия и не фон."""
+    counts: Counter = Counter()
+    first: dict[tuple, DecorShape] = {}
+    for pattern in patterns:
+        for d in pattern.decor:
+            if not (d.repeat_group and d.kind == "shape" and d.has_fill and d.fill_hex) or d.badge_text:
+                continue
+            if d.prst not in _CARD_PLAQUE_PRSTS:
+                # Кружок с номером шага (VK Education) плашкой карточки не
+                # бывает: текст ячейки в него не помещается.
+                continue
+            if d.fill_kind not in ("solid", "unspecified") or d.sample_photo:
+                continue
+            if min(d.box.width, d.box.height) <= 0.02 or _is_backdrop(d.box):
+                continue
+            key = (d.prst, d.fill_hex)
+            counts[key] += 1
+            first.setdefault(key, d)
+    if not counts:
+        return None
+    return first[counts.most_common(1)[0][0]]
 
 
 def _at_least_wide(box: Box, min_width: float, grid: Grid) -> Box:
@@ -3693,6 +4004,11 @@ def _local_background_luminance(
 
 def _color_for_role(role_hint: str, slot: PatternSlot, profile: TemplateProfile, bg_luminance: float) -> str:
     values = set(profile.palette_roles.values())
+    if role_hint == "quote_mark":
+        # Декоративная кавычка цитаты с нуля: акцент палитры, без него бренд.
+        mark = profile.palette_roles.get("accent") or profile.palette_roles.get("brand")
+        if mark:
+            return _best_contrast_color(mark, bg_luminance, profile)
     if slot.color_hex and slot.color_hex in values:
         return _best_contrast_color(slot.color_hex, bg_luminance, profile)
     color = profile.palette_roles.get(_ROLE_COLOR.get(role_hint, "on_surface"))
@@ -3794,6 +4110,7 @@ def _joined_text(paragraphs: list[Paragraph]) -> str:
 def _split_back(text: str, original: list[Paragraph]) -> list[Paragraph]:
     bullet_flags = [p.bullet for p in original]
     bold_flags = [p.bold for p in original]
+    italic_flags = [p.italic for p in original]
     last_flag = bullet_flags[-1] if bullet_flags else False
     lines = text.split("\n")
     return [
@@ -3801,6 +4118,7 @@ def _split_back(text: str, original: list[Paragraph]) -> list[Paragraph]:
             line,
             bullet=(bullet_flags[i] if i < len(bullet_flags) else last_flag),
             bold=(bold_flags[i] if i < len(bold_flags) else False),
+            italic=(italic_flags[i] if i < len(italic_flags) else False),
         )
         for i, line in enumerate(lines)
     ]
@@ -4008,6 +4326,8 @@ def _draw_slot(
         run.font.size = Pt(chosen_size)
         run.font.name = family
         run.font.bold = bold or para.bold
+        if para.italic:
+            run.font.italic = True
         run.font.color.rgb = RGBColor.from_string(color_hex.lstrip("#"))
         if para.bullet:
             _apply_bullet(p, bullet_char, family)

@@ -11,12 +11,16 @@
 
 - dense: соседние простые пункты сливаются в один слайд (не ниже
   `MIN_SLIDES`), на слайде 4-6 единиц, числа источника, которые никто не
-  взял, идут таблицей;
+  взял, идут таблицей, а два-четыре числа показателями;
 - airy: не больше трёх единиц на слайд, один тезис; разделители и так
   добавляет планировщик;
 - visual: каждый числовой ряд источника становится графиком, не только
-  обязательный, одно-два числа показателем, единиц на слайде не больше
+  обязательный, два-четыре числа показателем, единиц на слайде не больше
   четырёх: текст подчинён картинке.
+
+Во всех трёх пункт «данные» на два-четыре числа идёт показателями, а
+цитата из источника (`plan.data_types.find_quotes`) цитатой: раньше
+числа уходили в карточки, цитата в абзац.
 
 Числа для таблиц и графиков берутся только из источников (слой
 `plan.data_types`): стиль меняет форму показа, а не содержание."""
@@ -61,6 +65,13 @@ def _plain(intent: SlideIntent) -> bool:
     )
 
 
+def _cappable(intent: SlideIntent) -> bool:
+    """Пункт, чьё число единиц стиль вправе урезать: простой или команда.
+    У команды контракт всё равно просит от четырёх мест
+    (`plan.contracts._scratch_slots`), людей из источника стиль не теряет."""
+    return _plain(intent) or (intent.form == "team" and not intent.is_hero)
+
+
 def _words(intent: SlideIntent) -> set[str]:
     return stems(" ".join([intent.intent, *intent.needs]))
 
@@ -75,7 +86,7 @@ def _unused(intents: list[SlideIntent], visuals) -> list:
     return [vi for vi in visuals or () if vi.data_ref not in taken]
 
 
-def _attach(intents: list[SlideIntent], vi, form: str, visual) -> bool:
+def _attach(intents: list[SlideIntent], vi, form: str, visual, *, items: int = 1, needs: tuple[str, ...] = ()) -> bool:
     """Отдать набор данных самому близкому по словам простому пункту.
     Без общих слов отдаётся пункту «данные»: он о числах, а у числа
     источника другого места нет. Иначе набор никому не достаётся:
@@ -96,7 +107,8 @@ def _attach(intents: list[SlideIntent], vi, form: str, visual) -> bool:
             best = i
     if best is None:
         return False
-    intents[best] = replace(intents[best], form=form, items=1, visual_intent=visual)
+    it = intents[best]
+    intents[best] = replace(it, form=form, items=items, visual_intent=visual, needs=(*it.needs, *needs))
     return True
 
 
@@ -140,12 +152,14 @@ def room(profile, style) -> int:
 
 def places(profile) -> set[str]:
     """Какие места под визуал есть в шаблоне: `table`, `chart`, `kpi`.
-    Без профиля считаем, что есть все: решает планировщик. Форму, которой
-    шаблон не вмещает, стиль не назначает: планировщик ослабил бы
-    ограничения, и таблица легла бы в колонки (VK Tech без таблиц)."""
+    Без профиля считаем, что есть все: решает планировщик. Таблицу и
+    показатели сборка строит с нуля на раскладке-носителе, если своей
+    раскладки нет (`candidates.SCRATCH_FORMS`), поэтому они есть всегда.
+    График без своего места стиль не назначает: планировщик ослабил бы
+    ограничения, и ряд лёг бы в колонки."""
     if profile is None or not getattr(profile, "patterns", None):
         return {"table", "chart", "kpi"}
-    out: set[str] = set()
+    out: set[str] = {"table", "kpi"}
     for form in forms_of(profile).values():
         if form.has_table:
             out.add("table")
@@ -156,12 +170,91 @@ def places(profile) -> set[str]:
     return out
 
 
+# Показателей на слайде: одно число не показатель ряда, больше четырёх
+# крупным кеглем в ряд не читаются.
+KPI_MIN_ITEMS = 2
+KPI_MAX_ITEMS = 4
+
+
+def _kpi_sized(vi) -> bool:
+    """Набор данных из двух-четырёх чисел одного ряда: показатели, а не
+    график и не таблица."""
+    if getattr(vi, "type", None) == "kpi":
+        return True
+    data = getattr(vi, "data", None)
+    series = getattr(data, "series", None)
+    rows = getattr(series, "series", None)
+    if rows is None or len(rows) != 1 or getattr(vi, "type", None) not in ("chart", "table"):
+        return False
+    return KPI_MIN_ITEMS <= len(series.categories) <= KPI_MAX_ITEMS
+
+
+def _kpi_count(vi) -> int:
+    data = getattr(vi, "data", None)
+    rows = len(data.table.body) if data is not None else KPI_MIN_ITEMS
+    return max(KPI_MIN_ITEMS, min(KPI_MAX_ITEMS, rows))
+
+
+def _kpi_evidence(vi) -> tuple[str, ...]:
+    """Числа набора строками «подпись: значение»: писателю показатели
+    источника, а не пересказ."""
+    data = getattr(vi, "data", None)
+    if data is None:
+        return ()
+    return tuple(f"{r[0]}: {r[1]}" for r in data.table.body if len(r) >= 2)
+
+
+def _attach_kpi(intents: list[SlideIntent], vi) -> bool:
+    return _attach(intents, vi, "kpi", None, items=_kpi_count(vi), needs=_kpi_evidence(vi))
+
+
+def _data_as_kpi(intents: list[SlideIntent]) -> list[SlideIntent]:
+    """Пункт «данные» на два-четыре числа без своей формы: показатели.
+    Числа модель структуры уже нашла в источниках (`needs`), и карточками
+    они читались бы текстом."""
+    return [
+        replace(it, form="kpi") if _plain(it) and it.outline_kind == "data"
+        and KPI_MIN_ITEMS <= it.items <= KPI_MAX_ITEMS else it
+        for it in intents
+    ]
+
+
+def _quotes(intents: list[SlideIntent], visuals) -> list[SlideIntent]:
+    """Цитата источника (`VisualIntent` вида `quote`) уходит на пункт, где
+    её ждут: заказанный цитатой, со словом «цитата» или с двумя общими
+    основами слов. Текст цитаты едет в `needs` дословно: писатель берёт
+    её оттуда, а не пересказывает."""
+    result = list(intents)
+    for vi in visuals or ():
+        quote = getattr(vi, "quote", None)
+        if getattr(vi, "type", None) != "quote" or quote is None:
+            continue
+        line = f"цитата: «{quote.text}» — {quote.author}"
+        target = next((i for i, it in enumerate(result) if it.form == "quote" and line not in it.needs), None)
+        if target is None:
+            words = quote.words
+            scored = [
+                (len(_words(it) & words) + (2 if "цитат" in " ".join([it.intent, *it.needs]).lower() else 0), -i, i)
+                for i, it in enumerate(result) if _plain(it)
+            ]
+            best = max(scored, default=None)
+            if best is None or best[0] < 2:
+                continue
+            target = best[2]
+        it = result[target]
+        result[target] = replace(it, form="quote", items=1, needs=(*it.needs, line))
+    return result
+
+
 def _dense(
     intents: list[SlideIntent], visuals, most: int = DENSE_MAX_ITEMS, allowed=frozenset({"table"}),
 ) -> list[SlideIntent]:
-    result = list(intents)
+    result = _data_as_kpi(_quotes(intents, visuals))
+    for vi in _unused(result, visuals) if "kpi" in allowed else ():
+        if _kpi_sized(vi):
+            _attach_kpi(result, vi)
     for vi in _unused(result, visuals) if "table" in allowed else ():
-        if getattr(vi, "type", None) not in ("table", "chart"):
+        if getattr(vi, "type", None) not in ("table", "chart") or _kpi_sized(vi):
             continue
         # Плотный стиль показывает числа таблицей: в ней видно каждое
         # значение, и она держит больше, чем график.
@@ -188,16 +281,19 @@ def _dense(
     ]
 
 
-def _airy(intents: list[SlideIntent]) -> list[SlideIntent]:
-    return [replace(it, items=min(AIRY_MAX_ITEMS, it.items)) if _plain(it) else it for it in intents]
+def _airy(intents: list[SlideIntent], visuals=None) -> list[SlideIntent]:
+    result = _data_as_kpi(_quotes(intents, visuals))
+    return [replace(it, items=min(AIRY_MAX_ITEMS, it.items)) if _cappable(it) else it for it in result]
 
 
 def _visual(intents: list[SlideIntent], visuals, allowed=frozenset({"chart", "kpi"})) -> list[SlideIntent]:
-    result = list(intents)
+    result = _data_as_kpi(_quotes(intents, visuals))
     for vi in _unused(result, visuals):
         kind = getattr(vi, "type", None)
         data = getattr(vi, "data", None)
-        if "chart" in allowed and (
+        if "kpi" in allowed and _kpi_sized(vi):
+            _attach_kpi(result, vi)
+        elif "chart" in allowed and (
             kind == "chart" or (kind == "table" and data is not None and data.series is not None)
         ):
             chart = vi if kind == "chart" else replace(
@@ -205,9 +301,7 @@ def _visual(intents: list[SlideIntent], visuals, allowed=frozenset({"chart", "kp
                 reason="визуальный вариант: числовой ряд графиком",
             )
             _attach(result, vi, "chart", chart)
-        elif kind == "kpi" and "kpi" in allowed:
-            _attach(result, vi, "kpi", None)
-    return [replace(it, items=min(VISUAL_MAX_ITEMS, it.items)) if _plain(it) else it for it in result]
+    return [replace(it, items=min(VISUAL_MAX_ITEMS, it.items)) if _cappable(it) else it for it in result]
 
 
 def shape_for_style(intents: list[SlideIntent], style: str, visuals=None, profile=None) -> list[SlideIntent]:
@@ -219,7 +313,7 @@ def shape_for_style(intents: list[SlideIntent], style: str, visuals=None, profil
     if name == "dense":
         return _dense(list(intents), visuals, room(profile, name), places(profile))
     if name == "airy":
-        return _airy(list(intents))
+        return _airy(list(intents), visuals)
     if name == "visual":
         return _visual(list(intents), visuals, places(profile))
     return list(intents)
