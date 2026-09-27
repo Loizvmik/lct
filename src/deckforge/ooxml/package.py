@@ -30,6 +30,37 @@ class MediaEntry:
     md5: str
 
 
+MB = 1024 * 1024
+# Пределы распаковки чужого pptx (ревью 27 сентября 2026): zip на 200 КБ с
+# одной частью, сжатой 1000:1, разворачивался в 200 МБ памяти на одном
+# `part()`, а падение процесса роняло все задания сразу. Реальные шаблоны
+# датасета распаковываются в 20-60 МБ целиком; самая крупная часть (фото)
+# в единицы мегабайт.
+MAX_PART_BYTES = 64 * MB
+MAX_TOTAL_BYTES = 512 * MB
+MAX_ENTRIES = 20_000
+
+
+class PackageTooLarge(ValueError):
+    """Пакет распаковывается больше предела: чужой файл не должен ронять
+    процесс по памяти."""
+
+
+def check_zip_limits(zf: zipfile.ZipFile) -> None:
+    infos = zf.infolist()
+    if len(infos) > MAX_ENTRIES:
+        raise PackageTooLarge(f"в пакете {len(infos)} частей, предел {MAX_ENTRIES}")
+    total = 0
+    for info in infos:
+        if info.file_size > MAX_PART_BYTES:
+            raise PackageTooLarge(
+                f"часть {info.filename} распаковывается в {info.file_size // MB} МБ, предел {MAX_PART_BYTES // MB} МБ"
+            )
+        total += info.file_size
+    if total > MAX_TOTAL_BYTES:
+        raise PackageTooLarge(f"пакет распаковывается в {total // MB} МБ, предел {MAX_TOTAL_BYTES // MB} МБ")
+
+
 class PptxPackage:
     """Части .pptx как OPC zip-пакета: XML частей, relationships, медиа.
 
@@ -52,7 +83,9 @@ class PptxPackage:
 
     @classmethod
     def open(cls, path: Path) -> "PptxPackage":
-        return cls(zipfile.ZipFile(path, "r"))
+        zf = zipfile.ZipFile(path, "r")
+        check_zip_limits(zf)
+        return cls(zf)
 
     def close(self) -> None:
         self._zf.close()
@@ -67,6 +100,9 @@ class PptxPackage:
         return self._names
 
     def part(self, name: str) -> bytes:
+        info = self._zf.getinfo(name)
+        if info.file_size > MAX_PART_BYTES:
+            raise PackageTooLarge(f"часть {name} распаковывается в {info.file_size // MB} МБ, предел {MAX_PART_BYTES // MB} МБ")
         return self._zf.read(name)
 
     def xml(self, name: str) -> etree._Element:
