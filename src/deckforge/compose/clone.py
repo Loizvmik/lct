@@ -294,9 +294,18 @@ def match_slots(slide, slots: list[PatternSlot], canvas: Canvas) -> dict[int, Sh
     by_id = clone_map(refs)
     result: dict[int, ShapeRef | None] = {i: None for i in range(len(slots))}
     used: set[int] = set()
+    # Id, на который разбор повесил несколько слотов: одна фигура примера
+    # держит и значение, и подпись («43%» и строка под ним в одной надписи
+    # WorkSpace, слайды 17/18). Такие слоты делят фигуру, а не спорят за неё.
+    shared_ids = {
+        sid for sid in (s.source_shape_id for s in slots)
+        if sid and sum(1 for s in slots if s.source_shape_id == sid) > 1
+    }
     for i, slot in enumerate(slots):
         ref = by_id.get(slot.source_shape_id) if slot.source_shape_id else None
-        if ref is None or id(ref.element) in used or not _kind_fits(slot.role, ref):
+        if ref is None or not _kind_fits(slot.role, ref):
+            continue
+        if id(ref.element) in used and slot.source_shape_id not in shared_ids:
             continue
         result[i] = ref
         used.add(id(ref.element))
@@ -340,6 +349,42 @@ def bind_text(shape_element, paragraphs, *, bullet_char: str | None = None) -> N
     if tx_body is None:
         raise ValueError("bind_text: у фигуры нет p:txBody")
     _bind_tx_body(tx_body, paragraphs, bullet_char)
+
+
+def bind_text_parts(shape_element, parts, *, bullet_char: str | None = None) -> None:
+    """Несколько слотов в одной фигуре: `parts` это пары (абзацы, кегль)
+    по порядку слотов. Часть k берёт за образец k-й абзац примера с текстом
+    (последний, если частей больше): у показателя WorkSpace первый абзац
+    набран 80pt, второй, подпись, 16pt, и у каждого свои отступы. Кегль
+    части пишется явно: наследуемый кегль фигуры один на все абзацы, и
+    подпись вышла бы размером значения."""
+    tx_body = shape_element.find(qn("p:txBody"))
+    if tx_body is None:
+        raise ValueError("bind_text_parts: у фигуры нет p:txBody")
+    old = tx_body.findall(qn("a:p"))
+    texted = [p for p in old if p.find(qn("a:r")) is not None] or old[:1]
+    anchor = old[0] if old else None
+    built: list = []
+    for k, (paragraphs, size_pt) in enumerate(parts):
+        scratch = etree.Element(qn("p:txBody"))
+        if texted:
+            scratch.append(copy.deepcopy(texted[min(k, len(texted) - 1)]))
+        _bind_tx_body(scratch, paragraphs, bullet_char)
+        for p in scratch.findall(qn("a:p")):
+            if size_pt and size_pt > 0:
+                for r_pr in p.iter(qn("a:rPr"), qn("a:endParaRPr")):
+                    r_pr.set("sz", str(int(round(size_pt * 100))))
+            built.append(p)
+    for p in old:
+        if p is not anchor:
+            tx_body.remove(p)
+    for p in built:
+        if anchor is not None:
+            anchor.addprevious(p)
+        else:
+            tx_body.append(p)
+    if anchor is not None:
+        tx_body.remove(anchor)
 
 
 def _bind_tx_body(tx_body, paragraphs, bullet_char: str | None) -> None:

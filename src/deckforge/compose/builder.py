@@ -39,7 +39,7 @@ from deckforge.compose.charts import ChartSpec, Series, add_chart, fill_native_c
 from deckforge.compose.code import add_code_block, code_lines, fill_code_shape, widen_code_box
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
-    CLONE_MARK_PREFIX, allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
+    CLONE_MARK_PREFIX, allow_wrap, bind_text, bind_text_parts, clone_example_slide, fill_native_table, fix_duplicate_partnames,
     hide_layout_photos, inherited_text_color, inherited_text_size, mark_slide, match_slots, native_table,
     prune_unfilled, remove_in_box,
     remove_sample_frames, remove_shape, remove_stray_text, replace_picture, sample_slides_by_number,
@@ -2999,7 +2999,25 @@ def place_slide_by_clone(
     family = _primary_family(profile)
     bound_elements = [ref.element for _, ref in bound]
     budget = font_budget()
+    # Слоты, которые делят одну фигуру примера (значение и подпись
+    # показателя, `clone.match_slots`), связываются с ней вместе: абзацами
+    # по порядку слотов, каждый своим кеглем. Подгонки кегля у такой фигуры
+    # нет: её меряет аудит (L03), и переполнение отклоняет клон.
+    sharing: dict[int, list] = {}
     for content, ref in bound:
+        sharing.setdefault(id(ref.element), []).append(content)
+    for element_id, group in sharing.items():
+        if len(group) < 2:
+            continue
+        ref = next(r for c, r in bound if id(r.element) == element_id)
+        bind_text_parts(
+            ref.element, [(c.paragraphs, c.slot.size_pt) for c in group], bullet_char=bullet_char,
+        )
+        allow_wrap(ref.element)
+        _fix_cloned_contrast(slide, ref, profile, canvas, audit_config, inherited_pt=group[0].slot.size_pt)
+    for content, ref in bound:
+        if len(sharing[id(ref.element)]) > 1:
+            continue
         ref = _shrink_frame_away_from_decor(slide, ref, bound_elements, canvas)
         bind_text(ref.element, content.paragraphs, bullet_char=bullet_char)
         overflow = _fit_cloned_text(
