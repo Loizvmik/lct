@@ -15,11 +15,11 @@ from dataclasses import dataclass
 
 from deckforge.pattern.candidates import (
     RELAX_TITLES, candidates_for, compatible_kinds, cover_pattern_id, has_fixed_headline, not_plain_content,
-    is_closing_pattern,
+    is_closing_pattern, is_cover_like,
 )
 from deckforge.pattern.forms import PatternForm, forms_of
 from deckforge.pattern.intent import SlideIntent, intents_from_outline, with_dividers
-from deckforge.pattern.scoring import growing_repeat_cost, look_key, static_cost
+from deckforge.pattern.scoring import growing_repeat_cost, look_key, overflow, static_cost
 from deckforge.pattern.style import StylePolicy, load_style
 
 DEFAULT_BEAM_WIDTH = 20
@@ -28,6 +28,11 @@ DEFAULT_BEAM_WIDTH = 20
 # но дальше третьей-четвёртой по стоимости идут раскладки, которые
 # планировщик и так счёл плохими для этого содержания.
 MAX_ALTERNATIVES = 3
+
+# Доля содержания, которой раскладка не вмещает (`scoring.overflow`), выше
+# которой раскладка тесна слайду и альтернативой для разнообразия не
+# считается: половина слов стиля на единицу не ложится кеглем примера.
+TIGHT_OVERFLOW = 0.5
 
 # Вид слайда, когда раскладок нет вовсе (пустой профиль): первое
 # приближение по смыслу пункта структуры, как раньше у писателя.
@@ -141,6 +146,10 @@ def plan_patterns(
 
     per_slide: list[list[tuple[str, float]]] = []
     relaxed: list[tuple[str, ...]] = []
+    # Раскладки, где содержанию слайда хватает места (`scoring.overflow`
+    # ниже `TIGHT_OVERFLOW`): только они считаются альтернативой, ради
+    # которой разнообразие запрещает повтор.
+    roomy: list[set[str]] = []
     for position, intent in enumerate(intents):
         found = candidates_for(
             intent, profile, forms, position=position, last=last, cover_id=cover_id, closing_ids=closing_ids,
@@ -154,6 +163,7 @@ def plan_patterns(
         ]
         scored.sort(key=lambda pair: (pair[1], pair[0]))
         per_slide.append(scored)
+        roomy.append({pid for pid in found.pattern_ids if overflow(intent, forms[pid], policy) < TIGHT_OVERFLOW})
         relaxed.append(found.relaxed)
 
     # Повтор считается по облику раскладки, а не по `pattern_id` (задача
@@ -162,17 +172,24 @@ def plan_patterns(
     looks = {pid: look_key(p) for pid, p in patterns.items()}
     beams = [_Beam(cost=0.0, ids=(), uses={})]
     width = max(1, beam_width)
-    for scored in per_slide:
+    for scored, fits in zip(per_slide, roomy):
         expanded: dict[tuple, _Beam] = {}
         for beam in beams:
             previous = looks[beam.ids[-1]] if beam.ids else None
             previous_kind = patterns[beam.ids[-1]].kind if beam.ids else None
             # Ограничения разнообразия: запрет, но только если у этого
-            # слайда есть альтернатива, которая их не нарушает.
-            allowed = [
+            # слайда есть просторная альтернатива, которая их не нарушает.
+            # Тесная раскладка альтернативой не считается (задача V5: с
+            # честным замером клона таймлайн примера 42 держит в событии
+            # два слова, и запрет повтора сажал на него содержательные
+            # слайды dense). Нет просторной без нарушения: выбирают
+            # стоимости, где повтор дорожает с каждым разом, а теснота
+            # стоит как переполнение.
+            free = [
                 (pid, cost) for pid, cost in scored
                 if not _violates(beam, looks[pid], patterns[pid].kind, previous, previous_kind, policy)
-            ] or scored
+            ]
+            allowed = [pair for pair in free if pair[0] in fits] or (scored if fits else free or scored)
             for pid, cost in allowed:
                 look = looks[pid]
                 kind = patterns[pid].kind
@@ -233,6 +250,8 @@ def repick_pattern(
         if (p.pattern_id in closing_ids and position != last) or (p.pattern_id == cover_id and position != 0):
             continue
         if has_fixed_headline(p) and position != last:
+            continue
+        if is_cover_like(p, profile) and position not in (0, last):
             continue
         if not_plain_content(forms[p.pattern_id]) and not _has_chart(slide):
             # Место под график без графика пустеет: картинку-график и

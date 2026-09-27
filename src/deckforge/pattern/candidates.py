@@ -71,6 +71,41 @@ def has_fixed_headline(p) -> bool:
     return any(s.role == "headline" and s.fixed and is_fixed_phrase(s.sample_text) for s in p.slots)
 
 
+# Роли места под наше изображение: у обложечной раскладки их нет.
+_PICTURE_PLACE_ROLES = frozenset({"image", "table", "chart"})
+# Виды лейаута (`LayoutEntry.kind`), чьи примеры держат обложку и финал.
+_HERO_LAYOUT_KINDS = frozenset({"title", "closing"})
+
+
+def is_cover_like(p, profile=None) -> bool:
+    """Раскладка обложки по устройству. Два признака, любой из двух:
+
+    - лейаут примера разбор узнал титульным или финальным
+      (`LayoutEntry.kind`): у VK Education на титульных лейаутах примеры
+      1, 2 и 4 (синий фон, лого, крупные фигуры, заголовок 48 pt), на
+      финальных 52-55 (QR и подпись; «Риски» на примере 53 легли тремя
+      пунктами по два слова);
+    - вид `image` без места под картинку, таблицу или график и без повтора:
+      картинка лежит на лейауте и изображает бренд, содержания в раскладке
+      заголовок и строка подписи.
+
+    Содержательному слайду такая раскладка не годится: живой прогон visual
+    28 сентября 2026 посадил на пример 2 четыре слайда с пунктами, и
+    колода читалась как четыре обложки подряд. Место обложки и финала для
+    неё остаётся (`cover_pattern_id`, финал колоды)."""
+    if p.repeat is not None:
+        # Повтор карточек это содержание, даже на титульном лейауте (VK
+        # Tech, пример 4: две карточки рядом с фото).
+        return False
+    layouts = getattr(profile, "layouts", None) or ()
+    layout_id = getattr(p, "layout_id", None)
+    if any(getattr(l, "layout_id", None) == layout_id and getattr(l, "kind", None) in _HERO_LAYOUT_KINDS for l in layouts):
+        return True
+    if p.kind != "image":
+        return False
+    return not any(s.role in _PICTURE_PLACE_ROLES for s in p.slots)
+
+
 def _has_headline(p) -> bool:
     return any(s.role == "headline" for s in p.slots)
 
@@ -114,7 +149,7 @@ class Candidates:
 
 
 def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: int, cover_id: str | None,
-            closing: bool) -> dict[str, bool]:
+            closing: bool, profile=None) -> dict[str, bool]:
     """Каждое жёсткое ограничение отдельно: имя -> выполнено ли. Отдельно,
     чтобы ослаблять их по одному и называть, какое не выполнилось."""
     main = form.main
@@ -127,6 +162,10 @@ def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: i
         "fixed_headline": position == last or not has_fixed_headline(p),
         "headline": _has_headline(p),
         "form": block in _allowed_blocks(intent),
+        # Обложечная раскладка под содержанием читается как ещё одна
+        # обложка (задача V5). Ослабляется последней: бедный шаблон без
+        # иных раскладок всё равно должен собраться.
+        "hero_layout": intent.is_hero or position == last or not is_cover_like(p, profile),
     }
     if intent.is_hero:
         # Героическому слайду героическая раскладка: разделитель на
@@ -195,7 +234,7 @@ def not_plain_content(form: PatternForm) -> bool:
 
 # Порядок ослабления: от наименее важного к самому важному. Место
 # финальной и титульной раскладки не ослабляется никогда.
-_RELAX_ORDER = ("units", "capabilities", "form", "visual", "fixed_headline", "headline")
+_RELAX_ORDER = ("units", "capabilities", "form", "visual", "fixed_headline", "headline", "hero_layout")
 
 RELAX_TITLES = {
     "units": "единиц содержания больше, чем мест у любой раскладки",
@@ -204,6 +243,7 @@ RELAX_TITLES = {
     "capabilities": "у раскладок нет мест под содержание слайда или остаётся пустота на месте фото примера",
     "fixed_headline": "осталась только раскладка с постоянным заголовком",
     "headline": "осталась только раскладка без заголовка",
+    "hero_layout": "остались только раскладки обложки или финала",
 }
 
 
@@ -227,7 +267,7 @@ def candidates_for(
     for p in profile.patterns:
         checks = _checks(
             intent, forms[p.pattern_id], p, position=position, last=last, cover_id=cover_id,
-            closing=p.pattern_id in closing_ids,
+            closing=p.pattern_id in closing_ids, profile=profile,
         )
         table.append((p.pattern_id, checks))
     for step in range(len(_RELAX_ORDER) + 1):

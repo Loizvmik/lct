@@ -34,6 +34,7 @@ from deckforge.compose.blocks import (
     DROPPED_ROLE_TITLES, Paragraph, SlotContent, assign_content, assign_content_with_drops,
     expand_decor, filled_repeat_units, find_bullet_char, is_grid, repeat_unit_index, unfilled_unit_test,
 )
+from deckforge.compose.capacity import clone_text_frame, shrink_sequence
 from deckforge.compose.charts import ChartSpec, Series, add_chart, fill_native_chart
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
@@ -61,6 +62,8 @@ from deckforge.ooxml.walk import walk_shapes
 from deckforge.pattern.forms import forms_of
 from deckforge.pattern.intent import MAX_SLIDES
 from deckforge.pattern.planner import MAX_ALTERNATIVES
+from deckforge.pattern.scoring import look_key
+from deckforge.pattern.style import load_style
 from deckforge.plan.spec import BulletBlock, CardBlock, DeckSpec, KpiBlock, QuoteBlock, SlideSpec, TextBlock
 from deckforge.plan.variants import Variant
 from deckforge.settings import Settings
@@ -70,7 +73,6 @@ from deckforge.template.patterns import (
     CHART_FRAME_MIN_AREA, CHART_TIER_NATIVE, Capacity, DecorShape, Pattern, PatternSlot, RepeatSpec, RepeatUnit,
     chart_target_slot,
 )
-from deckforge.template.typography import fill_scale_gaps
 from deckforge.template.profile import LayoutEntryModel, TemplateProfile
 from deckforge.workflow.versions import manifest as workflow_manifest
 
@@ -145,10 +147,6 @@ _ALIGN_MAP = {"l": PP_ALIGN.LEFT, "ctr": PP_ALIGN.CENTER, "r": PP_ALIGN.RIGHT, "
 # template_margins` — иначе плавающая погрешность может протащить то, что
 # здесь прошло, но не пройдёт там).
 _FIT_TOLERANCE_IN = 0.01
-
-# Ступени шкалы, по которым ужимается текст — БЕЗ "micro" (брифом: "не ниже
-# подписи", т.е. "caption" — жёсткий пол).
-_SHRINK_STEPS = ("display", "h1", "h2", "body", "caption")
 
 # Роли, для которых используется ЗАГОЛОВОЧНЫЙ интерлиньяж/начертание
 # шаблона, а не текстовый — тот же список смысла, что `TITLE_PH_TYPES`
@@ -240,6 +238,11 @@ def build_deck(
     # `_resolve_pattern`).
     history = _SelectionHistory()
     forms = forms_of(profile)
+    by_id = {p.pattern_id: p for p in patterns}
+    diversity = load_style(variant).diversity
+    # Облики уже собранных слайдов по порядку: запасная раскладка лестницы
+    # не должна повторять соседа (задача V5).
+    placed_looks: list[str] = []
     rungs = dict.fromkeys(LADDER_RUNGS, 0)
     position = 0
     while position < len(spec.slides):
@@ -247,7 +250,10 @@ def build_deck(
         position += 1
         if slide_spec.semantic_gap:
             _refill_semantic_gap(slide_spec, repair, spec.meta, patterns, profile)
-        candidates = _capable_first(slide_spec, _resolve_pattern(slide_spec, patterns, profile, variant, history), forms)
+        candidates = _capable_first(
+            slide_spec, _content_candidates(slide_spec, _resolve_pattern(slide_spec, patterns, profile, variant, history), profile),
+            forms,
+        )
         if not candidates:
             slide_spec.findings.append(
                 f"Слайд {slide_spec.index}: для kind={slide_spec.kind!r} не нашлось ни одного "
@@ -258,7 +264,9 @@ def build_deck(
             prs, slide_spec, candidates, profile, canvas, audit_config, forms=forms, repair=repair,
             room=max_slides - len(spec.slides), bullet_char=bullet_char, user_photos=user_photos,
             image_bytes=image_bytes, source_slides=source_slides, look=look,
+            avoid_looks=_crowded_looks(spec.slides, position - 1, placed_looks, by_id, diversity),
         )
+        placed_looks.append(look_key(outcome.pattern))
         slide_spec.findings.extend(outcome.notes)
         _write_speaker_notes(prs.slides[-1], slide_spec.speaker_notes)
         history = history.with_choice(outcome.pattern.pattern_id)
@@ -1421,6 +1429,43 @@ def _divider_layouts(patterns: list[Pattern], profile) -> list[str]:
     ]
 
 
+def _content_candidates(slide_spec: SlideSpec, candidates: list[Pattern], profile=None) -> list[Pattern]:
+    """Без обложечных раскладок (`candidates.is_cover_like`) у слайда с
+    содержанием, если есть другие: запасные и сборка с нуля иначе сажали
+    пункты на обложку (живой прогон visual 28 сентября 2026: пример 2 VK
+    Education под четырьмя содержательными слайдами). Раскладку, которую
+    планировщик назначил сам (обложка, финал, бедный шаблон), фильтр не
+    трогает."""
+    from deckforge.pattern.candidates import is_cover_like
+
+    if not slide_spec.blocks:
+        return candidates
+    kept = [p for p in candidates if not is_cover_like(p, profile) or p.pattern_id == slide_spec.pattern_id]
+    return kept or candidates
+
+
+def _crowded_looks(
+    slides: list[SlideSpec], at: int, placed: list[str], by_id: dict[str, Pattern], diversity,
+) -> frozenset[str]:
+    """Облики, которые запасной раскладке слайда `at` лучше не брать: облик
+    соседа слева (уже собран) и справа (назначен планировщиком) и облики,
+    исчерпавшие предел повторов стиля (`config/styles.yaml`, `diversity`).
+    Планировщик соблюдает эти правила для выбранных раскладок, а лестница
+    раньше выбирала запасную только по вместимости и возвращала колоду к
+    двум раскладкам (dense 28 сентября 2026: slide21 x6, slide24 x5)."""
+    crowded = set()
+    if placed:
+        crowded.add(placed[-1])
+    nxt = slides[at + 1].pattern_id if at + 1 < len(slides) else None
+    if nxt in by_id:
+        crowded.add(look_key(by_id[nxt]))
+    counts: dict[str, int] = {}
+    for look in placed:
+        counts[look] = counts.get(look, 0) + 1
+    crowded |= {look for look, n in counts.items() if n >= diversity.same_pattern_max_total}
+    return frozenset(crowded)
+
+
 def _capable_first(slide_spec: SlideSpec, candidates: list[Pattern], forms: dict) -> list[Pattern]:
     """Кандидаты, чьи возможности держат написанное содержание, идут
     первыми, порядок внутри сохраняется (задача V2). Раскладка планировщика
@@ -1564,12 +1609,14 @@ def _scratch_candidates(
     потерянных блоков. Не наоборот: раскладка без потерь, но с наложениями
     и переполнением (диаграмма Ганта под три абзаца) читается хуже, чем
     честная находка «карточки не попали на слайд»."""
-    tried = candidates[:_MAX_LAYOUT_ATTEMPTS]
     grid = _grid_from_model(profile.grid)
-    # (число находок, потеряно блоков, номер попытки, паттерн, коды находок)
-    best: tuple[int, int, int, Pattern, list[str]] | None = None
+    tried = _keeping_content_first(slide_spec, candidates, grid)[:_MAX_LAYOUT_ATTEMPTS]
+    # (всё содержание потеряно, число находок, потеряно блоков, номер
+    # попытки, паттерн, коды находок)
+    best: tuple[bool, int, int, int, Pattern, list[str]] | None = None
     for attempt, pattern in enumerate(tried, start=1):
         lost = _lost_blocks(slide_spec, pattern, grid)
+        empty = _loses_all_content(slide_spec, pattern, grid)
         trial_spec = replace(slide_spec, findings=[])
         place_slide(
             prs, trial_spec, pattern, profile, audit_config, bullet_char=bullet_char,
@@ -1592,11 +1639,16 @@ def _scratch_candidates(
             f"Слайд {slide_spec.index}: раскладка {pattern.pattern_id!r} отклонена (попытка "
             f"{attempt}/{len(tried)}) — {why}."
         )
-        if best is None or (len(errors), lost, attempt) < best[:3]:
-            best = (len(errors), lost, attempt, pattern, ids)
+        # Слайд, на котором от содержания остался один заголовок, хуже любой
+        # раскладки, где оно легло хоть с находками: airy 28 сентября 2026,
+        # «Риски и как их снимаем» ушли на разделитель без единого пункта,
+        # потому что у него была одна находка против двух у раскладок с
+        # местом под список.
+        if best is None or (empty, len(errors), lost, attempt) < best[:4]:
+            best = (empty, len(errors), lost, attempt, pattern, ids)
         _remove_last_slide(prs)
 
-    best_errors, _lost, _attempt, best_pattern, best_ids = best
+    _empty, best_errors, _lost, _attempt, best_pattern, best_ids = best
     trial_spec = replace(slide_spec, findings=[])
     place_slide(
         prs, trial_spec, best_pattern, profile, audit_config, bullet_char=bullet_char,
@@ -1613,6 +1665,27 @@ def _scratch_candidates(
 
 # Роли, потеря которых не делает слайд пустым: сноска и подзаголовок.
 _MINOR_DROP_ROLES = frozenset({"source", "subhead"})
+
+
+def _loses_all_content(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> bool:
+    """На слайд с содержанием из всех его блоков не ляжет ни один: останутся
+    заголовок и подпись. Слайд с визуалом пустым не бывает: сборка с нуля
+    ставит визуал и без своего слота."""
+    if not slide_spec.blocks:
+        return False
+    contents, _drops = assign_content_with_drops(slide_spec, pattern, grid)
+    if not _only_frame_text(contents):
+        return False
+    return slide_spec.visual is None
+
+
+def _keeping_content_first(slide_spec: SlideSpec, candidates: list[Pattern], grid: Grid) -> list[Pattern]:
+    """Кандидаты, куда ляжет хоть часть содержания, идут первыми. Сборка с
+    нуля пробует только первые `_MAX_LAYOUT_ATTEMPTS`, и раскладки без
+    места под блоки (разделители у списка) занимали эти попытки."""
+    if not slide_spec.blocks:
+        return candidates
+    return sorted(candidates, key=lambda p: _loses_all_content(slide_spec, p, grid))
 
 
 def _lost_blocks(slide_spec: SlideSpec, pattern: Pattern, grid: Grid) -> int:
@@ -1754,6 +1827,8 @@ class _Ladder:
     room: int
     kw: dict
     look: TemplateLook | None
+    # Облики, которых запасной раскладке лучше избегать (`_crowded_looks`).
+    avoid_looks: frozenset[str] = frozenset()
     notes: list[str] = field(default_factory=list)
     failures: list[Failure] = field(default_factory=list)
     path: list[str] = field(default_factory=list)
@@ -1842,12 +1917,24 @@ class _Ladder:
 
     def spares(self) -> list[Pattern]:
         """Запасные раскладки планировщика (идут сразу за выбранной,
-        `_resolve_pattern`) в пределах бюджета клонов."""
-        return self.candidates[1:_MAX_CLONE_ATTEMPTS]
+        `_resolve_pattern`) в пределах бюджета клонов. Если все они
+        повторяют облик соседа или исчерпали предел повторов, к ним
+        добавляется первый кандидат дальше по списку с другим обликом."""
+        spares = self.candidates[1:_MAX_CLONE_ATTEMPTS]
+        if self.avoid_looks and all(look_key(p) in self.avoid_looks for p in spares):
+            fresh = next((p for p in self.candidates[_MAX_CLONE_ATTEMPTS:] if look_key(p) not in self.avoid_looks), None)
+            if fresh is not None:
+                spares = [*spares, fresh]
+        return spares
+
+    def _diverse(self, patterns: list[Pattern]) -> list[Pattern]:
+        """Сначала раскладки с обликом, которого нет у соседей и который не
+        исчерпал предел повторов; порядок внутри групп сохраняется."""
+        return sorted(patterns, key=lambda p: look_key(p) in self.avoid_looks)
 
     def roomier(self) -> Pattern | None:
         spares = sorted(self.spares(), key=lambda p: -_text_capacity(p))
-        return self.clone_original(spares)
+        return self.clone_original(self._diverse(spares))
 
     def alternate(self, category: str) -> Pattern | None:
         """Другая раскладка. При нехватке мест смотрим все совместимые
@@ -1857,8 +1944,8 @@ class _Ladder:
         if category == "MISSING_SLOT":
             grid = _grid_from_model(self.profile.grid)
             pool = [p for p in self.candidates[1:] if _has_places(self.slide_spec, p, grid)]
-            return self.clone_original(pool[:_MAX_CLONE_ATTEMPTS - 1])
-        return self.clone_original(self.spares())
+            return self.clone_original(self._diverse(pool)[:_MAX_CLONE_ATTEMPTS - 1])
+        return self.clone_original(self._diverse(self.spares()))
 
     def larger(self) -> Pattern | None:
         found = _main_units(self.slide_spec)
@@ -1868,11 +1955,11 @@ class _Ladder:
             if p.pattern_id in self.forms and self.forms[p.pattern_id].units >= need
         ]
         pool.sort(key=lambda p: self.forms[p.pattern_id].units)
-        return self.clone_original(pool[:_MAX_CLONE_ATTEMPTS - 1])
+        return self.clone_original(self._diverse(pool)[:_MAX_CLONE_ATTEMPTS - 1])
 
     def denser(self) -> Pattern | None:
         spares = sorted(self.spares(), key=_text_capacity)
-        return self.clone_original(spares, settle=False)
+        return self.clone_original(self._diverse(spares), settle=False)
 
     # -- другой текст ----------------------------------------------------
 
@@ -1982,7 +2069,7 @@ def _place_with_ladder(
     audit_config: AuditConfig, *, forms: dict, repair: SlideRepair | None, room: int, bullet_char: str,
     user_photos: dict[str, Path] | None, image_bytes: Callable[[str], bytes | None] | None,
     source_slides: dict[int, object] | None, look: TemplateLook | None = None,
-    policy: RepairPolicy | None = None,
+    policy: RepairPolicy | None = None, avoid_looks: frozenset[str] = frozenset(),
 ) -> LadderOutcome:
     """Лестница отказов одного слайда (раздел 11), с задачи V3 зависящая
     от причины отказа (разделы 12-13 идей четвёртой редакции).
@@ -2008,7 +2095,7 @@ def _place_with_ladder(
             "bullet_char": bullet_char, "user_photos": user_photos, "image_bytes": image_bytes,
             "source_slides": source_slides,
         },
-        look=look,
+        look=look, avoid_looks=avoid_looks,
     )
     ladder.path.append("clone")
     first = ladder.clone_original(candidates[:1], settle=False)
@@ -2524,39 +2611,28 @@ def _fit_cloned_text(
     (`TEXT_OVERFLOW`), и чинить его другой раскладкой или сокращением
     честнее, чем подписью вместо заголовка. `budget=None`: без предела,
     только шкала до подписи."""
-    style = text_style(ref.element)
-    # Кегль, которым PowerPoint нарисует текст: свой у run, иначе
-    # унаследованный от лейаута/мастера, и только если его нет, из профиля.
-    size = style.size_pt or inherited_text_size(slide, ref.element) or profile.denorm_pt(content.slot.size_pt)
-    fam = style.family or family
-    spacing = style.line_spacing or _AUDIT_DEFAULT_LINE_SPACING
-    left_in, top_in, right_in, bottom_in = style.insets_in
-    width_in = ref.box.width * canvas.width_emu / EMU_PER_INCH - left_in - right_in
-    height_in = ref.box.height * canvas.height_emu / EMU_PER_INCH - top_in - bottom_in
+    # Рамку, кегль и шкалу ужимания описывает `capacity.clone_text_frame`:
+    # тем же расчётом планировщик мерит вместимость места (задача V5), и
+    # контракт писателя не расходится с этой проверкой.
+    frame = clone_text_frame(
+        slide, ref.element, ref.box, profile, family, canvas, content.slot.size_pt, budget=budget,
+    )
     text = _joined_text(content.paragraphs)
-    if width_in <= 0 or height_in <= 0 or not text.strip():
+    if frame is None or not text.strip():
         return None
-    if measure(text, fam, size, width_in, line_spacing=spacing).lines > len(content.paragraphs):
+    size = frame.size_pt
+    if measure(text, frame.family, size, frame.width_in, line_spacing=frame.line_spacing).lines > len(content.paragraphs):
         allow_wrap(ref.element)
-    sizes = [size] + [s for s in _shrink_sequence(profile, content.slot.size_pt) if s < size - 0.05]
-    if budget is not None:
-        floor = budget.floor_pt(size, sizes[1:])
-        sizes = [s for s in sizes if s >= floor - 0.05] or [size]
-    # Рамка примера бывает ниже одной строки собственного кегля (пустой
-    # плейсхолдер заголовка ЛЦТ2026: 0,41" при 20 pt): PowerPoint рисует
-    # строку поверх рамки, и одна строка кеглем примера в ней считается
-    # помещающейся. Многострочный текст меряется как прежде.
-    one_line_in = measure("Xg", fam, size, width_in, line_spacing=spacing).height_in
-    allowed_in = max(height_in, one_line_in)
-    for candidate in sizes:
-        if measure(text, fam, candidate, width_in, line_spacing=spacing).height_in <= allowed_in + _FIT_TOLERANCE_IN:
-            # Кегль пишется, только если его пришлось ужать (ступень шкалы
-            # шаблона). Влезший унаследованный кегль остаётся наследуемым:
-            # записанный явно, он мог бы не совпасть ни с одной ступенью
-            # шкалы (VK Tech: 47pt у заголовка лейаута, находка T02).
-            if candidate != size:
-                set_text_size(ref.element, candidate)
-            return None
+    sizes = list(frame.sizes)
+    candidate = frame.fitting_size(text)
+    if candidate is not None:
+        # Кегль пишется, только если его пришлось ужать (ступень шкалы
+        # шаблона). Влезший унаследованный кегль остаётся наследуемым:
+        # записанный явно, он мог бы не совпасть ни с одной ступенью
+        # шкалы (VK Tech: 47pt у заголовка лейаута, находка T02).
+        if candidate != size:
+            set_text_size(ref.element, candidate)
+        return None
     if budget is not None:
         return (
             f"текст слота «{content.role_hint}» не помещается в рамку примера даже кеглем "
@@ -3346,23 +3422,7 @@ def _shrink_sequence(profile: TemplateProfile, slot_size_pt: float) -> list[floa
     `type_scale_pt`, единственное место в проекте, которое имеет право
     делить нормированный кегль на `canvas_norm`) один раз здесь, а не
     порознь у вызывающего."""
-    size_pt = profile.denorm_pt(slot_size_pt)
-    raw_steps = {name: profile.type_scale_pt(name, 0.0) for name in _SHRINK_STEPS}
-    # Пол тот же, что у автопочинки (`TemplateProfile.min_font_pt`): сборка и
-    # починка не должны расходиться в том, какой кегль ещё читается.
-    caption_pt = profile.min_font_pt()
-
-    seq = [size_pt]
-    for name in _SHRINK_STEPS:
-        value = raw_steps[name]
-        if 0 < value < seq[-1] - 0.05:
-            seq.append(value)
-    if caption_pt > 0 and abs(seq[-1] - caption_pt) > 0.05:
-        seq.append(caption_pt)
-    # Между далёкими ступенями (44 -> 16 у VK Education) промежуточные
-    # кегли, иначе заголовок ужимается сразу до кегля текста.
-    filled = [v for v in fill_scale_gaps(seq) if v <= size_pt + 0.05 and v >= caption_pt - 0.05]
-    return sorted(set(filled) | {size_pt}, reverse=True)
+    return shrink_sequence(profile, slot_size_pt)
 
 
 def _joined_text(paragraphs: list[Paragraph]) -> str:

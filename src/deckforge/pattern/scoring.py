@@ -31,14 +31,24 @@ _HERO_IMAGE_KINDS = frozenset({"section", "image", "closing"})
 # Плотность примера неизвестна (тестовые фикстуры, старый кэш): средний
 # штраф, чтобы такие раскладки не выигрывали у измеренных даром.
 _UNKNOWN_DENSITY_GAP = 0.3
+# Доля слов стиля на единицу, которая обязана лечь кеглем примера (задача
+# V5): меньше, и раскладка тесна стилю, даже если ужатым кеглем клон
+# текст ещё примет.
+NATIVE_SHARE = 0.6
 
 
 def overflow(intent: SlideIntent, form: PatternForm, style: StylePolicy) -> float:
     """Доля содержания, которой раскладка не вмещает: лишние единицы плюс
     нехватка слов на единицу против нижней границы стиля. Ноль, если
-    влезает. Оценка по вместимости, а не замер: текста ещё нет, его
+    влезает. Оценка по вместимости, а не замер текста: текста ещё нет, его
     напишут под контракт, и задача здесь не пустить стиль туда, где даже
-    короткий текст не поместится."""
+    короткий текст не поместится.
+
+    Если место измерено замером клона (`Limit.native_words`, задача V5),
+    слова берутся кеглем примера, без ужимания, а нижняя граница не ниже
+    `NATIVE_SHARE` от слов стиля на единицу: раскладка, где при родном
+    кегле ложится меньше, тесна, и узнать это планировщик должен сам, а
+    не от клона, отклонившего текст по бюджету кегля."""
     if intent.is_hero:
         return 0.0
     needs = intent.items
@@ -50,9 +60,14 @@ def overflow(intent: SlideIntent, form: PatternForm, style: StylePolicy) -> floa
     if main.block == "kpi":
         return unit_gap
     count = min(needs, units) or 1
-    per_unit = list_item_limit(main, count).max_words
+    limit = list_item_limit(main, count)
     floor = style.min_words_per_item
-    word_gap = max(0.0, (floor - per_unit) / floor) if per_unit and floor else 0.0
+    if limit.native_words is not None:
+        per_unit = limit.native_words
+        floor = max(floor, NATIVE_SHARE * style.words_per_item)
+    else:
+        per_unit = limit.max_words
+    word_gap = max(0.0, (floor - per_unit) / floor) if floor and (per_unit or limit.native_words is not None) else 0.0
     return unit_gap + word_gap
 
 

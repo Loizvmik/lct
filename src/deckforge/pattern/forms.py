@@ -11,7 +11,9 @@
 места) и контракту слайда (сколько писать), чтобы они не разошлись.
 
 Граница слоёв: читаются только роли, пределы слов и знаков, повтор и число
-декора. Ни одной координаты."""
+декора. Ни одной координаты. Вместимость места мерит `compose.capacity`
+тем же замером, которым клон проверяет текст (задача V5), и отдаёт сюда
+плоские числа (`SlotFit`): слова и знаки."""
 from __future__ import annotations
 from dataclasses import dataclass
 
@@ -40,6 +42,14 @@ class Limit:
     разбора не назвала и геометрия не сняла, мерить нечем."""
     max_words: int
     max_chars: int
+    # Слов кеглем примера, без ужимания (замер клона, задача V5). `None`:
+    # замера нет, есть только оценка профиля. По нему планировщик решает,
+    # тесна ли раскладка стилю (`scoring.overflow`), а предел `max_words`
+    # остаётся тем, что клон ещё примет, ужав кегль в пределах бюджета.
+    native_words: int | None = None
+    # Строк места по замеру клона (`SlotFit.lines`): столько однострочных
+    # пунктов список в нём вмещает. `None`: замера нет.
+    lines: int | None = None
 
     @property
     def target_words(self) -> int:
@@ -99,25 +109,69 @@ class PatternForm:
         return main.units if main is not None else 0
 
 
-def _limit(slot) -> Limit:
-    chars = slot_char_capacity(slot) if slot.max_chars > 0 else 0
-    words = slot.max_words or (max(1, chars // CHARS_PER_WORD) if chars else 0)
-    return Limit(max_words=int(words), max_chars=int(chars))
+def _slot_limit(slot, fit=None) -> Limit:
+    """Предел места. `fit`: замер клона (`compose.capacity.SlotFit`); без
+    него площадная оценка профиля. Слова от модели разбора (`max_words`:
+    сколько сюда пишут по замыслу макета) остаются верхней границей и при
+    замере: рамка бывает шире своего смысла."""
+    if fit is None:
+        chars = slot_char_capacity(slot) if slot.max_chars > 0 else 0
+        words = slot.max_words or (max(1, chars // CHARS_PER_WORD) if chars else 0)
+        return Limit(max_words=int(words), max_chars=int(chars))
+    words, chars, native = fit.words, fit.chars, fit.native_words
+    if slot.max_words:
+        words = min(words, slot.max_words)
+        chars = min(chars, slot.max_words * CHARS_PER_WORD)
+        native = min(native, slot.max_words)
+    # Ноль знаков у `Limit` значит «мерить нечем»; место, где по замеру
+    # не помещается ни слова, так и говорит: одно слово, один знак.
+    return Limit(
+        max_words=max(1, int(words)), max_chars=max(1, int(chars)), native_words=int(native),
+        lines=int(fit.lines) if fit.lines else None,
+    )
 
 
-def _biggest(slots):
-    return max(slots, key=lambda s: (slot_char_capacity(s), s.max_words or 0), default=None)
+def _capacity(slot, fit=None) -> int:
+    if fit is not None:
+        return min(fit.chars, slot.max_words * CHARS_PER_WORD) if slot.max_words else fit.chars
+    return slot_char_capacity(slot)
+
+
+def _biggest_slot(slots, fits=None):
+    fits = fits or {}
+    return max(slots, key=lambda s: (_capacity(s, fits.get(id(s))), s.max_words or 0), default=None)
 
 
 def _open(slots, role: str):
     return [s for s in slots if s.role == role and not keeps_sample_text(s)]
 
 
-def pattern_form(pattern) -> PatternForm:
+def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
     """Форма раскладки. Порядок ветвей повторяет `compose.blocks`: карточки
     разворачивают повтор, показатели ищут пары `kpi_value`/`kpi_label`,
-    цитата свой слот, текст и список самое ёмкое текстовое место."""
+    цитата свой слот, текст и список самое ёмкое текстовое место.
+
+    `fits`: номер слота в `pattern.slots` → замер клона
+    (`compose.capacity.measured_fits`). Без него пределы из профиля."""
     slots = list(pattern.slots)
+    by_slot = {id(s): fits[i] for i, s in enumerate(slots) if fits and i in fits}
+
+    def _limit(slot) -> Limit:
+        return _slot_limit(slot, by_slot.get(id(slot)))
+
+    def _biggest(candidates):
+        return _biggest_slot(candidates, by_slot)
+
+    def _unit_limit(candidates, fallback) -> Limit:
+        """Предел единицы повтора: по замеру самая тесная из её рамок, ведь
+        текст пишется один на все единицы, и лечь он обязан в каждую (у
+        таймлайна примера 42 одна рамка выше остальных, и контракт по ней
+        обещал вдвое больше, чем клон принимал в шести других)."""
+        measured = [s for s in candidates if id(s) in by_slot]
+        if not measured:
+            return _limit(fallback)
+        return _limit(min(measured, key=lambda s: (_capacity(s, by_slot[id(s)]), by_slot[id(s)].lines)))
+
     repeat = pattern.repeat if (pattern.repeat is not None and pattern.repeat.count >= 2) else None
     repeat_roles = set(repeat.slot_roles) if repeat is not None else set()
     parts: list[FormPart] = []
@@ -125,13 +179,14 @@ def pattern_form(pattern) -> PatternForm:
 
     if repeat is not None and repeat_roles & set(_UNIT_BODY_ROLES):
         body_role = next(r for r in _UNIT_BODY_ROLES if r in repeat_roles)
-        body = _biggest(_open(slots, body_role))
+        bodies = _open(slots, body_role)
+        body = _biggest(bodies)
         if body is not None:
             titles = _open(slots, "card_title") if "card_title" in repeat_roles else []
             title_slot = _biggest(titles)
             parts.append(FormPart(
-                block="cards", units=repeat.count, unit=_limit(body), role=body_role,
-                title=_limit(title_slot) if title_slot is not None else Limit(max_words=3, max_chars=3 * CHARS_PER_WORD),
+                block="cards", units=repeat.count, unit=_unit_limit(bodies, body), role=body_role,
+                title=_unit_limit(titles, title_slot) if title_slot is not None else Limit(max_words=3, max_chars=3 * CHARS_PER_WORD),
                 title_slot=title_slot is not None, purpose=body.purpose, content_hint=body.content_hint,
             ))
             used_roles |= repeat_roles
@@ -141,8 +196,8 @@ def pattern_form(pattern) -> PatternForm:
         if values:
             label = _biggest(labels)
             parts.append(FormPart(
-                block="kpi", units=repeat.count, unit=_limit(_biggest(values)), role="kpi_value",
-                title=_limit(label) if label is not None else None, title_slot=label is not None,
+                block="kpi", units=repeat.count, unit=_unit_limit(values, _biggest(values)), role="kpi_value",
+                title=_unit_limit(labels, label) if label is not None else None, title_slot=label is not None,
             ))
             used_roles |= repeat_roles
 
@@ -168,11 +223,14 @@ def pattern_form(pattern) -> PatternForm:
         s for s in slots
         if s.role in TEXT_ROLES and s.role not in used_roles and not keeps_sample_text(s) and s.max_chars > 0
     ]
-    free.sort(key=lambda s: -slot_char_capacity(s))
+    free.sort(key=lambda s: -_capacity(s, by_slot.get(id(s))))
     if free and not parts:
         main = free[0]
         limit = _limit(main)
         list_units = max(1, min(MAX_LIST_ITEMS, limit.max_words // _MIN_LIST_ITEM_WORDS or 1))
+        if limit.lines:
+            # Пункт это абзац не короче строки: пунктов не больше строк места.
+            list_units = max(1, min(list_units, limit.lines))
         parts.append(FormPart(
             block="bullets" if list_units >= 2 else "text", units=list_units, unit=limit, role=main.role,
             purpose=main.purpose, content_hint=main.content_hint,
@@ -221,13 +279,42 @@ def list_item_limit(part: FormPart, count: int) -> Limit:
     единицу, предел не делится."""
     if part.block != "bullets" or count <= 1:
         return part.unit
-    words = max(_MIN_LIST_ITEM_WORDS, part.unit.max_words // count)
-    chars = max(0, part.unit.max_chars // count - 1) if part.unit.max_chars else 0
-    return Limit(max_words=words, max_chars=chars)
+    unit = part.unit
+    if unit.lines and unit.lines >= count:
+        # По замеру: каждому пункту целые строки места, остаток строк
+        # (перенос внутри абзаца) делится так же, а не знаки поровну.
+        share = (unit.lines // count) / unit.lines
+        words = max(_MIN_LIST_ITEM_WORDS, int(unit.max_words * share))
+        chars = max(1, int(unit.max_chars * share) - 1)
+        native = int(unit.native_words * share) if unit.native_words is not None else None
+        return Limit(max_words=words, max_chars=chars, native_words=native, lines=unit.lines // count)
+    words = max(_MIN_LIST_ITEM_WORDS, unit.max_words // count)
+    chars = max(0, unit.max_chars // count - 1) if unit.max_chars else 0
+    if unit.lines:
+        # Пунктов больше строк места: каждому меньше строки.
+        native = 0 if unit.native_words is not None else None
+        return Limit(max_words=words, max_chars=chars, native_words=native, lines=0)
+    native = unit.native_words // count if unit.native_words is not None else None
+    return Limit(max_words=words, max_chars=chars, native_words=native)
+
+
+def slot_fits(profile) -> dict:
+    """Замер клона всех раскладок профиля (`compose.capacity`): чёрный
+    ящик, наружу только слова и знаки. Пусто, если файла шаблона нет."""
+    # Отложенный импорт: `compose` сам зовёт формы при сборке.
+    from deckforge.compose.capacity import measured_fits
+
+    return measured_fits(profile)
+
+
+def form_of(profile, pattern) -> PatternForm:
+    """Форма одной раскладки профиля с замером клона."""
+    return pattern_form(pattern, slot_fits(profile).get(pattern.pattern_id))
 
 
 def forms_of(profile) -> dict[str, PatternForm]:
-    return {p.pattern_id: pattern_form(p) for p in profile.patterns}
+    fits = slot_fits(profile)
+    return {p.pattern_id: pattern_form(p, fits.get(p.pattern_id)) for p in profile.patterns}
 
 
 # ---------------------------------------------------------------------------
