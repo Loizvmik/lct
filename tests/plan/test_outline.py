@@ -140,3 +140,14 @@ def test_load_content_pack_reads_frontmatter_and_sources():
     assert meta["target_slides"] == 12
     assert len(sources) == 1
     assert "1 240 заявок" in sources[0].text
+
+
+def test_every_content_pack_frontmatter_parses():
+    """Заголовок набора full-coverage с двоеточием без кавычек ломал YAML
+    фронтматтера, и CLI падал на чтении набора ещё до модели."""
+    packs = sorted(p for p in Path("fixtures/content-packs").iterdir() if (p / "brief.md").exists())
+    assert packs
+    for pack in packs:
+        _brief, sources, meta = load_content_pack(pack)
+        assert meta.get("title"), pack.name
+        assert sources, pack.name
