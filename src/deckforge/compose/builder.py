@@ -64,6 +64,7 @@ from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import walk_shapes
 from deckforge.pattern.forms import CODE_TIER_SLOT, code_target_slot, forms_of
+from deckforge.pattern.candidates import is_scratch_carrier
 from deckforge.pattern.intent import MAX_SLIDES
 from deckforge.pattern.planner import MAX_ALTERNATIVES
 from deckforge.pattern.scoring import look_key
@@ -267,6 +268,7 @@ def build_deck(
     # Облики уже собранных слайдов по порядку: запасная раскладка лестницы
     # не должна повторять соседа (задача V5).
     placed_looks: list[str] = []
+    form_spares = _form_spares(patterns, forms)
     rungs = dict.fromkeys(LADDER_RUNGS, 0)
     position = 0
     while position < len(spec.slides):
@@ -310,7 +312,7 @@ def build_deck(
                 room=max_slides - len(spec.slides), bullet_char=bullet_char, user_photos=user_photos,
                 image_bytes=image_bytes, source_slides=source_slides, look=look,
                 avoid_looks=_crowded_looks(spec.slides, position - 1, placed_looks, by_id, diversity),
-                language=spec.language,
+                language=spec.language, form_spares=form_spares,
             )
         placed_looks.append(look_key(outcome.pattern))
         slide_spec.findings.extend(outcome.notes)
@@ -594,6 +596,19 @@ def _carriers_of(slide_spec: SlideSpec, candidates: list[Pattern], by_id: dict[s
             seen.add(p.pattern_id)
             out.append(p)
     return out
+
+
+def _form_spares(patterns: list[Pattern], forms: dict) -> list[Pattern]:
+    """Запасные носители формы, чей клон не принят: сначала носители
+    планировщика (`is_scratch_carrier`), потом прочие раскладки содержания
+    без своей таблицы и графика. У WorkSpace носители-разделители места под
+    команду не дают, а раскладка пунктов (пример 10) даёт."""
+    plain = [
+        p for p in patterns
+        if (f := forms.get(p.pattern_id)) is not None and f.slide_class == "content_pattern"
+        and not f.has_table and not f.has_chart
+    ]
+    return sorted(plain, key=lambda p: not is_scratch_carrier(forms[p.pattern_id]))
 
 
 def _frame_spec(slide_spec: SlideSpec) -> SlideSpec:
@@ -2467,6 +2482,8 @@ class _Ladder:
     avoid_looks: frozenset[str] = frozenset()
     # Язык колоды: кавычки цитаты, собранной с нуля (`compose.quote`).
     language: str | None = None
+    # Запасные носители формы после кандидатов (`_form_spares`).
+    form_spares: list[Pattern] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     failures: list[Failure] = field(default_factory=list)
     path: list[str] = field(default_factory=list)
@@ -2701,8 +2718,10 @@ class _Ladder:
             # кандидатах как на носителях (родная раскладка формы даёт
             # заголовок и фирменную графику). Обычная сборка с нуля
             # разложила бы их по местам под текст.
+            seen = {p.pattern_id for p in self.candidates}
+            carriers = [*self.candidates, *(p for p in self.form_spares if p.pattern_id not in seen)]
             outcome = _place_scratch_form(
-                self.prs, self.slide_spec, form, self.candidates, self.profile, self.canvas, self.audit_config,
+                self.prs, self.slide_spec, form, carriers, self.profile, self.canvas, self.audit_config,
                 bullet_char=self.kw["bullet_char"], user_photos=self.kw["user_photos"],
                 image_bytes=self.kw["image_bytes"], look=self.look, language=self.language,
                 why="клон раскладки не принят",
@@ -2739,6 +2758,7 @@ def _place_with_ladder(
     user_photos: dict[str, Path] | None, image_bytes: Callable[[str], bytes | None] | None,
     source_slides: dict[int, object] | None, look: TemplateLook | None = None,
     policy: RepairPolicy | None = None, avoid_looks: frozenset[str] = frozenset(), language: str | None = None,
+    form_spares: list[Pattern] | None = None,
 ) -> LadderOutcome:
     """Лестница отказов одного слайда (раздел 11), с задачи V3 зависящая
     от причины отказа (разделы 12-13 идей четвёртой редакции).
@@ -2764,7 +2784,7 @@ def _place_with_ladder(
             "bullet_char": bullet_char, "user_photos": user_photos, "image_bytes": image_bytes,
             "source_slides": source_slides,
         },
-        look=look, avoid_looks=avoid_looks, language=language,
+        look=look, avoid_looks=avoid_looks, language=language, form_spares=list(form_spares or []),
     )
     ladder.path.append("clone")
     first = ladder.clone_original(candidates[:1], settle=False)

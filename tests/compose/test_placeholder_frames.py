@@ -138,8 +138,10 @@ def test_layout_with_a_third_of_the_canvas_left_empty_is_not_taken(lct_profile):
     треть холста пустеет. Такой клон отклоняется."""
     cards = CardBlock(items=[Card(title=f"Шаг {i}", body="Коротко по делу") for i in range(1, 5)])
     spec = DeckSpec(title="t", language="ru", slides=[SlideSpec(
-        index=0, kind="photo_text", headline="Пилот сократил согласование вдвое", blocks=[cards],
-        pattern_id="slide20",
+        # Вид раскладки берётся из разбора: после задачи T1 пример 20 уже
+        # не photo_text, и слайд чужого вида уходил мимо неё.
+        index=0, kind=next(p.kind for p in lct_profile.patterns if p.pattern_id == "slide20"),
+        headline="Пилот сократил согласование вдвое", blocks=[cards], pattern_id="slide20",
     )])
     builder.build_deck(spec, lct_profile, LCT, Variant.dense)
     assert any("slide20" in f and "пустеет" in f for f in spec.slides[0].findings)
