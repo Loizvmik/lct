@@ -1,8 +1,9 @@
 "use client";
 
 import { useParams, useRouter } from "next/navigation";
-import { useEffect, useState } from "react";
-import { createDeckBatch, VariantName, VARIANT_DESCRIPTIONS, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import PhotoPicker, { PickedPhoto, toPicked } from "@/components/PhotoPicker";
+import { createDeckBatch, loadExamplePhotos, VariantName, VARIANT_DESCRIPTIONS, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
 import { getAppSettings } from "@/lib/appSettings";
 import { clearBriefDraft, loadBriefDraft, saveBriefDraft } from "@/lib/briefDraft";
 import { EXAMPLES } from "@/lib/exampleContent";
@@ -20,6 +21,12 @@ export default function BriefPage() {
   const [sources, setSources] = useState("");
   const [targetSlides, setTargetSlides] = useState<number | "">("");
   const [autofix, setAutofix] = useState(true);
+  // Фото в черновик не пишутся: `photo_id` живут в памяти сервиса, и после
+  // его перезапуска черновик ссылался бы на пропавшие файлы.
+  const [photos, setPhotos] = useState<PickedPhoto[]>([]);
+  // Номер последней загрузки фото примера: ответ, пришедший после
+  // «Очистить поля» или другого примера, не должен вернуть старые фото.
+  const exampleRequest = useRef(0);
   // Задача Q: «все» означает три стиля тремя заданиями одной кнопкой.
   const [style, setStyle] = useState<StyleChoice>("all");
   const [busy, setBusy] = useState(false);
@@ -65,7 +72,8 @@ export default function BriefPage() {
     const settings = getAppSettings();
     setTitle(""); setBrief(""); setSources("");
     setTargetSlides(settings.defaultSlideCount === "auto" ? "" : settings.defaultSlideCount);
-    setAutofix(settings.defaultAutofix); setError(null);
+    setAutofix(settings.defaultAutofix); setError(null); setPhotos([]);
+    exampleRequest.current += 1;
     clearBriefDraft(params.templateId);
   }
 
@@ -73,13 +81,23 @@ export default function BriefPage() {
   // требует придумывать бриф, а главное, у модели есть исходные цифры.
   // Черновиком по умолчанию он не становится: `briefDraft` намеренно не
   // подставляет встроенный пример вместо пустой формы.
-  function fillExample(name: keyof typeof EXAMPLES = "queue-latency") {
+  // Фото примера лежат в том же контент-пакете на сервере; если сервис
+  // их не отдал, пример всё равно заполняется текстом.
+  async function fillExample(name: keyof typeof EXAMPLES = "queue-latency") {
     const example = EXAMPLES[name];
     setTitle(example.title);
     setBrief(example.brief);
     setSources(example.sources);
     setTargetSlides(example.targetSlides);
     setError(null);
+    setPhotos([]);
+    const request = ++exampleRequest.current;
+    try {
+      const loaded = toPicked(await loadExamplePhotos(name));
+      if (request === exampleRequest.current) setPhotos(loaded);
+    } catch {
+      // без фото пример остаётся рабочим
+    }
   }
 
   async function submit() {
@@ -98,6 +116,7 @@ export default function BriefPage() {
         target_slides: targetSlides === "" ? undefined : targetSlides,
         autofix,
         styles: style === "all" ? VARIANT_ORDER : [style],
+        photos: photos.map((p) => ({ photo_id: p.photo_id, caption: p.caption.trim() || undefined })),
       });
       router.push(`/batches/${batch_id}`);
     } catch (err) {
@@ -144,6 +163,8 @@ export default function BriefPage() {
           <textarea id="sources" value={sources} onChange={(e) => setSources(e.target.value)} placeholder="Вставьте факты, цифры, выдержки из документов и ссылки на источники." />
           <p className="field-hint">Необязательно. Числа из этого поля можно будет проверить на последнем шаге.</p>
         </div>
+
+        <PhotoPicker photos={photos} onChange={setPhotos} disabled={busy} />
 
         <div className="grid-2">
           <div className="field">
