@@ -425,6 +425,29 @@ def test_lone_table_frame_starts_at_the_left_margin_when_the_left_column_is_gone
     assert alone.width >= builder._TABLE_MIN_WIDTH
 
 
+def test_tall_title_frame_above_the_table_cuts_it_from_the_top_not_the_right():
+    """VK WorkSpace slide14: рамка заголовка на две строки кончается ниже
+    верха таблицы примера. Срез справа оставлял таблицу шириной в рамку
+    Google Slides (четверть слайда), срез сверху стоит полоски высоты."""
+    from types import SimpleNamespace
+    from pptx.util import Emu
+
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = Emu(12192000), Emu(6858000)
+    canvas = Canvas(width_emu=12192000, height_emu=6858000)
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    w, h = canvas.width_emu, canvas.height_emu
+    title = slide.shapes.add_textbox(Emu(int(0.035 * w)), Emu(int(0.062 * h)), Emu(int(0.64 * w)), Emu(int(0.17 * h)))
+    title.text_frame.text = "Заголовок"
+    grid = SimpleNamespace(margin_left=0.035, margin_right=0.045, margin_top=0.12, margin_bottom=0.2)
+    slot = Box(left=0.035, top=0.205, width=0.246, height=0.44)
+
+    box = builder._table_frame_box(slide, slot, SimpleNamespace(grid=grid), canvas)
+
+    assert box.width >= builder._TABLE_MIN_WIDTH
+    assert box.top >= 0.232 + builder._TABLE_GAP - 1e-6
+
+
 
 # ---------------------------------------------------------------------------
 # Привязка слотов к фигурам клона по id исходной фигуры

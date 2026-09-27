@@ -921,3 +921,72 @@ def test_example_with_empty_headline_has_no_source_density(profile_fixture):
     patterns = profile_fixture("Шаблон презентации VK Education.pptx").patterns
     empty = [p for p in patterns if any(s.role == "headline" and not (s.sample_text or "").strip() for s in p.slots)]
     assert empty and all(p.source_density is None for p in empty)
+
+
+# --- задача C, VK WorkSpace: раскладки, которые разбор терял --------------
+
+_WORKSPACE = "VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx"
+
+
+def test_workspace_card_and_kpi_slides_are_mined(profile_fixture):
+    """Карточки со значком (5, 9, 10, 23), показатели (17), три столбца
+    списков (16) и «Графики» (19, 20) раньше отбрасывались: значок
+    становился местом под фото внутри карточки, рамка заголовка на две
+    строки накрывала подпись, заголовок «Графики» был на процент шире
+    полей (разбор 27 сентября 2026)."""
+    mined = {i for p in profile_fixture(_WORKSPACE).patterns for i in p.source_slide_index}
+    assert {5, 9, 10, 16, 17, 19, 20, 23} <= mined, sorted(mined)
+
+
+def test_an_icon_is_never_a_photo_slot(profile_fixture):
+    for name in ALL_TEMPLATES:
+        for p in profile_fixture(name).patterns:
+            narrow = [s.box.width for s in p.slots if s.role == "image" and s.box.width < 0.08]
+            assert not narrow, f"{name} {p.pattern_id}: место под фото шириной со значок {narrow}"
+
+
+def test_tall_headline_frame_is_trimmed_to_the_slot_below():
+    from deckforge.template.patterns import _trim_tall_headline
+
+    head = PatternSlot(role="headline", box=Box(0.035, 0.062, 0.64, 0.17), size_pt=36.0, color_hex=None,
+                       align="l", max_chars=60, wraps=True, anchor="t")
+    below = PatternSlot(role="body", box=Box(0.035, 0.181, 0.3, 0.09), size_pt=14.0, color_hex=None,
+                        align="l", max_chars=60, wraps=True)
+    trimmed, same = _trim_tall_headline([head, below], _CANVAS)
+    assert abs(trimmed.box.bottom - 0.181) < 1e-9
+    assert trimmed.max_chars < head.max_chars
+    assert same == below
+    # Под рамкой не осталось бы и строки заголовка: это настоящее наложение.
+    tight = PatternSlot(role="body", box=Box(0.035, 0.08, 0.3, 0.09), size_pt=14.0, color_hex=None,
+                        align="l", max_chars=60, wraps=True)
+    assert _trim_tall_headline([head, tight], _CANVAS)[0] == head
+
+
+def test_slot_slightly_wider_than_the_margins_is_narrowed_to_them():
+    from deckforge.template.patterns import _snap_to_margins, _within_margins
+
+    grid = Grid(margin_left=0.035, margin_right=0.045, margin_top=0.1, margin_bottom=0.1,
+                columns=[], gutter=0.01, anchors={})
+    slot = PatternSlot(role="headline", box=Box(0.023, 0.062, 0.931, 0.11), size_pt=36.0, color_hex=None,
+                       align="l", max_chars=60, wraps=False)
+    (snapped,) = _snap_to_margins([slot], grid)
+    assert abs(snapped.box.left - 0.035) < 1e-9
+    assert _within_margins([snapped], grid)
+
+
+def test_number_masks_count_as_numbers():
+    from deckforge.template.patterns import _NUMBER_MASK_RE
+
+    for text in ("ХХ", "ххх%", "x%", "XX %"):
+        assert _NUMBER_MASK_RE.match(text), text
+    for text in ("Х", "Текст", "xxxxx"):
+        assert not _NUMBER_MASK_RE.match(text), text
+
+
+def test_second_sample_chart_picture_is_not_kept_as_decor(profile_fixture):
+    """VK WorkSpace slide20: два бублика-картинки. Одна место под график,
+    вторая в декоре; без пометки образцом она стояла рядом с нашим
+    графиком."""
+    pattern = next(p for p in profile_fixture(_WORKSPACE).patterns if 20 in p.source_slide_index)
+    big = [d for d in pattern.decor if d.kind == "picture" and d.box.area >= 0.15]
+    assert big and all(d.sample_photo for d in big)

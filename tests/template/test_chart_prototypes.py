@@ -55,14 +55,16 @@ def test_vk_education_rules_and_chart_samples_are_in_the_profile():
         assert any(s.chart_frame for s in pattern.slots if s.role == "image")
 
 
-def test_workspace_chart_pictures_are_prototypes_without_a_layout():
-    """WorkSpace рисует графики картинками на слайдах 20-21, в раскладки
-    они не попали: образец есть, раскладки у него нет, стиль берётся
+def test_workspace_chart_pictures_are_prototypes():
+    """WorkSpace рисует графики картинками на слайдах 19-21. С задачи C
+    слайды 19 и 20 стали раскладками (заголовок «Графики» сужен до полей),
+    у 21-го картинка шире холста, и раскладки у него нет: стиль берётся
     для графика на другой раскладке."""
     profile = _profile("VK_WorkSpace_Клиентская_конференция_Шаблон_03.pptx")
     samples = {p.source_slide: p for p in profile.chart_prototypes}
     assert {20, 21} <= set(samples)
-    assert all(p.pattern_id is None for p in samples.values())
+    assert samples[20].pattern_id == "slide20"
+    assert samples[21].pattern_id is None
     assert len(samples[20].palette) >= 2
 
 
