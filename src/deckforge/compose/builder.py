@@ -2795,6 +2795,9 @@ def _shrink_frame_away_from_decor(slide, ref, bound_elements: list, canvas: Canv
     return replace(ref, box=shrunk)
 
 
+_BOLD_WIDTH_SLACK = 1.2
+
+
 def _fit_title_plate(slide, ref, bound_elements: list, canvas: Canvas, family: str = "") -> None:
     """ADAPT: заголовок на плашке-«таблетке» уже рамки (ЛЦТ2026: плашка на
     четверть слайда, рамка плейсхолдера на восемь десятых). Аудит мерит
@@ -2817,14 +2820,17 @@ def _fit_title_plate(slide, ref, bound_elements: list, canvas: Canvas, family: s
     if not size:
         return
     left_in, _t, right_in, _b = style.insets_in
-    full_in = box.width * canvas.width_in - left_in - right_in
+    # Замер не знает начертания, а заголовок жирный; без Montserrat в
+    # системе замер идёт по Arial. Рендер переносил строку, которую замер
+    # клал в одну (прогон 27 сентября 2026, запас 1.12 не хватил).
+    full_in = (box.width * canvas.width_in - left_in - right_in) / _BOLD_WIDTH_SLACK
     fam = style.family or family
     lines = measure(text, fam, size, full_in).lines
     need_in = full_in
     for step in range(1, 40):
         width_in = full_in * step / 40
         if measure(text, fam, size, width_in).lines <= lines:
-            need_in = width_in * 1.05
+            need_in = width_in * _BOLD_WIDTH_SLACK
             break
     title_w = min(box.width, max(plate.box.right - box.left, (need_in + left_in + right_in) / canvas.width_in))
     pad = box.left - plate.box.left
@@ -2900,25 +2906,30 @@ def _fix_cloned_contrast(slide, ref, profile: TemplateProfile, canvas: Canvas, a
 
     Фон ищется в том же порядке, что у аудита: своя заливка фигуры, самая
     маленькая залитая фигура под ней, фон слайда, фон макета. Цвет без
-    явной заливки у run не трогается: аудит его тоже не судит, а
-    унаследованный цвет шаблон подбирал под свой фон."""
+    явной заливки у run берётся унаследованным (лейаут, мастер): шаблон
+    подбирал его под свой фон, но не всегда под фон этого примера."""
     run = ref.element.find(".//" + qn("a:r"))
     r_pr = run.find(qn("a:rPr")) if run is not None else None
     fill = r_pr.find(qn("a:solidFill")) if r_pr is not None else None
-    if fill is None:
-        return
     scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
-    color = resolve_color(fill, scheme, clr_map)
-    if not isinstance(color, Color):
+    if fill is not None:
+        color = resolve_color(fill, scheme, clr_map)
+        color_hex = color.hex if isinstance(color, Color) else None
+    else:
+        # ЛЦТ2026, пример 15 «Пункты»: плейсхолдеры наследуют белый текст
+        # мастера, а фон слайда светлый. Наш текст выходил белым по белому
+        # (прогон 27 сентября 2026), аудит унаследованный цвет не судит.
+        color_hex = inherited_text_color(slide, ref.element, scheme, clr_map)
+    if color_hex is None or r_pr is None:
         return
     bg_luminance = _clone_background_luminance(slide, ref, profile, canvas)
-    ratio = _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(color.hex))
-    size = int(r_pr.get("sz")) / 100 if r_pr.get("sz") else 0.0
+    ratio = _contrast_ratio_from_luminance(bg_luminance, _relative_luminance(color_hex))
+    size = int(r_pr.get("sz")) / 100 if r_pr.get("sz") else (inherited_text_size(slide, ref.element) or 0.0)
     cfg = audit_config.template
     is_large = size >= cfg.large_text_pt or (r_pr.get("b") == "1" and size >= cfg.large_bold_pt)
     if ratio >= (cfg.min_contrast_large if is_large else cfg.min_contrast_small):
         return
-    better = _best_contrast_color(color.hex, bg_luminance, profile)
+    better = _best_contrast_color(color_hex, bg_luminance, profile)
     for rpr in ref.element.iter(qn("a:rPr")):
         for old_fill in rpr.findall(qn("a:solidFill")):
             rpr.remove(old_fill)

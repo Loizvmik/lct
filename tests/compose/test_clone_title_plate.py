@@ -78,3 +78,30 @@ def test_two_line_headline_grows_plate_down(profile):
     assert plate.box.height > plate_before.box.height
     assert plate.box.bottom >= title.box.bottom
     assert not _plate_title_overlaps(slide, canvas, profile)
+
+
+def test_inherited_white_text_on_light_example_is_recolored(profile):
+    """Пример 15 «Пункты»: плейсхолдеры наследуют белый текст мастера, фон
+    слайда светлый. Клон обязан перекрасить наш текст, раз своего цвета у
+    run нет."""
+    from deckforge.audit.config import AuditConfig as _Cfg
+    from deckforge.compose.clone import inherited_text_color
+
+    prs = Presentation(str(TEMPLATE))
+    sources = sample_slides_by_number(prs)
+    builder._clear_sample_slides(prs)
+    pattern = next(builder._pattern_from_model(m) for m in profile.patterns if m.pattern_id == "slide15")
+    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
+    slide = clone_example_slide(prs, sources[15], builder._find_layout(prs, pattern.layout_id))
+    matched = match_slots(slide, pattern.slots, canvas)
+    ref = next(matched[i] for i, s in enumerate(pattern.slots) if s.role != "headline" and matched[i] is not None)
+    bind_text(ref.element, [Paragraph("Бюджет 2,4 млн рублей")])
+    scheme, clr_map = profile.theme.scheme, profile.theme.clr_map
+    bg = builder._clone_background_luminance(slide, ref, profile, canvas)
+    before = inherited_text_color(slide, ref.element, scheme, clr_map)
+    assert builder._contrast_ratio_from_luminance(bg, builder._relative_luminance(before)) < 3, "тест не о чем"
+
+    builder._fix_cloned_contrast(slide, ref, profile, canvas, _Cfg.load())
+
+    after = inherited_text_color(slide, ref.element, scheme, clr_map)
+    assert builder._contrast_ratio_from_luminance(bg, builder._relative_luminance(after)) >= 3
