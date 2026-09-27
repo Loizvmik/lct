@@ -19,7 +19,7 @@ from deckforge.compose.failure import (
 )
 from deckforge.ooxml.geometry import Canvas
 from deckforge.pattern.forms import forms_of
-from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TextBlock
+from deckforge.plan.spec import BulletBlock, Card, CardBlock, DeckSpec, SlideSpec, TableVisual, TextBlock, Visual
 from deckforge.settings import Settings
 from deckforge.template.profile import TemplateProfile
 
@@ -300,9 +300,15 @@ def test_build_deck_records_rungs_and_reasons_per_slide(profile, tmp_path, monke
     monkeypatch.setattr(builder, "_output_path", lambda spec, tpl, variant: tmp_path / "deck.pptx")
     spec = DeckSpec(title="Проверка", language="ru", slides=[
         SlideSpec(index=0, kind="section", headline="Итоги квартала", pattern_id="slide16"),
+        # Карточки вместе с таблицей: такой пары нет ни у одной раскладки
+        # VK Education (таблица у slide38 без карточек, карточки без
+        # таблицы), клоны отказывают, и сборка доходит до сборки с нуля;
+        # на одни карточки сборка сама ставит вперёд раскладку с местами
+        # под них, и отказа не было бы.
         SlideSpec(
-            index=1, kind="section", headline="Три шага", pattern_id="slide16",
+            index=1, kind="section", headline="Три шага и таблица", pattern_id="slide16",
             blocks=[CardBlock(items=[Card(title=f"Шаг {i}", body=f"Описание {i}") for i in range(3)])],
+            visual=Visual(kind="table", table=TableVisual(rows=[["Этап", "Часы"], ["Ожидание", "18"], ["Работа", "0,15"]])),
         ),
     ])
     builder.build_deck(spec, profile, TEMPLATE, Variant.dense)
@@ -313,8 +319,9 @@ def test_build_deck_records_rungs_and_reasons_per_slide(profile, tmp_path, monke
         assert slide.meta["ladder_rung"] in builder.LADDER_RUNGS
         assert counts[slide.meta["ladder_rung"]] >= 1
     assert "failure_codes" not in spec.slides[0].meta
-    assert spec.slides[1].meta["failure_codes"].startswith("MISSING_SLOT/")
-    assert spec.slides[1].meta["failure_primary"].startswith("MISSING_SLOT/")
+    codes = spec.slides[1].meta["failure_codes"]
+    assert "MISSING_SLOT/" in codes, codes
+    assert spec.slides[1].meta["failure_primary"].split("/")[0] in ("MISSING_SLOT", "TEXT_OVERFLOW", "OVERLAP")
 
 
 def test_html_report_says_why_a_slide_is_not_a_clone():

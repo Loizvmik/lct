@@ -282,7 +282,11 @@ def test_lost_blocks_count_content_without_a_slot(profile):
     без находок аудита: `_lost_blocks` считает такие части."""
     grid = builder._grid_from_model(profile.grid)
     by_id = {m.pattern_id: builder._pattern_from_model(m) for m in profile.patterns}
-    photos_only = next(pid for pid, p in by_id.items() if not any(s.role in ("body", "card_body") for s in p.slots))
+    # Подпись под иконкой и описание при номере тоже держат карточку
+    # (`compose.blocks._FALLBACK_BODY_ROLES`): раскладка «без места» это
+    # раскладка без единого текстового места под тело.
+    text_roles = ("body", "card_body", "bullet", "caption", "kpi_label")
+    photos_only = next(pid for pid, p in by_id.items() if not any(s.role in text_roles for s in p.slots))
 
     assert builder._lost_blocks(_cards_slide(4), by_id["slide21"], grid) == 0
     assert builder._lost_blocks(_cards_slide(4), by_id[photos_only], grid) >= 1

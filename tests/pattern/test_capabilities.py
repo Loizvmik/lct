@@ -168,3 +168,31 @@ def test_alternatives_keep_the_main_form_of_the_chosen_layout():
 
     assert plan[1].pattern_id == "gantt"
     assert "photo35" not in plan[1].alternatives
+
+
+def test_numbered_descriptions_and_captions_are_card_bodies():
+    """VK Education slide23: кружки с номерами (`kpi_value`, `ordinal`) и
+    описания при них (`kpi_label`) это карточки, не показатели; slide7/8:
+    подписи под иконками (`caption` в повторе) тоже карточки. Настоящий
+    показатель (значение без пометки `ordinal`) остаётся показателем."""
+    from .conftest import pattern, slot, headline
+
+    numbered = pattern("p23", "cards", [
+        headline(), *[slot("kpi_value", max_chars=3, ordinal=True, sample_text=str(i)) for i in range(1, 5)],
+        *[slot("kpi_label", max_chars=108, sample_text=f"Описание {i}") for i in range(1, 5)],
+    ], repeat=4, repeat_roles=("kpi_label", "kpi_value"))
+    form = pattern_form(numbered)
+    assert form.main is not None and form.main.block == "cards" and form.main.role == "kpi_label"
+    assert form.units == 4
+
+    captions = pattern("p7", "cards", [
+        headline(), *[slot("caption", max_chars=480, sample_text="Шрифт для заголовков") for _ in range(4)],
+    ], repeat=4, repeat_roles=("caption",))
+    form = pattern_form(captions)
+    assert form.main is not None and form.main.block == "cards" and form.main.role == "caption"
+
+    kpis = pattern("pk", "kpi", [
+        headline(), *[slot("kpi_value", max_chars=6, sample_text="42%") for _ in range(3)],
+        *[slot("kpi_label", max_chars=40, sample_text="доля") for _ in range(3)],
+    ], repeat=3, repeat_roles=("kpi_label", "kpi_value"))
+    assert pattern_form(kpis).main.block == "kpi"

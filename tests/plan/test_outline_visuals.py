@@ -74,7 +74,10 @@ def test_full_deck_converts_a_plain_slide_instead_of_growing_past_the_limit():
 
 
 def test_sources_without_chartable_series_do_not_force_a_chart():
-    outline = build_outline("бриф", _sources("queue-latency"), profile=None, llm=None, target_slides=12)
+    """Источник без числового ряда (набор «заявки» с приведением минут и
+    часов к одной единице ряд уже даёт, поэтому здесь текст без таблиц)."""
+    prose = [SourceDoc(name="sources.md", text="# Контекст\n\nЗаявки согласуются долго, комитет просит ускорить.")]
+    outline = build_outline("бриф", prose, profile=None, llm=None, target_slides=12)
     assert _chart_slides(outline.slides) == []
 
 

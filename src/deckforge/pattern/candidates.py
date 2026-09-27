@@ -53,10 +53,13 @@ def cover_pattern_id(profile) -> str | None:
     """Титульная раскладка: героическая, ближе всех к началу шаблона.
     Обложки лежат первыми, а по кеглю заголовка обложка и разделители у
     VK Education неотличимы (все по 48 pt), поэтому решает место примера."""
+    # Раскладка с повтором единиц обложкой не бывает: без модели вид
+    # «пример оформления 4 текстовых блоков» VK Education (слайд 7)
+    # геометрия считает разделителем, и он вставал обложкой.
     heroes = [
         p for p in profile.patterns
         if p.kind in _HERO_KINDS and p.source_slide_index and not is_closing_pattern(p, profile)
-        and any(s.role == "headline" for s in p.slots)
+        and any(s.role == "headline" for s in p.slots) and p.repeat is None
     ]
     if not heroes:
         return None

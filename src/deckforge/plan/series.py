@@ -117,15 +117,55 @@ def same_unit(units: list[str]) -> bool:
     return len({_unit_stem(u) for u in units}) <= 1
 
 
+# Длительности: единица -> минуты. Столбец «12 минут / 18 часов / 2 часа»
+# это одна величина в разных единицах; на графике она честна только в
+# одной (замер процесса согласования: ожидание 18 ч против работы 9 мин).
+_DURATION_MINUTES: tuple[tuple[re.Pattern, float], ...] = (
+    (re.compile(r"^сек|^с$|^с\.", re.IGNORECASE), 1 / 60),
+    (re.compile(r"^мин", re.IGNORECASE), 1.0),
+    (re.compile(r"^час|^ч$|^ч\.", re.IGNORECASE), 60.0),
+    (re.compile(r"^(дн|ден|сут)", re.IGNORECASE), 1440.0),
+    (re.compile(r"^нед", re.IGNORECASE), 10080.0),
+)
+_HOURS_FROM_MINUTES = 120.0
+
+
+def _duration_minutes(unit: str) -> float | None:
+    unit = (unit or "").strip()
+    for pattern, factor in _DURATION_MINUTES:
+        if pattern.match(unit):
+            return factor
+    return None
+
+
+def normalize_durations(parsed: list[tuple[float, str]]) -> list[tuple[float, str]] | None:
+    """Столбец длительностей в разных единицах -> одна единица: часы, если
+    самое большое значение не меньше двух часов, иначе минуты. `None`, если
+    это не длительности или единица и так одна."""
+    factors = [_duration_minutes(u) for _v, u in parsed]
+    if not parsed or any(f is None for f in factors) or same_unit([u for _v, u in parsed]):
+        return None
+    minutes = [v * f for (v, _u), f in zip(parsed, factors)]
+    if max(minutes) >= _HOURS_FROM_MINUTES:
+        return [(round(m / 60.0, 2), "ч") for m in minutes]
+    return [(round(m, 1), "мин") for m in minutes]
+
+
 def numeric_columns(table: RawTable) -> list[tuple[int, list[tuple[float, str]]]]:
     """Столбцы тела (без первого), где каждая ячейка число одной единицы:
-    (номер столбца, [(число, единица)])."""
+    (номер столбца, [(число, единица)]). Длительности в разных единицах
+    приводятся к одной (`normalize_durations`)."""
     body = table.body
     out = []
     for col in range(1, len(table.header)):
         parsed = [parse_number(r[col]) if col < len(r) else None for r in body]
-        if body and all(p is not None for p in parsed) and same_unit([p[1] for p in parsed]):
-            out.append((col, parsed))
+        if not body or any(p is None for p in parsed):
+            continue
+        if not same_unit([p[1] for p in parsed]):
+            parsed = normalize_durations(parsed)
+            if parsed is None:
+                continue
+        out.append((col, parsed))
     return out
 
 

@@ -279,6 +279,13 @@ def _assign_quote(
 
 
 _CARD_BODY_ROLES = ("card_body", "bullet", "body")
+# Единица повтора без места этих ролей: подпись под иконкой (VK Education
+# «Пример оформления 4/6 текстовых блоков», slide7/8, роль `caption`) или
+# описание при кружке с номером (slide23, `kpi_label` при `kpi_value`,
+# помеченном `ordinal`). Текст карточки ложится туда; без этого четыре
+# карточные раскладки шаблона не получали содержания вовсе (28 сентября
+# 2026: у dense и visual оставались две раскладки на всю презентацию).
+_FALLBACK_BODY_ROLES = ("caption", "kpi_label")
 
 
 # Раскладки, чьи единицы повтора это колонки текста, а не карточки с
@@ -439,6 +446,10 @@ def _pick_body_slot(group: list[PatternSlot]) -> PatternSlot | None:
     голого «…» (see `builder._is_cosmetic_truncation`) — пустая/усечённая-
     до-точек карточка хуже, чем оставить узкий слот вовсе без текста."""
     candidates = [s for s in group if s.role in _CARD_BODY_ROLES]
+    if not candidates:
+        # `group` уже без слотов с текстом примера (`_open_slots`): подпись
+        # при номере-`ordinal` остаётся единственным открытым местом единицы.
+        candidates = [s for s in group if s.role in _FALLBACK_BODY_ROLES]
     if not candidates:
         return None
     return max(candidates, key=lambda s: s.box.width * s.box.height)

@@ -177,8 +177,15 @@ def pattern_form(pattern, fits: dict | None = None) -> PatternForm:
     parts: list[FormPart] = []
     used_roles: set[str] = set()
 
-    if repeat is not None and repeat_roles & set(_UNIT_BODY_ROLES):
-        body_role = next(r for r in _UNIT_BODY_ROLES if r in repeat_roles)
+    # Кружки с номерами (`kpi_value` с текстом примера, `ordinal`) это
+    # нумерация карточек, а не показатели: описание при них (`kpi_label`)
+    # тело карточки. Подпись под иконкой (`caption` в повторе) тоже. Тот же
+    # порядок ролей, что у сборки (`compose.blocks._FALLBACK_BODY_ROLES`).
+    values_all = [s for s in slots if s.role == "kpi_value"]
+    numbering = bool(values_all) and all(keeps_sample_text(s) for s in values_all)
+    body_roles = (*_UNIT_BODY_ROLES, "caption", *(("kpi_label",) if numbering else ()))
+    if repeat is not None and repeat_roles & set(body_roles):
+        body_role = next(r for r in body_roles if r in repeat_roles)
         bodies = _open(slots, body_role)
         body = _biggest(bodies)
         if body is not None:

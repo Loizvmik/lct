@@ -51,12 +51,14 @@ def test_parts_that_add_up_to_the_total_row_are_part_to_whole_stacked_by_the_who
     assert data["unit"] == "млн ₽"
 
 
-def test_columns_with_different_units_stay_a_table():
-    """«12 минут» рядом с «18 часов» на графике дали бы почти равные
-    столбики при разнице в девяносто раз: такие данные остаются таблицей,
-    и графика код не требует."""
+def test_columns_with_different_quantities_stay_a_table():
+    """«31,5 ч» рядом с «39%» и «2,8 балла» в одном столбце: разные
+    величины, не разные единицы одной; такие данные остаются таблицей, и
+    графика код не требует (длительности в разных единицах приводятся к
+    одной, см. тест ниже)."""
     intents = visual_intents(_sources("queue-latency"))
-    assert intents and all(vi.type == "table" and not vi.required for vi in intents)
+    pilot = [vi for vi in intents if vi.data.table.heading.startswith("Пилот")]
+    assert pilot and all(vi.type == "table" and not vi.required for vi in pilot)
 
 
 def test_category_comparison_from_a_label_value_list():
@@ -98,3 +100,18 @@ def test_numbers_are_read_as_written_in_russian_sources():
 
 def test_text_without_numbers_gives_no_dataset():
     assert type_sources([SourceDoc(name="s", text="| Кто | Что |\n|---|---|\n| А | Б |\n| В | Г |\n| Д | Е |\n")]) == []
+
+
+def test_durations_in_mixed_units_become_one_series_in_hours():
+    """Замер процесса: «12 минут» рядом с «18 часов». Раньше столбец с
+    разными единицами оставался таблицей; теперь длительности приводятся к
+    часам, и шесть этапов сравниваются столбиками, где ожидание в 18 ч
+    видно против работы в 9 минут. Таблица пилота («31,5 ч» рядом с «39%»)
+    остаётся таблицей: там разные величины, не разные единицы."""
+    intents = visual_intents(_sources("queue-latency"))
+    kinds = [(vi.type, vi.required) for vi in intents]
+    assert kinds[0] == ("chart", True), kinds
+    series = intents[0].data.series
+    assert series.unit == "ч"
+    assert series.series[0].values[:2] == [0.2, 18.0]
+    assert kinds[1] == ("table", False), kinds

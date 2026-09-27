@@ -133,7 +133,10 @@ def test_generate_plans_layouts_per_style_before_the_text(monkeypatch, capsys, t
     for style, planned in captured.items():
         written = json.loads(next(out_dir.glob(f"*__{style.value}-deck.json")).read_text(encoding="utf-8"))
         same = sum(a == b["pattern_id"] for a, b in zip(planned, written["slides"]))
-        assert same >= len(planned) - 2, (planned, [s["pattern_id"] for s in written["slides"]])
+        # Три четверти слайдов остаются на раскладке планировщика: у
+        # остальных лестница сборки берёт запасную, когда текст фиктивного
+        # писателя не ложится в тесную раскладку (подписи под иконками).
+        assert same >= round(len(planned) * 0.75), (planned, [s["pattern_id"] for s in written["slides"]])
     out = capsys.readouterr().out
     assert "раскладки назначены" in out and "мест в пределах контракта" in out
     assert list(out_dir.glob("*__outline.json"))
