@@ -774,9 +774,18 @@ def _table_frame_box(
             continue
         cut_right = (right - (ob.left - _TABLE_GAP)) * (bottom - top) if ob.left > left else float("inf")
         cut_bottom = (bottom - (ob.top - _TABLE_GAP)) * (right - left) if ob.top > top else float("inf")
-        if cut_right == cut_bottom == float("inf"):
+        # Соседка, что начинается выше таблицы и свисает на её верх, режет
+        # сверху: у VK WorkSpace рамка заголовка на две строки кончается
+        # ниже верха таблицы примера, и срез справа оставлял таблицу
+        # шириной в рамку Google Slides, четверть слайда (прогон
+        # 27 сентября 2026, слайды 5 и 13).
+        cut_top = (ob.bottom + _TABLE_GAP - top) * (right - left) if ob.top <= top < ob.bottom else float("inf")
+        cheapest = min(cut_right, cut_bottom, cut_top)
+        if cheapest == float("inf"):
             continue
-        if cut_right <= cut_bottom:
+        if cheapest == cut_top:
+            top = ob.bottom + _TABLE_GAP
+        elif cheapest == cut_right:
             right = ob.left - _TABLE_GAP
         else:
             bottom = ob.top - _TABLE_GAP
