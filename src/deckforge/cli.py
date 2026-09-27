@@ -24,15 +24,17 @@ from deckforge.audit.deterministic import run_deterministic
 from deckforge.audit.fidelity import template_fidelity
 from deckforge.audit.report import AuditReport
 from deckforge.audit.visual import run_visual
-from deckforge.compose.builder import LADDER_TITLES, build_deck, count_embedded_photos, ladder_counts
+from deckforge.compose.builder import (
+    LADDER_TITLES, build_deck, embedded_photo_names, ladder_counts, photo_aspects, photo_frames,
+)
 from deckforge.pattern.intent import intents_from_outline
 from deckforge.plan.contracts import build_contracts, plan_contracts
 from deckforge.pattern.distinct import distinctness, slide_looks
 from deckforge.pattern.planner import plan_batch
 from deckforge.pattern.shape import shape_for_style
 from deckforge.plan.data_types import visual_intents
-from deckforge.plan.outline import build_outline, load_content_pack, outline_to_dict
-from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_photos
+from deckforge.plan.outline import build_outline, fallback_warning, load_content_pack, outline_to_dict
+from deckforge.plan.photos import assign_photos_to_outline, load_content_pack_photos, missing_photo_warnings
 from deckforge.plan.spec import deck_spec_from_debug_dict, deck_spec_to_dict
 from deckforge.plan.variants import GenerationStyle, Variant
 from deckforge.plan.writer import AGENT_MAX_STEPS_DEFAULT, DEFAULT_WRITER_MAX_WORKERS, WriteClock, write_slides
@@ -225,6 +227,10 @@ def _cmd_generate(args: argparse.Namespace) -> int:
     outlined_at = time.monotonic()
     record_shared("outline", outlined_at - parsed_at)
     print(f"Структура: {len(outline.slides)} слайдов за {outlined_at - parsed_at:.1f}с")
+    if (outline_note := fallback_warning(outline)) is not None:
+        print(f"  ! {outline_note}")
+        for style_budget in budgets.values():
+            style_budget.warn(outline_note)
 
     # Фотографии контент-пакета распределяются по пунктам структуры ДО
     # планирования раскладок: слайду с фото планировщик обязан дать место
@@ -247,7 +253,9 @@ def _cmd_generate(args: argparse.Namespace) -> int:
             print("  ! Ни одна фотография не попала ни на один слайд — см. находки выше.")
     user_photos = {p.name: p.path for p in photos}
     record_shared("photos", photos_at - outlined_at)
-    intents = intents_from_outline(outline, photo_by_slide)
+    intents = intents_from_outline(
+        outline, photo_by_slide, photo_aspects(user_photos), photo_frames(profile) if photo_by_slide else None,
+    )
 
     config = AuditConfig.load()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -470,7 +478,11 @@ def _generate_variant(variant: Variant, budget: RunBudget, ctx: dict) -> list[st
     # Сколько фотографий контент-пакета РЕАЛЬНО легло на слайды этого
     # варианта: по байтам сохранённого .pptx, не по плану распределения.
     if photos:
-        embedded = count_embedded_photos(path, ctx["user_photos"])
+        placed = embedded_photo_names(path, ctx["user_photos"])
+        embedded = len(placed)
+        for note in missing_photo_warnings(list(ctx["user_photos"]), placed, photo_report, deck):
+            out.append(f"  ! {note}")
+            budget.warn(note)
         not_embedded_findings = [
             f for f in slide_findings if "фотограф" in f.lower() and "не вставлен" in f.lower()
         ]
