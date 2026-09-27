@@ -51,7 +51,7 @@ from deckforge.compose.failure import (
     repair_policy,
 )
 from deckforge.compose.tables import TableSpec, add_table, column_shares
-from deckforge.compose.textfit import measure, register_template_fonts
+from deckforge.compose.textfit import font_substitute, measure, register_template_fonts
 from deckforge.ooxml.color import Color, resolve_color
 from deckforge.ooxml.customprops import write_custom_property
 from deckforge.ooxml.walk import walk_shapes
@@ -168,6 +168,22 @@ _ROLE_COLOR = {
 # ---------------------------------------------------------------------------
 
 
+def _note_font_substitutions(spec: DeckSpec, profile: TemplateProfile) -> None:
+    """Гарнитуры шаблона, которых нет ни в шаблоне, ни в системе, пишутся
+    в `spec.meta["font_substitutions"]` («Bogus Sans → Liberation Sans»).
+    Вместимость на подмене уже пересчитана с запасом (`textfit.measure`),
+    а в файл уходит имя гарнитуры шаблона: у зрителя со шрифтом колода
+    откроется как задумано. Отчёт нужен, чтобы человек не удивлялся
+    картинке на машине без шрифта."""
+    notes = []
+    for family in profile.type_scale.families:
+        substitute = font_substitute(family)
+        if substitute is not None:
+            notes.append(f"{family} → {substitute}")
+    if notes:
+        spec.meta["font_substitutions"] = "; ".join(notes)
+
+
 def build_deck(
     spec: DeckSpec, profile: TemplateProfile, template_path: Path, variant: Variant,
     *, user_photos: dict[str, Path] | None = None, clone_examples: bool | None = None,
@@ -196,6 +212,7 @@ def build_deck(
     picture_visual`, единственное место, которое реально читает файл с
     диска и вставляет его вместо ассета каталога шаблона."""
     register_template_fonts(template_path)
+    _note_font_substitutions(spec, profile)
     with PptxPackage.open(template_path) as pkg:
         bullet_char = find_bullet_char(pkg)
 
@@ -255,9 +272,23 @@ def build_deck(
             forms,
         )
         if not candidates:
+            candidates = _other_kind_candidates(slide_spec, patterns, profile, variant, history)
+            if candidates:
+                slide_spec.findings.append(
+                    f"Слайд {slide_spec.index}: в шаблоне нет раскладки вида {slide_spec.kind!r}; "
+                    f"слайд собран на раскладке другого вида ({candidates[0].pattern_id!r})."
+                )
+        if not candidates:
+            candidates = master_layout_patterns(slide_spec, profile, canvas)
+            if candidates:
+                slide_spec.findings.append(
+                    f"Слайд {slide_spec.index}: у шаблона нет ни одной раскладки со слайдов-примеров; "
+                    f"слайд собран на лейауте мастера {candidates[0].layout_id!r}."
+                )
+        if not candidates:
             slide_spec.findings.append(
                 f"Слайд {slide_spec.index}: для kind={slide_spec.kind!r} не нашлось ни одного "
-                "паттерна этого шаблона — слайд не собран."
+                "паттерна этого шаблона и ни одного лейаута с заголовком — слайд не собран."
             )
             continue
         outcome = _place_with_ladder(
@@ -336,7 +367,7 @@ def place_slide(
     # (`filled_repeat_units`). Находка ручной проверки: слайду с одним
     # заголовком досталась раскладка на три карточки, и три пустые белые
     # плашки 4×4 дюйма заняли больше половины слайда.
-    contents, drops = assign_content_with_drops(slide_spec, pattern, grid)
+    contents, drops = assign_content_with_drops(slide_spec, pattern, grid, cards_as_text=True)
     _note_drops(slide_spec, pattern, drops)
     decor = expand_decor(
         pattern, _repeat_item_count(slide_spec), grid, filled_repeat_units(pattern, contents),
@@ -424,6 +455,7 @@ def place_slide(
     _place_visual(
         slide, slide_spec, pattern, profile, user_photos, sole_content=_only_frame_text(contents),
         min_photo_width=_MIN_SCRATCH_PHOTO_WIDTH if look is not None else 0.0,
+        free_box=_free_visual_box(contents, grid),
     )
     _remove_empty_placeholders(slide)
 
@@ -550,15 +582,22 @@ def _visual_slot(pattern: Pattern, role: str) -> PatternSlot | None:
 def _place_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile,
     user_photos: dict[str, Path] | None = None, *, sole_content: bool = False, min_photo_width: float = 0.0,
+    free_box: Box | None = None,
 ) -> None:
+    """`free_box`: свободное место слайда, куда сборка с нуля ставит
+    таблицу или график, если у раскладки нет их слота (`_free_visual_box`).
+    Клон его не передаёт: клон без слота под визуал отклоняется раньше
+    (`place_slide_by_clone`)."""
     visual = slide_spec.visual
     if visual is None:
         return
 
     if visual.kind == "table" and visual.table is not None:
-        _place_table_visual(slide, slide_spec, pattern, profile, visual.table, sole_content=sole_content)
+        _place_table_visual(
+            slide, slide_spec, pattern, profile, visual.table, sole_content=sole_content, free_box=free_box,
+        )
     elif visual.kind == "chart" and visual.chart is not None:
-        _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart)
+        _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart, free_box=free_box)
     elif visual.kind in ("photo", "icon"):
         _place_picture_visual(
             slide, slide_spec, pattern, profile, visual.kind, user_photos,
@@ -566,10 +605,54 @@ def _place_visual(
         )
 
 
+# Свободное место под визуал ниже этой доли высоты холста не годится:
+# таблица на три строки и график в полосу высотой в строку не читаются.
+_FREE_VISUAL_MIN_HEIGHT = 0.3
+_FREE_VISUAL_GAP = 0.02
+
+
+def _free_visual_box(contents: list[SlotContent], grid: Grid) -> Box | None:
+    """Место под таблицу или график на слайде, собранном с нуля на
+    раскладке без их слота: под всем уложенным текстом, а если там мало
+    места, справа от текста под заголовком.
+
+    На датасете у таблиц и графиков всегда были свои раскладки. У
+    незнакомого шаблона из трёх слайдов-примеров их нет, и без этого места
+    таблица молча пропадала со слайда: оставался один заголовок."""
+    left, right = grid.margin_left, 1 - grid.margin_right
+    bottom = 1 - grid.margin_bottom
+    text_bottom = max((c.slot.box.bottom for c in contents), default=grid.margin_top)
+    top = text_bottom + _FREE_VISUAL_GAP
+    if bottom - top >= _FREE_VISUAL_MIN_HEIGHT:
+        return Box(left, top, right - left, bottom - top)
+    frame_bottom = max(
+        (c.slot.box.bottom for c in contents if c.role_hint in _CLONE_FRAME_ROLES), default=grid.margin_top,
+    )
+    top = frame_bottom + _FREE_VISUAL_GAP
+    middle = (left + right) / 2 + _FREE_VISUAL_GAP / 2
+    if bottom - top >= _FREE_VISUAL_MIN_HEIGHT:
+        return Box(middle, top, right - middle, bottom - top)
+    # Текст прижат к низу (разделитель с заголовком над полосой): место
+    # над ним.
+    text_top = min((c.slot.box.top for c in contents), default=bottom)
+    top, bottom = grid.margin_top, text_top - _FREE_VISUAL_GAP
+    if bottom - top >= _FREE_VISUAL_MIN_HEIGHT:
+        return Box(left, top, right - left, bottom - top)
+    return None
+
+
+def _free_slot(box: Box, profile: TemplateProfile) -> PatternSlot:
+    body_pt = profile.type_scale.steps.get("body") or 14.0
+    return PatternSlot(role="table", box=box, size_pt=body_pt, color_hex=None, align="l", max_chars=0, wraps=True)
+
+
 def _place_table_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, table, *, sole_content: bool = False,
+    free_box: Box | None = None,
 ) -> None:
     slot = _visual_slot(pattern, "table")
+    if slot is None and free_box is not None:
+        slot = _free_slot(free_box, profile)
     if slot is None:
         slide_spec.findings.append(
             f"Слайд {slide_spec.index}: в раскладке {pattern.pattern_id!r} нет слота под таблицу "
@@ -733,10 +816,14 @@ def _chart_slot(pattern: Pattern) -> PatternSlot | None:
 
 def _place_chart_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, chart, *, box: Box | None = None,
+    free_box: Box | None = None,
 ) -> None:
     """`box`: рамка, уже найденная клоном образца графика
-    (`_clear_sample_charts`); без неё рамка из слота раскладки."""
+    (`_clear_sample_charts`); без неё рамка из слота раскладки, а у
+    раскладки без такого слота свободное место слайда (`free_box`)."""
     slot = _chart_slot(pattern)
+    if slot is None and box is None and free_box is not None:
+        box = free_box
     if slot is None and box is None:
         slide_spec.findings.append(
             f"Слайд {slide_spec.index}: в раскладке {pattern.pattern_id!r} нет слота под график "
@@ -1262,6 +1349,80 @@ def _ranked_candidates(
     РЕАЛЬНОЙ геометрии уже уложенного слайда."""
     candidates = [p for p in patterns if p.kind == slide_spec.kind]
     return sorted(candidates, key=lambda p: _pattern_rank_key(slide_spec, p, profile, variant, history))
+
+
+def _other_kind_candidates(
+    slide_spec: SlideSpec, patterns: list[Pattern], profile: TemplateProfile, variant: Variant,
+    history: _SelectionHistory = _EMPTY_HISTORY,
+) -> list[Pattern]:
+    """Раскладки других видов, когда вида слайда в шаблоне нет вовсе.
+
+    На датасете у каждого вида была хотя бы одна раскладка, и слайд без
+    них молча выпадал из колоды. У незнакомого шаблона из трёх примеров
+    нет ни карточек, ни таблицы: слайд с карточками уходит на раскладку
+    другого вида, сборка с нуля раскладывает блоки по её слотам в стиле
+    шаблона, а таблицу и график ставит и без своего слота. Раскладки
+    содержания идут первыми; образцы графиков и листы ассетов, только если
+    больше ничего нет."""
+    content = [p for p in patterns if p.slide_class == "content_pattern"] or list(patterns)
+    return sorted(content, key=lambda p: _pattern_rank_key(slide_spec, p, profile, variant, history))
+
+
+# Канонические типы плейсхолдеров лейаута (`layouts._PH_TYPE_CANON`).
+_LAYOUT_TITLE_TYPES = ("TITLE", "CENTER_TITLE")
+_LAYOUT_BODY_TYPES = ("BODY", "OBJECT", "SUBTITLE")
+
+
+def master_layout_patterns(slide_spec: SlideSpec, profile: TemplateProfile, canvas: Canvas) -> list[Pattern]:
+    """Раскладки из лейаутов мастера для шаблона, с которого майнинг не
+    снял ни одной раскладки (слайдов-примеров нет, или все отброшены).
+    Слоты берутся из коробок плейсхолдеров: заголовок и самое крупное
+    текстовое место. Декора нет, его рисует сам лейаут.
+
+    Слайду с содержанием первыми идут лейауты с местом под текст, герою
+    (обложка, разделитель) лейауты без него. Кегли из шкалы шаблона,
+    вместимость по площади (`patterns.estimate_slot_chars`): точнее её
+    пересчитает замер сборки."""
+    from deckforge.template.patterns import estimate_slot_chars
+
+    steps = profile.type_scale.steps
+    head_pt = steps.get("h1") or steps.get("display") or 28.0
+    body_pt = steps.get("body") or 18.0
+    wants_body = bool(slide_spec.blocks) or slide_spec.visual is not None
+    with_body: list[Pattern] = []
+    heroes: list[Pattern] = []
+    for entry in profile.layouts:
+        titles = [ph for ph in entry.placeholders if ph.ph_type in _LAYOUT_TITLE_TYPES]
+        if not titles:
+            continue
+        bodies = sorted(
+            (ph for ph in entry.placeholders if ph.ph_type in _LAYOUT_BODY_TYPES),
+            key=lambda ph: -(ph.box.width * ph.box.height),
+        )
+        head_box = _box_from_model(titles[0].box)
+        slots = [PatternSlot(
+            role="headline", box=head_box, size_pt=head_pt, color_hex=None, align=profile.type_scale.default_align,
+            max_chars=estimate_slot_chars(head_box, canvas, head_pt), wraps=True,
+        )]
+        body_chars = 0
+        if bodies:
+            body_box = _box_from_model(bodies[0].box)
+            body_chars = estimate_slot_chars(body_box, canvas, body_pt)
+            slots.append(PatternSlot(
+                role="body", box=body_box, size_pt=body_pt, color_hex=None, align="l",
+                max_chars=body_chars, wraps=True,
+            ))
+        pattern = Pattern(
+            pattern_id=f"layout:{entry.layout_id}", source_slide_index=[], layout_id=entry.layout_id,
+            kind="bullets" if bodies else "section", slots=slots, repeat=None, decor=[],
+            capacity=Capacity(
+                max_items=6 if bodies else 0, max_chars_per_item=max(body_chars // 6, 1) if bodies else 0,
+                max_bullets=6 if bodies else 0, max_series=0, max_rows=0, max_cols=0,
+            ),
+            score=0.0, is_dark=entry.is_dark,
+        )
+        (with_body if bodies else heroes).append(pattern)
+    return with_body + heroes if wants_body else heroes + with_body
 
 
 def _pick_pattern(
@@ -2320,6 +2481,16 @@ def place_slide_by_clone(
         # клон с одной подписью вместо карточек хуже, чем следующий
         # кандидат (задача V2, airy слайд 3: вместо двух карточек «Май»).
         return CloneOutcome(f"блоки без места в раскладке: {', '.join(lost)}", "BLOCK_NO_SLOT")
+    visual = slide_spec.visual
+    if visual is not None and (
+        (visual.kind == "table" and visual.table is not None and _visual_slot(pattern, "table") is None)
+        or (visual.kind == "chart" and visual.chart is not None and _chart_slot(pattern) is None
+            and pattern.slide_class != "visual_prototype")
+    ):
+        # Клон не двигает фигуры и свободного места под таблицу не ищет:
+        # принятый клон терял её молча, и на слайде оставался заголовок.
+        # Сборка с нуля ставит её в свободное место (`_free_visual_box`).
+        return CloneOutcome(f"нет места под {visual.kind} в раскладке", "VISUAL_NO_SLOT")
     clean: list[SlotContent] = []
     for content in contents:
         hit = _placeholder_text_hit(content, audit_config)

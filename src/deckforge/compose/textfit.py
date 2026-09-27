@@ -277,6 +277,31 @@ def _resolve_font(family: str) -> tuple[Path | None, str]:
     return None, "fallback"
 
 
+def font_substitute(family: str) -> str | None:
+    """Чем на этой машине меряется гарнитура `family`, если не ею самой:
+    имя запасного семейства (`Liberation Sans`, `Arial`) или
+    `"встроенный шрифт Pillow"`; `None`, когда шрифт найден (встроен в
+    шаблон или стоит в системе).
+
+    Замер на подмене уже идёт с запасом `_FALLBACK_SAFETY_MARGIN`, то есть
+    вместимость пересчитана. Эта функция нужна отчёту: человек должен знать,
+    что колода на его машине откроется не тем шрифтом, что задумал шаблон
+    (незнакомый шаблон с «Bogus Sans» и тому подобным)."""
+    if not family.strip():
+        return _first_fallback_name()
+    _path, source = _resolve_font(family)
+    if source == "exact":
+        return None
+    return _first_fallback_name()
+
+
+def _first_fallback_name() -> str:
+    for fallback in _FALLBACK_FAMILIES:
+        if _system_font_file(fallback) is not None:
+            return fallback
+    return "встроенный шрифт Pillow"
+
+
 @lru_cache(maxsize=128)
 def _system_font_file(family: str) -> Path | None:
     key = _normalize_family(family)
