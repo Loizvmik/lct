@@ -41,7 +41,7 @@ from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
     CLONE_MARK_PREFIX, allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
     hide_layout_photos, inherited_text_color, inherited_text_size, mark_slide, match_slots, native_table,
-    prune_unfilled, remove_in_box,
+    prune_unfilled, prune_unit_lines, remove_in_box,
     remove_sample_frames, remove_shape, remove_stray_text, replace_picture, sample_slides_by_number,
     set_native_table_geometry, set_shape_box, set_table_text_size, set_text_size, shape_text, slide_refs,
     table_cell_styles, template_row_heights_emu, text_style,
@@ -393,6 +393,7 @@ def place_slide(
     frame_spec = _frame_spec(slide_spec) if scratch_form is not None else slide_spec
     contents, drops = assign_content_with_drops(frame_spec, pattern, grid, cards_as_text=True)
     _note_drops(slide_spec, pattern, drops)
+    contents = _clear_headline(contents, profile, look, grid)
     decor = expand_decor(
         pattern, _repeat_item_count(frame_spec), grid, filled_repeat_units(pattern, contents),
     )
@@ -3011,6 +3012,7 @@ def place_slide_by_clone(
             return CloneOutcome(overflow, "FONT_BUDGET")
         if content.slot.role == "headline":
             _fit_title_plate(slide, ref, bound_elements, canvas, family)
+            _clear_title_plate_of_background_marks(slide, ref, bound_elements, canvas, family)
         _fix_cloned_contrast(slide, ref, profile, canvas, audit_config, inherited_pt=content.slot.size_pt)
 
     keep = [ref.element for _, ref in bound]
@@ -3034,7 +3036,7 @@ def place_slide_by_clone(
     bound_slots = {id(content.slot) for content, _ in bound}
     if code_ref is not None:
         bound_slots.add(id(code_ref[0]))
-    for slot in _sample_text_slots(pattern, filled):
+    for slot in [*_sample_text_slots(pattern, filled), *_unit_ordinal_slots(pattern, filled)]:
         ref = matched.get(index_of[id(slot)])
         if id(slot) not in bound_slots and ref is not None and not orphan(slot.box):
             bound_slots.add(id(slot))
@@ -3068,6 +3070,10 @@ def place_slide_by_clone(
     )
     remove_stray_text(slide, canvas, keep=keep, badge_boxes=[d.box for d in kept_decor if d.badge_text])
     remove_sample_frames(slide, keep=keep)
+    if pattern.repeat is not None and not is_grid(pattern):
+        # Линии незаполненных единиц, которых майнинг к единице не отнёс
+        # (ножка карточки, отрезок оси таймлайна), уходят по геометрии.
+        prune_unit_lines(slide, _unit_cells(pattern), filled, pattern.repeat.axis, canvas, keep=keep)
     if native_frame is not None:
         _fill_native_table_on_clone(
             slide, slide_spec, pattern, profile, canvas, native_frame, table_ref.box, _only_frame_text(clean),
@@ -3216,6 +3222,50 @@ def _sample_text_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
     return kept
 
 
+def _unit_cells(pattern: Pattern) -> list[Box]:
+    """Ячейки единиц повтора в порядке обхода: общая коробка слотов
+    единицы (`RepeatUnit.slot_ids`). Пусто, если хоть одна единица без
+    слотов с известной коробкой: тогда геометрия единиц не известна."""
+    repeat = pattern.repeat
+    if repeat is None or not repeat.units:
+        return []
+    by_id = {s.source_shape_id: s.box for s in pattern.slots if s.source_shape_id}
+    cells = []
+    for unit in repeat.units:
+        boxes = [by_id[sid] for sid in unit.slot_ids if sid in by_id]
+        if not boxes:
+            return []
+        left, top = min(b.left for b in boxes), min(b.top for b in boxes)
+        cells.append(Box(left, top, max(b.right for b in boxes) - left, max(b.bottom for b in boxes) - top))
+    return cells
+
+
+def _unit_ordinal_slots(pattern: Pattern, filled: set[int]) -> list[PatternSlot]:
+    """Номера шагов вне единиц повтора, стоящие напротив заполненной
+    единицы. У таймлайна ЛЦТ2026 (`slide25`) кружки «1»-«5» на оси
+    майнинг не включил в единицы карточек, и клон удалял их как
+    незаполненные слоты: ножки карточек и отрезки оси оставались висеть
+    без узлов. Номер i-го кружка по оси и есть номер i-й карточки: клон
+    заполняет первые единицы по порядку."""
+    repeat = pattern.repeat
+    cells = _unit_cells(pattern)
+    if repeat is None or len(cells) < 2 or is_grid(pattern):
+        return []
+    x_axis = repeat.axis == "x"
+    centers = [(c.left + c.width / 2) if x_axis else (c.top + c.height / 2) for c in cells]
+    ordered = sorted(centers)
+    half = min(b - a for a, b in zip(ordered, ordered[1:])) / 2
+    kept = []
+    for slot in pattern.slots:
+        if slot.role in repeat.slot_roles or not (slot.sample_text and _ORDINAL_RE.fullmatch(slot.sample_text.strip())):
+            continue
+        at = (slot.box.left + slot.box.width / 2) if x_axis else (slot.box.top + slot.box.height / 2)
+        unit = min(range(len(centers)), key=lambda k: abs(centers[k] - at))
+        if abs(centers[unit] - at) <= half and unit in filled:
+            kept.append(slot)
+    return kept
+
+
 # Зазор между суженной рамкой текста и графикой справа, доли холста.
 _FRAME_GAP = 0.02
 # Суженная рамка не уже стольких долей холста и половины исходной: иначе
@@ -3272,6 +3322,118 @@ def _shrink_frame_away_from_decor(slide, ref, bound_elements: list, canvas: Canv
 
 
 _BOLD_WIDTH_SLACK = 1.2
+
+# Знаки на фоновой картинке слайда: пиксель отличается от фона своей
+# строки на столько (0-255 по каналу), столбец помечен, если таких в
+# полосе заголовка не меньше этой доли. Фон занят больше чем на половину
+# ширины справа от заголовка: это фото, а не логотипы, и рамку не сужаем.
+_MARK_PIXEL_DELTA = 60
+_MARK_COLUMN_SHARE = 0.04
+_MARK_BUSY_SHARE = 0.5
+_MARK_SCAN_WIDTH = 480
+
+
+def _background_blob(slide) -> bytes | None:
+    """Картинка фона слайда: своя, иначе лейаута, иначе мастера."""
+    for owner in (slide, slide.slide_layout, slide.slide_layout.slide_master):
+        bg = owner._element.find(qn("p:cSld") + "/" + qn("p:bg"))  # noqa: SLF001
+        if bg is None:
+            continue
+        blip = bg.find(".//" + qn("a:blip"))
+        rid = blip.get(qn("r:embed")) if blip is not None else None
+        if not rid:
+            return None
+        try:
+            return owner.part.related_part(rid).blob
+        except KeyError:
+            return None
+    return None
+
+
+def _background_marks_left(slide, top: float, bottom: float, start: float) -> float | None:
+    """Левый край первого знака на фоновой картинке в полосе `top..bottom`
+    правее `start` (доли холста), или `None`. У ЛЦТ2026 логотипы
+    партнёров нарисованы прямо в картинке фона, фигур под ними нет, и
+    `_frame_obstacles` их не видит: таблетка заголовка вырастала до
+    логотипа и накрывала его край (рендер 28 сентября 2026)."""
+    blob = _background_blob(slide)
+    if blob is None:
+        return None
+    try:
+        image = Image.open(io.BytesIO(blob)).convert("RGB")
+    except Exception:  # noqa: BLE001: нечитаемый фон: знаков не ищем
+        return None
+    w, h = image.size
+    scale = _MARK_SCAN_WIDTH / w if w > _MARK_SCAN_WIDTH else 1.0
+    if scale < 1.0:
+        image = image.resize((max(1, round(w * scale)), max(1, round(h * scale))))
+        w, h = image.size
+    y0, y1 = max(0, int(top * h)), min(h, int(bottom * h) + 1)
+    x0 = max(0, int(start * w))
+    if y1 - y0 < 2 or x0 >= w:
+        return None
+    px = image.load()
+    marked = [0] * w
+    for y in range(y0, y1):
+        row = [px[x, y] for x in range(w)]
+        ref = tuple(sorted(c[k] for c in row)[w // 2] for k in range(3))
+        for x in range(x0, w):
+            if max(abs(row[x][k] - ref[k]) for k in range(3)) > _MARK_PIXEL_DELTA:
+                marked[x] += 1
+    columns = [x for x in range(x0, w) if marked[x] >= _MARK_COLUMN_SHARE * (y1 - y0)]
+    if not columns or len(columns) > _MARK_BUSY_SHARE * (w - x0):
+        return None
+    return columns[0] / w
+
+
+def _clear_title_plate_of_background_marks(
+    slide, ref, bound_elements: list, canvas: Canvas, family: str = "",
+) -> None:
+    """Таблетка заголовка кончается левее знаков фоновой картинки
+    (логотипов) с зазором. Правится после `_fit_title_plate`, а не до
+    замера кегля: сужение рамки заранее отклоняло клон с длинным
+    заголовком по бюджету кегля (живой прогон ЛЦТ2026, 28 сентября 2026),
+    а здесь заголовок просто переносится на вторую строку, и таблетка
+    растёт вниз, как при сужении логотипом-фигурой. Больше двух строк
+    не допускается: такая таблетка легла бы на содержание под ней, и
+    заход на край логотипа меньшее зло."""
+    fresh = next((r for r in slide_refs(slide, canvas) if r.element is ref.element), None)
+    if fresh is None or fresh.box is None:
+        return
+    box = fresh.box
+    plates = [
+        r for r in slide_refs(slide, canvas)
+        if r.box is not None and r.kind == "shape" and not r.is_placeholder and r.element not in bound_elements
+        and not shape_text(r.element).strip() and r.box.left <= box.left + 0.005 and r.box.top <= box.top + 0.005
+        and r.box.bottom >= box.bottom - 0.005 and r.box.right > box.left
+    ]
+    text = shape_text(ref.element).strip()
+    if not plates or not text:
+        return
+    plate = min(plates, key=lambda r: r.box.area)
+    marks = _background_marks_left(slide, plate.box.top, plate.box.bottom, box.left + box.width * 0.3)
+    if marks is None or plate.box.right <= marks - _FRAME_GAP:
+        return
+    pad = box.left - plate.box.left
+    plate_w = marks - _FRAME_GAP - plate.box.left
+    frame_w = min(box.width, plate_w - 2 * pad)
+    if frame_w < _FRAME_MIN_WIDTH:
+        return
+    style = text_style(ref.element)
+    size = style.size_pt or inherited_text_size(slide, ref.element)
+    if not size:
+        return
+    left_in, top_in, right_in, bottom_in = style.insets_in
+    fam = style.family or family
+    width_in = (frame_w * canvas.width_in - left_in - right_in) / _BOLD_WIDTH_SLACK
+    spacing = {"line_spacing": style.line_spacing} if style.line_spacing else {}
+    metrics = measure(text, fam, size, width_in, **spacing)
+    if metrics.lines > 2:
+        return
+    need_h = metrics.height_in + top_in + bottom_in
+    dh = max(0.0, need_h / canvas.height_in - box.height)
+    set_shape_box(ref.element, replace(box, width=frame_w, height=box.height + dh), canvas)
+    set_shape_box(plate.element, replace(plate.box, width=plate_w, height=plate.box.height + dh), canvas)
 
 
 def _fit_title_plate(slide, ref, bound_elements: list, canvas: Canvas, family: str = "") -> None:
@@ -4029,6 +4191,110 @@ def _align_scattered_units(
                 plaque, box=Box(left=left, top=top, width=width, height=height), repeat_group=False,
             ))
     return out, plaques
+
+
+# Высота строки шрифта в долях кегля. Интерлиньяж в файле PowerPoint и
+# LibreOffice множат на высоту строки гарнитуры (у Play, Inter, VK Sans
+# 1,17-1,2 кегля), а не на сам кегль, как считает `measure`: заголовок в
+# две строки при интерлиньяже 0,9 выходил на пятую часть ниже замера и
+# ложился на подзаголовок (WorkSpace, рендер 28 сентября 2026).
+_FONT_LINE_HEIGHT = 1.2
+
+
+def _fitted_size(text: str, family: str, sizes: list[float], width_in: float, height_in: float,
+                 line_spacing: float) -> float:
+    """Кегль, который выберет `_draw_slot` для этого текста в этой рамке:
+    первый по убыванию, при котором замер лёг в высоту, иначе последний."""
+    for size_pt in sizes:
+        if measure(text, family, size_pt, width_in, line_spacing=line_spacing).height_in <= height_in + _FIT_TOLERANCE_IN:
+            return size_pt
+    return sizes[-1]
+
+
+def _headline_text_bottom(
+    content: SlotContent, profile: TemplateProfile, look: "TemplateLook | None",
+) -> tuple[float, float]:
+    """(низ набранного заголовка, кегль) в долях высоты холста: тем же
+    кеглем, что выберет отрисовка (облик шаблона и ужимание по рамке), с
+    реальной высотой строки гарнитуры. Коробка слота примера под заголовок
+    в одну строку, а наш заголовок бывает в две."""
+    if look is not None:
+        content, _color = look.restyle(content, profile, 0.0, 1.0)
+    box = content.slot.box
+    width_in = box.width * profile.canvas_width_emu / EMU_PER_INCH
+    canvas_h_in = profile.canvas_height_emu / EMU_PER_INCH
+    family = _primary_family(profile)
+    spacing = _line_spacing_for("headline", profile)
+    text = _joined_text(content.paragraphs)
+    size = _fitted_size(text, family, _shrink_sequence(profile, content.slot.size_pt), width_in,
+                        box.height * canvas_h_in, spacing)
+    metrics = measure(text, family, size, width_in, line_spacing=spacing)
+    height = metrics.lines * size / 72.0 * spacing * _FONT_LINE_HEIGHT / canvas_h_in
+    if metrics.font_source == "fallback":
+        height *= _FALLBACK_TEXT_MARGIN
+    if content.slot.anchor == "b":
+        return box.bottom, size
+    if content.slot.anchor == "ctr":
+        return box.top + box.height / 2 + height / 2, size
+    return box.top + height, size
+
+
+# Запас на замер чужой гарнитурой (как `textfit._FALLBACK_SAFETY_MARGIN`).
+_FALLBACK_TEXT_MARGIN = 1.15
+
+
+def _clear_headline(
+    contents: list[SlotContent], profile: TemplateProfile, look: "TemplateLook | None", grid: Grid,
+) -> list[SlotContent]:
+    """Всё, что стоит под заголовком, начинается ниже его набранного низа.
+
+    Сборка с нуля ставит заголовок в коробку слота примера, а подзаголовок,
+    абзац и места формы в коробки под ней. Заголовок длиннее примерного
+    переносится на вторую строку и ложится на них. Здесь заголовок
+    получает коробку по фактической высоте (замер тем же кеглем и шириной),
+    а места под ним, которые попали в эту высоту, сдвигаются вниз все на
+    одну величину, так что их взаимная раскладка не меняется. Места сбоку
+    от заголовка (колонка справа) не трогаются. Так же видят новый низ
+    заголовка и `_form_region`, и `_align_scattered_units`: они считают
+    место от коробок уже уложенного текста."""
+    head_i = next(
+        (i for i, c in enumerate(contents)
+         if c.role_hint == "headline" and any(p.text.strip() for p in c.paragraphs)),
+        None,
+    )
+    if head_i is None:
+        return contents
+    head = contents[head_i]
+    hb = head.slot.box
+    text_bottom, size = _headline_text_bottom(head, profile, look)
+    out = list(contents)
+    if text_bottom > hb.bottom + 1e-4:
+        grown = replace(head, slot=replace(head.slot, box=Box(hb.left, hb.top, hb.width, text_bottom - hb.top)))
+        # Выше коробка не должна поднять кегль: иначе отрисовка выберет
+        # кегль крупнее замеренного, и высота снова разойдётся.
+        if _headline_text_bottom(grown, profile, look)[1] <= size + 1e-6:
+            out[head_i] = grown
+    limit = text_bottom + max(grid.gutter, _FREE_VISUAL_GAP / 2)
+
+    def below(c: SlotContent) -> bool:
+        b = c.slot.box
+        return b.top > hb.top + 1e-4 and min(b.right, hb.right) - max(b.left, hb.left) > 1e-4
+
+    under = [i for i, c in enumerate(out) if i != head_i and below(c)]
+    clashing = [i for i in under if out[i].slot.box.top < limit - 1e-4]
+    if not clashing:
+        return out
+    first_top = min(out[i].slot.box.top for i in clashing)
+    delta = limit - first_top
+    floor = 1.0 - grid.margin_bottom
+    for i in under:
+        b = out[i].slot.box
+        if b.top < first_top - 1e-4:
+            continue
+        top = b.top + delta
+        height = max(min(b.height, floor - top), min(b.height, 0.04))
+        out[i] = replace(out[i], slot=replace(out[i].slot, box=Box(b.left, top, b.width, height)))
+    return out
 
 
 # ---------------------------------------------------------------------------
