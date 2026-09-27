@@ -52,6 +52,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.findings import Finding, Repair, Severity
 from deckforge.compose.clone import clone_pattern_id
+from deckforge.compose.code import CODE_LINE_HEIGHT, CODE_SHAPE_NAME, MONO_ADVANCE
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.failure import font_budget
 from deckforge.compose.textfit import measure
@@ -639,10 +640,55 @@ def _overflow_repair(item: _Item, ctx: _SlideContext, profile: TemplateProfile, 
     return "structural" if _overflow_at_floor(item, ctx, profile) > config.repair.overflow_ratio else "local"
 
 
+def _is_code_item(item: _Item) -> bool:
+    """Фигура фрагмента кода (`compose.code`, задача T2): код не текст
+    слайда, стеной текста и кеглем вне шкалы его не судят."""
+    return (item.name or "").startswith(CODE_SHAPE_NAME)
+
+
+def _code_extent_in(item: _Item) -> tuple[float, float] | None:
+    """(ширина, высота) кода в дюймах без переносов: строки как есть,
+    ширина знака моногарнитуры `MONO_ADVANCE` кегля. `None`: стиля нет."""
+    style = _dominant_run_style(item.element)
+    if style is None:
+        return None
+    _family, size_pt, _bold = style
+    lines = item.text.replace("\x0b", "\n").split("\n")
+    width = max((len(line) for line in lines), default=0) * MONO_ADVANCE * size_pt / 72.0
+    height = len(lines) * size_pt * CODE_LINE_HEIGHT / 72.0
+    return width, height
+
+
+def _check_code_fit(ctx: _SlideContext, item: _Item, config: AuditConfig) -> list[Finding]:
+    """L03 у кода: строки не переносятся, поэтому мерится ширина самой
+    длинной строки и высота всех строк, а не перенос по словам."""
+    extent = _code_extent_in(item)
+    if extent is None:
+        return []
+    need_w, need_h = extent
+    l_in, t_in, r_in, b_in = _text_frame_insets_in(item.element)
+    box_w = max(0.0, item.box.width * ctx.canvas.width_in - l_in - r_in)
+    box_h = max(0.0, item.box.height * ctx.canvas.height_in - t_in - b_in)
+    tol = config.layout.text_fit_tolerance_in
+    if need_w <= box_w + tol and need_h <= box_h + tol:
+        return []
+    what = "строка кода шире рамки" if need_w > box_w + tol else "строки кода не помещаются по высоте"
+    return [_finding(
+        "L03", "major", ctx, item,
+        f"Код «{item.name or item.shape_id}»: {what} (нужно {need_w:.2f}″×{need_h:.2f}″, "
+        f"доступно {box_w:.2f}″×{box_h:.2f}″).",
+        item.box, False, "Сократить фрагмент по строкам или взять раскладку с местом шире.",
+        repair="structural",
+    )]
+
+
 def _check_L03(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig) -> list[Finding]:
     findings = []
     for item in ctx.items:
         if item.kind != "shape" or not item.text.strip():
+            continue
+        if _is_code_item(item):
+            findings.extend(_check_code_fit(ctx, item, config))
             continue
         style = _dominant_run_style(item.element)
         if style is None:
@@ -677,6 +723,10 @@ def _check_L04(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
         # симптом (текст ВЫЛИВАЕТСЯ за край при рамке, лежащей в холсте),
         # не дублируем находку по той же фигуре.
         if item.box.right > 1 + _BOUNDS_EPS or item.box.bottom > 1 + _BOUNDS_EPS or item.box.left < -_BOUNDS_EPS or item.box.top < -_BOUNDS_EPS:
+            continue
+        if _is_code_item(item):
+            # Переносов у кода нет: высота его строк мерится в L03, а
+            # перенос по словам здесь дал бы ложное «вылезает за край».
             continue
         style = _dominant_run_style(item.element)
         if style is None:
@@ -878,6 +928,11 @@ def _check_T01(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
     for item in _text_shapes(ctx):
         families = _all_run_families(item.element)
         if not families:
+            continue
+        if _is_code_item(item):
+            # Код набран моногарнитурой шаблона, а без неё системной
+            # (`compose.code.FALLBACK_MONO`): гарнитурой бренда его не
+            # набрать, и лишним семейством колоды он не считается.
             continue
         all_families |= families
         bad = families - allowed
@@ -1120,6 +1175,10 @@ def _check_T02(ctx: _SlideContext, profile: TemplateProfile, config: AuditConfig
     tol = config.template.size_tolerance_pt
     findings = []
     for item in _text_shapes(ctx):
+        if _is_code_item(item):
+            # Кегль кода подобран под длину строк (10-18 pt), шкала
+            # шаблона про текст, не про листинг.
+            continue
         sizes = _all_run_sizes(item.element)
         for size_pt in sizes:
             if any(abs(size_pt - a) <= tol for a in allowed):
@@ -1177,7 +1236,7 @@ def _over_shrunk(ctx: _SlideContext, profile: TemplateProfile, config: AuditConf
     for item in _text_shapes(ctx):
         slot_native = native.get(item.shape_id)
         sizes = _all_run_sizes(item.element)
-        if slot_native is None or not sizes:
+        if slot_native is None or not sizes or _is_code_item(item):
             continue
         size0, slot_budget = slot_native
         floor = slot_budget.floor_pt(size0, scale)
@@ -1491,6 +1550,8 @@ def _check_D01(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
 def _check_D02(ctx: _SlideContext, config: AuditConfig) -> list[Finding]:
     findings = []
     for item in ctx.items:
+        if _is_code_item(item):
+            continue
         for p_el in _bulleted_paragraphs(item):
             text = _paragraph_text(p_el)
             words = [w for w in text.split() if w]

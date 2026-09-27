@@ -36,6 +36,7 @@ from deckforge.compose.blocks import (
 )
 from deckforge.compose.capacity import clone_text_frame, shrink_sequence
 from deckforge.compose.charts import ChartSpec, Series, add_chart, fill_native_chart
+from deckforge.compose.code import add_code_block, code_lines, fill_code_shape, widen_code_box
 from deckforge.compose.colorpick import slide_background_luminance
 from deckforge.compose.clone import (
     CLONE_MARK_PREFIX, allow_wrap, bind_text, clone_example_slide, fill_native_table, fix_duplicate_partnames,
@@ -59,7 +60,7 @@ from deckforge.ooxml.geometry import Box, Canvas
 from deckforge.ooxml.ns import qn
 from deckforge.ooxml.package import PptxPackage
 from deckforge.ooxml.walk import walk_shapes
-from deckforge.pattern.forms import forms_of
+from deckforge.pattern.forms import CODE_TIER_SLOT, code_target_slot, forms_of
 from deckforge.pattern.intent import MAX_SLIDES
 from deckforge.pattern.planner import MAX_ALTERNATIVES
 from deckforge.pattern.scoring import look_key
@@ -600,6 +601,8 @@ def _place_visual(
         )
     elif visual.kind == "chart" and visual.chart is not None:
         _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart, free_box=free_box, occupied=occupied)
+    elif visual.kind == "code" and visual.code is not None:
+        _place_code_visual(slide, slide_spec, pattern, profile, free_box=free_box, occupied=occupied)
     elif visual.kind in ("photo", "icon"):
         _place_picture_visual(
             slide, slide_spec, pattern, profile, visual.kind, user_photos,
@@ -872,6 +875,38 @@ def _place_chart_visual(
         )
     except ValueError as exc:
         slide_spec.findings.append(f"Слайд {slide_spec.index}: график не построен ({exc}).")
+
+
+def _place_code_visual(
+    slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, *, box: Box | None = None,
+    free_box: Box | None = None, occupied: list[Box] | None = None,
+) -> None:
+    """Фрагмент кода своей плашкой (задача T2): на место кода раскладки
+    (`forms.code_target_slot`), а если оно уже занято текстом слайда или
+    его нет, на свободное место слайда, как график."""
+    visual = slide_spec.visual
+    slot, _tier = code_target_slot(pattern)
+    if box is None and slot is not None and free_box is not None and _slot_is_occupied(slot, occupied):
+        box, slot = free_box, None
+    if box is None and slot is not None:
+        box = slot.box
+    if box is None:
+        box = free_box
+    if box is None:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: в раскладке {pattern.pattern_id!r} нет места под код, фрагмент не показан."
+        )
+        return
+    canvas = Canvas(width_emu=profile.canvas_width_emu, height_emu=profile.canvas_height_emu)
+    box = widen_code_box(
+        slide, box, canvas, _grid_from_model(profile.grid), code_lines(visual.code),
+        profile.type_scale_pt("body", 14.0) or 14.0,
+    )
+    notes = add_code_block(
+        slide, box, visual.code, profile, _box_background_luminance(slide, box, profile, canvas),
+        caption=visual.caption or visual.code.caption,
+    )
+    slide_spec.findings.extend(f"Слайд {slide_spec.index}: {n}." for n in notes)
 
 
 def _chart_prototype(profile: TemplateProfile, pattern: Pattern, spec: ChartSpec):
@@ -2519,6 +2554,7 @@ def place_slide_by_clone(
         (visual.kind == "table" and visual.table is not None and _visual_slot(pattern, "table") is None)
         or (visual.kind == "chart" and visual.chart is not None and _chart_slot(pattern) is None
             and pattern.slide_class != "visual_prototype")
+        or (visual.kind == "code" and visual.code is not None and code_target_slot(pattern)[0] is None)
     ):
         # Клон не двигает фигуры и свободного места под таблицу не ищет:
         # принятый клон терял её молча, и на слайде оставался заголовок.
@@ -2594,6 +2630,9 @@ def place_slide_by_clone(
     chart_frame = _native_chart_frame(slide_spec, pattern, matched, index_of)
     if chart_frame is not None:
         keep.append(chart_frame)
+    code_ref = _bind_code_on_clone(slide, slide_spec, pattern, profile, matched, index_of)
+    if code_ref is not None:
+        keep.append(code_ref[1].element)
     filled = filled_repeat_units(pattern, native)
     # Колонка единицы повтора, в которую ничего не легло, уходит целиком,
     # даже если майнинг не узнал в ней единицу (`unfilled_unit_test`):
@@ -2602,6 +2641,8 @@ def place_slide_by_clone(
     kept_decor = [d for d in expand_decor(pattern, None, grid, filled) if not orphan(d.box)]
     kept_ids = {id(d) for d in kept_decor}
     bound_slots = {id(content.slot) for content, _ in bound}
+    if code_ref is not None:
+        bound_slots.add(id(code_ref[0]))
     for slot in _sample_text_slots(pattern, filled):
         ref = matched.get(index_of[id(slot)])
         if id(slot) not in bound_slots and ref is not None and not orphan(slot.box):
@@ -2641,6 +2682,8 @@ def place_slide_by_clone(
             slide, slide_spec, pattern, profile, canvas, native_frame, table_ref.box, _only_frame_text(clean),
         )
     elif chart_frame is not None and _fill_native_chart_on_clone(slide, slide_spec, pattern, chart_frame):
+        pass
+    elif code_ref is not None:
         pass
     else:
         _place_visual_on_clone(
@@ -3027,6 +3070,31 @@ def _clone_background_luminance(slide, ref, profile: TemplateProfile, canvas: Ca
     return _box_background_luminance(slide, ref.box, profile, canvas, exclude=ref.element)
 
 
+def _bind_code_on_clone(slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile,
+                        matched: dict, index_of: dict):
+    """Код в фигуру слота роли `code` примера (задача T2, раскладка вида
+    `code` задачи T1): плашка и моногарнитура дизайнера остаются, меняются
+    строки и кегль. `(слот, фигура)` или `None`, если слота роли `code` нет
+    (тогда код встаёт своей плашкой, `_place_visual_on_clone`)."""
+    visual = slide_spec.visual
+    if visual is None or visual.kind != "code" or visual.code is None:
+        return None
+    slot, tier = code_target_slot(pattern)
+    if slot is None or tier != CODE_TIER_SLOT:
+        return None
+    ref = matched.get(index_of.get(id(slot), -1))
+    if ref is None:
+        return None
+    canvas_w_in = profile.canvas_width_emu / EMU_PER_INCH
+    canvas_h_in = profile.canvas_height_emu / EMU_PER_INCH
+    notes = fill_code_shape(
+        ref.element, visual.code, profile, ref.box.width * canvas_w_in, ref.box.height * canvas_h_in,
+        profile.denorm_pt(slot.size_pt) if slot.size_pt else 0.0,
+    )
+    slide_spec.findings.extend(f"Слайд {slide_spec.index}: {n}." for n in notes)
+    return slot, ref
+
+
 def _place_visual_on_clone(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, canvas: Canvas,
     matched: dict, user_photos: dict[str, Path] | None, keep: list, *, sole_content: bool = False,
@@ -3049,6 +3117,14 @@ def _place_visual_on_clone(
             _place_chart_visual(slide, slide_spec, pattern, profile, visual.chart, box=frame)
             return
         _place_visual(slide, slide_spec, pattern, profile, user_photos, sole_content=sole_content)
+        return
+    if visual.kind == "code" and visual.code is not None:
+        # Своей плашкой на крупное текстовое место: текст примера с него
+        # уже снят (слот не привязан), остатки фигур на той же рамке уходят.
+        slot, _tier = code_target_slot(pattern)
+        if slot is not None:
+            remove_in_box(slide, slot.box, canvas, keep=keep)
+        _place_code_visual(slide, slide_spec, pattern, profile)
         return
     if visual.kind not in ("photo", "icon"):
         return
