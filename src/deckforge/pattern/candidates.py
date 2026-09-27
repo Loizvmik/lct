@@ -31,6 +31,9 @@ _HERO_KINDS = frozenset({"section", "closing", "image", "photo_text"})
 _HERO_ONLY_KINDS = frozenset({"section", "closing"})
 # Раскладки, смысл которых несёт картинка.
 _PICTURE_KINDS = frozenset({"image", "photo_text"})
+# Классы слайдов-примеров (`prototypes.SLIDE_CLASSES`), которые не раскладки
+# содержания: правила оформления, лист ассетов, инструкция дизайнера.
+_NOT_LAYOUT_CLASSES = frozenset({"style_guide", "asset_sheet", "instruction"})
 
 
 def is_closing_pattern(p, profile) -> bool:
@@ -199,7 +202,10 @@ def _checks(intent: SlideIntent, form: PatternForm, p, *, position: int, last: i
     elif visual == "chart":
         checks["visual"] = has_chart_place(form)
     elif visual == "photo":
-        checks["visual"] = form.has_image
+        # Лист ассетов и инструкция тоже держат картинку, но это не раскладки
+        # (VK Tech: slide30 с 3D-иллюстрациями и кнопками «Перейти», slide52
+        # с диаграммой Ганта шли под фото наравне с «фото и текст»).
+        checks["visual"] = form.has_image and form.slide_class not in _NOT_LAYOUT_CLASSES
     else:
         # Главное у раскладки картинка или таблица, а слайду нечего туда
         # поставить: место останется пустым. Таблица примера без нашей
@@ -230,7 +236,7 @@ def not_plain_content(form: PatternForm) -> bool:
     она удаляется как чужое содержание, и слайд остаётся с одним
     заголовком. Правила, лист ассетов и инструкция шаблона
     (`prototypes.SLIDE_CLASSES`) не раскладки содержания вовсе."""
-    if form.slide_class in ("style_guide", "asset_sheet", "instruction"):
+    if form.slide_class in _NOT_LAYOUT_CLASSES:
         return True
     return form.has_chart or form.chart_tier == CHART_TIER_FRAME or form.slide_class == "visual_prototype"
 
