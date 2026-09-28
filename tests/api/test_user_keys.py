@@ -164,3 +164,13 @@ def test_cors_lets_the_key_headers_through(plain_client):
     assert response.status_code == 200
     allowed = response.headers["access-control-allow-headers"].lower()
     assert "x-yandex-api-key" in allowed and "x-yandex-folder-id" in allowed
+
+
+def test_health_reports_the_generation_model_without_secrets(client):
+    """Настройки интерфейса показывают модель генерации из реестра."""
+    body = client.get("/api/health").json()
+    model = body["model"]
+    assert model["id"] == "qwen3.6-35b-a3b"
+    assert model["license"] == "Apache-2.0" and model["params_b"] == 35 and model["active_params_b"] == 3
+    assert model["provider"] == "Yandex AI Studio"
+    assert "key" not in " ".join(model.keys()).lower()

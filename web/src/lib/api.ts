@@ -175,7 +175,25 @@ export async function uploadTemplate(file: File): Promise<TemplateUploadResponse
 
 // `server_key`: есть ли ключ модели в `.env` сервера. Без него и без своего
 // ключа презентация соберётся запасными путями, без модели.
-export async function healthcheck(): Promise<{ status: string; stages: Stage[]; server_key?: boolean }> {
+// Модель генерации по умолчанию из реестра сервера (`config/models.yaml`).
+export interface ModelInfo {
+  id: string;
+  hf: string;
+  license: string;
+  params_b: number;
+  active_params_b: number | null;
+  vision: boolean;
+  provider: string;
+}
+
+export function describeModel(model: ModelInfo): string {
+  const size = model.active_params_b
+    ? `${model.params_b}B параметров, ${model.active_params_b}B активных`
+    : `${model.params_b}B параметров`;
+  return `${model.hf.split("/").pop()} · ${size} · ${model.license} · ${model.provider}`;
+}
+
+export async function healthcheck(): Promise<{ status: string; stages: Stage[]; server_key?: boolean; model?: ModelInfo | null }> {
   const response = await fetch(`${API_BASE}/api/health`);
   return asJson(response);
 }

@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { checkYandexCredentials, getJob, getProfile, healthcheck, TemplateProfile } from "@/lib/api";
+import { checkYandexCredentials, describeModel, getJob, getProfile, healthcheck, ModelInfo, TemplateProfile } from "@/lib/api";
 import {
   AppSettings,
   clearSavedTaskDrafts,
@@ -33,7 +33,7 @@ function CloseButton({ onClick, label }: { onClick: () => void; label: string })
 // Монтируется только в открытом диалоге: поля читают сохранённый ключ при
 // создании, и каждое открытие начинается со скрытого ключа без старого
 // результата проверки.
-function YandexKeySection() {
+function YandexKeySection({ model }: { model: ModelInfo | null }) {
   const [apiKey, setApiKey] = useState(() => getYandexCredentials()?.apiKey ?? "");
   const [folderId, setFolderId] = useState(() => getYandexCredentials()?.folderId ?? "");
   const [showKey, setShowKey] = useState(false);
@@ -71,6 +71,11 @@ function YandexKeySection() {
   return (
     <section className="settings-section" aria-labelledby="yandex-settings">
       <h3 id="yandex-settings">Yandex AI Studio</h3>
+      <div className="settings-field">
+        <span className="field-label">Модель</span>
+        <p className="model-name">{model ? describeModel(model) : "Сведения о модели недоступны"}</p>
+        <p className="helper-text">Одна модель с открытыми весами для структуры, текста и проверки по картинке. Ваш ключ используется с этой же моделью.</p>
+      </div>
       <div className="settings-field">
         <label htmlFor="yandex-api-key">API-ключ</label>
         <div className="secret-input">
@@ -127,6 +132,7 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [apiAvailable, setApiAvailable] = useState<boolean | null>(null);
   const [serverKey, setServerKey] = useState<boolean | null>(null);
+  const [model, setModel] = useState<ModelInfo | null>(null);
   const [profile, setProfile] = useState<TemplateProfile | null>(null);
   const [preferences, setPreferences] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
   const [draftMessage, setDraftMessage] = useState<string | null>(null);
@@ -148,6 +154,7 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
       .then((health) => {
         setApiAvailable(true);
         setServerKey(health.server_key ?? null);
+        setModel(health.model ?? null);
       })
       .catch(() => setApiAvailable(false));
 
@@ -263,7 +270,7 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
         {draftMessage && <p className="helper-text" role="status">{draftMessage}</p>}
       </section>
 
-      {open && <YandexKeySection />}
+      {open && <YandexKeySection model={model} />}
 
       <details className="diagnostics">
         <summary>Диагностика</summary>
@@ -279,6 +286,12 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
             <div>
               <dt>Ключ модели на сервере</dt>
               <dd>{serverKey ? "Настроен" : "Не настроен"}</dd>
+            </div>
+          )}
+          {model && (
+            <div>
+              <dt>Модель</dt>
+              <dd>{model.id}</dd>
             </div>
           )}
           <div>

@@ -128,6 +128,21 @@ def _server_has_key() -> bool:
     return bool(settings.yandex_api_key and settings.yandex_folder_id)
 
 
+def _model_info() -> dict | None:
+    """Модель генерации по умолчанию из реестра (`config/models.yaml`):
+    интерфейс показывает её в настройках. Секретов здесь нет."""
+    try:
+        settings = Settings.load(APP_YAML_PATH)
+        from deckforge.provider.registry import assert_allowed
+        card = assert_allowed(settings.llm.model)
+    except Exception:  # noqa: BLE001 — сведения для интерфейса, не повод ронять health
+        return None
+    return {
+        "id": card.id, "hf": card.hf, "license": card.license, "params_b": card.params_b,
+        "active_params_b": card.active_params_b, "vision": card.vision, "provider": "Yandex AI Studio",
+    }
+
+
 def create_app(store: JobStore | None = None) -> FastAPI:
     app = FastAPI(title="DeckForge API", description="Генерация презентаций по .pptx-шаблону")
     app.state.store = store if store is not None else JobStore()
@@ -336,7 +351,7 @@ def create_app(store: JobStore | None = None) -> FastAPI:
     async def health() -> dict:
         # `server_key`: интерфейс по нему решает, просить ли человека
         # вставить свой ключ (без ключа генерация идёт запасными путями).
-        return {"status": "ok", "stages": list(STAGES), "server_key": _server_has_key()}
+        return {"status": "ok", "stages": list(STAGES), "server_key": _server_has_key(), "model": _model_info()}
 
     return app
 
