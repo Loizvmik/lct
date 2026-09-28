@@ -948,6 +948,7 @@ def _place_visual(
         _place_picture_visual(
             slide, slide_spec, pattern, profile, visual.kind, user_photos,
             min_width=min_photo_width if visual.kind == "photo" else 0.0,
+            free_box=free_box if visual.kind == "photo" else None,
         )
 
 
@@ -1337,9 +1338,33 @@ def _contain_box(
     return pic_left, pic_top, pic_width, pic_height
 
 
+def _add_user_picture(slide, slide_spec: SlideSpec, user_photo_path: Path, photo_name, left, top, width, height) -> None:
+    """Фото пользователя в рамку целиком, кадрирование по центру, как в
+    клоне (`clone.replace_picture`): вписанное с полями оно оставляло
+    пустые полосы, а растянутое искажало лицо и экран. Рамку не по
+    пропорциям планировщик штрафует (`scoring.photo_fit_cost`), сюда она
+    доходит, только если лучшей не нашлось."""
+    try:
+        data = user_photo_path.read_bytes()
+        with Image.open(io.BytesIO(data)) as img:
+            native_width, native_height = img.size
+    except Exception as exc:
+        slide_spec.findings.append(
+            f"Слайд {slide_spec.index}: пользовательская фотография {photo_name!r} "
+            f"({user_photo_path}) не читается ({exc}) — не вставлена."
+        )
+        return
+    picture = slide.shapes.add_picture(
+        io.BytesIO(data), Emu(left), Emu(top), Emu(max(1, width)), Emu(max(1, height)),
+    )
+    crop = _cover_crop(native_width, native_height, width, height)
+    if crop is not None:
+        picture.crop_left, picture.crop_right, picture.crop_top, picture.crop_bottom = crop
+
+
 def _place_picture_visual(
     slide, slide_spec: SlideSpec, pattern: Pattern, profile: TemplateProfile, kind: str,
-    user_photos: dict[str, Path] | None = None, *, min_width: float = 0.0,
+    user_photos: dict[str, Path] | None = None, *, min_width: float = 0.0, free_box: Box | None = None,
 ) -> None:
     slot = (
         _visual_slot(pattern, "image") if kind == "photo" else _visual_slot(pattern, "icon")
@@ -1355,6 +1380,14 @@ def _place_picture_visual(
     photo_name = slide_spec.visual.photo_name if slide_spec.visual is not None else None
     user_photo_path = (user_photos or {}).get(photo_name) if photo_name else None
 
+    if slot is None and user_photo_path is not None and free_box is not None:
+        # Сборка с нуля на раскладке без рамки под фото: фото пользователя
+        # встаёт на свободное место слайда (контроль 28 сентября 2026:
+        # третье фото терялось с находкой «нет слота»).
+        box = _at_least_wide(free_box, min_width, _grid_from_model(profile.grid)) if min_width > 0 else free_box
+        left, top, width, height = _emu_visual_box(box, profile)
+        _add_user_picture(slide, slide_spec, user_photo_path, photo_name, left, top, width, height)
+        return
     if slot is None:
         if user_photo_path is not None:
             # Раскладка под фото не нашлась (бриф задачи, п.3: "либо
@@ -1373,27 +1406,7 @@ def _place_picture_visual(
     left, top, width, height = _emu_visual_box(box, profile)
 
     if user_photo_path is not None:
-        try:
-            data = user_photo_path.read_bytes()
-            with Image.open(io.BytesIO(data)) as img:
-                native_width, native_height = img.size
-        except Exception as exc:
-            slide_spec.findings.append(
-                f"Слайд {slide_spec.index}: пользовательская фотография {photo_name!r} "
-                f"({user_photo_path}) не читается ({exc}) — не вставлена."
-            )
-            return
-        # Фото пользователя занимает рамку целиком и кадрируется по центру,
-        # как в клоне (`clone.replace_picture`): вписанное с полями оно
-        # оставляло пустые полосы, а растянутое искажало лицо и экран.
-        # Рамку не по пропорциям планировщик штрафует (`scoring.photo_fit_
-        # cost`), сюда она доходит, только если лучшей не нашлось.
-        picture = slide.shapes.add_picture(
-            io.BytesIO(data), Emu(left), Emu(top), Emu(max(1, width)), Emu(max(1, height)),
-        )
-        crop = _cover_crop(native_width, native_height, width, height)
-        if crop is not None:
-            picture.crop_left, picture.crop_right, picture.crop_top, picture.crop_bottom = crop
+        _add_user_picture(slide, slide_spec, user_photo_path, photo_name, left, top, width, height)
         return
 
     catalog = list(profile.assets.photos if kind == "photo" else profile.assets.icons)

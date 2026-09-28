@@ -254,6 +254,8 @@ def assign_photos(
     ]
 
     assignments: dict[int, str] = {}
+
+    displaced: list[str] = []
     notes: list[str] = []
     try:
         raw = llm.complete(messages, schema=_SCHEMA, max_tokens=PHOTO_PICKER_MAX_TOKENS)
@@ -289,6 +291,7 @@ def assign_photos(
                     f"На слайд {slide_index} модель предложила больше одной фотографии — "
                     f"оставлена первая, {photo_name!r} отклонена."
                 )
+                displaced.append(photo_name)
                 continue
             assignments[slide_index] = photo_name
     except Exception as exc:
@@ -296,6 +299,17 @@ def assign_photos(
             f"Распределение фотографий не выполнено (сбой вызова/разбора ответа модели: {exc}) "
             "— фотографии не размещены."
         )
+
+    # Фото, которое модель предложила на уже занятый слайд, встаёт на
+    # свободный слайд по порядку: пользователь принёс его специально, и
+    # оставить его вне презентации хуже, чем поставить не на самый точный
+    # слайд (контроль 28 сентября 2026: скриншот терялся так). Фото, которое
+    # модель не предложила вовсе, остаётся вне презентации, как и раньше.
+    leftover = [name for name in displaced if name not in assignments.values()]
+    free = [s.index for s in candidates if s.index not in assignments]
+    for name, index in zip(leftover, free):
+        assignments[index] = name
+        notes.append(f"Фотография {name!r} поставлена на слайд {index}: модель предложила её на занятый слайд.")
 
     if not assignments:
         notes.append(f"Пришло {len(photos)} фотографий контент-пакета, ни одна не была поставлена ни на один слайд.")
