@@ -1,6 +1,8 @@
 // Клиент API — тонкая обёртка над `fetch`, без
 // дополнительных библиотек: эндпоинтов немного, и типы здесь — прямое
 // зеркало `deckforge.api.schemas` (см. комментарии у каждого типа).
+import { YandexCredentials, yandexHeaders } from "@/lib/yandexCredentials";
+
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
 
@@ -165,12 +167,24 @@ export function assetUrl(path: string): string {
 export async function uploadTemplate(file: File): Promise<TemplateUploadResponse> {
   const form = new FormData();
   form.append("file", file);
-  const response = await fetch(`${API_BASE}/api/templates`, { method: "POST", body: form });
+  // Разбор шаблона зовёт модель (имена цветов, виды раскладок), поэтому
+  // тоже несёт ключ пользователя.
+  const response = await fetch(`${API_BASE}/api/templates`, { method: "POST", body: form, headers: yandexHeaders() });
   return asJson(response);
 }
 
-export async function healthcheck(): Promise<{ status: string; stages: Stage[] }> {
+// `server_key`: есть ли ключ модели в `.env` сервера. Без него и без своего
+// ключа презентация соберётся запасными путями, без модели.
+export async function healthcheck(): Promise<{ status: string; stages: Stage[]; server_key?: boolean }> {
   const response = await fetch(`${API_BASE}/api/health`);
+  return asJson(response);
+}
+
+export async function checkYandexCredentials(credentials: YandexCredentials): Promise<{ ok: boolean; message: string }> {
+  const response = await fetch(`${API_BASE}/api/credentials/check`, {
+    method: "POST",
+    headers: yandexHeaders(credentials),
+  });
   return asJson(response);
 }
 
@@ -222,7 +236,7 @@ export async function createDeck(
 ): Promise<{ job_id: string }> {
   const response = await fetch(`${API_BASE}/api/decks`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...yandexHeaders() },
     body: JSON.stringify(payload),
   });
   return asJson(response);
@@ -235,7 +249,7 @@ export async function createDeckBatch(
 ): Promise<{ batch_id: string; job_ids: string[] }> {
   const response = await fetch(`${API_BASE}/api/decks/batch`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...yandexHeaders() },
     body: JSON.stringify(payload),
   });
   return asJson(response);

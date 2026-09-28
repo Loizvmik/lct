@@ -4,7 +4,7 @@ import Image from "next/image";
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { getJob, getProfile, healthcheck, TemplateProfile } from "@/lib/api";
+import { checkYandexCredentials, getJob, getProfile, healthcheck, TemplateProfile } from "@/lib/api";
 import {
   AppSettings,
   clearSavedTaskDrafts,
@@ -14,6 +14,11 @@ import {
   saveAppSettings,
 } from "@/lib/appSettings";
 import StepNav from "@/components/StepNav";
+import {
+  forgetYandexCredentials,
+  getYandexCredentials,
+  saveYandexCredentials,
+} from "@/lib/yandexCredentials";
 
 function CloseButton({ onClick, label }: { onClick: () => void; label: string }) {
   return (
@@ -25,10 +30,103 @@ function CloseButton({ onClick, label }: { onClick: () => void; label: string })
   );
 }
 
+// Монтируется только в открытом диалоге: поля читают сохранённый ключ при
+// создании, и каждое открытие начинается со скрытого ключа без старого
+// результата проверки.
+function YandexKeySection() {
+  const [apiKey, setApiKey] = useState(() => getYandexCredentials()?.apiKey ?? "");
+  const [folderId, setFolderId] = useState(() => getYandexCredentials()?.folderId ?? "");
+  const [showKey, setShowKey] = useState(false);
+  const [checking, setChecking] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
+
+  // Пара сохраняется, как только оба поля заполнены: отдельной кнопки
+  // «Сохранить» нет, как и у остальных настроек диалога.
+  function update(nextKey: string, nextFolder: string) {
+    setApiKey(nextKey);
+    setFolderId(nextFolder);
+    setResult(null);
+    if (nextKey.trim() && nextFolder.trim()) {
+      saveYandexCredentials({ apiKey: nextKey, folderId: nextFolder });
+    } else {
+      forgetYandexCredentials();
+    }
+  }
+
+  async function check() {
+    if (!apiKey.trim() || !folderId.trim()) {
+      setResult({ ok: false, message: "Заполните оба поля." });
+      return;
+    }
+    setChecking(true);
+    try {
+      setResult(await checkYandexCredentials({ apiKey: apiKey.trim(), folderId: folderId.trim() }));
+    } catch (error) {
+      setResult({ ok: false, message: error instanceof Error ? error.message : "Проверка не удалась." });
+    } finally {
+      setChecking(false);
+    }
+  }
+
+  return (
+    <section className="settings-section" aria-labelledby="yandex-settings">
+      <h3 id="yandex-settings">Yandex AI Studio</h3>
+      <div className="settings-field">
+        <label htmlFor="yandex-api-key">API-ключ</label>
+        <div className="secret-input">
+          <input
+            id="yandex-api-key"
+            type={showKey ? "text" : "password"}
+            autoComplete="off"
+            spellCheck={false}
+            value={apiKey}
+            onChange={(event) => update(event.target.value, folderId)}
+          />
+          <button
+            className="secondary"
+            type="button"
+            aria-pressed={showKey}
+            onClick={() => setShowKey((value) => !value)}
+          >
+            {showKey ? "Скрыть" : "Показать"}
+          </button>
+        </div>
+      </div>
+      <div className="settings-field">
+        <label htmlFor="yandex-folder-id">ID каталога</label>
+        <input
+          id="yandex-folder-id"
+          type="text"
+          autoComplete="off"
+          spellCheck={false}
+          value={folderId}
+          onChange={(event) => update(apiKey, event.target.value)}
+        />
+      </div>
+      <div className="settings-actions">
+        <button className="secondary" type="button" onClick={check} disabled={checking}>
+          {checking ? "Проверяем…" : "Проверить"}
+        </button>
+        <button className="secondary" type="button" onClick={() => update("", "")}>
+          Забыть
+        </button>
+      </div>
+      {result && (
+        <p className={result.ok ? "helper-text key-ok" : "helper-text key-error"} role="status">{result.message}</p>
+      )}
+      <p className="helper-text">
+        Ключ хранится только в этом браузере и уходит на сервер с каждым запросом. Где взять: консоль Yandex Cloud →
+        сервисный аккаунт с ролью ai.languageModels.user → API-ключ; ID каталога на странице каталога.
+      </p>
+    </section>
+  );
+}
+
 function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void }) {
   const pathname = usePathname();
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [apiAvailable, setApiAvailable] = useState<boolean | null>(null);
+  const [serverKey, setServerKey] = useState<boolean | null>(null);
   const [profile, setProfile] = useState<TemplateProfile | null>(null);
   const [preferences, setPreferences] = useState<AppSettings>(DEFAULT_APP_SETTINGS);
   const [draftMessage, setDraftMessage] = useState<string | null>(null);
@@ -46,7 +144,12 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
       setPreferences(getAppSettings());
       setDraftMessage(null);
     }, 0);
-    healthcheck().then(() => setApiAvailable(true)).catch(() => setApiAvailable(false));
+    healthcheck()
+      .then((health) => {
+        setApiAvailable(true);
+        setServerKey(health.server_key ?? null);
+      })
+      .catch(() => setApiAvailable(false));
 
     const templateMatch = pathname.match(/^\/templates\/([^/]+)/);
     const deckMatch = pathname.match(/^\/decks\/([^/]+)/);
@@ -160,6 +263,8 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
         {draftMessage && <p className="helper-text" role="status">{draftMessage}</p>}
       </section>
 
+      {open && <YandexKeySection />}
+
       <details className="diagnostics">
         <summary>Диагностика</summary>
         <p className="helper-text">
@@ -170,6 +275,12 @@ function SettingsDialog({ open, onClose }: { open: boolean; onClose: () => void 
             <dt>Сервер обработки</dt>
             <dd>{apiAvailable === null ? "Проверяем…" : apiAvailable ? "Доступен" : "Недоступен"}</dd>
           </div>
+          {serverKey !== null && (
+            <div>
+              <dt>Ключ модели на сервере</dt>
+              <dd>{serverKey ? "Настроен" : "Не настроен"}</dd>
+            </div>
+          )}
           <div>
             <dt>Текущий шаблон</dt>
             <dd>{profile?.source_name ?? "Не выбран"}</dd>

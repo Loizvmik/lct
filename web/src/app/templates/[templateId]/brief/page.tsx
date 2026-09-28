@@ -3,10 +3,11 @@
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import PhotoPicker, { PickedPhoto, toPicked } from "@/components/PhotoPicker";
-import { createDeckBatch, loadExamplePhotos, VariantName, VARIANT_DESCRIPTIONS, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
+import { createDeckBatch, healthcheck, loadExamplePhotos, VariantName, VARIANT_DESCRIPTIONS, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
 import { getAppSettings } from "@/lib/appSettings";
 import { clearBriefDraft, loadBriefDraft, saveBriefDraft } from "@/lib/briefDraft";
 import { EXAMPLES } from "@/lib/exampleContent";
+import { getYandexCredentials, subscribeToYandexCredentials } from "@/lib/yandexCredentials";
 
 const MIN_SLIDES = 4;
 const MAX_SLIDES = 15;
@@ -27,6 +28,24 @@ export default function BriefPage() {
   // Номер последней загрузки фото примера: ответ, пришедший после
   // «Очистить поля» или другого примера, не должен вернуть старые фото.
   const exampleRequest = useRef(0);
+  // Предупреждение «модели не будет»: на сервере нет ключа, и свой ключ
+  // человек не вставил. Кнопку не блокируем, запасной путь тоже соберёт файл.
+  const [serverKey, setServerKey] = useState<boolean | null>(null);
+  const [ownKey, setOwnKey] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    healthcheck()
+      .then((health) => { if (alive) setServerKey(health.server_key ?? null); })
+      .catch(() => undefined);
+    const readOwnKey = () => setOwnKey(getYandexCredentials() !== null);
+    const timer = window.setTimeout(readOwnKey, 0);
+    const unsubscribe = subscribeToYandexCredentials(readOwnKey);
+    return () => {
+      alive = false;
+      window.clearTimeout(timer);
+      unsubscribe();
+    };
+  }, []);
   // Задача Q: «все» означает три стиля тремя заданиями одной кнопкой.
   const [style, setStyle] = useState<StyleChoice>("all");
   const [busy, setBusy] = useState(false);
@@ -215,6 +234,12 @@ export default function BriefPage() {
         </fieldset>
       </section>
 
+      {serverKey === false && !ownKey && (
+        <p className="notice" role="note">
+          На сервере не настроен ключ модели. Добавьте свой ключ Yandex AI Studio в настройках, иначе презентация
+          соберётся без модели и будет хуже.
+        </p>
+      )}
       <div className="row-actions">
         <button type="button" onClick={submit} disabled={!canSubmit}>
           {busy ? "Начинаем…" : style === "all" ? "Создать три варианта" : "Создать презентацию"}

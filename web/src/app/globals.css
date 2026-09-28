@@ -143,6 +143,12 @@ textarea::-webkit-scrollbar-thumb,.thumb-strip::-webkit-scrollbar-thumb { border
 .settings-field label { margin: 0; }
 .settings-field select { width: 100%; min-height: 46px; padding: 10px 38px 10px 12px; border: 1px solid #b8b5ad; border-radius: 10px; background: var(--surface); color: var(--text); }
 .settings-field .helper-text { margin: 0; }
+.settings-field input { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid #b8b5ad; border-radius: 10px; background: var(--surface); color: var(--text); }
+.secret-input { display: flex; gap: 8px; }
+.secret-input input { flex: 1; min-width: 0; }
+.settings-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+.helper-text.key-ok { color: #1f7a3a; }
+.helper-text.key-error { color: #b3261e; }
 .settings-check { display: grid; grid-template-columns: 22px minmax(0,1fr); align-items: start; gap: 11px; margin: 18px 0 0; padding: 15px; border: 1px solid var(--border); border-radius: 12px; background: var(--surface-soft); cursor: pointer; }
 .settings-check input { width: 19px; height: 19px; margin: 2px 0 0; accent-color: var(--brand); }
 .settings-check small { display: block; margin-top: 3px; color: var(--text-dim); font-size: 13px; font-weight: 400; line-height: 1.45; }
