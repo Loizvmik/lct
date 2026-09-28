@@ -157,7 +157,7 @@ def _slide_already_has_visual_slot(slide: SlideSpec) -> bool:
     ассета шаблона наиболее естественна."""
     if slide.visual is None:
         return False
-    return slide.visual.kind in ("table", "chart", "icon")
+    return slide.visual.kind in ("table", "chart", "icon", "code")
 
 
 def _content_summary(slide: SlideSpec) -> str:
@@ -332,7 +332,7 @@ def assign_photos(
 # таком пункте терялось молча: писатель ставит график, и `writer._with_
 # photo` фото не кладёт (27 сентября 2026, VK Education: 3 прислано,
 # 2 в плане, 1 на слайдах).
-_DATA_FORMS = {"chart": "chart", "table": "table", "kpi": "chart"}
+_DATA_FORMS = {"chart": "chart", "table": "table", "kpi": "chart", "code": "code"}
 
 
 def _outline_visual(slide) -> Visual | None:

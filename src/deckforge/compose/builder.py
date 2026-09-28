@@ -505,6 +505,18 @@ def place_slide(
     elif form_cards:
         for name in place_member_photos(slide, form_cards, canvas_width_emu, canvas_height_emu):
             slide_spec.findings.append(f"Слайд {slide_spec.index}: фото участника «{name}» не читается, стоит кружок без фото.")
+    elif slide_spec.visual is not None and slide_spec.visual.kind == "photo" and slide_spec.visual.photo_name:
+        # Форма с нуля на слайде, которому назначено фото пользователя:
+        # фото ставится в рамку раскладки-носителя, если рамка не лежит на
+        # самой форме (контроль 28 сентября 2026: показатели уходили на
+        # носитель, и фото пропадало с предупреждением «раскладка не дала
+        # рамки»).
+        frame = _visual_slot(pattern, "image")
+        if frame is not None and (region is None or _overlap_ratio(frame.box, region) <= _OVERLAP_MIN_AREA_SHARE):
+            _place_picture_visual(
+                slide, slide_spec, pattern, profile, "photo", user_photos,
+                min_width=_MIN_SCRATCH_PHOTO_WIDTH if look is not None else 0.0,
+            )
     _remove_empty_placeholders(slide)
     return form_done
 
@@ -596,6 +608,10 @@ def _carriers_of(slide_spec: SlideSpec, candidates: list[Pattern], by_id: dict[s
         if p.pattern_id not in seen:
             seen.add(p.pattern_id)
             out.append(p)
+    if slide_spec.visual is not None and slide_spec.visual.kind == "photo" and slide_spec.visual.photo_name:
+        # У слайда фото пользователя: носители с рамкой под картинку идут
+        # первыми, иначе форма встаёт, а фото пропадает.
+        out.sort(key=lambda p: _visual_slot(p, "image") is None)
     return out
 
 
