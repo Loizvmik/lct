@@ -142,10 +142,79 @@ def add_chart(slide, box: Box, spec: ChartSpec, profile: TemplateProfile, protot
         rules = template_style_rules(getattr(profile, "chart_rules", None))
         _strip_chart_frame(frame.chart)
     apply_chart_rules(frame.chart, spec, rules)
-    if getattr(rules, "data_labels", False) and spec.kind != "scatter":
+    caption_pt = profile.type_scale_pt("caption", 12.0)
+    label_pt = _fitted_label_pt(spec, width, height, caption_pt)
+    if getattr(rules, "data_labels", False) and spec.kind != "scatter" and label_pt is not None:
         # У точечного графика python-pptx подписей значений не умеет.
-        _show_values(frame.chart, spec, size_pt=profile.type_scale_pt("caption", 12.0))
+        _show_values(frame.chart, spec, size_pt=label_pt)
+    _fit_category_labels(frame.chart, spec, width, height, caption_pt)
     return frame
+
+
+# Кегль, мельче которого подпись на графике не читается.
+_MIN_CHART_LABEL_PT = 7.0
+# Доля рамки, которую занимает сама область построения (остальное легенда,
+# подписи осей и поля).
+_PLOT_SHARE = 0.7
+_EMU_PER_PT = 12700
+
+
+def _band_pt(spec: ChartSpec, width: int, height: int) -> float | None:
+    """Сколько пунктов приходится на одну категорию вдоль оси категорий:
+    по высоте у полос (`bar_h`), по ширине у столбцов. `None` у графиков
+    без оси категорий."""
+    if spec.kind not in _BAR_KINDS or not spec.categories:
+        return None
+    extent = (height if spec.kind == "bar_h" else width) * _PLOT_SHARE / _EMU_PER_PT
+    return extent / len(spec.categories)
+
+
+def _fitted_label_pt(spec: ChartSpec, width: int, height: int, caption_pt: float) -> float | None:
+    """Кегль подписей значений под толщину столбика или `None`: столбик
+    тоньше читаемой подписи, и подписи рядов налезают друг на друга
+    (6 этапов × 2 ряда в низкой рамке, сервер 28 сентября 2026). Тогда
+    значения читаются по оси."""
+    band = _band_pt(spec, width, height)
+    if band is None:
+        return caption_pt
+    bars = 1 if spec.kind == "bar_stacked" else max(1, len(spec.series))
+    # Зазор между группами по умолчанию полторы толщины столбика.
+    thickness = band / (bars + 1.5)
+    if spec.kind != "bar_h":
+        # У вертикальных столбиков подпись стоит над столбиком, её мешает
+        # ширина числа, а не высота строки: число из 3-4 знаков.
+        thickness = thickness * 1.6
+    if thickness < _MIN_CHART_LABEL_PT:
+        return None
+    return min(caption_pt, max(_MIN_CHART_LABEL_PT, thickness * 0.9))
+
+
+def _fit_category_labels(chart, spec: ChartSpec, width: int, height: int, caption_pt: float) -> None:
+    """Все подписи категорий видны: PowerPoint сам пропускал каждую вторую,
+    когда строка ниже кегля (у полос пропадали «Исполнение» и «Ожидание»).
+    Пропуск запрещён явно, а кегль подписей уменьшается под высоту
+    строки, но не мельче читаемого."""
+    band = _band_pt(spec, width, height)
+    if band is None:
+        return
+    axis = chart.category_axis
+    ax = axis._element
+    skip = ax.find(qn("c:tickLblSkip"))
+    if skip is None:
+        skip = ax.makeelement(qn("c:tickLblSkip"), {})
+        # Порядок элементов оси по схеме: … lblAlgn, lblOffset, tickLblSkip,
+        # tickMarkSkip, noMultiLvlLbl, extLst. Вставка перед первым из
+        # идущих следом, иначе PowerPoint считает файл повреждённым.
+        after = next((ax.find(qn(t)) for t in ("c:tickMarkSkip", "c:noMultiLvlLbl", "c:extLst")
+                      if ax.find(qn(t)) is not None), None)
+        if after is not None:
+            after.addprevious(skip)
+        else:
+            ax.append(skip)
+    skip.set("val", "1")
+    if spec.kind == "bar_h":
+        size = min(caption_pt, max(_MIN_CHART_LABEL_PT, band / 1.3))
+        axis.tick_labels.font.size = Pt(size)
 
 
 def template_style_rules(rules) -> "_Rules":

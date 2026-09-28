@@ -232,3 +232,45 @@ def test_pie_and_doughnut_sectors_are_all_distinct_colors(new_slide, profile_fix
     colors = _point_colors(frame.chart.plots[0].series[0])
     assert len(colors) == 4
     assert len(set(colors)) == 4, (template_name, kind, colors)
+
+
+def test_dense_horizontal_bars_keep_every_category_and_drop_colliding_values():
+    """6 этапов × 2 ряда в низкой рамке: PowerPoint пропускал подписи
+    этапов через одну, а подписи значений налезали друг на друга (сервер,
+    28 сентября 2026). Все подписи категорий показаны, подписи значений
+    убраны, если столбик тоньше читаемого кегля, и остаются в высокой рамке."""
+    from deckforge.compose import charts as C
+    from pptx.oxml.ns import qn
+
+    cats = ["Оформление", "Ожидание 1", "Работа 1", "Ожидание 2", "Работа 2", "Исполнение"]
+    spec = C.ChartSpec(kind="bar_h", categories=cats, series=[
+        C.Series(name="90-й процентиль", values=[0.68, 74, 0.58, 52, 0.47, 9]),
+        C.Series(name="Медиана", values=[0.2, 18, 0.15, 11, 0.12, 2]),
+    ], unit="ч", axis_titles=("Этап", "Время, ч"))
+    low = 5 * 914400 * 0.3
+    tall = 7.5 * 914400 * 0.72
+    width = 13.33 * 914400 * 0.5
+    assert C._fitted_label_pt(spec, int(width), int(low), 12.0) is None
+    assert C._fitted_label_pt(spec, int(width), int(tall), 12.0) is not None
+
+    from pptx import Presentation
+    prs = Presentation()
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE
+    data = CategoryChartData()
+    data.categories = cats
+    for s in spec.series:
+        data.add_series(s.name, s.values)
+    frame = slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, 0, 0, int(width), int(low), data)
+    C._fit_category_labels(frame.chart, spec, int(width), int(low), 12.0)
+    skip = frame.chart.category_axis._element.find(qn("c:tickLblSkip"))
+    assert skip is not None and skip.get("val") == "1"
+
+
+def test_category_axis_title_comes_from_the_data_not_the_model():
+    from deckforge.plan.writer import _merged_axis_titles
+
+    assert _merged_axis_titles(("Этап", "Значение"), ("Время, ч", "Этап")) == ("Этап", "Время, ч")
+    assert _merged_axis_titles(("Этап", "Значение"), ("Этап процесса", "Часы")) == ("Этап", "Часы")
+    assert _merged_axis_titles(("Этап", "Значение"), None) == ("Этап", "Значение")

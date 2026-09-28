@@ -497,6 +497,24 @@ def chart_problems(slide: SlideSpec, contract: SlideContract, source_text: str) 
     return [f"график: чисел нет в источниках ({', '.join(missing[:5])}); возьми числа из sources дословно"]
 
 
+def _merged_axis_titles(data_titles, model_titles):
+    """Подписи осей графика по данным источника и по ответу модели. Ось
+    категорий всегда подписана по данным (заголовок столбца таблицы):
+    модель иногда ставила подпись значений на ось категорий, и у полос
+    «Время, ч» оказывалось у этапов (сервер, 28 сентября 2026). Модели
+    остаётся подпись оси значений, если она не повторяет ось категорий."""
+    if not data_titles:
+        return model_titles if model_titles and all(model_titles) else None
+    category, value = data_titles
+    if model_titles and all(model_titles):
+        first, second = model_titles
+        if second.strip().lower() == category.strip().lower():
+            first, second = second, first
+        if second.strip().lower() != category.strip().lower():
+            value = second
+    return (category, value)
+
+
 def _visual_from_contract(contract: SlideContract) -> Visual | None:
     """Визуал по данным слоя типов (`contract.visual_data`) или `None`."""
     data = contract.visual_data
@@ -571,8 +589,7 @@ def _ensure_visual(slide: SlideSpec, contract: SlideContract) -> SlideSpec:
         highlight = mine.highlight_index
         if highlight is not None and not (0 <= highlight < len(chart.categories)):
             highlight = None
-        axis = mine.axis_titles if mine.axis_titles and all(mine.axis_titles) else chart.axis_titles
-        chart = replace(chart, axis_titles=axis, highlight_index=highlight)
+        chart = replace(chart, axis_titles=_merged_axis_titles(chart.axis_titles, mine.axis_titles), highlight_index=highlight)
     caption = visual.caption if visual is not None else None
     return replace(
         slide, visual=Visual(kind="chart", caption=caption, chart=chart),
