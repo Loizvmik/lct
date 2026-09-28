@@ -272,5 +272,8 @@ def test_category_axis_title_comes_from_the_data_not_the_model():
     from deckforge.plan.writer import _merged_axis_titles
 
     assert _merged_axis_titles(("Этап", "Значение"), ("Время, ч", "Этап")) == ("Этап", "Время, ч")
-    assert _merged_axis_titles(("Этап", "Значение"), ("Этап процесса", "Часы")) == ("Этап", "Часы")
+    # Уточнение модели, содержащее подпись по данным, принимается.
+    assert _merged_axis_titles(("Этап", "Значение"), ("Этап процесса", "Часы")) == ("Этап процесса", "Часы")
+    # Посторонняя подпись на оси категорий заменяется подписью по данным.
+    assert _merged_axis_titles(("Этап", "Значение"), ("Время, ч", "Минуты")) == ("Этап", "Минуты")
     assert _merged_axis_titles(("Этап", "Значение"), None) == ("Этап", "Значение")

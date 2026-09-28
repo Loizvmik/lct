@@ -501,16 +501,22 @@ def _merged_axis_titles(data_titles, model_titles):
     """Подписи осей графика по данным источника и по ответу модели. Ось
     категорий всегда подписана по данным (заголовок столбца таблицы):
     модель иногда ставила подпись значений на ось категорий, и у полос
-    «Время, ч» оказывалось у этапов (сервер, 28 сентября 2026). Модели
-    остаётся подпись оси значений, если она не повторяет ось категорий."""
+    «Время, ч» оказывалось у этапов (сервер, 28 сентября 2026). Модель
+    может уточнить подпись категорий, если уточнение содержит подпись по
+    данным, и подписать ось значений, если та не повторяет ось категорий."""
     if not data_titles:
         return model_titles if model_titles and all(model_titles) else None
     category, value = data_titles
     if model_titles and all(model_titles):
         first, second = model_titles
-        if second.strip().lower() == category.strip().lower():
+        key = category.strip().lower()
+        if key in second.strip().lower() and key not in first.strip().lower():
             first, second = second, first
-        if second.strip().lower() != category.strip().lower():
+        # Уточнение модели («Квартал» → «Квартал 2026») принимается, если
+        # содержит подпись по данным; посторонняя подпись нет.
+        if key in first.strip().lower():
+            category = first
+        if key not in second.strip().lower():
             value = second
     return (category, value)
 
