@@ -1,7 +1,7 @@
 // Клиент API — тонкая обёртка над `fetch`, без
 // дополнительных библиотек: эндпоинтов немного, и типы здесь — прямое
 // зеркало `deckforge.api.schemas` (см. комментарии у каждого типа).
-import { YandexCredentials, yandexHeaders } from "@/lib/yandexCredentials";
+import { getYandexCredentials, YandexCredentials, yandexHeaders } from "@/lib/yandexCredentials";
 
 export const API_BASE =
   process.env.NEXT_PUBLIC_API_BASE ?? "http://127.0.0.1:8000";
@@ -193,7 +193,24 @@ export function describeModel(model: ModelInfo): string {
   return `${model.hf.split("/").pop()} · ${size} · ${model.license} · ${model.provider}`;
 }
 
-export async function healthcheck(): Promise<{ status: string; stages: Stage[]; server_key?: boolean; model?: ModelInfo | null }> {
+export const MISSING_KEY_MESSAGE =
+  "Не указан ключ Yandex AI Studio. Откройте «Настройки» (значок в правом верхнем углу) → раздел «Yandex AI Studio», вставьте API-ключ и ID каталога и нажмите «Проверить».";
+
+// Понятная ошибка до запроса: сервер без своего ключа требует ключ
+// пользователя (`key_required`), а в этом браузере он не сохранён.
+export async function missingKeyError(): Promise<string | null> {
+  if (getYandexCredentials()) return null;
+  try {
+    const health = await healthcheck();
+    return health.key_required ? MISSING_KEY_MESSAGE : null;
+  } catch {
+    return null;
+  }
+}
+
+export async function healthcheck(): Promise<{
+  status: string; stages: Stage[]; server_key?: boolean; model?: ModelInfo | null; key_required?: boolean;
+}> {
   const response = await fetch(`${API_BASE}/api/health`);
   return asJson(response);
 }

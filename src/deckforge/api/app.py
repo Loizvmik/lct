@@ -36,6 +36,7 @@
 from __future__ import annotations
 import asyncio
 import json
+import os
 from pathlib import Path
 from urllib.parse import quote
 
@@ -120,6 +121,52 @@ def _request_credentials(
     return user_credentials.from_headers(x_yandex_api_key, x_yandex_folder_id)
 
 
+# Сервер без своего ключа требует ключ пользователя (`DECKFORGE_REQUIRE_
+# MODEL_KEY=1` в юните systemd): иначе презентация молча собралась бы
+# запасными путями без модели. Локально и в тестах выключено, там запасной
+# путь работает как раньше.
+MSG_NO_KEY = (
+    "Не указан ключ Yandex AI Studio. Откройте «Настройки» (значок в правом верхнем углу) → "
+    "раздел «Yandex AI Studio», вставьте API-ключ и ID каталога и нажмите «Проверить»."
+)
+_KEY_CHECK_TTL = 600.0
+_key_checks: dict[str, tuple[float, bool, str]] = {}
+
+
+def _require_key() -> bool:
+    return os.environ.get("DECKFORGE_REQUIRE_MODEL_KEY", "").strip() in ("1", "true", "yes")
+
+
+async def _ensure_model_key(creds: user_credentials.YandexCredentials | None) -> None:
+    """Понятная ошибка до начала работы, а не презентация без модели: ключ
+    не указан (и у сервера своего нет) или Yandex его не принял. Проверка
+    ключа кэшируется на 10 минут по отпечатку, сам ключ не хранится."""
+    if not _require_key():
+        return
+    if creds is None:
+        if _server_has_key():
+            return
+        raise HTTPException(status_code=400, detail=MSG_NO_KEY)
+    import hashlib
+    import time as _time
+    fingerprint = hashlib.sha256(f"{creds.api_key}\n{creds.folder_id}".encode()).hexdigest()
+    cached = _key_checks.get(fingerprint)
+    if cached is not None and _time.monotonic() - cached[0] < _KEY_CHECK_TTL:
+        ok, message = cached[1], cached[2]
+    else:
+        ok, message = await asyncio.to_thread(user_credentials.check_credentials, creds)
+        if ok or message != user_credentials.MSG_NO_NETWORK:
+            _key_checks[fingerprint] = (_time.monotonic(), ok, message)
+    if ok:
+        return
+    if message == user_credentials.MSG_NO_NETWORK:
+        raise HTTPException(status_code=503, detail="Нет связи с Yandex Cloud. Попробуйте ещё раз через минуту.")
+    raise HTTPException(
+        status_code=400,
+        detail=f"Ключ Yandex AI Studio не принят: {message}. Проверьте API-ключ и ID каталога в «Настройках».",
+    )
+
+
 def _server_has_key() -> bool:
     try:
         settings = Settings.load(APP_YAML_PATH)
@@ -186,6 +233,7 @@ def create_app(store: JobStore | None = None) -> FastAPI:
                 status_code=413,
                 detail=f"Шаблон больше {MAX_TEMPLATE_BYTES // (1024 * 1024)} МБ.",
             )
+        await _ensure_model_key(creds)
         # Ключ ставится на время разбора: провайдеры строятся внутри
         # `create_template` и берут его из контекста (`api.credentials`).
         token = user_credentials.use(creds)
@@ -243,6 +291,7 @@ def create_app(store: JobStore | None = None) -> FastAPI:
         request: schemas.DeckCreateRequest, store: JobStore = Depends(get_store),
         creds: user_credentials.YandexCredentials | None = Depends(_request_credentials),
     ) -> schemas.DeckCreateResponse:
+        await _ensure_model_key(creds)
         # Фоновая задача задания копирует контекст при создании
         # (`asyncio.create_task`) и уносит ключ с собой; сброс после
         # создания её копию не трогает.
@@ -260,6 +309,7 @@ def create_app(store: JobStore | None = None) -> FastAPI:
         request: schemas.DeckBatchRequest, store: JobStore = Depends(get_store),
         creds: user_credentials.YandexCredentials | None = Depends(_request_credentials),
     ) -> schemas.DeckBatchResponse:
+        await _ensure_model_key(creds)
         token = user_credentials.use(creds)
         try:
             batch_id, jobs = store.create_batch(styles=list(request.styles), **_job_args(request))
@@ -351,7 +401,8 @@ def create_app(store: JobStore | None = None) -> FastAPI:
     async def health() -> dict:
         # `server_key`: интерфейс по нему решает, просить ли человека
         # вставить свой ключ (без ключа генерация идёт запасными путями).
-        return {"status": "ok", "stages": list(STAGES), "server_key": _server_has_key(), "model": _model_info()}
+        return {"status": "ok", "stages": list(STAGES), "server_key": _server_has_key(), "model": _model_info(),
+                "key_required": _require_key() and not _server_has_key()}
 
     return app
 

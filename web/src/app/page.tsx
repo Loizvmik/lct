@@ -2,7 +2,7 @@
 
 import { useRouter } from "next/navigation";
 import { useRef, useState } from "react";
-import { uploadTemplate } from "@/lib/api";
+import { missingKeyError, uploadTemplate } from "@/lib/api";
 
 const MAX_FILE_SIZE = 100 * 1024 * 1024;
 
@@ -24,6 +24,12 @@ export default function UploadPage() {
     }
     setBusy(true);
     setError(null);
+    const keyError = await missingKeyError();
+    if (keyError) {
+      setError(keyError);
+      setBusy(false);
+      return;
+    }
     try {
       const result = await uploadTemplate(file);
       router.push(`/templates/${result.template_id}`);

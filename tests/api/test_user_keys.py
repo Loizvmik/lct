@@ -174,3 +174,46 @@ def test_health_reports_the_generation_model_without_secrets(client):
     assert model["license"] == "Apache-2.0" and model["params_b"] == 35 and model["active_params_b"] == 3
     assert model["provider"] == "Yandex AI Studio"
     assert "key" not in " ".join(model.keys()).lower()
+
+
+def test_missing_key_gives_a_clear_error_when_the_server_requires_one(client, monkeypatch):
+    """Сервер без своего ключа (`DECKFORGE_REQUIRE_MODEL_KEY=1`) не начинает
+    работу без ключа пользователя и говорит, где его ввести."""
+    from deckforge.api import app as app_module
+
+    monkeypatch.setenv("DECKFORGE_REQUIRE_MODEL_KEY", "1")
+    monkeypatch.setattr(app_module, "_server_has_key", lambda: False)
+    assert client.get("/api/health").json()["key_required"] is True
+    response = client.post("/api/templates", files={"file": ("t.pptx", b"PK", "application/octet-stream")})
+    assert response.status_code == 400
+    assert "Не указан ключ Yandex AI Studio" in response.json()["detail"]
+    assert "Настройки" in response.json()["detail"]
+
+
+def test_rejected_key_gives_a_clear_error_and_is_checked_once(client, monkeypatch):
+    from deckforge.api import app as app_module
+    from deckforge.api import credentials as creds_module
+
+    calls = []
+
+    def fake_check(creds):
+        calls.append(1)
+        return False, creds_module.MSG_BAD_KEY
+
+    monkeypatch.setenv("DECKFORGE_REQUIRE_MODEL_KEY", "1")
+    monkeypatch.setattr(app_module, "_server_has_key", lambda: False)
+    monkeypatch.setattr(creds_module, "check_credentials", fake_check)
+    monkeypatch.setattr(app_module, "_key_checks", {})
+    headers = {"X-Yandex-Api-Key": "bad-key-123", "X-Yandex-Folder-Id": "b1gfolder"}
+    for _ in range(2):
+        response = client.post("/api/templates", headers=headers,
+                               files={"file": ("t.pptx", b"PK", "application/octet-stream")})
+        assert response.status_code == 400
+        assert "Неверный API-ключ" in response.json()["detail"]
+    assert len(calls) == 1, "проверка ключа кэшируется"
+    assert all("bad-key-123" not in k for k in app_module._key_checks), "в кэше отпечаток, не ключ"
+
+
+def test_no_key_check_when_not_required(client, monkeypatch):
+    monkeypatch.delenv("DECKFORGE_REQUIRE_MODEL_KEY", raising=False)
+    assert client.get("/api/health").json()["key_required"] is False

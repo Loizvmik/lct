@@ -3,7 +3,7 @@
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import PhotoPicker, { PickedPhoto, toPicked } from "@/components/PhotoPicker";
-import { createDeckBatch, healthcheck, loadExamplePhotos, VariantName, VARIANT_DESCRIPTIONS, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
+import { createDeckBatch, missingKeyError, healthcheck, loadExamplePhotos, VariantName, VARIANT_DESCRIPTIONS, VARIANT_LABELS, VARIANT_ORDER } from "@/lib/api";
 import { getAppSettings } from "@/lib/appSettings";
 import { clearBriefDraft, loadBriefDraft, saveBriefDraft } from "@/lib/briefDraft";
 import { EXAMPLES } from "@/lib/exampleContent";
@@ -124,6 +124,12 @@ export default function BriefPage() {
     setBusy(true);
     setError(null);
     saveBriefDraft(params.templateId, { title, brief, sources, targetSlides, autofix });
+    const keyError = await missingKeyError();
+    if (keyError) {
+      setError(keyError);
+      setBusy(false);
+      return;
+    }
     try {
       // Один запрос создаёт по заданию на стиль: они идут параллельно, у
       // каждого свой бюджет, а структура презентации считается один раз.
