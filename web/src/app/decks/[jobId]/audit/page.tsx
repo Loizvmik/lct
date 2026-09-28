@@ -20,7 +20,7 @@ import {
   VARIANT_LABELS,
   VARIANT_ORDER,
 } from "@/lib/api";
-import { EXPORT_FORMATS, ExportFormat, getAppSettings, subscribeToAppSettings } from "@/lib/appSettings";
+import { DEFAULT_APP_SETTINGS, EXPORT_FORMATS, ExportFormat, getAppSettings, subscribeToAppSettings } from "@/lib/appSettings";
 
 function AuditScreen() {
   const params = useParams<{ jobId: string }>();
@@ -35,7 +35,7 @@ function AuditScreen() {
   const [applying, setApplying] = useState(false);
   const [result, setResult] = useState<string | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
-  const [preferredFormat, setPreferredFormat] = useState<ExportFormat>("pptx");
+  const [preferredFormat, setPreferredFormat] = useState<ExportFormat>(DEFAULT_APP_SETTINGS.preferredExportFormat);
   // Задача Q: стили одного запуска это отдельные задания пакета; переключатель
   // ведёт на проверку соседнего задания, а не на вариант внутри этого.
   const [siblings, setSiblings] = useState<JobResponse[]>([]);

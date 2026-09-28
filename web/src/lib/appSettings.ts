@@ -11,7 +11,7 @@ export interface AppSettings {
 export const DEFAULT_APP_SETTINGS: AppSettings = {
   defaultSlideCount: "auto",
   defaultAutofix: true,
-  preferredExportFormat: "pptx",
+  preferredExportFormat: "pdf",
   rememberDrafts: true,
 };
 

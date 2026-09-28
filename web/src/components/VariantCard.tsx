@@ -20,7 +20,7 @@ import {
   VARIANT_DESCRIPTIONS,
   VARIANT_LABELS,
 } from "@/lib/api";
-import { EXPORT_FORMATS, ExportFormat, getAppSettings, subscribeToAppSettings } from "@/lib/appSettings";
+import { DEFAULT_APP_SETTINGS, EXPORT_FORMATS, ExportFormat, getAppSettings, subscribeToAppSettings } from "@/lib/appSettings";
 
 function formatScore(value: number): string {
   return value.toFixed(1).replace(".", ",");
@@ -29,7 +29,7 @@ function formatScore(value: number): string {
 // Предпочитаемый формат скачивания из настроек; до первого чтения
 // localStorage стоит pptx, чтобы разметка сервера и клиента совпала.
 export function usePreferredFormat(): ExportFormat {
-  const [preferred, setPreferred] = useState<ExportFormat>("pptx");
+  const [preferred, setPreferred] = useState<ExportFormat>(DEFAULT_APP_SETTINGS.preferredExportFormat);
   useEffect(() => {
     const timer = window.setTimeout(() => setPreferred(getAppSettings().preferredExportFormat), 0);
     const unsubscribe = subscribeToAppSettings((settings) => setPreferred(settings.preferredExportFormat));
