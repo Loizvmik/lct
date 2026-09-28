@@ -186,6 +186,8 @@ _MALFORMED_FIX_HINT = "Повторить вызов модели или про�
 _COLLAGE_WIDTH_PX = 480
 _COLLAGE_GAP_PX = 6
 _COLLAGE_LABEL_HEIGHT_PX = 18
+# Предел стороны картинки у Yandex AI Studio (400 «image dimensions too large»).
+_COLLAGE_MAX_SIDE_PX = 4096
 
 
 SlideScore = dict[str, "int | str"]
@@ -551,8 +553,8 @@ def _build_deck_prompt(agent_body: str, spec: DeckSpec, pairs: list[tuple]) -> s
 
 
 def _build_collage(pngs: list[Path]) -> bytes:
-    """Одна картинка — вертикальная "простыня" уменьшенных превью всех
-    слайдов по порядку, каждое подписано номером. Нужна ТОЛЬКО C09/C11
+    """Одна картинка: сетка уменьшенных превью всех слайдов по порядку
+    (по строкам слева направо), каждое подписано номером. Нужна ТОЛЬКО C09/C11
     (докстрока модуля — они спрашиваются один раз на колоду, а
     `VisionProvider.ask_image` принимает ровно одну картинку за вызов, не
     список)."""
@@ -565,17 +567,27 @@ def _build_collage(pngs: list[Path]) -> bytes:
             ratio = _COLLAGE_WIDTH_PX / im.width
             thumbs.append(im.resize((_COLLAGE_WIDTH_PX, max(1, round(im.height * ratio)))))
 
-    total_height = sum(t.height for t in thumbs) + _COLLAGE_GAP_PX * len(thumbs) + _COLLAGE_LABEL_HEIGHT_PX * len(thumbs)
-    collage = Image.new("RGB", (_COLLAGE_WIDTH_PX, max(1, total_height)), color=(255, 255, 255))
+    # Превью укладываются сеткой по строкам, а не одним столбцом: Yandex
+    # принимает картинку не больше `_COLLAGE_MAX_SIDE_PX` по каждой стороне,
+    # и столбец из 15 слайдов (480×4410) давал 400 на всю проверку колоды
+    # (сервер, 28 сентября 2026). Колонок столько, чтобы высота влезла.
+    cell_h = max((t.height for t in thumbs), default=1) + _COLLAGE_LABEL_HEIGHT_PX + _COLLAGE_GAP_PX
+    cols = 1
+    while cols < max(1, len(thumbs)) and -(-len(thumbs) // cols) * cell_h > _COLLAGE_MAX_SIDE_PX:
+        cols += 1
+    rows = -(-len(thumbs) // cols) if thumbs else 1
+    cell_w = _COLLAGE_WIDTH_PX + _COLLAGE_GAP_PX
+    collage = Image.new("RGB", (max(1, cols * cell_w), max(1, rows * cell_h)), color=(255, 255, 255))
     draw = ImageDraw.Draw(collage)
     font = ImageFont.load_default()
 
-    y = 0
-    for i, thumb in enumerate(thumbs, start=1):
-        draw.text((2, y), f"Слайд {i}", fill=(0, 0, 0), font=font)
-        y += _COLLAGE_LABEL_HEIGHT_PX
-        collage.paste(thumb, (0, y))
-        y += thumb.height + _COLLAGE_GAP_PX
+    for i, thumb in enumerate(thumbs):
+        x, y = (i % cols) * cell_w, (i // cols) * cell_h
+        draw.text((x + 2, y), f"Слайд {i + 1}", fill=(0, 0, 0), font=font)
+        collage.paste(thumb, (x, y + _COLLAGE_LABEL_HEIGHT_PX))
+    if max(collage.size) > _COLLAGE_MAX_SIDE_PX:
+        scale = _COLLAGE_MAX_SIDE_PX / max(collage.size)
+        collage = collage.resize((max(1, round(collage.width * scale)), max(1, round(collage.height * scale))))
 
     buf = io.BytesIO()
     collage.save(buf, format="PNG")

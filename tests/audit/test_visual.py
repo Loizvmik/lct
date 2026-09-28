@@ -933,3 +933,22 @@ def test_supports_vision_looks_through_the_scheduler_wrapper():
             return "{}"
 
     assert _supports_vision(ScheduledProvider(_Vision(), role="visual_audit", scheduler=ModelScheduler(1)))
+
+
+def test_deck_collage_never_exceeds_the_provider_image_limit(tmp_path):
+    """Yandex отвечает 400 на картинку больше 4096 px по стороне: столбец
+    из 15 превью (480×4410) ронял проверку всей колоды на сервере
+    (28 сентября 2026). Коллаж укладывается сеткой и влезает при любом
+    числе слайдов."""
+    import io
+    from PIL import Image
+    from deckforge.audit.visual import _COLLAGE_MAX_SIDE_PX, _build_collage
+
+    for n in (1, 12, 15, 40):
+        pngs = []
+        for i in range(n):
+            path = tmp_path / f"s{n}-{i}.png"
+            Image.new("RGB", (1466, 825), (200, 200, 200)).save(path)
+            pngs.append(path)
+        size = Image.open(io.BytesIO(_build_collage(pngs))).size
+        assert max(size) <= _COLLAGE_MAX_SIDE_PX, (n, size)
