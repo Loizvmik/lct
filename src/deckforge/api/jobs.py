@@ -35,6 +35,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
 
+from deckforge.api import credentials as user_credentials
 from deckforge.audit.autofix import SUPPORTED_CHECKS, apply_fixes
 from deckforge.audit.config import AuditConfig
 from deckforge.audit.deterministic import run_deterministic
@@ -164,17 +165,24 @@ def _build_role_provider(role: str, *, deadline_seconds: float | None = None) ->
     """Тот же приём, что `cli._build_role_provider` — без ключа/сети
     пайплайн обязан продолжать работать запасными вариантами, не падать.
     Вызовы идут через планировщик процесса; задания оборачивают провайдера
-    ещё раз своим бюджетом (`_in_budget`)."""
+    ещё раз своим бюджетом (`_in_budget`).
+
+    Ключ пользователя из заголовков запроса (`api.credentials`) главнее
+    ключа сервера из `.env`: человек, вставивший свой ключ, платит сам и
+    ждёт, что генерация пойдёт на нём. Модель роли при этом из реестра."""
     try:
         settings = Settings.load(APP_YAML_PATH)
     except Exception:
         return None
-    if not settings.yandex_api_key or not settings.yandex_folder_id:
+    user = user_credentials.current()
+    api_key = user.api_key if user else settings.yandex_api_key
+    folder_id = user.folder_id if user else settings.yandex_folder_id
+    if not api_key or not folder_id:
         return None
     try:
         provider = YandexProvider(
-            model=settings.llm.model_for(role), api_key=settings.yandex_api_key,
-            folder_id=settings.yandex_folder_id,
+            model=settings.llm.model_for(role), api_key=api_key,
+            folder_id=folder_id,
             deadline_seconds=deadline_seconds if deadline_seconds is not None else settings.llm.deadline_seconds,
             reasoning_effort=settings.llm.reasoning_for(role),
         )

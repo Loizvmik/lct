@@ -170,3 +170,9 @@ class FixResponse(BaseModel):
     skipped: list[str]
     findings: list[FindingModel]
     preview_pngs: list[str]
+
+
+class CredentialsCheckResponse(BaseModel):
+    """Итог проверки ключа пользователя: `message` готов к показу как есть."""
+    ok: bool
+    message: str

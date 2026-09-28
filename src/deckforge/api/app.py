@@ -21,6 +21,10 @@
   записи со стилем задания) с превью-PNG и находками аудита.
 - `POST /api/decks/{id}/fix` — применяет выбранные исправления и
   пересобирает (`api.jobs.fix_deck`).
+- `POST /api/credentials/check` — проверка ключа Yandex AI Studio из
+  заголовков `X-Yandex-Api-Key`/`X-Yandex-Folder-Id`. Те же заголовки на
+  загрузке шаблона и создании заданий пускают модель на ключе пользователя
+  вместо ключа сервера (`api.credentials`).
 - `GET /api/decks/{id}/export` — скачивание готового файла
   (`?format=pptx|pdf|html`, `variant` необязателен: по умолчанию стиль
   задания).
@@ -35,7 +39,7 @@ import json
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile
 
 # Предел загрузки шаблона. Самый крупный шаблон датасета 34 МБ (ЛЦТ2026);
 # корпоративные шаблоны с фотографиями доходят до сотни.
@@ -44,12 +48,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
+from deckforge.api import credentials as user_credentials
 from deckforge.api import schemas
 from deckforge.api.jobs import (
-    MAX_PHOTO_BYTES, MAX_PHOTOS_PER_UPLOAD, JobError, JobRecord, JobStore, PhotoRecord, PhotoRejected, STAGES,
+    APP_YAML_PATH, MAX_PHOTO_BYTES, MAX_PHOTOS_PER_UPLOAD, JobError, JobRecord, JobStore, PhotoRecord, PhotoRejected, STAGES,
     VariantState, finding_id, fix_deck,
 )
 from deckforge.audit.findings import Finding
+from deckforge.settings import Settings
 
 _FORMAT_ATTR = {"pptx": "pptx_path", "pdf": "pdf_path", "html": "html_path"}
 _FORMAT_MEDIA = {
@@ -107,6 +113,21 @@ def _job_args(request: schemas.DeckInput) -> dict:
     )
 
 
+def _request_credentials(
+    x_yandex_api_key: str | None = Header(None), x_yandex_folder_id: str | None = Header(None),
+) -> user_credentials.YandexCredentials | None:
+    """Ключ пользователя из заголовков запроса, если пришла вся пара."""
+    return user_credentials.from_headers(x_yandex_api_key, x_yandex_folder_id)
+
+
+def _server_has_key() -> bool:
+    try:
+        settings = Settings.load(APP_YAML_PATH)
+    except Exception:  # noqa: BLE001 — нечитаемый конфиг для интерфейса значит «ключа нет»
+        return False
+    return bool(settings.yandex_api_key and settings.yandex_folder_id)
+
+
 def create_app(store: JobStore | None = None) -> FastAPI:
     app = FastAPI(title="DeckForge API", description="Генерация презентаций по .pptx-шаблону")
     app.state.store = store if store is not None else JobStore()
@@ -140,6 +161,7 @@ def create_app(store: JobStore | None = None) -> FastAPI:
     @app.post("/api/templates", response_model=schemas.TemplateUploadResponse)
     async def upload_template(
         file: UploadFile = File(...), store: JobStore = Depends(get_store),
+        creds: user_credentials.YandexCredentials | None = Depends(_request_credentials),
     ) -> schemas.TemplateUploadResponse:
         # Тело читается не дальше предела (ревью 27 сентября 2026): без
         # него файл любого размера целиком ложился в память процесса.
@@ -149,10 +171,15 @@ def create_app(store: JobStore | None = None) -> FastAPI:
                 status_code=413,
                 detail=f"Шаблон больше {MAX_TEMPLATE_BYTES // (1024 * 1024)} МБ.",
             )
+        # Ключ ставится на время разбора: провайдеры строятся внутри
+        # `create_template` и берут его из контекста (`api.credentials`).
+        token = user_credentials.use(creds)
         try:
             record = await store.create_template(data, file.filename or "template.pptx")
         except JobError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        finally:
+            user_credentials.reset(token)
         return schemas.TemplateUploadResponse(
             template_id=record.template_id, profile=json.loads(record.profile.to_json()),
         )
@@ -199,21 +226,32 @@ def create_app(store: JobStore | None = None) -> FastAPI:
     @app.post("/api/decks", response_model=schemas.DeckCreateResponse)
     async def create_deck(
         request: schemas.DeckCreateRequest, store: JobStore = Depends(get_store),
+        creds: user_credentials.YandexCredentials | None = Depends(_request_credentials),
     ) -> schemas.DeckCreateResponse:
+        # Фоновая задача задания копирует контекст при создании
+        # (`asyncio.create_task`) и уносит ключ с собой; сброс после
+        # создания её копию не трогает.
+        token = user_credentials.use(creds)
         try:
             job = store.create_job(style=request.style, **_job_args(request))
         except JobError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        finally:
+            user_credentials.reset(token)
         return schemas.DeckCreateResponse(job_id=job.job_id)
 
     @app.post("/api/decks/batch", response_model=schemas.DeckBatchResponse)
     async def create_deck_batch(
         request: schemas.DeckBatchRequest, store: JobStore = Depends(get_store),
+        creds: user_credentials.YandexCredentials | None = Depends(_request_credentials),
     ) -> schemas.DeckBatchResponse:
+        token = user_credentials.use(creds)
         try:
             batch_id, jobs = store.create_batch(styles=list(request.styles), **_job_args(request))
         except JobError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        finally:
+            user_credentials.reset(token)
         return schemas.DeckBatchResponse(batch_id=batch_id, job_ids=[job.job_id for job in jobs])
 
     @app.get("/api/jobs", response_model=list[schemas.JobResponse])
@@ -283,9 +321,22 @@ def create_app(store: JobStore | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Файл формата {format!r} для варианта {variant!r} ещё не готов.")
         return FileResponse(path, media_type=_FORMAT_MEDIA[format], filename=Path(path).name)
 
+    @app.post("/api/credentials/check", response_model=schemas.CredentialsCheckResponse)
+    async def check_credentials(
+        creds: user_credentials.YandexCredentials | None = Depends(_request_credentials),
+    ) -> schemas.CredentialsCheckResponse:
+        if creds is None:
+            raise HTTPException(
+                status_code=400, detail="Нужны оба заголовка: X-Yandex-Api-Key и X-Yandex-Folder-Id.",
+            )
+        ok, message = await asyncio.to_thread(user_credentials.check_credentials, creds)
+        return schemas.CredentialsCheckResponse(ok=ok, message=message)
+
     @app.get("/api/health")
     async def health() -> dict:
-        return {"status": "ok", "stages": list(STAGES)}
+        # `server_key`: интерфейс по нему решает, просить ли человека
+        # вставить свой ключ (без ключа генерация идёт запасными путями).
+        return {"status": "ok", "stages": list(STAGES), "server_key": _server_has_key()}
 
     return app
 
