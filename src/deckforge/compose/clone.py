@@ -1076,6 +1076,92 @@ def prune_unfilled(
     return removed + remove_orphan_plates(slide, canvas, text_boxes, keep=keep)
 
 
+# Линия тоньше этой доли холста по одной из сторон: соединитель,
+# нарисованный автофигурой, а не `p:cxnSp`.
+_LINE_THICKNESS = 0.004
+
+
+def _is_line(ref: ShapeRef) -> bool:
+    if ref.box is None or shape_text(ref.element).strip():
+        return False
+    if ref.kind == "connector":
+        return True
+    return ref.kind == "shape" and min(ref.box.width, ref.box.height) < _LINE_THICKNESS
+
+
+def prune_unit_lines(
+    slide, cells: list[Box], filled: set[int], axis: str, canvas: Canvas, *, keep: Iterable = (),
+) -> int:
+    """Убирает линии и соединители незаполненных единиц повтора.
+
+    Майнинг относит к единице не все её линии: у таймлайна ЛЦТ2026
+    (`slide25`, пять карточек зигзагом на общей оси с кружками-номерами)
+    ножка крайней карточки нулевой ширины в декор не попала вовсе, а
+    отрезки оси между кружками ни к какой единице не отнесены. При
+    четырёх карточках из пяти они висели в пустоте (рендер 28 сентября
+    2026). Поэтому принадлежность решает геометрия: `cells` это ячейки
+    единиц (коробки их слотов) в порядке обхода, `axis` ось повтора.
+
+    Короткая поперёк оси линия (ножка от карточки к оси) принадлежит
+    ближайшей по оси единице. Длинная вдоль оси линия соединяет единицы у
+    своих концов и те, чей центр она проходит: уходит, если среди них есть
+    незаполненная. Сплошная ось через три единицы и больше не удаляется,
+    а укорачивается до последней заполненной. Линии вне полосы ячеек
+    (подчёркивание заголовка) не трогаются. Возвращает, сколько линий
+    убрано или укорочено."""
+    if len(cells) < 2 or not filled or len(filled) >= len(cells):
+        return 0
+    x_axis = axis == "x"
+
+    def along(b: Box) -> tuple[float, float]:
+        return (b.left, b.right) if x_axis else (b.top, b.bottom)
+
+    def across(b: Box) -> tuple[float, float]:
+        return (b.top, b.bottom) if x_axis else (b.left, b.right)
+
+    centers = [(a + b) / 2 for a, b in map(along, cells)]
+    ordered = sorted(centers)
+    half = min(b - a for a, b in zip(ordered, ordered[1:])) / 2
+    if half <= 1e-4:
+        return 0
+    band = (min(across(c)[0] for c in cells) - 0.02, max(across(c)[1] for c in cells) + 0.02)
+
+    def nearest(x: float) -> int | None:
+        i = min(range(len(centers)), key=lambda k: abs(centers[k] - x))
+        return i if abs(centers[i] - x) <= half + 1e-4 else None
+
+    keep_ids = {id(el) for el in keep}
+    last_filled = max(filled)
+    changed = 0
+    for ref in slide_refs(slide, canvas):
+        if id(ref.element) in keep_ids or ref.element.getparent() is None or not _is_line(ref):
+            continue
+        lo, hi = across(ref.box)
+        if hi < band[0] or lo > band[1]:
+            continue
+        a0, a1 = along(ref.box)
+        if a1 - a0 < half:
+            units = {nearest((a0 + a1) / 2)}
+        else:
+            units = {nearest(a0), nearest(a1)} | {i for i, c in enumerate(centers) if a0 - 1e-4 <= c <= a1 + 1e-4}
+        units.discard(None)
+        if not units or units <= filled:
+            continue
+        if len(units) >= 3 and any(u in filled for u in units):
+            end = centers[last_filled]
+            if end <= a0:
+                remove_shape(ref.element)
+            elif x_axis:
+                set_shape_box(ref.element, Box(ref.box.left, ref.box.top, end - ref.box.left, ref.box.height), canvas)
+            else:
+                set_shape_box(ref.element, Box(ref.box.left, ref.box.top, ref.box.width, end - ref.box.top), canvas)
+            changed += 1
+            continue
+        remove_shape(ref.element)
+        changed += 1
+    return changed
+
+
 def _top_group(element):
     """Группа верхнего уровня (прямой ребёнок `p:spTree`), в которой лежит
     фигура, или `None`, если фигура сама на верхнем уровне."""
